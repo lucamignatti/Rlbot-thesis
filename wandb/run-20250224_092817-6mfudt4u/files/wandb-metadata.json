@@ -1,0 +1,40 @@
+{
+  "os":  "macOS-14.4.1-arm64-arm-64bit",
+  "python":  "CPython 3.12.7",
+  "startedAt":  "2025-02-24T14:28:17.095609Z",
+  "program":  "/Users/lumignatti/Documents/RLbot/main.py",
+  "codePath":  "main.py",
+  "email":  "lucamignatti@icloud.com",
+  "root":  "/Users/lumignatti/Documents/RLbot",
+  "host":  "USLucMig2200075",
+  "executable":  "/Users/lumignatti/miniconda3/bin/python",
+  "codePathLocal":  "main.py",
+  "cpu_count":  8,
+  "cpu_count_logical":  8,
+  "disk":  {
+    "/":  {
+      "total":  "245107195904",
+      "used":  "238452117504"
+    },
+    "/System/Volumes/Data":  {
+      "total":  "245107195904",
+      "used":  "238452117504"
+    }
+  },
+  "memory":  {
+    "total":  "17179869184"
+  },
+  "cpu":  {
+    "count":  8,
+    "countLogical":  8
+  },
+  "apple":  {
+    "name":  "Apple M1",
+    "ecpuCores":  4,
+    "pcpuCores":  4,
+    "gpuCores":  7,
+    "memoryGb":  16,
+    "swapTotalBytes":  "2147483648",
+    "ramTotalBytes":  "17179869184"
+  }
+}

@@ -1,0 +1,66 @@
+_wandb:
+    value:
+        cli_version: 0.19.7
+        m: []
+        python_version: 3.12.7
+        t:
+            "1":
+                - 1
+                - 55
+            "2":
+                - 1
+                - 55
+            "3":
+                - 2
+                - 13
+                - 16
+                - 23
+                - 55
+            "4": 3.12.7
+            "5": 0.19.7
+            "8":
+                - 5
+            "12": 0.19.7
+            "13": darwin-arm64
+critic_layer_sizes:
+    value:
+        - 512
+        - 512
+critic_lr:
+    value: 5e-05
+exp_buffer_size:
+    value: 150000
+gae_gamma:
+    value: 0.99
+gae_lambda:
+    value: 0.95
+min_inference_size:
+    value: 7
+n_proc:
+    value: 8
+policy_layer_sizes:
+    value:
+        - 512
+        - 512
+policy_lr:
+    value: 5e-05
+ppo_batch_size:
+    value: 50000
+ppo_clip_range:
+    value: 0.2
+ppo_ent_coef:
+    value: 0.01
+ppo_epochs:
+    value: 1
+ppo_minibatch_size:
+    value: 50000
+shm_buffer_size:
+    value: 8192
+standardize_obs:
+    value: false
+standardize_returns:
+    value: true
+timestep_limit:
+    value: 1000000000
+ts_per_iteration:
+    value: 50000
