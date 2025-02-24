@@ -1,5 +1,4 @@
 from rlgym.api import RLGym
-from rlgym.api import RLGym
 from rlgym.rocket_league.action_parsers import LookupTableAction, RepeatAction
 from rlgym.rocket_league.done_conditions import GoalCondition, AnyCondition, TimeoutCondition, NoTouchTimeoutCondition
 from rlgym.rocket_league.obs_builders import DefaultObs
@@ -12,17 +11,16 @@ from rewards import ProximityReward
 import time
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
+import argparse
+from tqdm import tqdm
+import os
 
+parser = argparse.ArgumentParser(description='RLBot Training Script')
+parser.add_argument('--render', type=bool, default=False, help='Enable rendering')
+parser.add_argument('--episodes', type=int, default=200, help='Number of episodes to run')
+parser.add_argument('--processes', type=int, default=os.cpu_count(), help='Number of parallel processes')
 
-
-#Parse args later
-
-render = True
-
-episodes = 100
-
-processes = 4
-
+args = parser.parse_args()
 
 
 
@@ -51,14 +49,12 @@ def getenv():
 
 
 def episode(env, render=False):
+
     obs_dict = env.reset()
 
     obs_space_dims = env.observation_space(env.agents[0])[1]
 
     action_space_dims = env.action_space(env.agents[0])[1]
-
-    print(obs_space_dims)
-    print(action_space_dims)
 
     terminated = False
     truncated = False
@@ -71,20 +67,22 @@ def episode(env, render=False):
     log_probs = {agent: [] for agent in env.agents}
 
 
-    while not terminated or truncated:
+    while not (terminated or truncated):
         if render:
             env.render()
             time.sleep(6/120)
 
 
-        actions = {}
+        current_actions = {}
 
         for agent_id, action_space in env.action_spaces.items():
             action = np.random.randint(action_space_dims, size=1)
-            actions[agent_id] = action
+            current_actions[agent_id] = action
+            states[agent_id].append(obs_dict[agent_id])
+            actions[agent_id].append(action)
 
 
-        obs_dict, reward_dict, terminated_dict, truncated_dict = env.step(actions)
+        obs_dict, reward_dict, terminated_dict, truncated_dict = env.step(current_actions)
 
         for agent in reward_dict.keys():
             rewards[agent].append(reward_dict[agent])
@@ -99,13 +97,13 @@ def episode(env, render=False):
 
 
 
-def run_parallel_episodes(num_processes, envs):
+def run_parallel_episodes(num_processes, envs, progress_bar):
     with ProcessPoolExecutor(max_workers=num_processes) as executor:
 
         # Create tasks
         futures = []
         for i in range(num_processes):
-            futures.append(executor.submit(episode, envs[i], True if i==0 and render else False))
+            futures.append(executor.submit(episode, envs[i], (i==0 and args.render)))
 
         # Collect results
         results = []
@@ -113,14 +111,22 @@ def run_parallel_episodes(num_processes, envs):
             try:
                 result = future.result()
                 results.append(result)
+                progress_bar.update(1)
             except Exception as e:
                 print(f"An error occurred: {e}")
 
     return results
 
 if __name__ == "__main__":
-    envs = [getenv() for _ in range(processes)]
 
-    results = run_parallel_episodes(processes, envs)
 
-    print(results)
+
+    batches = args.episodes // args.processes
+    progress_bar = tqdm(total=batches * args.processes)
+
+
+    envs = [getenv() for _ in range(args.processes)]
+
+    results = []
+    for _ in range(batches):
+        results.append(run_parallel_episodes(args.processes, envs, progress_bar))
