@@ -17,7 +17,6 @@ class PPOMemory:
     def __init__(self, batch_size, buffer_size=10000):
         self.batch_size = batch_size
         self.buffer_size = buffer_size
-        self.lock = mp.Lock()  # Use multiprocessing lock
 
         # Initialize arrays with default shapes
         self.states = np.zeros((buffer_size, 1), dtype=np.float32)
@@ -40,110 +39,106 @@ class PPOMemory:
         Process-safe store of one timestep of agent-environment interaction in the buffer.
         Uses pre-allocated arrays for efficient storage.
         """
-        with self.lock:
-            # Initialize arrays if needed
-            if not self.state_initialized and state is not None:
-                state_array = np.asarray(state, dtype=np.float32)
-                self.states = np.zeros((self.buffer_size,) + state_array.shape, dtype=np.float32)
-                self.state_initialized = True
+        # Initialize arrays if needed
+        if not self.state_initialized and state is not None:
+            state_array = np.asarray(state, dtype=np.float32)
+            self.states = np.zeros((self.buffer_size,) + state_array.shape, dtype=np.float32)
+            self.state_initialized = True
 
-            if not self.action_initialized and action is not None:
-                action_array = np.asarray(action)
-                if action_array.size == 1:  # Discrete action
-                    self.actions = np.zeros((self.buffer_size,), dtype=np.int64)
-                else:  # Continuous action
-                    self.actions = np.zeros((self.buffer_size,) + action_array.shape, dtype=np.float32)
-                self.action_initialized = True
+        if not self.action_initialized and action is not None:
+            action_array = np.asarray(action)
+            if action_array.size == 1:  # Discrete action
+                self.actions = np.zeros((self.buffer_size,), dtype=np.int64)
+            else:  # Continuous action
+                self.actions = np.zeros((self.buffer_size,) + action_array.shape, dtype=np.float32)
+            self.action_initialized = True
 
-            # Store at current position with None handling
-            if state is not None:
-                self.states[self.pos] = np.asarray(state, dtype=np.float32)
-            else:
-                self.states[self.pos] = np.zeros_like(self.states[0])
+        # Store at current position with None handling
+        if state is not None:
+            self.states[self.pos] = np.asarray(state, dtype=np.float32)
+        else:
+            self.states[self.pos] = np.zeros_like(self.states[0])
 
-            if action is not None:
-                action_array = np.asarray(action)
-                if action_array.size == 1:  # Discrete action
-                    self.actions[self.pos] = int(action_array.item())
-                else:  # Continuous action
-                    self.actions[self.pos] = action_array
-            else:
-                self.actions[self.pos] = np.zeros_like(self.actions[0])
+        if action is not None:
+            action_array = np.asarray(action)
+            if action_array.size == 1:  # Discrete action
+                self.actions[self.pos] = int(action_array.item())
+            else:  # Continuous action
+                self.actions[self.pos] = action_array
+        else:
+            self.actions[self.pos] = np.zeros_like(self.actions[0])
 
-            self.logprobs[self.pos] = float(logprob if logprob is not None else 0)
-            self.rewards[self.pos] = float(reward if reward is not None else 0)
-            self.values[self.pos] = float(value if value is not None else 0)
-            self.dones[self.pos] = bool(done if done is not None else False)
+        self.logprobs[self.pos] = float(logprob if logprob is not None else 0)
+        self.rewards[self.pos] = float(reward if reward is not None else 0)
+        self.values[self.pos] = float(value if value is not None else 0)
+        self.dones[self.pos] = bool(done if done is not None else False)
 
-            # Update position and size
-            self.pos = (self.pos + 1) % self.buffer_size
-            self.size = min(self.size + 1, self.buffer_size)
+        # Update position and size
+        self.pos = (self.pos + 1) % self.buffer_size
+        self.size = min(self.size + 1, self.buffer_size)
 
     def clear(self):
         """
         Process-safe reset buffer after an update.
         Resets position and size counters without deallocating memory.
         """
-        with self.lock:
-            # Reset position and size without clearing arrays
-            self.pos = 0
-            self.size = 0
+        # Reset position and size without clearing arrays
+        self.pos = 0
+        self.size = 0
 
     def get(self):
         """
         Process-safe get all data from buffer.
         Returns valid data from the circular buffer.
         """
-        with self.lock:
-            if self.size == 0 or not self.state_initialized:
-                return [], [], [], [], [], []
+        if self.size == 0 or not self.state_initialized:
+            return [], [], [], [], [], []
 
-            # Get valid slice of data ensuring proper numpy arrays
-            valid_states = np.array(self.states[:self.size], dtype=np.float32)
-            valid_actions = np.array(self.actions[:self.size], dtype=np.float32)
-            valid_logprobs = np.array(self.logprobs[:self.size], dtype=np.float32)
-            valid_rewards = np.array(self.rewards[:self.size], dtype=np.float32)
-            valid_values = np.array(self.values[:self.size], dtype=np.float32)
-            valid_dones = np.array(self.dones[:self.size], dtype=bool)
+        # Get valid slice of data ensuring proper numpy arrays
+        valid_states = np.array(self.states[:self.size], dtype=np.float32)
+        valid_actions = np.array(self.actions[:self.size], dtype=np.float32)
+        valid_logprobs = np.array(self.logprobs[:self.size], dtype=np.float32)
+        valid_rewards = np.array(self.rewards[:self.size], dtype=np.float32)
+        valid_values = np.array(self.values[:self.size], dtype=np.float32)
+        valid_dones = np.array(self.dones[:self.size], dtype=bool)
 
-            # Return only the valid data
-            return (
-                valid_states,
-                valid_actions,
-                valid_logprobs,
-                valid_rewards,
-                valid_values,
-                valid_dones
-            )
+        # Return only the valid data
+        return (
+            valid_states,
+            valid_actions,
+            valid_logprobs,
+            valid_rewards,
+            valid_values,
+            valid_dones
+        )
 
     def generate_batches(self):
-        with self.lock:
-            if self.size == 0:
-                return []
+        if self.size == 0:
+            return []
 
-            # Generate shuffled indices
-            indices = np.arange(self.size, dtype=np.int32)
-            np.random.shuffle(indices)
+        # Generate shuffled indices
+        indices = np.arange(self.size, dtype=np.int32)
+        np.random.shuffle(indices)
 
-            # Calculate batch info
-            n_batches = (self.size + self.batch_size - 1) // self.batch_size  # Ceiling division
+        # Calculate batch info
+        n_batches = (self.size + self.batch_size - 1) // self.batch_size  # Ceiling division
 
-            # Pre-allocate fixed-size array for all batches
-            # Make last batch same size as others, just with some indices repeated
-            batches = np.zeros((n_batches, self.batch_size), dtype=np.int32)
+        # Pre-allocate fixed-size array for all batches
+        # Make last batch same size as others, just with some indices repeated
+        batches = np.zeros((n_batches, self.batch_size), dtype=np.int32)
 
-            # Fill complete batches
-            complete_size = (self.size // self.batch_size) * self.batch_size
-            batches[:complete_size//self.batch_size] = indices[:complete_size].reshape(-1, self.batch_size)
+        # Fill complete batches
+        complete_size = (self.size // self.batch_size) * self.batch_size
+        batches[:complete_size//self.batch_size] = indices[:complete_size].reshape(-1, self.batch_size)
 
-            # Handle last batch by repeating some indices if needed
-            if complete_size < self.size:
-                remaining = indices[complete_size:]
-                # Pad with repeated indices to maintain batch size
-                padding = indices[:self.batch_size - len(remaining)]
-                batches[-1] = np.concatenate([remaining, padding])
+        # Handle last batch by repeating some indices if needed
+        if complete_size < self.size:
+            remaining = indices[complete_size:]
+            # Pad with repeated indices to maintain batch size
+            padding = indices[:self.batch_size - len(remaining)]
+            batches[-1] = np.concatenate([remaining, padding])
 
-            return batches
+        return batches
 
 class PPOTrainer:
     def __init__(
@@ -185,11 +180,6 @@ class PPOTrainer:
         self.actor = actor
         self.critic = critic
 
-        # Share memory for multiprocessing
-        self.actor.to("cpu")
-        self.critic.to("cpu")
-        self.actor.share_memory()
-        self.critic.share_memory()
 
         # PPO hyperparameters
         self.gamma = gamma
@@ -207,7 +197,6 @@ class PPOTrainer:
 
         # Memory and experience queue
         self.memory = PPOMemory(batch_size, buffer_size=10000)
-        self.experience_queue = mp.Queue()
 
         # Training metrics
         self.actor_losses = []
@@ -221,7 +210,6 @@ class PPOTrainer:
 
         if self.debug:
             print(f"[DEBUG] PPOTrainer initialized with target device: {self.device}")
-            print(f"[DEBUG] Model parameters are shared on CPU for multiprocessing")
 
         if self.use_wandb:
             wandb.log({"device": self.device})
@@ -235,32 +223,26 @@ class PPOTrainer:
         """Get the appropriate device for inference operations"""
         return self.device
 
-    def collect_experiences(self, timeout=0.1):
+    def store_experience(self, state, action, log_prob, reward, value, done):
         """
-        Collect experiences from the experience queue and store them in memory.
-        Returns True if experiences were collected, False if queue was empty.
+        Store experience directly in memory buffer.
         """
-        try:
-            experience = self.experience_queue.get(timeout=timeout)
-            state, action, log_prob, reward, value, done = experience
-            self.memory.store(state, action, log_prob, reward, value, done)
-            return True
-        except Empty:
-            return False
+        self.memory.store(state, action, log_prob, reward, value, done)
 
     def get_action(self, state, evaluate=False):
         """
         Get action and log probability from state using the actor network.
+        Optimized for both single and batched inputs.
         """
+        # Handle different input formats
         if not isinstance(state, torch.Tensor):
-            state = torch.FloatTensor(state).unsqueeze(0)
+            state = torch.FloatTensor(state)
+            # Only add batch dimension if this isn't already a batch
+            if state.dim() == 1 or (len(state.shape) == 2 and state.shape[0] == 1 and state.shape[1] > 1):
+                state = state.unsqueeze(0)
 
         # Move state to target device for inference
         state_device = state.to(self.device)
-
-        # Temporarily move models to target device for inference
-        self.actor.to(self.device)
-        self.critic.to(self.device)
 
         with torch.no_grad():
             # Get value estimate from critic
@@ -291,14 +273,11 @@ class PPOTrainer:
 
                 log_prob = dist.log_prob(action)
 
-                if len(action.shape) > 1:
-                    log_prob = log_prob.sum(dim=1)
+                # Sum log probs across action dimensions but preserve batch dimension
+                if len(log_prob.shape) > 1:
+                    log_prob = log_prob.sum(dim=-1)  # Sum over last dimension (action dimension)
 
                 action = torch.clamp(action, self.action_bounds[0], self.action_bounds[1])
-
-        # Move models back to CPU for multiprocessing
-        self.actor.to("cpu")
-        self.critic.to("cpu")
 
         return action.cpu().numpy(), log_prob.cpu().numpy(), value.cpu().numpy()
 
@@ -340,10 +319,6 @@ class PPOTrainer:
         if len(states) > 0 and not dones[-1]:
             self.debug_print("Computing next value...")
             try:
-                # Move models to device one at a time
-                self.debug_print("Moving critic to device...")
-                self.critic.to(self.device)
-
                 self.debug_print("Preparing next state...")
                 with torch.no_grad():
                     next_state = torch.FloatTensor(states[-1]).to(self.device)
@@ -356,14 +331,7 @@ class PPOTrainer:
                     self.debug_print("Moving result to CPU...")
                     next_value = next_value.cpu()
 
-                    # Force MPS synchronization
-                    if self.device == "mps":
-                        torch.mps.synchronize()
-
                     next_value = next_value.numpy()[0]
-
-                self.debug_print("Moving critic back to CPU...")
-                self.critic.to("cpu")
 
                 self.debug_print("Next value computation complete")
             except Exception as e:
@@ -391,11 +359,6 @@ class PPOTrainer:
         self.debug_print("Moving data to device...")
         device_start = time.time()
         try:
-            # Move models one at a time
-            self.debug_print("Moving actor to device...")
-            self.actor.to(self.device)
-            self.debug_print("Moving critic to device...")
-            self.critic.to(self.device)
 
             self.debug_print("Converting and moving tensors...")
             # Convert and move data in smaller chunks
@@ -409,10 +372,6 @@ class PPOTrainer:
             advantages = torch.FloatTensor(advantages).to(self.device)
             returns = torch.FloatTensor(returns).to(self.device)
 
-            # Force MPS synchronization after data movement
-            if self.device == "mps":
-                self.debug_print("Synchronizing MPS device...")
-                torch.mps.synchronize()
 
             self.debug_print(f"Data movement took {time.time() - device_start:.2f}s")
         except Exception as e:
@@ -449,16 +408,12 @@ class PPOTrainer:
                     # Critic forward pass
                     self.debug_print("Running critic forward pass...")
                     values = self.critic(batch_states).squeeze()
-                    if self.device == "mps":
-                        torch.mps.synchronize()
                     self.debug_print("Critic forward pass complete")
 
                     # Actor forward pass
                     self.debug_print("Running actor forward pass...")
                     if self.action_space_type == "discrete":
                         logits = self.actor(batch_states)
-                        if self.device == "mps":
-                            torch.mps.synchronize()
 
                         action_probs = F.softmax(logits, dim=1)
                         dist = Categorical(action_probs)
@@ -466,8 +421,6 @@ class PPOTrainer:
                         entropy = dist.entropy().mean()
                     else:
                         mu, sigma = self.actor(batch_states)
-                        if self.device == "mps":
-                            torch.mps.synchronize()
 
                         sigma = F.softplus(sigma) + 1e-5
                         dist = Normal(mu, sigma)
@@ -476,9 +429,6 @@ class PPOTrainer:
                             new_log_probs = new_log_probs.sum(dim=1)
                         entropy = dist.entropy().mean()
 
-                    # Force final synchronization before timing
-                    if self.device == "mps":
-                        torch.mps.synchronize()
 
                     batch_time = time.time() - batch_loop_start
                     batch_times.append(batch_time)
@@ -491,11 +441,6 @@ class PPOTrainer:
                 except Exception as e:
                     # Keep error messages as regular prints
                     print(f"Error in batch {batch_idx+1}: {str(e)}")
-                    if self.device == "mps":
-                        try:
-                            torch.mps.synchronize()
-                        except:
-                            pass
                     raise
 
                 self.debug_print("Computing PPO objectives...")
@@ -511,22 +456,14 @@ class PPOTrainer:
                 self.actor_optimizer.zero_grad()
                 self.critic_optimizer.zero_grad()
                 loss.backward()
-                if self.device == "mps":
-                    torch.mps.synchronize()
 
                 self.debug_print("Clipping gradients...")
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-                if self.device == "mps":
-                    self.debug_print("Synchronizing after gradient clipping...")
-                    torch.mps.synchronize()
 
                 self.debug_print("Applying optimizer steps...")
                 self.actor_optimizer.step()
                 self.critic_optimizer.step()
-                if self.device == "mps":
-                    self.debug_print("Synchronizing after optimizer steps...")
-                    torch.mps.synchronize()
 
                 self.debug_print("Accumulating losses...")
                 total_actor_loss += actor_loss.item()
@@ -544,11 +481,6 @@ class PPOTrainer:
                 print(f"[DEBUG] Average batch time: {avg_batch_time:.3f}s")
                 print(f"[DEBUG] Min/Max batch time: {min(batch_times):.3f}s / {max(batch_times):.3f}s")
                 print(f"[DEBUG] Current losses: actor={actor_loss.item():.4f}, critic={critic_loss.item():.4f}, entropy={entropy_loss.item():.4f}")
-
-        # Move models back to CPU for multiprocessing
-        self.debug_print("Moving models back to CPU...")
-        self.actor.to("cpu")
-        self.critic.to("cpu")
 
         num_updates = self.ppo_epochs * len(batches)
         avg_actor_loss = total_actor_loss / num_updates
@@ -577,8 +509,6 @@ class PPOTrainer:
             self.debug_print("Logged metrics to wandb")
 
         # Clean up
-        self.actor.to("cpu")
-        self.critic.to("cpu")
         self.memory.clear()
 
         total_time = time.time() - update_start
@@ -602,5 +532,5 @@ class PPOTrainer:
 
     def load_models(self, actor_path, critic_path):
         """Load actor and critic models from disk."""
-        self.actor.load_state_dict(torch.load(actor_path, map_location="cpu"))
-        self.critic.load_state_dict(torch.load(critic_path, map_location="cpu"))
+        self.actor.load_state_dict(torch.load(actor_path, map_location=self.device))
+        self.critic.load_state_dict(torch.load(critic_path, map_location=self.device))
