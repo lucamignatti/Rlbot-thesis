@@ -283,20 +283,27 @@ def run_parallel_training(
 
             # Collect experiences from queue (non-blocking)
             try:
-                # Try to get as many experiences as possible without blocking
+                # Try to get experiences without using qsize()
                 experience_batch_start = time.time()
-                experiences_to_process = min(
-                    experience_queue.qsize(),
-                    update_interval - collected_experiences
-                )
+                experiences_collected_this_loop = 0
 
-                for _ in range(experiences_to_process):
-                    experience = experience_queue.get_nowait()
-                    trainer.store_experience(*experience)
-                    collected_experiences += 1
+                # Set a limit for how many experiences to process in one loop iteration
+                max_experiences_per_loop = 100
 
-                if experiences_to_process > 0 and debug:
-                    print(f"[DEBUG] Processed {experiences_to_process} experiences in {time.time() - experience_batch_start:.3f}s")
+                # Keep collecting until either queue is empty or we've hit the update threshold
+                while experiences_collected_this_loop < max_experiences_per_loop and collected_experiences < update_interval:
+                    try:
+                        # Use get_nowait() to avoid blocking
+                        experience = experience_queue.get_nowait()
+                        trainer.store_experience(*experience)
+                        collected_experiences += 1
+                        experiences_collected_this_loop += 1
+                    except Empty:
+                        # Queue is empty, break the inner loop
+                        break
+
+                if experiences_collected_this_loop > 0 and debug:
+                    print(f"[DEBUG] Processed {experiences_collected_this_loop} experiences in {time.time() - experience_batch_start:.3f}s")
 
                 # Update progress bar description
                 if collected_experiences > 0:
