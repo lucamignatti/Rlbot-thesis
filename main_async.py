@@ -10,7 +10,7 @@ from rlgym.rocket_league.sim import RocketSimEngine
 from rlgym.rocket_league.rlviser import RLViserRenderer
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
 from rewards import ProximityReward
-from models import BasicModel
+from models import BasicModel, SimBa
 from training import PPOTrainer
 import time
 import argparse
@@ -60,15 +60,13 @@ def worker(
             print(f"[DEBUG] Worker {rank} starting")
 
         # Create local copies of models for inference
-        local_actor = BasicModel(
-            input_size=shared_actor.network[0].in_features,
-            output_size=shared_actor.network[-1].out_features,
-            hidden_size=shared_actor.network[0].out_features
+        local_actor = SimBa(
+            obs_shape=shared_actor.obs_shape,
+            action_shape=shared_actor.action_shape,
         )
-        local_critic = BasicModel(
-            input_size=shared_critic.network[0].in_features,
-            output_size=shared_critic.network[-1].out_features,
-            hidden_size=shared_critic.network[0].out_features
+        local_critic = SimBa(
+            obs_shape=shared_critic.obs_shape,
+            action_shape=shared_critic.action_shape,
         )
 
         # Initialize with shared model weights
@@ -239,16 +237,14 @@ def run_parallel_training(
         # Create separate models for the trainer on the target device
         # Don't share the CUDA models with worker processes
         if device != "cpu":
-            trainer_actor = BasicModel(
-                input_size=actor.network[0].in_features,
-                output_size=actor.network[-1].out_features,
-                hidden_size=actor.network[0].out_features
+            trainer_actor = SimBa(
+                obs_shape=actor.obs_shape,
+                action_shape=actor.action_shape,
             ).to(device)
 
-            trainer_critic = BasicModel(
-                input_size=critic.network[0].in_features,
-                output_size=critic.network[-1].out_features,
-                hidden_size=critic.network[0].out_features
+            trainer_critic = SimBa(
+                obs_shape=critic.obs_shape,
+                action_shape=critic.action_shape,
             ).to(device)
 
             # Copy the weights from CPU models
@@ -398,7 +394,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='RLBot Training Script')
     parser.add_argument('--render', action='store_true', help='Enable rendering')
     parser.add_argument('-e', '--episodes', type=int, default=200, help='Number of episodes to run')
-    parser.add_argument('-p', '--processes', type=int, default=min(os.cpu_count() or 1, 4),
+    parser.add_argument('-p', '--processes', type=int, default=os.cpu_count(),
                         help='Number of parallel processes')
     parser.add_argument('--update_interval', type=int, default=1000,
                         help='Experiences before policy update')
@@ -432,8 +428,8 @@ if __name__ == "__main__":
     env.close()
 
     # Initialize models
-    actor = BasicModel(input_size=obs_space_dims, output_size=action_space_dims, hidden_size=obs_space_dims//2)
-    critic = BasicModel(input_size=obs_space_dims, output_size=1, hidden_size=obs_space_dims//2)
+    actor = SimBa(obs_shape=obs_space_dims, action_shape=action_space_dims)
+    critic = SimBa(obs_shape=obs_space_dims, action_shape=1)
 
     # Determine device
     device = args.device
