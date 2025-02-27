@@ -74,7 +74,13 @@ def worker(
         local_critic.load_state_dict(shared_critic.state_dict())
 
         # Create local trainer for action selection only
-        local_trainer = PPOTrainer(local_actor, local_critic, device="cpu", debug=False)
+        local_trainer = PPOTrainer(
+            local_actor,
+            local_critic,
+            action_dim=local_actor.action_shape,
+            device="cpu",
+            debug=False
+        )
 
         # Set up environment
         env = get_env()
@@ -181,8 +187,20 @@ def run_parallel_training(
     render: bool = False,
     update_interval: int = 1000,
     use_wandb: bool = False,
-    debug: bool = False
+    debug: bool = False,
+    # Hyperparameters
+    lr_actor: float = 3e-4,
+    lr_critic: float = 1e-3,
+    gamma: float = 0.99,
+    gae_lambda: float = 0.95,
+    clip_epsilon: float = 0.2,
+    critic_coef: float = 0.5,
+    entropy_coef: float = 0.01,
+    max_grad_norm: float = 0.5,
+    ppo_epochs: int = 10,
+    batch_size: int = 64
 ):
+
     # Initialize variables that might be accessed in finally block
     collected_experiences = 0
     processes = []
@@ -256,7 +274,24 @@ def run_parallel_training(
             trainer_critic = shared_critic
 
         # Create trainer with the device-specific models
-        trainer = PPOTrainer(trainer_actor, trainer_critic, device=device, use_wandb=use_wandb, debug=debug)
+        trainer = PPOTrainer(
+            trainer_actor,
+            trainer_critic,
+            action_dim=trainer_actor.action_shape,
+            device=device,
+            lr_actor=lr_actor,
+            lr_critic=lr_critic,
+            gamma=gamma,
+            gae_lambda=gae_lambda,
+            clip_epsilon=clip_epsilon,
+            critic_coef=critic_coef,
+            entropy_coef=entropy_coef,
+            max_grad_norm=max_grad_norm,
+            ppo_epochs=ppo_epochs,
+            batch_size=batch_size,
+            use_wandb=use_wandb,
+            debug=debug
+        )
 
         # Main training loop variables
         collected_experiences = 0
@@ -487,7 +522,18 @@ if __name__ == "__main__":
         render=args.render,
         update_interval=args.update_interval,
         use_wandb=args.wandb,
-        debug=args.debug
+        debug=args.debug,
+        # Hyperparameters
+        lr_actor=args.lra,
+        lr_critic=args.lrc,
+        gamma=args.gamma,
+        gae_lambda=args.gae_lambda,
+        clip_epsilon=args.clip_epsilon,
+        critic_coef=args.critic_coef,
+        entropy_coef=args.entropy_coef,
+        max_grad_norm=args.max_grad_norm,
+        ppo_epochs=args.ppo_epochs,
+        batch_size=args.batch_size
     )
 
     # Create models directory and save models
