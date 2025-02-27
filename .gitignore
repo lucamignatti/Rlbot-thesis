@@ -4,3 +4,7 @@ rlviser
 settings.txt
 collision_meshes/
 rlut_meshes/
+
+# outputs
+wandb/
+models/

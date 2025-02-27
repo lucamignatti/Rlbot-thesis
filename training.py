@@ -316,6 +316,31 @@ class PPOTrainer:
         states, actions, old_log_probs, rewards, values, dones = self.memory.get()
         self.debug_print(f"Memory retrieved: {len(states)} timesteps")
 
+        # Calculate episode metrics before processing
+        episodes_ended = np.sum(dones) if len(dones) > 0 else 0
+        if episodes_ended > 0:
+            # Calculate average reward per episode
+            episode_rewards = []
+            episode_reward = 0
+            episode_lengths = []
+            episode_length = 0
+
+            for i, (reward, done) in enumerate(zip(rewards, dones)):
+                episode_reward += reward
+                episode_length += 1
+
+                if done or i == len(rewards) - 1:
+                    episode_rewards.append(episode_reward)
+                    episode_lengths.append(episode_length)
+                    episode_reward = 0
+                    episode_length = 0
+
+            avg_episode_reward = np.mean(episode_rewards)
+            avg_episode_length = np.mean(episode_lengths)
+        else:
+            avg_episode_reward = np.mean(rewards) if len(rewards) > 0 else 0
+            avg_episode_length = len(rewards)
+
         if len(states) > 0 and not dones[-1]:
             self.debug_print("Computing next value...")
             try:
@@ -359,7 +384,6 @@ class PPOTrainer:
         self.debug_print("Moving data to device...")
         device_start = time.time()
         try:
-
             self.debug_print("Converting and moving tensors...")
             # Convert and move data in smaller chunks
             states = torch.FloatTensor(states).to(self.device)
@@ -372,7 +396,6 @@ class PPOTrainer:
             advantages = torch.FloatTensor(advantages).to(self.device)
             returns = torch.FloatTensor(returns).to(self.device)
 
-
             self.debug_print(f"Data movement took {time.time() - device_start:.2f}s")
         except Exception as e:
             print(f"Error during data movement: {str(e)}")
@@ -383,6 +406,20 @@ class PPOTrainer:
         total_entropy_loss = 0
         total_loss = 0
 
+        # Variables for tracking policy changes
+        old_policy_kl = 0
+        explained_var = 0
+
+        # Default values for potentially unbound variables
+        old_probs = None
+        old_mu = None
+        old_sigma = None
+        batches = []
+        actor_loss = 0
+        critic_loss = 0
+        entropy_loss = 0
+        epoch_time = 0
+
         self.debug_print(f"Starting {self.ppo_epochs} PPO epochs...")
         for epoch in range(self.ppo_epochs):
             self.debug_print(f"Epoch {epoch+1}/{self.ppo_epochs}, generating batches...")
@@ -391,6 +428,16 @@ class PPOTrainer:
             epoch_batch_start = time.time()
 
             batch_times = []
+            # Save old policy outputs for KL calculation
+            if epoch == 0 and self.action_space_type == "discrete":
+                with torch.no_grad():
+                    old_logits = self.actor(states)
+                    old_probs = F.softmax(old_logits, dim=1)
+            elif epoch == 0:
+                with torch.no_grad():
+                    old_mu, old_sigma_raw = self.actor(states)
+                    old_sigma = F.softplus(old_sigma_raw) + 1e-5
+
             for batch_idx, batch_indices in enumerate(batches):
                 batch_loop_start = time.time()
 
@@ -420,9 +467,9 @@ class PPOTrainer:
                         new_log_probs = dist.log_prob(batch_actions)
                         entropy = dist.entropy().mean()
                     else:
-                        mu, sigma = self.actor(batch_states)
+                        mu, sigma_raw = self.actor(batch_states)
 
-                        sigma = F.softplus(sigma) + 1e-5
+                        sigma = F.softplus(sigma_raw) + 1e-5
                         dist = Normal(mu, sigma)
                         new_log_probs = dist.log_prob(batch_actions)
                         if len(new_log_probs.shape) > 1:
@@ -471,42 +518,93 @@ class PPOTrainer:
                 total_entropy_loss += entropy_loss.item()
                 total_loss += loss.item()
                 self.debug_print("Batch complete\n")
+
             # End of epoch statistics
             epoch_time = time.time() - epoch_batch_start
-            avg_batch_time = sum(batch_times) / len(batch_times)
+            avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else 0
 
             if self.debug:
                 print(f"[DEBUG] Epoch {epoch+1} summary:")
                 print(f"[DEBUG] Total epoch time: {epoch_time:.2f}s")
                 print(f"[DEBUG] Average batch time: {avg_batch_time:.3f}s")
-                print(f"[DEBUG] Min/Max batch time: {min(batch_times):.3f}s / {max(batch_times):.3f}s")
+                print(f"[DEBUG] Min/Max batch time: {min(batch_times):.3f}s / {max(batch_times):.3f}s") if batch_times else None
                 print(f"[DEBUG] Current losses: actor={actor_loss.item():.4f}, critic={critic_loss.item():.4f}, entropy={entropy_loss.item():.4f}")
 
-        num_updates = self.ppo_epochs * len(batches)
+        # Calculate final metrics
+        num_updates = self.ppo_epochs * len(batches) if len(batches) > 0 else 1
         avg_actor_loss = total_actor_loss / num_updates
         avg_critic_loss = total_critic_loss / num_updates
         avg_entropy_loss = total_entropy_loss / num_updates
         avg_loss = total_loss / num_updates
+
+        # Calculate KL divergence after updates
+        kl_div = 0
+        if self.action_space_type == "discrete" and len(states) > 0 and old_probs is not None:
+            with torch.no_grad():
+                new_logits = self.actor(states)
+                new_probs = F.softmax(new_logits, dim=1)
+                kl_div = (old_probs * (torch.log(old_probs + 1e-10) - torch.log(new_probs + 1e-10))).sum(1).mean().item()
+        elif len(states) > 0 and old_mu is not None and old_sigma is not None:
+            with torch.no_grad():
+                new_mu, new_sigma_raw = self.actor(states)
+                new_sigma = F.softplus(new_sigma_raw) + 1e-5
+                kl_div = (torch.log(new_sigma/old_sigma) + (old_sigma**2 + (old_mu - new_mu)**2)/(2*new_sigma**2) - 0.5).mean().item()
+
+        # Calculate explained variance safely
+        if len(states) > 0:
+            with torch.no_grad():
+                # Get all values for all states
+                all_values = self.critic(states).cpu().detach().numpy().flatten()
+                all_returns = returns.cpu().detach().numpy().flatten()
+
+                # Ensure same length
+                min_length = min(len(all_values), len(all_returns))
+                if min_length > 0:
+                    all_values = all_values[:min_length]
+                    all_returns = all_returns[:min_length]
+                    explained_var = 1 - np.var(all_returns - all_values) / (np.var(all_returns) + 1e-8)
+                else:
+                    explained_var = 0
+        else:
+            explained_var = 0
 
         self.actor_losses.append(avg_actor_loss)
         self.critic_losses.append(avg_critic_loss)
         self.entropy_losses.append(avg_entropy_loss)
         self.total_losses.append(avg_loss)
 
-        # Always log metrics to wandb if enabled
+        # Always log metrics to wandb if enabled and available
         if self.use_wandb:
-            metrics = {
-                "actor_loss": avg_actor_loss,
-                "critic_loss": avg_critic_loss,
-                "entropy_loss": avg_entropy_loss,
-                "total_loss": avg_loss,
-                "mean_advantage": advantages.mean().item(),
-                "mean_return": returns.mean().item(),
-                "training_epoch_time": epoch_time,
-                "avg_batch_time": avg_batch_time
-            }
-            wandb.log(metrics)
-            self.debug_print("Logged metrics to wandb")
+            try:
+                import sys
+                if 'wandb' in sys.modules:
+                    metrics = {
+                        # Learning metrics
+                        "actor_loss": avg_actor_loss,
+                        "critic_loss": avg_critic_loss,
+                        "entropy_loss": avg_entropy_loss,
+                        "total_loss": avg_loss,
+
+                        # Performance metrics
+                        "mean_episode_reward": avg_episode_reward,
+                        "mean_episode_length": avg_episode_length,
+                        "mean_advantage": advantages.mean().item() if isinstance(advantages, torch.Tensor) and advantages.numel() > 0 else 0,
+                        "mean_return": returns.mean().item() if isinstance(returns, torch.Tensor) and returns.numel() > 0 else 0,
+
+                        # Training statistics
+                        "policy_kl_divergence": kl_div,
+                        "value_explained_variance": explained_var,
+
+                        # Training efficiency
+                        "training_epoch_time": epoch_time
+                    }
+
+                    import wandb
+                    wandb.log(metrics)
+                    self.debug_print("Logged metrics to wandb")
+            except (ImportError, AttributeError) as e:
+                if self.debug:
+                    print(f"[DEBUG] Failed to log to wandb: {e}")
 
         # Clean up
         self.memory.clear()
@@ -515,14 +613,15 @@ class PPOTrainer:
         if self.debug:
             print(f"[DEBUG] Update completed in {total_time:.2f}s")
 
-        if self.use_wandb:
-            wandb.log({"update_time": total_time})
-
+        # Return the most important metrics
         return {
             "actor_loss": avg_actor_loss,
             "critic_loss": avg_critic_loss,
             "entropy_loss": avg_entropy_loss,
-            "total_loss": avg_loss
+            "total_loss": avg_loss,
+            "mean_episode_reward": avg_episode_reward,
+            "value_explained_variance": explained_var,
+            "kl_divergence": kl_div
         }
 
     def save_models(self, actor_path, critic_path):

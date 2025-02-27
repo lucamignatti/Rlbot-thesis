@@ -276,13 +276,6 @@ def run_parallel_training(
                 progress_bar.update(progress_increment)
                 last_episode_count = current_episodes
 
-                # Log to wandb if enabled
-                if use_wandb:
-                    wandb.log({
-                        "episodes_completed": current_episodes,
-                        "completion_percentage": current_episodes / total_episodes * 100
-                    })
-
             # Check if processes are still alive
             alive_count = sum(1 for p in processes if p.is_alive())
             if alive_count < num_processes:
@@ -327,23 +320,16 @@ def run_parallel_training(
                     print(f"[DEBUG] Updating policy with {collected_experiences} experiences")
 
                 if collected_experiences > 0:
-                    update_start = time.time()
-                    stats = trainer.update()
-                    update_duration = time.time() - update_start
+                    if collected_experiences > 0:
+                            stats = trainer.update()
+                            # Display relevant metrics in progress bar
+                            progress_bar.set_postfix({
+                                "Reward": f"{stats.get('mean_episode_reward', 0):.2f}",
+                                "P-Loss": f"{stats.get('actor_loss', 0):.4f}",
+                                "V-Loss": f"{stats.get('critic_loss', 0):.4f}",
+                                "Entropy": f"{stats.get('entropy_loss', 0):.4f}"
+                            })
 
-                    # The keys in stats match what your update method returns
-                    avg_reward = np.mean(trainer.memory.rewards) if hasattr(trainer.memory, 'rewards') else 0
-                    policy_loss = stats.get('actor_loss', 0)
-                    value_loss = stats.get('critic_loss', 0)
-
-                    # Use postfix with the correct metric names
-                    progress_bar.set_postfix({
-                        "Reward": f"{avg_reward:.2f}",
-                        "P-Loss": f"{policy_loss:.4f}",
-                        "V-Loss": f"{value_loss:.4f}",
-                        "Update": f"{update_duration:.2f}s",
-                        "Device": device
-                    })
 
                     # After policy update, sync the weights back to the shared CPU models
                     if device != "cpu":
@@ -414,6 +400,18 @@ if __name__ == "__main__":
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
     parser.add_argument('--debug', action='store_true', help='Enable verbose debug logging')
 
+    parser.add_argument('--lra', type=float, default=3e-4, help='Learning rate for actor network')
+    parser.add_argument('--lrc', type=float, default=1e-3, help='Learning rate for critic network')
+    parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
+    parser.add_argument('--gae_lambda', type=float, default=0.95, help='GAE lambda parameter')
+    parser.add_argument('--clip_epsilon', type=float, default=0.2, help='PPO clip epsilon')
+    parser.add_argument('--critic_coef', type=float, default=0.5, help='Critic loss coefficient')
+    parser.add_argument('--entropy_coef', type=float, default=0.01, help='Entropy coefficient')
+    parser.add_argument('--max_grad_norm', type=float, default=0.5, help='Maximum gradient norm for clipping')
+    parser.add_argument('--ppo_epochs', type=int, default=10, help='Number of PPO epochs per update')
+    parser.add_argument('--batch_size', type=int, default=64, help='Batch size for PPO updates')
+
+
     args = parser.parse_args()
 
     # Ensure at least one process
@@ -447,14 +445,34 @@ if __name__ == "__main__":
     # Initialize wandb if requested
     if args.wandb:
         import wandb
-        wandb.init(project="rlbot-training", config={
-            "episodes": args.episodes,
-            "processes": args.processes,
-            "update_interval": args.update_interval,
-            "device": device,
-            "obs_space_dims": obs_space_dims,
-            "action_space_dims": action_space_dims
-        })
+        wandb.init(
+            project="rlbot-training",
+            config={
+                # Hyperparameters
+                "learning_rate_actor": args.lra,
+                "learning_rate_critic": args.lrc,
+                "gamma": args.gamma,
+                "gae_lambda": args.gae_lambda,
+                "clip_epsilon": args.clip_epsilon,
+                "critic_coef": args.critic_coef,
+                "entropy_coef": args.entropy_coef,
+                "max_grad_norm": args.max_grad_norm,
+                "ppo_epochs": args.ppo_epochs,
+                "batch_size": args.batch_size,
+
+                # Environment
+                "action_repeat": 8,
+                "num_agents": 4,  # 2 per team
+
+                # System
+                "episodes": args.episodes,
+                "processes": args.processes,
+                "update_interval": args.update_interval,
+                "device": device,
+            },
+            name=f"PPO_{time.strftime('%Y%m%d-%H%M%S')}",
+            monitor_gym=False,
+        )
 
     # Start training with descriptive progress bar
     trainer = run_parallel_training(
