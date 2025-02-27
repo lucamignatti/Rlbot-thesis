@@ -223,9 +223,25 @@ def run_parallel_training(
         terminate_event = mp.Event()  # Signal workers to terminate
         episode_counter = mp.Value('i', 0)  # Shared episode counter
 
-        # Setup progress tracking
-        progress_bar = tqdm(total=total_episodes, bar_format='{n_fmt}/{total_fmt} [{bar}] {percentage:3.0f}% | {postfix}')
-        progress_bar.set_postfix({"Device": device, "Workers": num_processes})
+        # Setup improved progress tracking with more details
+        progress_bar = tqdm(
+            total=total_episodes, 
+            desc="Episodes", 
+            bar_format='{desc}: {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {percentage:3.0f}%|{bar}| {postfix}',
+            dynamic_ncols=True  # Better adapts to terminal resizing
+        )
+        
+        # Initialize stats dict to avoid KeyErrors when updating
+        stats_dict = {
+            "Device": device, 
+            "Workers": num_processes,
+            "Exp": 0,
+            "Reward": 0.0,
+            "PLoss": 0.0,
+            "VLoss": 0.0,
+            "Entropy": 0.0
+        }
+        progress_bar.set_postfix(stats_dict)
 
         # Start worker processes
         processes = []
@@ -336,9 +352,9 @@ def run_parallel_training(
                 if experiences_collected_this_loop > 0 and debug:
                     print(f"[DEBUG] Processed {experiences_collected_this_loop} experiences in {time.time() - experience_batch_start:.3f}s")
 
-                # Update progress bar description
-                if collected_experiences > 0:
-                    progress_bar.set_description(f"Collecting: {collected_experiences}/{update_interval}")
+                # Update progress bar with current experience count
+                stats_dict["Exp"] = f"{collected_experiences}/{update_interval}"
+                progress_bar.set_postfix(stats_dict)
 
             except Empty:
                 # No experiences available right now, short sleep
@@ -358,16 +374,21 @@ def run_parallel_training(
                     print(f"[DEBUG] Updating policy with {collected_experiences} experiences")
 
                 if collected_experiences > 0:
-                    if collected_experiences > 0:
-                            stats = trainer.update()
-                            # Display relevant metrics in progress bar
-                            progress_bar.set_postfix({
-                                "Reward": f"{stats.get('mean_episode_reward', 0):.2f}",
-                                "P-Loss": f"{stats.get('actor_loss', 0):.4f}",
-                                "V-Loss": f"{stats.get('critic_loss', 0):.4f}",
-                                "Entropy": f"{stats.get('entropy_loss', 0):.4f}"
-                            })
-
+                    stats = trainer.update()
+                    
+                    # Update stats dictionary with all possible values
+                    stats_dict.update({
+                        "Device": device,
+                        "Workers": num_processes,
+                        "Exp": f"0/{update_interval}",  # Reset after update
+                        "Reward": f"{stats.get('mean_episode_reward', 0):.2f}",
+                        "PLoss": f"{stats.get('actor_loss', 0):.4f}",
+                        "VLoss": f"{stats.get('critic_loss', 0):.4f}",
+                        "Entropy": f"{stats.get('entropy_loss', 0):.4f}"
+                    })
+                    
+                    # Update progress bar with all stats
+                    progress_bar.set_postfix(stats_dict)
 
                     # After policy update, sync the weights back to the shared CPU models
                     if device != "cpu":
