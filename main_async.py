@@ -63,10 +63,12 @@ def worker(
         local_actor = SimBa(
             obs_shape=shared_actor.obs_shape,
             action_shape=shared_actor.action_shape,
+            device="cpu"
         )
         local_critic = SimBa(
             obs_shape=shared_critic.obs_shape,
             action_shape=shared_critic.action_shape,
+            device="cpu"
         )
 
         # Initialize with shared model weights
@@ -88,7 +90,9 @@ def worker(
 
         # Process variables
         episode_steps = 0
-        sync_interval = 10  # Sync models every N steps
+        sync_interval = float('inf')  # Sync models only when update_event is set
+        experience_batch = []
+        batch_size = 32 # experiences
 
         if debug:
             print(f"[DEBUG] Worker {rank} initialized")
@@ -100,8 +104,8 @@ def worker(
                 if episode_counter.value >= total_episodes:
                     break
 
-            # Sync with shared models periodically or when update is ready
-            if update_event.is_set() or episode_steps % sync_interval == 0:
+            # Sync with shared models only when update is ready
+            if update_event.is_set():
                 local_actor.load_state_dict(shared_actor.state_dict())
                 local_critic.load_state_dict(shared_critic.state_dict())
 
@@ -125,7 +129,7 @@ def worker(
             # Step the environment with the actions
             next_obs_dict, reward_dict, terminated_dict, truncated_dict = env.step(actions)
 
-            # Send experiences to main process
+            # Collect experiences
             for agent_id in obs_dict.keys():
                 obs = obs_dict[agent_id]
                 action = actions[agent_id]
@@ -138,9 +142,9 @@ def worker(
                 truncated = truncated_dict[agent_id]
                 done = terminated or truncated
 
-                # Send experience tuple to queue
+                # Store experience tuple
                 experience = (obs, action, log_prob, reward, value, done)
-                experience_queue.put(experience)
+                experience_batch.append(experience)
 
             # Update for next iteration
             obs_dict = next_obs_dict
@@ -165,6 +169,15 @@ def worker(
 
                 if debug:
                     print(f"[DEBUG] Worker {rank} completed episode. Total: {current_episodes}/{total_episodes}")
+
+            # Send experiences in batches
+            if len(experience_batch) >= batch_size:
+                experience_queue.put(experience_batch)
+                experience_batch = []
+
+        # Send any remaining experiences
+        if len(experience_batch) > 0:
+            experience_queue.put(experience_batch)
 
     except Exception as e:
         print(f"Error in worker process {rank}: {str(e)}", file=sys.stderr)
@@ -205,6 +218,7 @@ def run_parallel_training(
     collected_experiences = 0
     processes = []
     trainer = None  # Initialize trainer to None for safety
+    effective_update_interval = update_interval * num_processes
 
     try:
         # IMPORTANT: Move models to CPU first for sharing
@@ -216,7 +230,7 @@ def run_parallel_training(
         shared_critic = critic_cpu.share_memory()
 
         # Create experience queue for collecting transitions
-        experience_queue = mp.Queue(maxsize=update_interval*2)  # Allow buffer room
+        experience_queue = mp.Queue(maxsize=2)  # Reduced maxsize
 
         # Create synchronization primitives
         update_event = mp.Event()     # Signal that model has been updated
@@ -225,15 +239,15 @@ def run_parallel_training(
 
         # Setup improved progress tracking with more details
         progress_bar = tqdm(
-            total=total_episodes, 
-            desc="Episodes", 
+            total=total_episodes,
+            desc="Episodes",
             bar_format='{desc}: {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {percentage:3.0f}%|{bar}| {postfix}',
             dynamic_ncols=True  # Better adapts to terminal resizing
         )
-        
+
         # Initialize stats dict to avoid KeyErrors when updating
         stats_dict = {
-            "Device": device, 
+            "Device": device,
             "Workers": num_processes,
             "Exp": 0,
             "Reward": 0.0,
@@ -330,30 +344,20 @@ def run_parallel_training(
 
             # Collect experiences from queue (non-blocking)
             try:
-                # Try to get experiences without using qsize()
-                experience_batch_start = time.time()
-                experiences_collected_this_loop = 0
-
-                # Set a limit for how many experiences to process in one loop iteration
-                max_experiences_per_loop = 100
-
-                # Keep collecting until either queue is empty or we've hit the update threshold
-                while experiences_collected_this_loop < max_experiences_per_loop and collected_experiences < update_interval:
+                while collected_experiences < effective_update_interval:
                     try:
                         # Use get_nowait() to avoid blocking
-                        experience = experience_queue.get_nowait()
-                        trainer.store_experience(*experience)
-                        collected_experiences += 1
-                        experiences_collected_this_loop += 1
+                        experience_batch = experience_queue.get_nowait()
+                        for experience in experience_batch:
+                            trainer.store_experience(*experience)
+                            collected_experiences += 1
+
                     except Empty:
                         # Queue is empty, break the inner loop
                         break
 
-                if experiences_collected_this_loop > 0 and debug:
-                    print(f"[DEBUG] Processed {experiences_collected_this_loop} experiences in {time.time() - experience_batch_start:.3f}s")
-
                 # Update progress bar with current experience count
-                stats_dict["Exp"] = f"{collected_experiences}/{update_interval}"
+                stats_dict["Exp"] = f"{collected_experiences}/{effective_update_interval}"
                 progress_bar.set_postfix(stats_dict)
 
             except Empty:
@@ -367,7 +371,7 @@ def run_parallel_training(
 
             # Update policy when enough experiences are collected or enough time has passed
             time_since_update = time.time() - last_update_time
-            enough_experiences = collected_experiences >= update_interval
+            enough_experiences = collected_experiences >= effective_update_interval
 
             if enough_experiences or (collected_experiences > 100 and time_since_update > 30):
                 if debug:
@@ -375,18 +379,18 @@ def run_parallel_training(
 
                 if collected_experiences > 0:
                     stats = trainer.update()
-                    
+
                     # Update stats dictionary with all possible values
                     stats_dict.update({
                         "Device": device,
                         "Workers": num_processes,
-                        "Exp": f"0/{update_interval}",  # Reset after update
+                        "Exp": f"0/{effective_update_interval}",  # Reset after update
                         "Reward": f"{stats.get('mean_episode_reward', 0):.2f}",
                         "PLoss": f"{stats.get('actor_loss', 0):.4f}",
                         "VLoss": f"{stats.get('critic_loss', 0):.4f}",
                         "Entropy": f"{stats.get('entropy_loss', 0):.4f}"
                     })
-                    
+
                     # Update progress bar with all stats
                     progress_bar.set_postfix(stats_dict)
 
@@ -394,10 +398,8 @@ def run_parallel_training(
                     if device != "cpu":
                         # Copy weights from trainer models back to the shared CPU models
                         with torch.no_grad():
-                            for param_cpu, param_device in zip(shared_actor.parameters(), trainer_actor.parameters()):
-                                param_cpu.copy_(param_device.cpu())
-                            for param_cpu, param_device in zip(shared_critic.parameters(), trainer_critic.parameters()):
-                                param_cpu.copy_(param_device.cpu())
+                            shared_actor.load_state_dict(trainer_actor.cpu().state_dict())
+                            shared_critic.load_state_dict(trainer_critic.cpu().state_dict())
 
                         # Signal workers to update their models
                         update_event.set()
@@ -426,7 +428,8 @@ def run_parallel_training(
                     print(f"[DEBUG] Forcing termination of worker {i}")
                 p.terminate()
 
-        progress_bar.close()
+        if 'progress_bar' in locals():
+            progress_bar.close()
 
         # Final update with any remaining experiences
         if collected_experiences > 0 and trainer is not None:
@@ -559,5 +562,8 @@ if __name__ == "__main__":
 
     # Create models directory and save models
     os.makedirs("models", exist_ok=True)
-    trainer.save_models("models/actor.pth", "models/critic.pth")
-    print("Training complete - Models saved")
+    if trainer is not None:
+        trainer.save_models("models/actor.pth", "models/critic.pth")
+        print("Training complete - Models saved")
+    else:
+        print("Training failed.")

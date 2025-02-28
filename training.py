@@ -120,23 +120,28 @@ class PPOMemory:
         indices = np.arange(self.size, dtype=np.int32)
         np.random.shuffle(indices)
 
-        # Calculate batch info
-        n_batches = (self.size + self.batch_size - 1) // self.batch_size  # Ceiling division
+        # Create batches of equal size
+        batches = []
 
-        # Pre-allocate fixed-size array for all batches
-        # Make last batch same size as others, just with some indices repeated
-        batches = np.zeros((n_batches, self.batch_size), dtype=np.int32)
+        # Calculate how many complete batches we can make
+        num_complete_batches = self.size // self.batch_size
 
-        # Fill complete batches
-        complete_size = (self.size // self.batch_size) * self.batch_size
-        batches[:complete_size//self.batch_size] = indices[:complete_size].reshape(-1, self.batch_size)
+        # First add complete batches
+        for i in range(num_complete_batches):
+            start_idx = i * self.batch_size
+            batches.append(indices[start_idx:start_idx + self.batch_size])
 
-        # Handle last batch by repeating some indices if needed
-        if complete_size < self.size:
-            remaining = indices[complete_size:]
-            # Pad with repeated indices to maintain batch size
-            padding = indices[:self.batch_size - len(remaining)]
-            batches[-1] = np.concatenate([remaining, padding])
+        # Handle remaining data (if any)
+        if self.size % self.batch_size != 0:
+            # Get remaining indices
+            remaining = indices[num_complete_batches * self.batch_size:]
+            # Create a batch with the remaining indices, possibly with some repeated
+            if len(remaining) > 0:
+                # Repeat indices to fill the batch
+                needed = self.batch_size - len(remaining)
+                # Use indices from the beginning to pad
+                padding = indices[:needed]
+                batches.append(np.concatenate([remaining, padding]))
 
         return batches
 
@@ -176,9 +181,12 @@ class PPOTrainer:
         self.action_dim = action_dim
         self.action_bounds = action_bounds
 
-        # IMPORTANT: For multiprocessing, models must be created and kept on CPU
-        self.actor = actor
-        self.critic = critic
+        self.actor = actor.to(self.device)
+        self.critic = critic.to(self.device)
+
+        # Enable train mode
+        self.actor.train()
+        self.critic.train()
 
 
         # PPO hyperparameters
@@ -313,6 +321,11 @@ class PPOTrainer:
         self.debug_print("Starting policy update...")
         update_start = time.time()
 
+        # Ensure correct devices
+        self.critic.to(self.device)
+        self.actor.to(self.device)
+
+
         states, actions, old_log_probs, rewards, values, dones = self.memory.get()
         self.debug_print(f"Memory retrieved: {len(states)} timesteps")
 
@@ -354,9 +367,7 @@ class PPOTrainer:
                     next_value = self.critic(next_state)
 
                     self.debug_print("Moving result to CPU...")
-                    next_value = next_value.cpu()
-
-                    next_value = next_value.numpy()[0]
+                    next_value = next_value.cpu().numpy()[0]
 
                 self.debug_print("Next value computation complete")
             except Exception as e:
@@ -386,15 +397,15 @@ class PPOTrainer:
         try:
             self.debug_print("Converting and moving tensors...")
             # Convert and move data in smaller chunks
-            states = torch.FloatTensor(states).to(self.device)
+            states_tensor = torch.FloatTensor(states).to(self.device)
             if self.action_space_type == "discrete":
-                actions = torch.LongTensor(actions).to(self.device)
+                actions_tensor = torch.LongTensor(actions).to(self.device)
             else:
-                actions = torch.FloatTensor(actions).to(self.device)
+                actions_tensor = torch.FloatTensor(actions).to(self.device)
 
-            old_log_probs = torch.FloatTensor(old_log_probs).to(self.device)
-            advantages = torch.FloatTensor(advantages).to(self.device)
-            returns = torch.FloatTensor(returns).to(self.device)
+            old_log_probs_tensor = torch.FloatTensor(old_log_probs).to(self.device)
+            advantages_tensor = torch.FloatTensor(advantages).to(self.device)
+            returns_tensor = torch.FloatTensor(returns).to(self.device)
 
             self.debug_print(f"Data movement took {time.time() - device_start:.2f}s")
         except Exception as e:
@@ -431,21 +442,21 @@ class PPOTrainer:
             # Save old policy outputs for KL calculation
             if epoch == 0 and self.action_space_type == "discrete":
                 with torch.no_grad():
-                    old_logits = self.actor(states)
+                    old_logits = self.actor(states_tensor)
                     old_probs = F.softmax(old_logits, dim=1)
             elif epoch == 0:
                 with torch.no_grad():
-                    old_mu, old_sigma_raw = self.actor(states)
+                    old_mu, old_sigma_raw = self.actor(states_tensor)
                     old_sigma = F.softplus(old_sigma_raw) + 1e-5
 
             for batch_idx, batch_indices in enumerate(batches):
                 batch_loop_start = time.time()
 
-                batch_states = states[batch_indices]
-                batch_actions = actions[batch_indices]
-                batch_old_log_probs = old_log_probs[batch_indices]
-                batch_advantages = advantages[batch_indices]
-                batch_returns = returns[batch_indices]
+                batch_states = states_tensor[batch_indices]
+                batch_actions = actions_tensor[batch_indices]
+                batch_old_log_probs = old_log_probs_tensor[batch_indices]
+                batch_advantages = advantages_tensor[batch_indices]
+                batch_returns = returns_tensor[batch_indices]
 
                 try:
                     self.debug_print(f"Processing batch {batch_idx+1}/{len(batches)}")
@@ -541,12 +552,12 @@ class PPOTrainer:
         kl_div = 0
         if self.action_space_type == "discrete" and len(states) > 0 and old_probs is not None:
             with torch.no_grad():
-                new_logits = self.actor(states)
+                new_logits = self.actor(states_tensor)
                 new_probs = F.softmax(new_logits, dim=1)
                 kl_div = (old_probs * (torch.log(old_probs + 1e-10) - torch.log(new_probs + 1e-10))).sum(1).mean().item()
         elif len(states) > 0 and old_mu is not None and old_sigma is not None:
             with torch.no_grad():
-                new_mu, new_sigma_raw = self.actor(states)
+                new_mu, new_sigma_raw = self.actor(states_tensor)
                 new_sigma = F.softplus(new_sigma_raw) + 1e-5
                 kl_div = (torch.log(new_sigma/old_sigma) + (old_sigma**2 + (old_mu - new_mu)**2)/(2*new_sigma**2) - 0.5).mean().item()
 
@@ -554,8 +565,8 @@ class PPOTrainer:
         if len(states) > 0:
             with torch.no_grad():
                 # Get all values for all states
-                all_values = self.critic(states).cpu().detach().numpy().flatten()
-                all_returns = returns.cpu().detach().numpy().flatten()
+                all_values = self.critic(states_tensor).cpu().detach().numpy().flatten()
+                all_returns = returns_tensor.cpu().detach().numpy().flatten()
 
                 # Ensure same length
                 min_length = min(len(all_values), len(all_returns))
@@ -588,8 +599,8 @@ class PPOTrainer:
                         # Performance metrics
                         "mean_episode_reward": avg_episode_reward,
                         "mean_episode_length": avg_episode_length,
-                        "mean_advantage": advantages.mean().item() if isinstance(advantages, torch.Tensor) and advantages.numel() > 0 else 0,
-                        "mean_return": returns.mean().item() if isinstance(returns, torch.Tensor) and returns.numel() > 0 else 0,
+                        "mean_advantage": advantages_tensor.mean().item() if isinstance(advantages_tensor, torch.Tensor) and advantages_tensor.numel() > 0 else 0,
+                        "mean_return": returns_tensor.mean().item() if isinstance(returns_tensor, torch.Tensor) and returns_tensor.numel() > 0 else 0,
 
                         # Training statistics
                         "policy_kl_divergence": kl_div,

@@ -24,7 +24,7 @@ class SimBa(nn.Module):
     def __init__(self, obs_shape, action_shape, hidden_dim=512, num_blocks=2,
                  dropout_rate=0.1, device="cpu"):
         super(SimBa, self).__init__()
-        self.device = torch.device(device)
+        self.device = device
 
         # save IO shapes
         self.obs_shape = obs_shape
@@ -51,9 +51,11 @@ class SimBa(nn.Module):
         self.to(self.device)
 
     def forward(self, x):
+        # Convert to tensor if needed
         if not isinstance(x, torch.Tensor):
-            x = torch.tensor(x, dtype=torch.float32)
-        x = x.to(self.device)
+            x = torch.tensor(x, dtype=torch.float32).to(self.device)
+        elif x.device != self.device:
+            x = x.to(self.device)
 
         # Normalize input with running statistics
         x = self.rsnorm(x)
@@ -73,6 +75,13 @@ class SimBa(nn.Module):
         x = self.output_layer(x)
 
         return x
+
+    def to(self, device=None, dtype=None, non_blocking=False):
+        # Call parent's to() method with all parameters
+        super().to(device=device, dtype=dtype, non_blocking=non_blocking)
+        # Update instance device attribute
+        self.device = device
+        return self
 
 
 class ResidualFFBlock(nn.Module):
@@ -115,8 +124,12 @@ class RSNorm(nn.Module):
         self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
 
     def forward(self, x):
-        device = self.running_mean.device
-        x = x.to(device)
+        device = x.device
+
+        if self.running_mean.device != device:
+            self.running_mean = self.running_mean.to(device)
+            self.running_var = self.running_var.to(device)
+            self.num_batches_tracked = self.num_batches_tracked.to(device)
 
         if self.training:
             batch_mean = x.mean(dim=0)
@@ -124,10 +137,9 @@ class RSNorm(nn.Module):
 
             self.num_batches_tracked += 1
 
+            update_factor = self.momentum
             if self.num_batches_tracked == 1:
-                update_factor = 1
-            else:
-                update_factor = self.momentum
+                update_factor = 1.0
 
             self.running_mean = (1 - update_factor) * self.running_mean + update_factor * batch_mean
             self.running_var = (1 - update_factor) * self.running_var + update_factor * batch_var
