@@ -1,3 +1,8 @@
+import os
+
+# Configure environment variables and settings for MPS backend compatibility
+# os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
 import numpy as np
 import torch
 from rlgym.api import RLGym
@@ -14,7 +19,6 @@ from training import PPOTrainer
 import time
 import argparse
 from tqdm import tqdm
-import os
 import signal
 import sys
 
@@ -123,6 +127,7 @@ def run_training(
     update_interval: int = 1000,
     use_wandb: bool = False,
     debug: bool = False,
+    use_compile: bool = True,
     # Hyperparameters
     lr_actor: float = 3e-4,
     lr_critic: float = 1e-3,
@@ -160,7 +165,8 @@ def run_training(
         ppo_epochs=ppo_epochs,
         batch_size=batch_size,
         use_wandb=use_wandb,
-        debug=debug
+        debug=debug,
+        use_compile=use_compile
     )
 
     # Create vectorized environment
@@ -338,6 +344,8 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 if __name__ == "__main__":
+
+
     # Register signal handler for clean exit
     signal.signal(signal.SIGINT, signal_handler)
 
@@ -363,6 +371,11 @@ if __name__ == "__main__":
     parser.add_argument('--max_grad_norm', type=float, default=0.5, help='Maximum gradient norm for clipping')
     parser.add_argument('--ppo_epochs', type=int, default=10, help='Number of PPO epochs per update')
     parser.add_argument('--batch_size', type=int, default=64, help='Batch size for PPO updates')
+
+    parser.add_argument('--compile', action='store_true', help='Use torch.compile for model optimization')
+    parser.add_argument('--no-compile', action='store_false', dest='compile', help='Disable torch.compile')
+    parser.set_defaults(compile=True)
+
 
     # For backwards compatibility
     parser.add_argument('-p', '--processes', type=int, default=None,
@@ -445,6 +458,7 @@ if __name__ == "__main__":
         update_interval=args.update_interval,
         use_wandb=args.wandb,
         debug=args.debug,
+        use_compile=args.compile,
         # Hyperparameters
         lr_actor=args.lra,
         lr_critic=args.lrc,

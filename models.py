@@ -19,6 +19,21 @@ class BasicModel(nn.Module):
     def forward(self, x):
         return self.network(x)
 
+class MPSFriendlyDropout(nn.Module):
+    """Dropout layer that's compatible with MPS backend by avoiding native_dropout"""
+    def __init__(self, p=0.5):
+        super(MPSFriendlyDropout, self).__init__()
+        self.p = p
+
+    def forward(self, x):
+        if not self.training or self.p == 0:
+            return x
+
+        # Implementation using binary mask
+        mask = torch.bernoulli(torch.full_like(x, 1 - self.p)) / (1 - self.p)
+        return x * mask
+
+
 
 class SimBa(nn.Module):
     def __init__(self, obs_shape, action_shape, hidden_dim=512, num_blocks=2,
@@ -35,12 +50,15 @@ class SimBa(nn.Module):
 
         # Initial embedding
         self.embedding = nn.Linear(obs_shape, hidden_dim)
-        self.dropout = nn.Dropout(dropout_rate)
+        if torch.backends.mps.is_available():
+            self.dropout = MPSFriendlyDropout(dropout_rate)
+        else:
+            self.dropout = nn.Dropout(dropout_rate)
 
         # Residual feedforward blocks
         self.blocks = nn.ModuleList()
         for _ in range(num_blocks):
-            self.blocks.append(ResidualFFBlock(hidden_dim, dropout_rate))
+            self.blocks.append(ResidualFFBlock(hidden_dim, dropout_rate, device=self.device))
 
         # Post-layer normalization
         self.post_ln = nn.LayerNorm(hidden_dim)
@@ -85,17 +103,26 @@ class SimBa(nn.Module):
 
 
 class ResidualFFBlock(nn.Module):
-    def __init__(self, hidden_dim, dropout_rate=0.1):
+    def __init__(self, hidden_dim, dropout_rate=0.1, device=None):
         super(ResidualFFBlock, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.dropout_rate = dropout_rate
 
         # Pre-layer normalization
         self.ln = nn.LayerNorm(hidden_dim)
 
         # MLP with inverted bottleneck (4x expansion)
         self.linear1 = nn.Linear(hidden_dim, hidden_dim * 4)
-        self.dropout1 = nn.Dropout(dropout_rate)
+
+        # Use device-appropriate dropout
+        if torch.backends.mps.is_available():
+            self.dropout1 = MPSFriendlyDropout(dropout_rate)
+            self.dropout2 = MPSFriendlyDropout(dropout_rate)
+        else:
+            self.dropout1 = nn.Dropout(dropout_rate)
+            self.dropout2 = nn.Dropout(dropout_rate)
+
         self.linear2 = nn.Linear(hidden_dim * 4, hidden_dim)
-        self.dropout2 = nn.Dropout(dropout_rate)
 
     def forward(self, x):
         # Pre-layer normalization
@@ -110,6 +137,12 @@ class ResidualFFBlock(nn.Module):
 
         # Residual connection
         return x + h
+
+    def to(self, device=None, dtype=None, non_blocking=False):
+        # Call parent's to() method with all parameters
+        result = super().to(device=device, dtype=dtype, non_blocking=non_blocking)
+
+        return result
 
 class RSNorm(nn.Module):
     def __init__(self, num_features, eps=1e-5, momentum=0.1):

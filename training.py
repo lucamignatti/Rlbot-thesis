@@ -166,7 +166,13 @@ class PPOTrainer:
         batch_size: int = 64,
         use_wandb: bool = False,
         debug: bool = False,
+        use_compile: bool = True
     ):
+
+        # Logging
+        self.use_wandb = use_wandb
+        self.debug = debug
+
         # Determine device priority: CUDA -> MPS -> CPU
         if device is None:
             if torch.cuda.is_available():
@@ -183,6 +189,31 @@ class PPOTrainer:
 
         self.actor = actor.to(self.device)
         self.critic = critic.to(self.device)
+
+        # Compile models if requested and available
+        self.use_compile = use_compile and hasattr(torch, 'compile')
+        if self.use_compile:
+            try:
+                self.debug_print("Compiling actor and critic models with torch.compile...")
+
+                # Choose compile settings based on device
+                if self.device == "mps":
+                    # Apple Silicon - simplified settings without extra kwargs
+                    self.actor = torch.compile(self.actor, backend="aot_eager")
+                    self.critic = torch.compile(self.critic, backend="aot_eager")
+                elif self.device == "cuda":
+                    # CUDA with full optimization
+                    self.actor = torch.compile(self.actor, mode="max-autotune")
+                    self.critic = torch.compile(self.critic, mode="max-autotune")
+                else:
+                    # CPU with balanced settings
+                    self.actor = torch.compile(self.actor, mode="reduce-overhead")
+                    self.critic = torch.compile(self.critic, mode="reduce-overhead")
+
+                self.debug_print(f"Models successfully compiled for {self.device}")
+            except Exception as e:
+                self.debug_print(f"Model compilation failed, falling back to standard models: {str(e)}")
+                self.use_compile = False
 
         # Enable train mode
         self.actor.train()
@@ -212,9 +243,6 @@ class PPOTrainer:
         self.entropy_losses = []
         self.total_losses = []
 
-        # Logging
-        self.use_wandb = use_wandb
-        self.debug = debug
 
         if self.debug:
             print(f"[DEBUG] PPOTrainer initialized with target device: {self.device}")
