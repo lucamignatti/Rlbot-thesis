@@ -296,6 +296,144 @@ class PPOTrainer:
         if self.use_wandb:
             wandb.log({"device": self.device})
 
+    def _create_compiled_gae(self):
+        """Create a compiled version of GAE computation for tensor inputs"""
+        def _tensor_gae(rewards, values, dones, next_value):
+            advantages = torch.zeros_like(rewards, device=self.device)
+            last_gae = torch.tensor(0.0, device=self.device)
+
+            # Match dimensions for concatenation
+            next_value_shaped = next_value.reshape(*[1] + list(values.shape[1:]))
+            all_values = torch.cat([values, next_value_shaped], dim=0)
+
+            for t in reversed(range(len(rewards))):
+                mask = ~dones[t]
+                if not mask:
+                    delta = rewards[t] - values[t]
+                    last_gae = delta
+                else:
+                    delta = rewards[t] + self.gamma * all_values[t+1] - values[t]
+                    last_gae = delta + self.gamma * self.gae_lambda * last_gae
+                advantages[t] = last_gae
+
+            returns = advantages + values
+            return advantages, returns
+
+        # Compile the function for the target device
+        if self.device == "mps":
+            return torch.compile(_tensor_gae, backend="aot_eager")
+        elif self.device == "cuda":
+            return torch.compile(_tensor_gae, mode="max-autotune")
+        else:
+            return torch.compile(_tensor_gae, mode="reduce-overhead")
+
+    def _create_compiled_policy_eval(self):
+        """Create a compiled version of policy evaluation logic"""
+        def _policy_eval(states, actions, old_log_probs, advantages):
+            # Actor forward pass
+            if self.action_space_type == "discrete":
+                logits = self.actor(states)
+                action_probs = F.softmax(logits, dim=1)
+                dist = Categorical(action_probs)
+                new_log_probs = dist.log_prob(actions)
+                entropy = dist.entropy().mean()
+            else:
+                mu, sigma_raw = self.actor(states)
+                sigma = F.softplus(sigma_raw) + 1e-5
+                dist = Normal(mu, sigma)
+                new_log_probs = dist.log_prob(actions)
+                if len(new_log_probs.shape) > 1:
+                    new_log_probs = new_log_probs.sum(dim=1)
+                entropy = dist.entropy().mean()
+
+            # PPO objectives
+            ratio = torch.exp(new_log_probs - old_log_probs)
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * advantages
+
+            actor_loss = -torch.min(surr1, surr2).mean()
+            entropy_loss = -self.entropy_coef * entropy
+
+            return actor_loss, entropy_loss, entropy
+
+        # Compile function based on device
+        if self.device == "mps":
+            return torch.compile(_policy_eval, backend="aot_eager")
+        elif self.device == "cuda":
+            return torch.compile(_policy_eval, mode="max-autotune")
+        else:
+            return torch.compile(_policy_eval, mode="reduce-overhead")
+
+    def _create_compiled_batch_processor(self):
+        """Create compiled version of the batch processing logic"""
+        def _process_batch(batch_states, batch_actions, batch_old_log_probs,
+                            batch_advantages, batch_returns):
+            # Critic forward pass
+            values = self.critic(batch_states).squeeze()
+
+            # Actor evaluation (using our compiled function)
+            actor_loss, entropy_loss, entropy = self._policy_eval_fn(
+                batch_states, batch_actions, batch_old_log_probs, batch_advantages
+            )
+
+            # Critic loss
+            critic_loss = F.mse_loss(values, batch_returns)
+
+            # Total loss
+            total_loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
+
+            return actor_loss, critic_loss, entropy_loss, total_loss, entropy
+
+        # Compile with appropriate backend
+        if self.device == "mps":
+            return torch.compile(_process_batch, backend="aot_eager")
+        elif self.device == "cuda":
+            return torch.compile(_process_batch, mode="max-autotune")
+        else:
+            return torch.compile(_process_batch, mode="reduce-overhead")
+
+    def _uncompiled_policy_eval(self, states, actions, old_log_probs, advantages):
+        """Uncompiled fallback for policy evaluation"""
+        # Same logic as _policy_eval without compilation
+        if self.action_space_type == "discrete":
+            logits = self.actor(states)
+            action_probs = F.softmax(logits, dim=1)
+            dist = Categorical(action_probs)
+            new_log_probs = dist.log_prob(actions)
+            entropy = dist.entropy().mean()
+        else:
+            mu, sigma_raw = self.actor(states)
+            sigma = F.softplus(sigma_raw) + 1e-5
+            dist = Normal(mu, sigma)
+            new_log_probs = dist.log_prob(actions)
+            if len(new_log_probs.shape) > 1:
+                new_log_probs = new_log_probs.sum(dim=1)
+            entropy = dist.entropy().mean()
+
+        ratio = torch.exp(new_log_probs - old_log_probs)
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * advantages
+
+        actor_loss = -torch.min(surr1, surr2).mean()
+        entropy_loss = -self.entropy_coef * entropy
+
+        return actor_loss, entropy_loss, entropy
+
+    def _uncompiled_process_batch(self, batch_states, batch_actions, batch_old_log_probs,
+                            batch_advantages, batch_returns):
+        """Uncompiled fallback for batch processing"""
+        # Same logic as _process_batch without compilation
+        values = self.critic(batch_states).squeeze()
+
+        actor_loss, entropy_loss, entropy = self._uncompiled_policy_eval(
+            batch_states, batch_actions, batch_old_log_probs, batch_advantages
+        )
+
+        critic_loss = F.mse_loss(values, batch_returns)
+        total_loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
+
+        return actor_loss, critic_loss, entropy_loss, total_loss, entropy
+
     def debug_print(self, message):
         """Print debug messages only when debug mode is enabled."""
         if self.debug:
@@ -411,6 +549,10 @@ class PPOTrainer:
         """Compute GAE with support for both tensor and numpy inputs"""
         # Check if inputs are tensors or numpy arrays
         is_tensor = isinstance(rewards, torch.Tensor)
+
+        if self.use_compile:
+            if hasattr(self, '_compute_gae_fn'):
+                return self._compute_gae_fn(rewards, values, dones, next_value)
 
         if is_tensor:
             advantages = torch.zeros_like(rewards, device=self.device)
@@ -618,30 +760,45 @@ class PPOTrainer:
                     self.debug_print(f"Batch states shape: {batch_states.shape}")
                     self.debug_print(f"Batch actions shape: {batch_actions.shape}")
 
-                    # Critic forward pass
-                    self.debug_print("Running critic forward pass...")
-                    values = self.critic(batch_states).squeeze()
-                    self.debug_print("Critic forward pass complete")
-
-                    # Actor forward pass
-                    self.debug_print("Running actor forward pass...")
-                    if self.action_space_type == "discrete":
-                        logits = self.actor(batch_states)
-
-                        action_probs = F.softmax(logits, dim=1)
-                        dist = Categorical(action_probs)
-                        new_log_probs = dist.log_prob(batch_actions)
-                        entropy = dist.entropy().mean()
+                    # Use compiled functions if available
+                    if self.use_compile and hasattr(self, '_process_batch_fn'):
+                        actor_loss, critic_loss, entropy_loss, loss, entropy = self._process_batch_fn(
+                            batch_states, batch_actions, batch_old_log_probs,
+                            batch_advantages, batch_returns
+                        )
                     else:
-                        mu, sigma_raw = self.actor(batch_states)
+                        # Critic forward pass
+                        self.debug_print("Running critic forward pass...")
+                        values = self.critic(batch_states).squeeze()
+                        self.debug_print("Critic forward pass complete")
 
-                        sigma = F.softplus(sigma_raw) + 1e-5
-                        dist = Normal(mu, sigma)
-                        new_log_probs = dist.log_prob(batch_actions)
-                        if len(new_log_probs.shape) > 1:
-                            new_log_probs = new_log_probs.sum(dim=1)
-                        entropy = dist.entropy().mean()
+                        # Actor forward pass
+                        self.debug_print("Running actor forward pass...")
+                        if self.action_space_type == "discrete":
+                            logits = self.actor(batch_states)
 
+                            action_probs = F.softmax(logits, dim=1)
+                            dist = Categorical(action_probs)
+                            new_log_probs = dist.log_prob(batch_actions)
+                            entropy = dist.entropy().mean()
+                        else:
+                            mu, sigma_raw = self.actor(batch_states)
+
+                            sigma = F.softplus(sigma_raw) + 1e-5
+                            dist = Normal(mu, sigma)
+                            new_log_probs = dist.log_prob(batch_actions)
+                            if len(new_log_probs.shape) > 1:
+                                new_log_probs = new_log_probs.sum(dim=1)
+                            entropy = dist.entropy().mean()
+
+                        ratio = torch.exp(new_log_probs - batch_old_log_probs)
+                        surr1 = ratio * batch_advantages
+                        surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * batch_advantages
+
+                        actor_loss = -torch.min(surr1, surr2).mean()
+                        critic_loss = F.mse_loss(values, batch_returns)
+                        entropy_loss = -self.entropy_coef * entropy
+                        loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
 
                     batch_time = time.time() - batch_loop_start
                     batch_times.append(batch_time)
@@ -649,21 +806,10 @@ class PPOTrainer:
                     if batch_idx % 10 == 0:
                         self.debug_print(f"Batch {batch_idx+1}/{len(batches)} took {batch_time:.3f}s")
 
-                    self.debug_print("Computing policy ratio...")
-                    ratio = torch.exp(new_log_probs - batch_old_log_probs)
                 except Exception as e:
                     # Keep error messages as regular prints
                     print(f"Error in batch {batch_idx+1}: {str(e)}")
                     raise
-
-                self.debug_print("Computing PPO objectives...")
-                surr1 = ratio * batch_advantages
-                surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * batch_advantages
-
-                actor_loss = -torch.min(surr1, surr2).mean()
-                critic_loss = F.mse_loss(values, batch_returns)
-                entropy_loss = -self.entropy_coef * entropy
-                loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
 
                 self.debug_print("Starting backward pass...")
                 self.actor_optimizer.zero_grad()
