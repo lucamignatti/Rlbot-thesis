@@ -70,7 +70,7 @@ class SimBa(nn.Module):
 
     def forward(self, x):
         # Add cudagraph_mark_step_begin call to prevent CUDA graph overwriting issues
-        if self.device == torch.device("cuda:0"):
+        if "cuda" in str(self.device):
             torch.compiler.cudagraph_mark_step_begin()
 
         # Convert to tensor if needed

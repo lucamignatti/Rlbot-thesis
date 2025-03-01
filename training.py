@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical, Normal
+from torch.amp import autocast, GradScaler
 from typing import Union, Tuple
 import time
 import wandb
@@ -214,7 +215,8 @@ class PPOTrainer:
         batch_size: int = 64,
         use_wandb: bool = False,
         debug: bool = False,
-        use_compile: bool = True
+        use_compile: bool = True,
+        use_amp: bool = True,
     ):
 
         # Logging
@@ -241,6 +243,30 @@ class PPOTrainer:
         # Compile models if requested and available
         self.use_compile = use_compile and hasattr(torch, 'compile')
         if self.use_compile:
+            try:
+                self.debug_print("Compiling performance-critical functions...")
+
+                # Compile GAE computation
+                self._compute_gae_fn = self._create_compiled_gae()
+                self.debug_print("GAE function compiled")
+
+                # Compile policy evaluation
+                self._policy_eval_fn = self._create_compiled_policy_eval()
+                self.debug_print("Policy evaluation function compiled")
+
+                # Compile batch processor
+                self._process_batch_fn = self._create_compiled_batch_processor()
+                self.debug_print("Batch processor function compiled")
+
+                # Pre-warm compiled functions
+                self._prewarm_compiled_functions()
+                self.debug_print("Compiled functions pre-warmed")
+
+            except Exception as e:
+                self.debug_print(f"Function compilation failed: {str(e)}")
+                self.use_compile = False
+
+
             try:
                 self.debug_print(f"Compiling models for {self.device}...")
 
@@ -282,6 +308,14 @@ class PPOTrainer:
 
         # Memory and experience queue
         self.memory = PPOMemory(batch_size, buffer_size=10000, device=device)
+
+        # AMP
+        self.use_amp = "cuda" in str(device) and use_amp
+        if self.use_amp:
+            self.scaler = GradScaler()
+            self.debug_print("Automatic Mixed Precision (AMP) enabled")
+        else:
+            self.debug_print("Automatic Mixed Precision (AMP) disabled: requires CUDA")
 
         # Training metrics
         self.actor_losses = []
@@ -434,6 +468,52 @@ class PPOTrainer:
 
         return actor_loss, critic_loss, entropy_loss, total_loss, entropy
 
+    def _prewarm_compiled_functions(self):
+        """Pre-warm compiled functions with dummy data to complete compilation"""
+        if not self.use_compile:
+            return
+
+        self.debug_print("Pre-warming compiled functions...")
+
+        try:
+            # Create small dummy tensors based on expected shapes
+            dummy_size = 4  # Small batch size for pre-warming
+
+            # For GAE
+            if hasattr(self, '_compute_gae_fn'):
+                dummy_rewards = torch.zeros(dummy_size, device=self.device)
+                dummy_values = torch.zeros(dummy_size, device=self.device)
+                dummy_dones = torch.zeros(dummy_size, dtype=torch.bool, device=self.device)
+                dummy_next_value = torch.zeros(1, device=self.device)
+
+                # Run once to trigger compilation
+                _ = self._compute_gae_fn(dummy_rewards, dummy_values, dummy_dones, dummy_next_value)
+                self.debug_print("GAE function pre-warmed")
+
+            # For policy evaluation
+            if hasattr(self, '_policy_eval_fn'):
+                action_size = 1 if self.action_space_type == "discrete" else self.action_dim
+                dummy_states = torch.zeros((dummy_size, self.actor.obs_shape), device=self.device)
+                dummy_actions = torch.zeros((dummy_size, action_size), device=self.device) if self.action_space_type != "discrete" else torch.zeros(dummy_size, dtype=torch.long, device=self.device)
+                dummy_log_probs = torch.zeros(dummy_size, device=self.device)
+                dummy_advantages = torch.zeros(dummy_size, device=self.device)
+
+                # Run once to trigger compilation
+                _ = self._policy_eval_fn(dummy_states, dummy_actions, dummy_log_probs, dummy_advantages)
+                self.debug_print("Policy evaluation function pre-warmed")
+
+            # For batch processor
+            if hasattr(self, '_process_batch_fn'):
+                dummy_returns = torch.zeros(dummy_size, device=self.device)
+
+                # Run once to trigger compilation
+                _ = self._process_batch_fn(dummy_states, dummy_actions, dummy_log_probs, dummy_advantages, dummy_returns)
+                self.debug_print("Batch processor function pre-warmed")
+
+        except Exception as e:
+            self.debug_print(f"Function pre-warming failed: {str(e)}")
+            self.use_compile = False
+
     def debug_print(self, message):
         """Print debug messages only when debug mode is enabled."""
         if self.debug:
@@ -481,14 +561,13 @@ class PPOTrainer:
             if done is not None:
                 self.memory.dones[idx] = bool(done)
 
-
     def get_action(self, state, evaluate=False):
         """
         Get action and log probability from state using the actor network.
         Optimized for both single and batched inputs.
         """
         # Mark CUDA graph step if using CUDA
-        if self.device == torch.device("cuda:0"):
+        if "cuda" in str(self.device):
             torch.compiler.cudagraph_mark_step_begin()
 
         # Handle different input formats
@@ -502,46 +581,47 @@ class PPOTrainer:
         state_device = state.to(self.device)
 
         with torch.no_grad():
-            # Get value estimate from critic
-            value = self.critic(state_device)
-            # Clone to avoid CUDA graph overwriting
-            value = value.clone()
+            with autocast(enabled=self.use_amp, device_type="cuda"):
+                # Get value estimate from critic
+                value = self.critic(state_device)
+                # Clone to avoid CUDA graph overwriting
+                value = value.clone()
 
-            # Get action distribution from actor
-            if self.action_space_type == "discrete":
-                logits = self.actor(state_device)
-                action_probs = F.softmax(logits, dim=1)
-                dist = Categorical(action_probs)
+                # Get action distribution from actor
+                if self.action_space_type == "discrete":
+                    logits = self.actor(state_device)
+                    action_probs = F.softmax(logits, dim=1)
+                    dist = Categorical(action_probs)
 
-                if evaluate:
-                    action = torch.argmax(action_probs, dim=1)
+                    if evaluate:
+                        action = torch.argmax(action_probs, dim=1)
+                    else:
+                        action = dist.sample()
+
+                    log_prob = dist.log_prob(action)
+
                 else:
-                    action = dist.sample()
+                    mu, sigma = self.actor(state_device)
+                    mu = mu.clone()  # Clone to avoid CUDA graph overwriting
+                    sigma = F.softplus(sigma) + 1e-5
+                    dist = Normal(mu, sigma)
 
-                log_prob = dist.log_prob(action)
+                    if evaluate:
+                        action = mu
+                    else:
+                        action = dist.sample()
 
-            else:
-                mu, sigma = self.actor(state_device)
-                mu = mu.clone()  # Clone to avoid CUDA graph overwriting
-                sigma = F.softplus(sigma) + 1e-5
-                dist = Normal(mu, sigma)
+                    log_prob = dist.log_prob(action)
 
-                if evaluate:
-                    action = mu
-                else:
-                    action = dist.sample()
+                    # Sum log probs across action dimensions but preserve batch dimension
+                    if len(log_prob.shape) > 1:
+                        log_prob = log_prob.sum(dim=-1)  # Sum over last dimension (action dimension)
 
-                log_prob = dist.log_prob(action)
+                    action = torch.clamp(action, self.action_bounds[0], self.action_bounds[1])
 
-                # Sum log probs across action dimensions but preserve batch dimension
-                if len(log_prob.shape) > 1:
-                    log_prob = log_prob.sum(dim=-1)  # Sum over last dimension (action dimension)
-
-                action = torch.clamp(action, self.action_bounds[0], self.action_bounds[1])
-
-            # Clone all outputs to avoid CUDA graph overwriting issues
-            action = action.clone()
-            log_prob = log_prob.clone()
+                # Clone all outputs to avoid CUDA graph overwriting issues
+                action = action.clone()
+                log_prob = log_prob.clone()
 
         return action.cpu().numpy(), log_prob.cpu().numpy(), value.cpu().numpy()
 
@@ -760,45 +840,51 @@ class PPOTrainer:
                     self.debug_print(f"Batch states shape: {batch_states.shape}")
                     self.debug_print(f"Batch actions shape: {batch_actions.shape}")
 
-                    # Use compiled functions if available
-                    if self.use_compile and hasattr(self, '_process_batch_fn'):
-                        actor_loss, critic_loss, entropy_loss, loss, entropy = self._process_batch_fn(
-                            batch_states, batch_actions, batch_old_log_probs,
-                            batch_advantages, batch_returns
-                        )
-                    else:
-                        # Critic forward pass
-                        self.debug_print("Running critic forward pass...")
-                        values = self.critic(batch_states).squeeze()
-                        self.debug_print("Critic forward pass complete")
+                    # Reset gradients
+                    self.actor_optimizer.zero_grad()
+                    self.critic_optimizer.zero_grad()
 
-                        # Actor forward pass
-                        self.debug_print("Running actor forward pass...")
-                        if self.action_space_type == "discrete":
-                            logits = self.actor(batch_states)
-
-                            action_probs = F.softmax(logits, dim=1)
-                            dist = Categorical(action_probs)
-                            new_log_probs = dist.log_prob(batch_actions)
-                            entropy = dist.entropy().mean()
+                    # Use AMP autocast for forward pass
+                    with autocast(enabled=self.use_amp, device_type="cuda"):
+                        # Use compiled functions if available
+                        if self.use_compile and hasattr(self, '_process_batch_fn'):
+                            actor_loss, critic_loss, entropy_loss, loss, entropy = self._process_batch_fn(
+                                batch_states, batch_actions, batch_old_log_probs,
+                                batch_advantages, batch_returns
+                            )
                         else:
-                            mu, sigma_raw = self.actor(batch_states)
+                            # Critic forward pass
+                            self.debug_print("Running critic forward pass...")
+                            values = self.critic(batch_states).squeeze()
+                            self.debug_print("Critic forward pass complete")
 
-                            sigma = F.softplus(sigma_raw) + 1e-5
-                            dist = Normal(mu, sigma)
-                            new_log_probs = dist.log_prob(batch_actions)
-                            if len(new_log_probs.shape) > 1:
-                                new_log_probs = new_log_probs.sum(dim=1)
-                            entropy = dist.entropy().mean()
+                            # Actor forward pass
+                            self.debug_print("Running actor forward pass...")
+                            if self.action_space_type == "discrete":
+                                logits = self.actor(batch_states)
 
-                        ratio = torch.exp(new_log_probs - batch_old_log_probs)
-                        surr1 = ratio * batch_advantages
-                        surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * batch_advantages
+                                action_probs = F.softmax(logits, dim=1)
+                                dist = Categorical(action_probs)
+                                new_log_probs = dist.log_prob(batch_actions)
+                                entropy = dist.entropy().mean()
+                            else:
+                                mu, sigma_raw = self.actor(batch_states)
 
-                        actor_loss = -torch.min(surr1, surr2).mean()
-                        critic_loss = F.mse_loss(values, batch_returns)
-                        entropy_loss = -self.entropy_coef * entropy
-                        loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
+                                sigma = F.softplus(sigma_raw) + 1e-5
+                                dist = Normal(mu, sigma)
+                                new_log_probs = dist.log_prob(batch_actions)
+                                if len(new_log_probs.shape) > 1:
+                                    new_log_probs = new_log_probs.sum(dim=1)
+                                entropy = dist.entropy().mean()
+
+                            ratio = torch.exp(new_log_probs - batch_old_log_probs)
+                            surr1 = ratio * batch_advantages
+                            surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * batch_advantages
+
+                            actor_loss = -torch.min(surr1, surr2).mean()
+                            critic_loss = F.mse_loss(values, batch_returns)
+                            entropy_loss = -self.entropy_coef * entropy
+                            loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
 
                     batch_time = time.time() - batch_loop_start
                     batch_times.append(batch_time)
@@ -812,17 +898,25 @@ class PPOTrainer:
                     raise
 
                 self.debug_print("Starting backward pass...")
-                self.actor_optimizer.zero_grad()
-                self.critic_optimizer.zero_grad()
-                loss.backward()
 
-                self.debug_print("Clipping gradients...")
-                torch.nn.utils.clip_grad_norm_(self.actor_optimizer.param_groups[0]["params"], self.max_grad_norm)
-                torch.nn.utils.clip_grad_norm_(self.critic_optimizer.param_groups[0]["params"], self.max_grad_norm)
-
-                self.debug_print("Applying optimizer steps...")
-                self.actor_optimizer.step()
-                self.critic_optimizer.step()
+                # Use scaler for backward pass if AMP is enabled
+                if self.use_amp:
+                    self.scaler.scale(loss).backward()
+                    self.debug_print("Clipping gradients...")
+                    self.scaler.unscale_(self.actor_optimizer)
+                    self.scaler.unscale_(self.critic_optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+                    self.scaler.step(self.actor_optimizer)
+                    self.scaler.step(self.critic_optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    self.debug_print("Clipping gradients...")
+                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                    torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+                    self.actor_optimizer.step()
+                    self.critic_optimizer.step()
 
                 self.debug_print("Accumulating losses...")
                 total_actor_loss += actor_loss.item()

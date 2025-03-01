@@ -128,6 +128,7 @@ def run_training(
     use_wandb: bool = False,
     debug: bool = False,
     use_compile: bool = True,
+    use_amp: bool = True,
     # Hyperparameters
     lr_actor: float = 3e-4,
     lr_critic: float = 1e-3,
@@ -166,7 +167,8 @@ def run_training(
         batch_size=batch_size,
         use_wandb=use_wandb,
         debug=debug,
-        use_compile=use_compile
+        use_compile=use_compile,
+        use_amp=use_amp
     )
 
     # Create vectorized environment
@@ -377,6 +379,10 @@ if __name__ == "__main__":
     parser.add_argument('--no-compile', action='store_false', dest='compile', help='Disable torch.compile')
     parser.set_defaults(compile=True)
 
+    parser.add_argument('--amp', action='store_true', help='Use automatic mixed precision')
+    parser.add_argument('--no-amp', action='store_false', dest='amp', help='Disable automatic mixed precision')
+    parser.set_defaults(amp=True)
+
 
     # For backwards compatibility
     parser.add_argument('-p', '--processes', type=int, default=None,
@@ -460,6 +466,7 @@ if __name__ == "__main__":
         use_wandb=args.wandb,
         debug=args.debug,
         use_compile=args.compile,
+        use_amp=args.amp,
         # Hyperparameters
         lr_actor=args.lra,
         lr_critic=args.lrc,
