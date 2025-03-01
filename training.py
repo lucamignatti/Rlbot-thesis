@@ -1,77 +1,110 @@
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torch.multiprocessing as mp
 from torch.distributions import Categorical, Normal
 from typing import Union, Tuple
 import time
 import wandb
-from queue import Empty
 
 class PPOMemory:
     """
     Process-safe buffer for storing trajectories experienced by a PPO agent.
     """
-    def __init__(self, batch_size, buffer_size=10000):
+    def __init__(self, batch_size, buffer_size=10000, device="cuda"):
         self.batch_size = batch_size
         self.buffer_size = buffer_size
+        self.device = device
 
-        # Initialize arrays with default shapes
-        self.states = np.zeros((buffer_size, 1), dtype=np.float32)
-        self.actions = np.zeros((buffer_size,), dtype=np.float32)
+        # Determine if we should keep data on device or as numpy arrays
+        # For CPU, numpy arrays are often more efficient
+        self.use_device_tensors = device != "cpu"
+
+        if self.use_device_tensors:
+            # Pre-allocate tensors on device (GPU/MPS)
+            self.states = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
+            self.actions = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
+            self.logprobs = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
+            self.rewards = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
+            self.values = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
+            self.dones = torch.zeros((buffer_size,), dtype=torch.bool, device=device)
+        else:
+            # Use numpy arrays for CPU (more efficient)
+            self.states = np.zeros((buffer_size, 1), dtype=np.float32)
+            self.actions = np.zeros((buffer_size,), dtype=np.float32)
+            self.logprobs = np.zeros((buffer_size,), dtype=np.float32)
+            self.rewards = np.zeros((buffer_size,), dtype=np.float32)
+            self.values = np.zeros((buffer_size,), dtype=np.float32)
+            self.dones = np.zeros((buffer_size,), dtype=bool)
+
         self.state_initialized = False
         self.action_initialized = False
-
-        # Pre-allocate scalar arrays
-        self.logprobs = np.zeros((buffer_size,), dtype=np.float32)
-        self.rewards = np.zeros((buffer_size,), dtype=np.float32)
-        self.values = np.zeros((buffer_size,), dtype=np.float32)
-        self.dones = np.zeros((buffer_size,), dtype=bool)
-
-        # Keep track of current position and size
         self.pos = 0
         self.size = 0
 
     def store(self, state, action, logprob, reward, value, done):
-        """
-        Process-safe store of one timestep of agent-environment interaction in the buffer.
-        Uses pre-allocated arrays for efficient storage.
-        """
-        # Initialize arrays if needed
+        """Store experience appropriately based on device strategy"""
+        # Initialize arrays/tensors if needed
         if not self.state_initialized and state is not None:
-            state_array = np.asarray(state, dtype=np.float32)
-            self.states = np.zeros((self.buffer_size,) + state_array.shape, dtype=np.float32)
+            state_shape = np.asarray(state).shape
+
+            if self.use_device_tensors:
+                self.states = torch.zeros((self.buffer_size,) + state_shape,
+                                         dtype=torch.float32, device=self.device)
+            else:
+                self.states = np.zeros((self.buffer_size,) + state_shape, dtype=np.float32)
+
             self.state_initialized = True
 
         if not self.action_initialized and action is not None:
             action_array = np.asarray(action)
+
             if action_array.size == 1:  # Discrete action
-                self.actions = np.zeros((self.buffer_size,), dtype=np.int64)
+                if self.use_device_tensors:
+                    self.actions = torch.zeros(self.buffer_size, dtype=torch.int64, device=self.device)
+                else:
+                    self.actions = np.zeros(self.buffer_size, dtype=np.int64)
             else:  # Continuous action
-                self.actions = np.zeros((self.buffer_size,) + action_array.shape, dtype=np.float32)
+                if self.use_device_tensors:
+                    self.actions = torch.zeros((self.buffer_size,) + action_array.shape,
+                                              dtype=torch.float32, device=self.device)
+                else:
+                    self.actions = np.zeros((self.buffer_size,) + action_array.shape, dtype=np.float32)
+
             self.action_initialized = True
 
-        # Store at current position with None handling
-        if state is not None:
-            self.states[self.pos] = np.asarray(state, dtype=np.float32)
-        else:
-            self.states[self.pos] = np.zeros_like(self.states[0])
+        # Store values appropriately
+        if self.use_device_tensors:
+            if state is not None:
+                self.states[self.pos] = torch.as_tensor(state, dtype=torch.float32, device=self.device)
 
-        if action is not None:
-            action_array = np.asarray(action)
-            if action_array.size == 1:  # Discrete action
-                self.actions[self.pos] = int(action_array.item())
-            else:  # Continuous action
-                self.actions[self.pos] = action_array
-        else:
-            self.actions[self.pos] = np.zeros_like(self.actions[0])
+            if action is not None:
+                action_array = np.asarray(action)
+                if action_array.size == 1:  # Discrete action
+                    self.actions[self.pos] = int(action_array.item())
+                else:  # Continuous action
+                    self.actions[self.pos] = torch.as_tensor(action_array, dtype=torch.float32, device=self.device)
 
-        self.logprobs[self.pos] = float(logprob if logprob is not None else 0)
-        self.rewards[self.pos] = float(reward if reward is not None else 0)
-        self.values[self.pos] = float(value if value is not None else 0)
-        self.dones[self.pos] = bool(done if done is not None else False)
+            self.logprobs[self.pos] = torch.tensor(float(logprob if logprob is not None else 0), device=self.device)
+            self.rewards[self.pos] = torch.tensor(float(reward if reward is not None else 0), device=self.device)
+            self.values[self.pos] = torch.tensor(float(value if value is not None else 0), device=self.device)
+            self.dones[self.pos] = torch.tensor(bool(done if done is not None else False), device=self.device)
+        else:
+            # Traditional numpy storage for CPU
+            if state is not None:
+                self.states[self.pos] = np.asarray(state, dtype=np.float32)
+
+            if action is not None:
+                action_array = np.asarray(action)
+                if action_array.size == 1:
+                    self.actions[self.pos] = int(action_array.item())
+                else:
+                    self.actions[self.pos] = action_array
+
+            self.logprobs[self.pos] = float(logprob if logprob is not None else 0)
+            self.rewards[self.pos] = float(reward if reward is not None else 0)
+            self.values[self.pos] = float(value if value is not None else 0)
+            self.dones[self.pos] = bool(done if done is not None else False)
 
         # Update position and size
         self.pos = (self.pos + 1) % self.buffer_size
@@ -87,61 +120,76 @@ class PPOMemory:
         self.size = 0
 
     def get(self):
-        """
-        Process-safe get all data from buffer.
-        Returns valid data from the circular buffer.
-        """
+        """Get data in appropriate format for the device"""
         if self.size == 0 or not self.state_initialized:
             return [], [], [], [], [], []
 
-        # Get valid slice of data ensuring proper numpy arrays
-        valid_states = np.array(self.states[:self.size], dtype=np.float32)
-        valid_actions = np.array(self.actions[:self.size], dtype=np.float32)
-        valid_logprobs = np.array(self.logprobs[:self.size], dtype=np.float32)
-        valid_rewards = np.array(self.rewards[:self.size], dtype=np.float32)
-        valid_values = np.array(self.values[:self.size], dtype=np.float32)
-        valid_dones = np.array(self.dones[:self.size], dtype=bool)
+        if self.use_device_tensors:
+            # For GPU/MPS, data is already on device
+            valid_states = self.states[:self.size]
+            valid_actions = self.actions[:self.size]
+            valid_logprobs = self.logprobs[:self.size]
+            valid_rewards = self.rewards[:self.size]
+            valid_values = self.values[:self.size]
+            valid_dones = self.dones[:self.size]
+        else:
+            # For CPU, convert numpy arrays to tensors and move to device
+            valid_states = torch.tensor(self.states[:self.size], dtype=torch.float32, device=self.device)
 
-        # Return only the valid data
-        return (
-            valid_states,
-            valid_actions,
-            valid_logprobs,
-            valid_rewards,
-            valid_values,
-            valid_dones
-        )
+            # Handle different action types
+            if np.issubdtype(self.actions.dtype, np.integer):
+                valid_actions = torch.tensor(self.actions[:self.size], dtype=torch.long, device=self.device)
+            else:
+                valid_actions = torch.tensor(self.actions[:self.size], dtype=torch.float32, device=self.device)
+
+            valid_logprobs = torch.tensor(self.logprobs[:self.size], dtype=torch.float32, device=self.device)
+            valid_rewards = torch.tensor(self.rewards[:self.size], dtype=torch.float32, device=self.device)
+            valid_values = torch.tensor(self.values[:self.size], dtype=torch.float32, device=self.device)
+            valid_dones = torch.tensor(self.dones[:self.size], dtype=torch.bool, device=self.device)
+
+        return (valid_states, valid_actions, valid_logprobs, valid_rewards, valid_values, valid_dones)
 
     def generate_batches(self):
         if self.size == 0:
             return []
 
         # Generate shuffled indices
-        indices = np.arange(self.size, dtype=np.int32)
-        np.random.shuffle(indices)
+        if self.use_device_tensors:
+            indices = torch.randperm(self.size, device=self.device)
+        else:
+            indices = np.random.permutation(self.size)
 
-        # Create batches of equal size
+        # Create batches
         batches = []
-
-        # Calculate how many complete batches we can make
         num_complete_batches = self.size // self.batch_size
 
-        # First add complete batches
-        for i in range(num_complete_batches):
-            start_idx = i * self.batch_size
-            batches.append(indices[start_idx:start_idx + self.batch_size])
+        # Handle batch creation based on device strategy
+        if self.use_device_tensors:
+            # GPU/MPS tensor-based batches
+            for i in range(num_complete_batches):
+                start_idx = i * self.batch_size
+                batches.append(indices[start_idx:start_idx + self.batch_size])
 
-        # Handle remaining data (if any)
-        if self.size % self.batch_size != 0:
-            # Get remaining indices
-            remaining = indices[num_complete_batches * self.batch_size:]
-            # Create a batch with the remaining indices, possibly with some repeated
-            if len(remaining) > 0:
-                # Repeat indices to fill the batch
-                needed = self.batch_size - len(remaining)
-                # Use indices from the beginning to pad
-                padding = indices[:needed]
-                batches.append(np.concatenate([remaining, padding]))
+            # Handle remaining data
+            if self.size % self.batch_size != 0:
+                remaining = indices[num_complete_batches * self.batch_size:]
+                if len(remaining) > 0:
+                    needed = self.batch_size - len(remaining)
+                    padding = indices[:needed]
+                    batches.append(torch.cat([remaining, padding]))
+        else:
+            # CPU numpy-based batches
+            for i in range(num_complete_batches):
+                start_idx = i * self.batch_size
+                batches.append(indices[start_idx:start_idx + self.batch_size])
+
+            # Handle remaining data
+            if self.size % self.batch_size != 0:
+                remaining = indices[num_complete_batches * self.batch_size:]
+                if len(remaining) > 0:
+                    needed = self.batch_size - len(remaining)
+                    padding = indices[:needed]
+                    batches.append(np.concatenate([remaining, padding]))
 
         return batches
 
@@ -194,15 +242,14 @@ class PPOTrainer:
         self.use_compile = use_compile and hasattr(torch, 'compile')
         if self.use_compile:
             try:
-                self.debug_print("Compiling actor and critic models with torch.compile...")
+                self.debug_print(f"Compiling models for {self.device}...")
 
-                # Choose compile settings based on device
                 if self.device == "mps":
-                    # Apple Silicon - simplified settings without extra kwargs
+                    # Apple Silicon - use compatible settings
                     self.actor = torch.compile(self.actor, backend="aot_eager")
                     self.critic = torch.compile(self.critic, backend="aot_eager")
                 elif self.device == "cuda":
-                    # CUDA with full optimization
+                    # CUDA with optimization
                     self.actor = torch.compile(self.actor, mode="max-autotune")
                     self.critic = torch.compile(self.critic, mode="max-autotune")
                 else:
@@ -210,9 +257,8 @@ class PPOTrainer:
                     self.actor = torch.compile(self.actor, mode="reduce-overhead")
                     self.critic = torch.compile(self.critic, mode="reduce-overhead")
 
-                self.debug_print(f"Models successfully compiled for {self.device}")
             except Exception as e:
-                self.debug_print(f"Model compilation failed, falling back to standard models: {str(e)}")
+                self.debug_print(f"Model compilation failed: {str(e)}")
                 self.use_compile = False
 
         # Enable train mode
@@ -235,7 +281,7 @@ class PPOTrainer:
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_critic)
 
         # Memory and experience queue
-        self.memory = PPOMemory(batch_size, buffer_size=10000)
+        self.memory = PPOMemory(batch_size, buffer_size=10000, device=device)
 
         # Training metrics
         self.actor_losses = []
@@ -262,8 +308,41 @@ class PPOTrainer:
     def store_experience(self, state, action, log_prob, reward, value, done):
         """
         Store experience directly in memory buffer.
+        Handles different data types for consistent storage.
         """
-        self.memory.store(state, action, log_prob, reward, value, done)
+        # Convert done to the appropriate type based on memory configuration
+        if self.memory.use_device_tensors and not isinstance(done, torch.Tensor):
+            # Convert Python/numpy boolean to PyTorch boolean tensor
+            done_tensor = torch.tensor(bool(done), dtype=torch.bool, device=self.device)
+            self.memory.store(state, action, log_prob, reward, value, done_tensor)
+        else:
+            self.memory.store(state, action, log_prob, reward, value, done)
+
+    def store_experience_at_idx(self, idx, state, action, log_prob, reward, value, done):
+        """
+        Update specific fields of an existing experience entry.
+        Only updates the provided values (non-None values).
+        """
+        if idx >= self.memory.buffer_size:
+            raise ValueError(f"Index {idx} out of bounds for buffer size {self.memory.buffer_size}")
+
+        # Only update fields that are provided (not None)
+        if self.memory.use_device_tensors:
+            if reward is not None:
+                self.memory.rewards[idx] = torch.tensor(float(reward), device=self.device)
+
+            if done is not None:
+                if isinstance(done, torch.Tensor):
+                    self.memory.dones[idx] = done.to(self.device)
+                else:
+                    self.memory.dones[idx] = torch.tensor(bool(done), device=self.device)
+        else:
+            if reward is not None:
+                self.memory.rewards[idx] = float(reward)
+
+            if done is not None:
+                self.memory.dones[idx] = bool(done)
+
 
     def get_action(self, state, evaluate=False):
         """
@@ -318,28 +397,84 @@ class PPOTrainer:
         return action.cpu().numpy(), log_prob.cpu().numpy(), value.cpu().numpy()
 
     def compute_gae(self, rewards, values, dones, next_value):
-        """Compute Generalized Advantage Estimation (GAE)."""
-        advantages = np.zeros(len(rewards), dtype=np.float32)
-        last_gae = 0
+        """Compute GAE with support for both tensor and numpy inputs"""
+        # Check if inputs are tensors or numpy arrays
+        is_tensor = isinstance(rewards, torch.Tensor)
 
-        if not isinstance(rewards, np.ndarray):
-            rewards = np.array(rewards)
-        if not isinstance(values, np.ndarray):
-            values = np.array(values)
-        if not isinstance(dones, np.ndarray):
-            dones = np.array(dones)
+        if is_tensor:
+            advantages = torch.zeros_like(rewards, device=self.device)
+            last_gae = torch.tensor(0.0, device=self.device)
 
-        all_values = np.append(values, next_value)
+            # Handle dimension mismatch more carefully
+            if next_value.dim() != values.dim():
+                if next_value.dim() > values.dim():
+                    # Squeeze extra dimensions
+                    next_value = next_value.squeeze()
 
-        for t in reversed(range(len(rewards))):
-            if dones[t]:
-                delta = rewards[t] - values[t]
-                last_gae = delta
+                # Add necessary dimensions if still needed
+                while next_value.dim() < values.dim():
+                    next_value = next_value.unsqueeze(0)
+
+            # Create compatible tensor for concatenation
+            if len(values.shape) == 1:
+                next_value_shaped = next_value.reshape(1)
             else:
-                delta = rewards[t] + self.gamma * all_values[t+1] - values[t]
-                last_gae = delta + self.gamma * self.gae_lambda * last_gae
+                # Match the last dimensions
+                next_value_shaped = next_value.reshape(*[1] + list(values.shape[1:]))
 
-            advantages[t] = last_gae
+            # Now concatenate
+            try:
+                all_values = torch.cat([values, next_value_shaped], dim=0)
+            except RuntimeError as e:
+                # Debug shapes
+                print(f"values shape: {values.shape}, next_value shape: {next_value_shaped.shape}")
+                print(f"values dim: {values.dim()}, next_value dim: {next_value_shaped.dim()}")
+                raise RuntimeError(f"Error in torch.cat: {e}. Shape mismatch between values and next_value.")
+
+            for t in reversed(range(len(rewards))):
+                mask = ~dones[t] if isinstance(dones[t], torch.Tensor) else not dones[t]
+                if not mask:
+                    delta = rewards[t] - values[t]
+                    last_gae = delta
+                else:
+                    delta = rewards[t] + self.gamma * all_values[t+1] - values[t]
+                    last_gae = delta + self.gamma * self.gae_lambda * last_gae
+
+                advantages[t] = last_gae
+        else:
+            # Original numpy implementation for CPU
+            advantages = np.zeros(len(rewards), dtype=np.float32)
+            last_gae = 0
+
+            if not isinstance(rewards, np.ndarray):
+                rewards = np.array(rewards)
+            if not isinstance(values, np.ndarray):
+                values = np.array(values)
+            if not isinstance(dones, np.ndarray):
+                dones = np.array(dones)
+
+            # Handle numpy arrays and torch tensors
+            if isinstance(next_value, torch.Tensor):
+                next_value = next_value.cpu().detach().numpy()
+
+            # Reshape to match values dimensions
+            if values.ndim == 1:
+                next_value = np.array([next_value]).flatten()
+            else:
+                next_value = np.reshape(next_value, (1,) + values.shape[1:])
+
+            # Concatenate
+            all_values = np.concatenate([values, next_value], axis=0)
+
+            for t in reversed(range(len(rewards))):
+                if dones[t]:
+                    delta = rewards[t] - values[t]
+                    last_gae = delta
+                else:
+                    delta = rewards[t] + self.gamma * all_values[t+1] - values[t]
+                    last_gae = delta + self.gamma * self.gae_lambda * last_gae
+
+                advantages[t] = last_gae
 
         returns = advantages + values
         return advantages, returns
@@ -350,15 +485,14 @@ class PPOTrainer:
         update_start = time.time()
 
         # Ensure correct devices
-        self.critic.to(self.device)
-        self.actor.to(self.device)
-
+        # self.critic.to(self.device)
+        # self.actor.to(self.device)
 
         states, actions, old_log_probs, rewards, values, dones = self.memory.get()
         self.debug_print(f"Memory retrieved: {len(states)} timesteps")
 
         # Calculate episode metrics before processing
-        episodes_ended = np.sum(dones) if len(dones) > 0 else 0
+        episodes_ended = torch.sum(dones.int()).item() if isinstance(dones, torch.Tensor) else np.sum(dones) if len(dones) > 0 else 0
         if episodes_ended > 0:
             # Calculate average reward per episode
             episode_rewards = []
@@ -367,10 +501,14 @@ class PPOTrainer:
             episode_length = 0
 
             for i, (reward, done) in enumerate(zip(rewards, dones)):
-                episode_reward += reward
+                # Handle tensor or numpy value
+                r_val = reward.item() if isinstance(reward, torch.Tensor) else reward
+                d_val = done.item() if isinstance(done, torch.Tensor) else done
+
+                episode_reward += r_val
                 episode_length += 1
 
-                if done or i == len(rewards) - 1:
+                if d_val or i == len(rewards) - 1:
                     episode_rewards.append(episode_reward)
                     episode_lengths.append(episode_length)
                     episode_reward = 0
@@ -379,66 +517,38 @@ class PPOTrainer:
             avg_episode_reward = np.mean(episode_rewards)
             avg_episode_length = np.mean(episode_lengths)
         else:
-            avg_episode_reward = np.mean(rewards) if len(rewards) > 0 else 0
-            avg_episode_length = len(rewards)
+            # Handle rewards properly based on type
+            if isinstance(rewards, torch.Tensor):
+                avg_episode_reward = rewards.mean().item() if rewards.numel() > 0 else 0
+            else:
+                avg_episode_reward = np.mean(rewards) if len(rewards) > 0 else 0
+        avg_episode_length = len(rewards)
 
         if len(states) > 0 and not dones[-1]:
             self.debug_print("Computing next value...")
             try:
                 self.debug_print("Preparing next state...")
                 with torch.no_grad():
-                    next_state = torch.FloatTensor(states[-1]).to(self.device)
-                    if next_state.dim() == 1:
-                        next_state = next_state.unsqueeze(0)
-
+                    next_state = states[-1].unsqueeze(0) if isinstance(states, torch.Tensor) else torch.FloatTensor(states[-1]).unsqueeze(0).to(self.device)
                     self.debug_print("Running critic forward pass...")
                     next_value = self.critic(next_state)
-
-                    self.debug_print("Moving result to CPU...")
-                    next_value = next_value.cpu().numpy()[0]
-
-                self.debug_print("Next value computation complete")
+                    self.debug_print("Next value computation complete")
             except Exception as e:
                 print(f"Error during next value computation: {str(e)}")
                 raise
         else:
-            next_value = 0
-
-        self.debug_print("Converting data to numpy arrays...")
-        array_start = time.time()
-        states = np.asarray(states)
-        actions = np.asarray(actions)
-        old_log_probs = np.asarray(old_log_probs)
-        rewards = np.asarray(rewards)
-        values = np.asarray(values)
-        dones = np.asarray(dones)
-        self.debug_print(f"Array conversion took {time.time() - array_start:.4f}s")
+            next_value = torch.tensor([0.0], device=self.device) if isinstance(values, torch.Tensor) else 0.0
 
         self.debug_print("Computing advantages...")
         compute_start = time.time()
         advantages, returns = self.compute_gae(rewards, values, dones, next_value)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # Normalize advantages
+        if isinstance(advantages, torch.Tensor):
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        else:
+            advantages = (advantages - np.mean(advantages)) / (np.std(advantages) + 1e-8)
         self.debug_print(f"Advantage computation took {time.time() - compute_start:.2f}s")
-
-        self.debug_print("Moving data to device...")
-        device_start = time.time()
-        try:
-            self.debug_print("Converting and moving tensors...")
-            # Convert and move data in smaller chunks
-            states_tensor = torch.FloatTensor(states).to(self.device)
-            if self.action_space_type == "discrete":
-                actions_tensor = torch.LongTensor(actions).to(self.device)
-            else:
-                actions_tensor = torch.FloatTensor(actions).to(self.device)
-
-            old_log_probs_tensor = torch.FloatTensor(old_log_probs).to(self.device)
-            advantages_tensor = torch.FloatTensor(advantages).to(self.device)
-            returns_tensor = torch.FloatTensor(returns).to(self.device)
-
-            self.debug_print(f"Data movement took {time.time() - device_start:.2f}s")
-        except Exception as e:
-            print(f"Error during data movement: {str(e)}")
-            raise
 
         total_actor_loss = 0
         total_critic_loss = 0
@@ -446,7 +556,6 @@ class PPOTrainer:
         total_loss = 0
 
         # Variables for tracking policy changes
-        old_policy_kl = 0
         explained_var = 0
 
         # Default values for potentially unbound variables
@@ -468,23 +577,30 @@ class PPOTrainer:
 
             batch_times = []
             # Save old policy outputs for KL calculation
-            if epoch == 0 and self.action_space_type == "discrete":
+            if epoch == 0 and self.action_space_type == "discrete" and isinstance(states, torch.Tensor):
                 with torch.no_grad():
-                    old_logits = self.actor(states_tensor)
+                    old_logits = self.actor(states)
                     old_probs = F.softmax(old_logits, dim=1)
-            elif epoch == 0:
+            elif epoch == 0 and isinstance(states, torch.Tensor):
                 with torch.no_grad():
-                    old_mu, old_sigma_raw = self.actor(states_tensor)
+                    old_mu, old_sigma_raw = self.actor(states)
                     old_sigma = F.softplus(old_sigma_raw) + 1e-5
 
             for batch_idx, batch_indices in enumerate(batches):
                 batch_loop_start = time.time()
 
-                batch_states = states_tensor[batch_indices]
-                batch_actions = actions_tensor[batch_indices]
-                batch_old_log_probs = old_log_probs_tensor[batch_indices]
-                batch_advantages = advantages_tensor[batch_indices]
-                batch_returns = returns_tensor[batch_indices]
+                if isinstance(states, torch.Tensor):
+                    batch_states = states[batch_indices]
+                    batch_actions = actions[batch_indices]
+                    batch_old_log_probs = old_log_probs[batch_indices]
+                    batch_advantages = advantages[batch_indices]
+                    batch_returns = returns[batch_indices]
+                else:
+                    batch_states = torch.tensor(states[batch_indices], dtype=torch.float32, device=self.device)
+                    batch_actions = torch.tensor(actions[batch_indices], dtype=torch.long if self.action_space_type == "discrete" else torch.float32, device=self.device)
+                    batch_old_log_probs = torch.tensor(old_log_probs[batch_indices], dtype=torch.float32, device=self.device)
+                    batch_advantages = torch.tensor(advantages[batch_indices], dtype=torch.float32, device=self.device)
+                    batch_returns = torch.tensor(returns[batch_indices], dtype=torch.float32, device=self.device)
 
                 try:
                     self.debug_print(f"Processing batch {batch_idx+1}/{len(batches)}")
@@ -544,8 +660,8 @@ class PPOTrainer:
                 loss.backward()
 
                 self.debug_print("Clipping gradients...")
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(self.actor_optimizer.param_groups[0]["params"], self.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(self.critic_optimizer.param_groups[0]["params"], self.max_grad_norm)
 
                 self.debug_print("Applying optimizer steps...")
                 self.actor_optimizer.step()
@@ -578,14 +694,14 @@ class PPOTrainer:
 
         # Calculate KL divergence after updates
         kl_div = 0
-        if self.action_space_type == "discrete" and len(states) > 0 and old_probs is not None:
+        if self.action_space_type == "discrete" and len(states) > 0 and old_probs is not None and isinstance(states, torch.Tensor):
             with torch.no_grad():
-                new_logits = self.actor(states_tensor)
+                new_logits = self.actor(states)
                 new_probs = F.softmax(new_logits, dim=1)
                 kl_div = (old_probs * (torch.log(old_probs + 1e-10) - torch.log(new_probs + 1e-10))).sum(1).mean().item()
-        elif len(states) > 0 and old_mu is not None and old_sigma is not None:
+        elif len(states) > 0 and old_mu is not None and old_sigma is not None and isinstance(states, torch.Tensor):
             with torch.no_grad():
-                new_mu, new_sigma_raw = self.actor(states_tensor)
+                new_mu, new_sigma_raw = self.actor(states)
                 new_sigma = F.softplus(new_sigma_raw) + 1e-5
                 kl_div = (torch.log(new_sigma/old_sigma) + (old_sigma**2 + (old_mu - new_mu)**2)/(2*new_sigma**2) - 0.5).mean().item()
 
@@ -593,8 +709,8 @@ class PPOTrainer:
         if len(states) > 0:
             with torch.no_grad():
                 # Get all values for all states
-                all_values = self.critic(states_tensor).cpu().detach().numpy().flatten()
-                all_returns = returns_tensor.cpu().detach().numpy().flatten()
+                all_values = self.critic(states).cpu().detach().numpy().flatten() if isinstance(states, torch.Tensor) else self.critic(torch.tensor(states, dtype=torch.float32, device=self.device)).cpu().detach().numpy().flatten()
+                all_returns = returns.cpu().detach().numpy().flatten() if isinstance(returns, torch.Tensor) else returns
 
                 # Ensure same length
                 min_length = min(len(all_values), len(all_returns))
@@ -627,8 +743,8 @@ class PPOTrainer:
                         # Performance metrics
                         "mean_episode_reward": avg_episode_reward,
                         "mean_episode_length": avg_episode_length,
-                        "mean_advantage": advantages_tensor.mean().item() if isinstance(advantages_tensor, torch.Tensor) and advantages_tensor.numel() > 0 else 0,
-                        "mean_return": returns_tensor.mean().item() if isinstance(returns_tensor, torch.Tensor) and returns_tensor.numel() > 0 else 0,
+                        "mean_advantage": advantages.mean().item() if isinstance(advantages, torch.Tensor) else np.mean(advantages),
+                        "mean_return": returns.mean().item() if isinstance(returns, torch.Tensor) else np.mean(returns),
 
                         # Training statistics
                         "policy_kl_divergence": kl_div,

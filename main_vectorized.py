@@ -259,8 +259,7 @@ def run_training(
                         if mem_idx < 0:  # Handle wraparound in circular buffer
                             mem_idx += trainer.memory.buffer_size
 
-                        trainer.memory.rewards[mem_idx] = reward
-                        trainer.memory.dones[mem_idx] = done
+                        trainer.store_experience_at_idx(mem_idx, None, None, None, reward, None, done)
 
                         # Track episode rewards
                         episode_rewards[env_idx][agent_id] += reward
@@ -352,9 +351,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='RLBot Training Script')
     parser.add_argument('--render', action='store_true', help='Enable rendering')
     parser.add_argument('-e', '--episodes', type=int, default=200, help='Number of episodes to run')
-    parser.add_argument('-n', '--num_envs', type=int, default=4,
+    parser.add_argument('-n', '--num_envs', type=int, default=os.cpu_count(),
                         help='Number of parallel environments')
-    parser.add_argument('--update_interval', type=int, default=1000,
+    parser.add_argument('--update_interval', type=int, default=min(1000 * os.cpu_count(), 6000),
                         help='Experiences before policy update')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use (cuda/mps/cpu). If not specified, will use best available.')
