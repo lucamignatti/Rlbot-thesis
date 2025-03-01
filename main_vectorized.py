@@ -16,6 +16,7 @@ from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMut
 from rewards import ProximityReward
 from models import BasicModel, SimBa
 from training import PPOTrainer
+import concurrent.futures
 import time
 import argparse
 from tqdm import tqdm
@@ -72,48 +73,66 @@ class VectorizedEnv:
         # Get action space information for proper formatting
         self.is_discrete = True  # LookupTableAction uses discrete actions
 
+        # Initialize thread pool
+        self.max_workers = min(32, num_envs)  # Cap max threads
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
+
+    def _step_env(self, args):
+        """Process a single environment step in parallel"""
+        i, env, actions_dict = args
+
+        # Format actions
+        formatted_actions = {}
+        for agent_id, action in actions_dict.items():
+            if isinstance(action, np.ndarray):
+                formatted_actions[agent_id] = action
+            elif isinstance(action, int):
+                formatted_actions[agent_id] = np.array([action])
+            else:
+                formatted_actions[agent_id] = np.array([int(action)])
+
+        # Handle rendering
+        if self.render and i == self.render_env_idx:
+            env.render()
+            time.sleep(6/120)  # ~120 FPS limit
+
+        # Step environment
+        next_obs_dict, reward_dict, terminated_dict, truncated_dict = env.step(formatted_actions)
+
+        return i, (next_obs_dict, reward_dict, terminated_dict, truncated_dict)
+
     def step(self, actions_dict_list):
-        """Step all environments with their corresponding actions."""
-        results = []
-
+        """Step all environments with their corresponding actions using parallel threads."""
+        # Submit all environment steps to thread pool
+        futures = []
         for i, (env, actions_dict) in enumerate(zip(self.envs, actions_dict_list)):
-            # Make sure actions are in the correct format for LookupTableAction
-            # LookupTableAction expects integers for discrete actions
-            formatted_actions = {}
-            for agent_id, action in actions_dict.items():
-                # For LookupTableAction, we need a single integer value
-                if isinstance(action, np.ndarray):
-                    formatted_actions[agent_id] = action
-                elif isinstance(action, int):
-                    formatted_actions[agent_id] = np.array([action])
-                else:
-                    formatted_actions[agent_id] = np.array([int(action)])
+            future = self.executor.submit(self._step_env, (i, env, actions_dict))
+            futures.append(future)
 
-            # Render only the first environment when rendering is enabled
-            if self.render and i == self.render_env_idx:
-                env.render()
-                time.sleep(6/120)  # ~120 FPS limit
+        # Collect results maintaining original order
+        results = [None] * self.num_envs
+        for future in concurrent.futures.as_completed(futures):
+            i, result = future.result()
+            results[i] = result
 
-            # Step the environment
-            next_obs_dict, reward_dict, terminated_dict, truncated_dict = env.step(formatted_actions)
+            # Process results
+            next_obs_dict, reward_dict, terminated_dict, truncated_dict = result
 
-            # Store the results
-            results.append((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
-
-            # Check if episode is done for this environment
+            # Update done status
             self.dones[i] = any(terminated_dict.values()) or any(truncated_dict.values())
 
             # Update episode count and reset if needed
             if self.dones[i]:
                 self.episode_counts[i] += 1
-                self.obs_dicts[i] = env.reset()
+                self.obs_dicts[i] = self.envs[i].reset()
             else:
                 self.obs_dicts[i] = next_obs_dict
 
         return results, self.dones.copy(), self.episode_counts.copy()
 
     def close(self):
-        """Close all environments."""
+        """Close all environments and thread pool."""
+        self.executor.shutdown()
         for env in self.envs:
             env.close()
 
