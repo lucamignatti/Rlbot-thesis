@@ -344,6 +344,8 @@ def signal_handler(sig, frame):
 
 if __name__ == "__main__":
 
+    # Set float32 matmul precision to high for better performance
+    torch.set_float32_matmul_precision('high')
 
     # Register signal handler for clean exit
     signal.signal(signal.SIGINT, signal_handler)

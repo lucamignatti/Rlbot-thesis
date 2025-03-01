@@ -349,6 +349,10 @@ class PPOTrainer:
         Get action and log probability from state using the actor network.
         Optimized for both single and batched inputs.
         """
+        # Mark CUDA graph step if using CUDA
+        if self.device == torch.device("cuda:0"):
+            torch.compiler.cudagraph_mark_step_begin()
+
         # Handle different input formats
         if not isinstance(state, torch.Tensor):
             state = torch.FloatTensor(state)
@@ -362,6 +366,8 @@ class PPOTrainer:
         with torch.no_grad():
             # Get value estimate from critic
             value = self.critic(state_device)
+            # Clone to avoid CUDA graph overwriting
+            value = value.clone()
 
             # Get action distribution from actor
             if self.action_space_type == "discrete":
@@ -378,6 +384,7 @@ class PPOTrainer:
 
             else:
                 mu, sigma = self.actor(state_device)
+                mu = mu.clone()  # Clone to avoid CUDA graph overwriting
                 sigma = F.softplus(sigma) + 1e-5
                 dist = Normal(mu, sigma)
 
@@ -393,6 +400,10 @@ class PPOTrainer:
                     log_prob = log_prob.sum(dim=-1)  # Sum over last dimension (action dimension)
 
                 action = torch.clamp(action, self.action_bounds[0], self.action_bounds[1])
+
+            # Clone all outputs to avoid CUDA graph overwriting issues
+            action = action.clone()
+            log_prob = log_prob.clone()
 
         return action.cpu().numpy(), log_prob.cpu().numpy(), value.cpu().numpy()
 

@@ -69,6 +69,10 @@ class SimBa(nn.Module):
         self.to(self.device)
 
     def forward(self, x):
+        # Add cudagraph_mark_step_begin call to prevent CUDA graph overwriting issues
+        if self.device == torch.device("cuda:0"):
+            torch.compiler.cudagraph_mark_step_begin()
+
         # Convert to tensor if needed
         if not isinstance(x, torch.Tensor):
             x = torch.tensor(x, dtype=torch.float32).to(self.device)
@@ -91,6 +95,9 @@ class SimBa(nn.Module):
 
         # Output layer
         x = self.output_layer(x)
+
+        # Clone the output tensor to avoid CUDA graph overwriting
+        x = x.clone()
 
         return x
 
@@ -135,14 +142,8 @@ class ResidualFFBlock(nn.Module):
         h = self.linear2(h)
         h = self.dropout2(h)
 
-        # Residual connection
-        return x + h
-
-    def to(self, device=None, dtype=None, non_blocking=False):
-        # Call parent's to() method with all parameters
-        result = super().to(device=device, dtype=dtype, non_blocking=non_blocking)
-
-        return result
+        # Residual connection with clone to avoid CUDA graph issues
+        return (x + h).clone()
 
 class RSNorm(nn.Module):
     def __init__(self, num_features, eps=1e-5, momentum=0.1):
@@ -168,15 +169,25 @@ class RSNorm(nn.Module):
             batch_mean = x.mean(dim=0)
             batch_var = x.var(dim=0, unbiased=False)
 
-            self.num_batches_tracked += 1
+            # Clone the tensor to avoid CUDA graph issues
+            cloned_num_batches = self.num_batches_tracked.clone()
+            cloned_num_batches += 1
+            self.num_batches_tracked.copy_(cloned_num_batches)
 
             update_factor = self.momentum
             if self.num_batches_tracked == 1:
                 update_factor = 1.0
 
-            self.running_mean = (1 - update_factor) * self.running_mean + update_factor * batch_mean
-            self.running_var = (1 - update_factor) * self.running_var + update_factor * batch_var
+            # Use clones to avoid CUDA graph overwrite issues
+            new_running_mean = (1 - update_factor) * self.running_mean.clone() + update_factor * batch_mean
+            new_running_var = (1 - update_factor) * self.running_var.clone() + update_factor * batch_var
 
-            return (x - batch_mean) / torch.sqrt(batch_var + self.eps)
+            self.running_mean.copy_(new_running_mean)
+            self.running_var.copy_(new_running_var)
+
+            # Clone to avoid overwriting
+            normalized = (x - batch_mean) / torch.sqrt(batch_var + self.eps)
+            return normalized.clone()
         else:
-            return (x - self.running_mean) / torch.sqrt(self.running_var + self.eps)
+            normalized = (x - self.running_mean) / torch.sqrt(self.running_var + self.eps)
+            return normalized.clone()
