@@ -267,25 +267,38 @@ class PPOTrainer:
                 self.use_compile = False
 
 
-            try:
-                self.debug_print(f"Compiling models for {self.device}...")
+        try:
+            self.debug_print(f"Compiling models for {self.device}...")
 
-                if self.device == "mps":
-                    # Apple Silicon - use compatible settings
-                    self.actor = torch.compile(self.actor, backend="aot_eager")
-                    self.critic = torch.compile(self.critic, backend="aot_eager")
-                elif self.device == "cuda":
-                    # CUDA with optimization
-                    self.actor = torch.compile(self.actor, mode="max-autotune")
-                    self.critic = torch.compile(self.critic, mode="max-autotune")
-                else:
-                    # CPU with balanced settings
-                    self.actor = torch.compile(self.actor, mode="reduce-overhead")
-                    self.critic = torch.compile(self.critic, mode="reduce-overhead")
+            # Configure common options for torch.compile
+            compile_options = {
+                "fullgraph": False,  # Don't try to capture the full graph
+                "dynamic": True,     # Support for dynamic shapes
+            }
 
-            except Exception as e:
-                self.debug_print(f"Model compilation failed: {str(e)}")
-                self.use_compile = False
+            if self.device == "mps":
+                # Apple Silicon - use compatible settings
+                self.actor = torch.compile(self.actor, backend="aot_eager", **compile_options)
+                self.critic = torch.compile(self.critic, backend="aot_eager", **compile_options)
+            elif self.device == "cuda":
+                # Configure PyTorch Dynamo for safer CUDA graph usage
+                if hasattr(torch._dynamo.config, "allow_cudagraph_ops"):
+                    torch._dynamo.config.allow_cudagraph_ops = True
+
+                # Use safer backend mode for CUDA
+                backend = "inductor"
+
+                # CUDA with safer settings
+                self.actor = torch.compile(self.actor, backend=backend, **compile_options)
+                self.critic = torch.compile(self.critic, backend=backend, **compile_options)
+            else:
+                # CPU with balanced settings
+                self.actor = torch.compile(self.actor, backend="inductor", **compile_options)
+                self.critic = torch.compile(self.critic, backend="inductor", **compile_options)
+
+        except Exception as e:
+            self.debug_print(f"Model compilation failed: {str(e)}")
+            self.use_compile = False
 
         # Enable train mode
         self.actor.train()
@@ -566,30 +579,52 @@ class PPOTrainer:
         Get action and log probability from state using the actor network.
         Optimized for both single and batched inputs.
         """
-        # Mark CUDA graph step if using CUDA
+        # Before any processing, make sure we're in a clean CUDA state
         if "cuda" in str(self.device):
-            torch.compiler.cudagraph_mark_step_begin()
+            try:
+                # Force synchronization at the beginning of the call
+                torch.cuda.synchronize()
+                torch.compiler.cudagraph_mark_step_begin()
+            except Exception as e:
+                # Just log and continue if this fails
+                if self.debug:
+                    print(f"[DEBUG] CUDA sync warning: {str(e)}")
 
-        # Handle different input formats
+        # Convert input to tensor
         if not isinstance(state, torch.Tensor):
             state = torch.FloatTensor(state)
-            # Only add batch dimension if this isn't already a batch
             if state.dim() == 1 or (len(state.shape) == 2 and state.shape[0] == 1 and state.shape[1] > 1):
                 state = state.unsqueeze(0)
 
-        # Move state to target device for inference
-        state_device = state.to(self.device)
+        # Clone input tensor to avoid CUDA graph dependencies, but keep on CPU
+        state_clone = state.clone()
 
-        with torch.no_grad():
+        # Move to device
+        state_device = state_clone.to(self.device)
+
+        with torch.no_grad():  # No grad for inference actions
             with autocast(enabled=self.use_amp, device_type="cuda"):
+                # Mark step before each model execution
+                if "cuda" in str(self.device):
+                    torch.compiler.cudagraph_mark_step_begin()
+
                 # Get value estimate from critic
                 value = self.critic(state_device)
-                # Clone to avoid CUDA graph overwriting
-                value = value.clone()
+                value = value.clone()  # Clone but keep on device
+
+                # Mark step before actor execution
+                if "cuda" in str(self.device):
+                    torch.compiler.cudagraph_mark_step_begin()
 
                 # Get action distribution from actor
                 if self.action_space_type == "discrete":
                     logits = self.actor(state_device)
+                    logits = logits.clone()  # Clone but keep on device
+
+                    # Mark step after model execution
+                    if "cuda" in str(self.device):
+                        torch.compiler.cudagraph_mark_step_begin()
+
                     action_probs = F.softmax(logits, dim=1)
                     dist = Categorical(action_probs)
 
@@ -599,11 +634,17 @@ class PPOTrainer:
                         action = dist.sample()
 
                     log_prob = dist.log_prob(action)
-
                 else:
-                    mu, sigma = self.actor(state_device)
-                    mu = mu.clone()  # Clone to avoid CUDA graph overwriting
-                    sigma = F.softplus(sigma) + 1e-5
+                    # Continuous actions
+                    mu, sigma_raw = self.actor(state_device)
+                    mu = mu.clone()  # Clone but keep on device
+                    sigma_raw = sigma_raw.clone() if isinstance(sigma_raw, torch.Tensor) else sigma_raw
+
+                    # Mark step after model execution
+                    if "cuda" in str(self.device):
+                        torch.compiler.cudagraph_mark_step_begin()
+
+                    sigma = F.softplus(sigma_raw) + 1e-5
                     dist = Normal(mu, sigma)
 
                     if evaluate:
@@ -612,17 +653,17 @@ class PPOTrainer:
                         action = dist.sample()
 
                     log_prob = dist.log_prob(action)
-
-                    # Sum log probs across action dimensions but preserve batch dimension
                     if len(log_prob.shape) > 1:
-                        log_prob = log_prob.sum(dim=-1)  # Sum over last dimension (action dimension)
+                        log_prob = log_prob.sum(dim=-1)
 
                     action = torch.clamp(action, self.action_bounds[0], self.action_bounds[1])
 
-                # Clone all outputs to avoid CUDA graph overwriting issues
+                # Make sure all outputs are cloned
                 action = action.clone()
                 log_prob = log_prob.clone()
+                value = value.clone()
 
+        # Return detached numpy arrays for use in the environment
         return action.cpu().numpy(), log_prob.cpu().numpy(), value.cpu().numpy()
 
     def compute_gae(self, rewards, values, dones, next_value):
@@ -846,6 +887,10 @@ class PPOTrainer:
 
                     # Use AMP autocast for forward pass
                     with autocast(enabled=self.use_amp, device_type="cuda"):
+                        # Make sure tensors will have proper gradients
+                        if not batch_states.requires_grad:
+                            batch_states = batch_states.clone()
+
                         # Use compiled functions if available
                         if self.use_compile and hasattr(self, '_process_batch_fn'):
                             actor_loss, critic_loss, entropy_loss, loss, entropy = self._process_batch_fn(
@@ -853,15 +898,24 @@ class PPOTrainer:
                                 batch_advantages, batch_returns
                             )
                         else:
+                            # Mark CUDA graph step if on CUDA
+                            if "cuda" in str(self.device):
+                                torch.compiler.cudagraph_mark_step_begin()
+
                             # Critic forward pass
                             self.debug_print("Running critic forward pass...")
                             values = self.critic(batch_states).squeeze()
                             self.debug_print("Critic forward pass complete")
 
+                            # Mark CUDA graph step before actor
+                            if "cuda" in str(self.device):
+                                torch.compiler.cudagraph_mark_step_begin()
+
                             # Actor forward pass
                             self.debug_print("Running actor forward pass...")
                             if self.action_space_type == "discrete":
                                 logits = self.actor(batch_states)
+                                logits = logits.clone() # Clone to prevent CUDA graph issues
 
                                 action_probs = F.softmax(logits, dim=1)
                                 dist = Categorical(action_probs)
@@ -869,6 +923,8 @@ class PPOTrainer:
                                 entropy = dist.entropy().mean()
                             else:
                                 mu, sigma_raw = self.actor(batch_states)
+                                mu = mu.clone() # Clone to prevent CUDA graph issues
+                                sigma_raw = sigma_raw.clone() if isinstance(sigma_raw, torch.Tensor) else sigma_raw
 
                                 sigma = F.softplus(sigma_raw) + 1e-5
                                 dist = Normal(mu, sigma)
@@ -876,6 +932,10 @@ class PPOTrainer:
                                 if len(new_log_probs.shape) > 1:
                                     new_log_probs = new_log_probs.sum(dim=1)
                                 entropy = dist.entropy().mean()
+
+                            # Mark CUDA graph step before loss computation
+                            if "cuda" in str(self.device):
+                                torch.compiler.cudagraph_mark_step_begin()
 
                             ratio = torch.exp(new_log_probs - batch_old_log_probs)
                             surr1 = ratio * batch_advantages
@@ -885,6 +945,48 @@ class PPOTrainer:
                             critic_loss = F.mse_loss(values, batch_returns)
                             entropy_loss = -self.entropy_coef * entropy
                             loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
+
+                            # Verify loss has gradients
+                            if not loss.requires_grad:
+                                self.debug_print("Warning: Loss doesn't have gradients. Creating new computation graph.")
+                                # Create a fresh computation with explicit gradient tracking
+                                with torch.enable_grad():
+                                    if hasattr(self.actor, '_orig_mod'):
+                                        actor = self.actor._orig_mod
+                                    else:
+                                        actor = self.actor
+
+                                    if hasattr(self.critic, '_orig_mod'):
+                                        critic = self.critic._orig_mod
+                                    else:
+                                        critic = self.critic
+
+                                    # Recompute with gradient tracking explicitly enabled
+                                    values = critic(batch_states).squeeze()
+
+                                    if self.action_space_type == "discrete":
+                                        logits = actor(batch_states)
+                                        action_probs = F.softmax(logits, dim=1)
+                                        dist = Categorical(action_probs)
+                                        new_log_probs = dist.log_prob(batch_actions)
+                                        entropy = dist.entropy().mean()
+                                    else:
+                                        mu, sigma_raw = actor(batch_states)
+                                        sigma = F.softplus(sigma_raw) + 1e-5
+                                        dist = Normal(mu, sigma)
+                                        new_log_probs = dist.log_prob(batch_actions)
+                                        if len(new_log_probs.shape) > 1:
+                                            new_log_probs = new_log_probs.sum(dim=1)
+                                        entropy = dist.entropy().mean()
+
+                                    ratio = torch.exp(new_log_probs - batch_old_log_probs)
+                                    surr1 = ratio * batch_advantages
+                                    surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * batch_advantages
+
+                                    actor_loss = -torch.min(surr1, surr2).mean()
+                                    critic_loss = F.mse_loss(values, batch_returns)
+                                    entropy_loss = -self.entropy_coef * entropy
+                                    loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
 
                     batch_time = time.time() - batch_loop_start
                     batch_times.append(batch_time)

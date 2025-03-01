@@ -69,42 +69,64 @@ class SimBa(nn.Module):
         self.to(self.device)
 
     def forward(self, x):
-        # Add cudagraph_mark_step_begin call to prevent CUDA graph overwriting issues
+        # For CUDA graphs, explicitly mark step before we begin
         if "cuda" in str(self.device):
             torch.compiler.cudagraph_mark_step_begin()
 
-        # Convert to tensor if needed
+        # Convert input to correct device and format, but preserve grad history
         if not isinstance(x, torch.Tensor):
-            x = torch.tensor(x, dtype=torch.float32).to(self.device)
+            x = torch.tensor(x, dtype=torch.float32, device=self.device)
         elif x.device != self.device:
             x = x.to(self.device)
 
-        # Normalize input with running statistics
-        x = self.rsnorm(x)
-
-        # Initial embedding
-        x = self.embedding(x)
-        x = self.dropout(x)
-
-        # Apply residual blocks
-        for block in self.blocks:
-            x = block(x)
-
-        # Apply post-layer normalization
-        x = self.post_ln(x)
-
-        # Output layer
-        x = self.output_layer(x)
-
-        # Clone the output tensor to avoid CUDA graph overwriting
+        # Just clone, don't detach (to preserve gradients)
         x = x.clone()
 
-        return x
+        # Mark another step after input preparation
+        if "cuda" in str(self.device):
+            torch.compiler.cudagraph_mark_step_begin()
+
+        # Normalize input with running statistics
+        x_normalized = self.rsnorm(x)
+
+        # Mark step after normalization which modifies buffers
+        if "cuda" in str(self.device):
+            torch.compiler.cudagraph_mark_step_begin()
+
+        # Initial embedding
+        h = self.embedding(x_normalized)
+        h = self.dropout(h)
+
+        # Apply residual blocks with explicit steps between blocks
+        for i, block in enumerate(self.blocks):
+            # Mark step before each block
+            if "cuda" in str(self.device):
+                torch.compiler.cudagraph_mark_step_begin()
+            h = block(h)
+
+        # Mark step before normalization
+        if "cuda" in str(self.device):
+            torch.compiler.cudagraph_mark_step_begin()
+
+        # Apply post-layer normalization
+        h = self.post_ln(h)
+
+        # Mark step before final layer
+        if "cuda" in str(self.device):
+            torch.compiler.cudagraph_mark_step_begin()
+
+        # Output layer
+        output = self.output_layer(h)
+
+        # Mark step after the model completes
+        if "cuda" in str(self.device):
+            torch.compiler.cudagraph_mark_step_begin()
+
+        # Clone for CUDA graph safety but don't detach (preserve gradients)
+        return output.clone()
 
     def to(self, device=None, dtype=None, non_blocking=False):
-        # Call parent's to() method with all parameters
         super().to(device=device, dtype=dtype, non_blocking=non_blocking)
-        # Update instance device attribute
         self.device = device
         return self
 
@@ -114,6 +136,7 @@ class ResidualFFBlock(nn.Module):
         super(ResidualFFBlock, self).__init__()
         self.hidden_dim = hidden_dim
         self.dropout_rate = dropout_rate
+        self.device = device
 
         # Pre-layer normalization
         self.ln = nn.LayerNorm(hidden_dim)
@@ -132,18 +155,45 @@ class ResidualFFBlock(nn.Module):
         self.linear2 = nn.Linear(hidden_dim * 4, hidden_dim)
 
     def forward(self, x):
+        # Use clone() but not detach() to preserve gradient history
+        x = x.clone()
+
+        # Mark CUDA graph step if on CUDA device
+        if self.device and "cuda" in str(self.device):
+            torch.compiler.cudagraph_mark_step_begin()
+
         # Pre-layer normalization
         norm_x = self.ln(x)
+
+        # Mark step after normalization
+        if self.device and "cuda" in str(self.device):
+            torch.compiler.cudagraph_mark_step_begin()
 
         # Apply MLP with dropout
         h = self.linear1(norm_x)
         h = F.relu(h)
         h = self.dropout1(h)
+
+        # Mark step between linear layers
+        if self.device and "cuda" in str(self.device):
+            torch.compiler.cudagraph_mark_step_begin()
+
         h = self.linear2(h)
         h = self.dropout2(h)
 
-        # Residual connection with clone to avoid CUDA graph issues
-        return (x + h).clone()
+        # Mark step before residual connection
+        if self.device and "cuda" in str(self.device):
+            torch.compiler.cudagraph_mark_step_begin()
+
+        # Combine with residual connection
+        output = x + h
+
+        # Mark step after computation completes
+        if self.device and "cuda" in str(self.device):
+            torch.compiler.cudagraph_mark_step_begin()
+
+        # Clone but preserve gradients
+        return output.clone()
 
 class RSNorm(nn.Module):
     def __init__(self, num_features, eps=1e-5, momentum=0.1):
@@ -160,34 +210,72 @@ class RSNorm(nn.Module):
     def forward(self, x):
         device = x.device
 
+        # Use clone without detach to preserve gradients
+        x = x.clone()
+
+        # Move buffers to the correct device if needed
         if self.running_mean.device != device:
             self.running_mean = self.running_mean.to(device)
             self.running_var = self.running_var.to(device)
             self.num_batches_tracked = self.num_batches_tracked.to(device)
 
-        if self.training:
-            batch_mean = x.mean(dim=0)
-            batch_var = x.var(dim=0, unbiased=False)
+        # Mark CUDA graph step if on CUDA device
+        if "cuda" in str(device):
+            torch.compiler.cudagraph_mark_step_begin()
 
-            # Clone the tensor to avoid CUDA graph issues
+        if self.training:
+            # Compute batch statistics
+            batch_mean = x.mean(dim=0, keepdim=True)
+            batch_var = x.var(dim=0, unbiased=False, keepdim=True)
+
+            # Mark step before modifying buffers
+            if "cuda" in str(device):
+                torch.compiler.cudagraph_mark_step_begin()
+
+            # Update batch counter
             cloned_num_batches = self.num_batches_tracked.clone()
             cloned_num_batches += 1
+
+            # Mark step before updating buffer
+            if "cuda" in str(device):
+                torch.compiler.cudagraph_mark_step_begin()
+
             self.num_batches_tracked.copy_(cloned_num_batches)
 
+            # Calculate momentum
             update_factor = self.momentum
             if self.num_batches_tracked == 1:
                 update_factor = 1.0
 
-            # Use clones to avoid CUDA graph overwrite issues
-            new_running_mean = (1 - update_factor) * self.running_mean.clone() + update_factor * batch_mean
-            new_running_var = (1 - update_factor) * self.running_var.clone() + update_factor * batch_var
+            # Mark step before modifying running stats
+            if "cuda" in str(device):
+                torch.compiler.cudagraph_mark_step_begin()
 
+            # Update running statistics with proper cloning
+            new_running_mean = (1 - update_factor) * self.running_mean + update_factor * batch_mean.squeeze()
+            new_running_var = (1 - update_factor) * self.running_var + update_factor * batch_var.squeeze()
+
+            # Mark step before updating buffers
+            if "cuda" in str(device):
+                torch.compiler.cudagraph_mark_step_begin()
+
+            # Copy updated values to buffers
             self.running_mean.copy_(new_running_mean)
             self.running_var.copy_(new_running_var)
 
-            # Clone to avoid overwriting
+            # Mark step after buffer updates
+            if "cuda" in str(device):
+                torch.compiler.cudagraph_mark_step_begin()
+
+            # Use batch statistics for normalization
             normalized = (x - batch_mean) / torch.sqrt(batch_var + self.eps)
-            return normalized.clone()
         else:
-            normalized = (x - self.running_mean) / torch.sqrt(self.running_var + self.eps)
-            return normalized.clone()
+            # Use running statistics for normalization
+            normalized = (x - self.running_mean.unsqueeze(0)) / torch.sqrt(self.running_var.unsqueeze(0) + self.eps)
+
+        # Mark step after normalization
+        if "cuda" in str(device):
+            torch.compiler.cudagraph_mark_step_begin()
+
+        # Clone but don't detach to preserve gradient flow
+        return normalized.clone()

@@ -346,9 +346,6 @@ def signal_handler(sig, frame):
 
 if __name__ == "__main__":
 
-    # Set float32 matmul precision to high for better performance
-    torch.set_float32_matmul_precision('high')
-
     # Register signal handler for clean exit
     signal.signal(signal.SIGINT, signal_handler)
 
@@ -416,6 +413,31 @@ if __name__ == "__main__":
             device = "mps"
         else:
             device = "cpu"
+
+
+    torch.set_printoptions(precision=10)
+
+    if "cuda" in str(device):
+        # Performance optimization for CUDA device
+        torch.set_float32_matmul_precision('high')
+        # Enable TF32 precision for faster computations on Ampere GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        # Configure for safe CUDA graphs
+        torch._C._jit_set_bailout_depth(20)
+
+        # Configure CUDA device for optimal performance
+        torch.cuda.set_device(torch.cuda.current_device())
+
+        # For tensor safety in cuda graphs
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+        # Configure PyTorch dynamo for safer CUDA graphs
+        if hasattr(torch, '_dynamo'):
+            # Use more conservative dynamo settings
+            torch._dynamo.config.cache_size_limit = 16  # Smaller cache to avoid memory issues
+            torch._dynamo.config.suppress_errors = True
 
     # Initialize wandb if requested
     if args.wandb:
