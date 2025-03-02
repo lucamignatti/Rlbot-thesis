@@ -1153,8 +1153,16 @@ class PPOTrainer:
 
     def save_models(self, actor_path, critic_path):
         """Save actor and critic models to disk."""
-        torch.save(self.actor.state_dict(), actor_path)
-        torch.save(self.critic.state_dict(), critic_path)
+        # Get the original model if using compiled version
+        if hasattr(self.actor, '_orig_mod'):
+            torch.save(self.actor._orig_mod.state_dict(), actor_path)
+        else:
+            torch.save(self.actor.state_dict(), actor_path)
+
+        if hasattr(self.critic, '_orig_mod'):
+            torch.save(self.critic._orig_mod.state_dict(), critic_path)
+        else:
+            torch.save(self.critic.state_dict(), critic_path)
 
     def load_models(self, actor_path, critic_path):
         """Load actor and critic models from disk."""

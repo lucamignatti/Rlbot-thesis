@@ -33,6 +33,22 @@ class MPSFriendlyDropout(nn.Module):
         mask = torch.bernoulli(torch.full_like(x, 1 - self.p)) / (1 - self.p)
         return x * mask
 
+def fix_compiled_state_dict(state_dict):
+    """
+    Fixes state dictionaries saved from compiled models by removing the '_orig_mod.' prefix
+    from keys, allowing them to be loaded into non-compiled models.
+    """
+    if not any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+        return state_dict  # No fix needed
+
+    fixed_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith('_orig_mod.'):
+            new_key = key[len('_orig_mod.'):]
+            fixed_dict[new_key] = value
+        else:
+            fixed_dict[key] = value
+    return fixed_dict
 
 
 class SimBa(nn.Module):

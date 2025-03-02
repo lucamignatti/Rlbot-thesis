@@ -14,7 +14,7 @@ from rlgym.rocket_league.sim import RocketSimEngine
 from rlgym.rocket_league.rlviser import RLViserRenderer
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
 from rewards import ProximityReward
-from models import BasicModel, SimBa
+from models import BasicModel, SimBa, fix_compiled_state_dict
 from training import PPOTrainer
 import concurrent.futures
 import time
@@ -405,13 +405,19 @@ if __name__ == "__main__":
     parser.add_argument('--load_critic', type=str, default=None,
                         help='Path to the critic.pth')
 
-
+    parser.add_argument('--test', action='store_true',
+                        help='Enable test mode: enables rendering and limits to 1 environment')
 
     # For backwards compatibility
     parser.add_argument('-p', '--processes', type=int, default=None,
                         help='Legacy parameter; use --num_envs instead')
 
     args = parser.parse_args()
+
+    if args.test:
+        args.render = True
+        args.num_envs = 1
+        print("Test mode enabled: Rendering ON, using 1 environment")
 
     # If processes is specified but num_envs isn't, use processes value
     if args.processes is not None and args.num_envs == 4:  # 4 is the default for num_envs
@@ -506,7 +512,11 @@ if __name__ == "__main__":
     if args.load_actor or args.load_critic:
         if args.load_actor:
             try:
-                actor.load_state_dict(torch.load(args.load_actor, map_location=device))
+                actor_state_dict = torch.load(args.load_actor, map_location=device)
+                # Fix compiled state dict
+                from models import fix_compiled_state_dict
+                actor_state_dict = fix_compiled_state_dict(actor_state_dict)
+                actor.load_state_dict(actor_state_dict)
                 print(f"Successfully loaded actor model from {args.load_actor}")
             except Exception as e:
                 print(f"Error loading actor model: {e}")
@@ -516,7 +526,10 @@ if __name__ == "__main__":
 
         if args.load_critic:
             try:
-                critic.load_state_dict(torch.load(args.load_critic, map_location=device))
+                critic_state_dict = torch.load(args.load_critic, map_location=device)
+                # Fix compiled state dict
+                critic_state_dict = fix_compiled_state_dict(critic_state_dict)
+                critic.load_state_dict(critic_state_dict)
                 print(f"Successfully loaded critic model from {args.load_critic}")
             except Exception as e:
                 print(f"Error loading critic model: {e}")
@@ -553,9 +566,10 @@ if __name__ == "__main__":
 
 
     # Create models directory and save models
-    os.makedirs("models", exist_ok=True)
-    if trainer is not None:
-        trainer.save_models("models/actor.pth", "models/critic.pth")
-        print("Training complete - Models saved")
-    else:
-        print("Training failed.")
+    if not args.test:
+        os.makedirs("models", exist_ok=True)
+        if trainer is not None:
+            trainer.save_models("models/actor.pth", "models/critic.pth")
+            print("Training complete - Models saved")
+        else:
+            print("Training failed.")
