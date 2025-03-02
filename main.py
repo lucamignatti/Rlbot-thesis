@@ -149,6 +149,7 @@ def run_training(
     debug: bool = False,
     use_compile: bool = True,
     use_amp: bool = True,
+    save_interval: int = 200,
     # Hyperparameters
     lr_actor: float = 3e-4,
     lr_critic: float = 1e-3,
@@ -218,6 +219,7 @@ def run_training(
     collected_experiences = 0
     total_episodes_so_far = 0
     last_update_time = time.time()
+    last_save_episode = 0
     episode_rewards = {i: {agent_id: 0 for agent_id in vec_env.obs_dicts[i]} for i in range(num_envs)}
 
     try:
@@ -293,6 +295,26 @@ def run_training(
                     # Update progress bar for completed episodes
                     progress_bar.update(newly_completed_episodes)
                     total_episodes_so_far += newly_completed_episodes
+
+                    # Check if it's time to save the models
+                    if save_interval > 0 and (total_episodes_so_far - last_save_episode) >= save_interval:
+                        # Create checkpoint directory if it doesn't exist
+                        os.makedirs("checkpoints", exist_ok=True)
+
+                        # Save models with episode number in filename
+                        trainer.save_models(
+                            f"checkpoints/actor_ep{total_episodes_so_far}.pth",
+                            f"checkpoints/critic_ep{total_episodes_so_far}.pth"
+                        )
+
+                        # Also save as latest for easy loading
+                        trainer.save_models("checkpoints/actor_latest.pth", "checkpoints/critic_latest.pth")
+
+                        if debug:
+                            print(f"[DEBUG] Saved checkpoint at episode {total_episodes_so_far}")
+
+                        # Update last save counter
+                        last_save_episode = total_episodes_so_far
 
                     # Reset episode rewards for completed episodes
                     for env_idx, done in enumerate(dones):
@@ -408,6 +430,11 @@ if __name__ == "__main__":
 
     parser.add_argument('--test', action='store_true',
                         help='Enable test mode: enables rendering and limits to 1 environment')
+
+
+    parser.add_argument('--save_interval', type=int, default=200,
+                       help='Save models every N episodes')
+
 
     # For backwards compatibility
     parser.add_argument('-p', '--processes', type=int, default=None,
@@ -551,6 +578,7 @@ if __name__ == "__main__":
         debug=args.debug,
         use_compile=args.compile,
         use_amp=args.amp,
+        save_interval=args.save_interval,
         # Hyperparameters
         lr_actor=args.lra,
         lr_critic=args.lrc,
