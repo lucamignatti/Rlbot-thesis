@@ -11,7 +11,7 @@ from rlgym.rocket_league.sim import RocketSimEngine
 from rlgym.rocket_league.rlviser import RLViserRenderer
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
 from rewards import BallProximityReward, BallNetProximityReward
-from models import BasicModel, SimBa, fix_compiled_state_dict
+from models import BasicModel, SimBa, fix_compiled_state_dict, extract_model_dimensions
 from training import PPOTrainer
 import concurrent.futures
 import time
@@ -393,7 +393,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='RLBot Training Script')
     parser.add_argument('--render', action='store_true', help='Enable rendering')
-    parser.add_argument('-e', '--episodes', type=int, default=200, help='Number of episodes to run')
+    parser.add_argument('-e', '--episodes', type=int, default=5000, help='Number of episodes to run')
     parser.add_argument('-n', '--num_envs', type=int, default=os.cpu_count(),
                         help='Number of parallel environments')
     parser.add_argument('--update_interval', type=int, default=min(1000 * os.cpu_count(), 6000),
@@ -407,10 +407,10 @@ if __name__ == "__main__":
     # Hyperparameter arguments
     parser.add_argument('--lra', type=float, default=3e-4, help='Learning rate for actor network')
     parser.add_argument('--lrc', type=float, default=3e-3, help='Learning rate for critic network')
-    parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
+    parser.add_argument('--gamma', type=float, default=0.997, help='Discount factor')
     parser.add_argument('--gae_lambda', type=float, default=0.97, help='GAE lambda parameter')
     parser.add_argument('--clip_epsilon', type=float, default=0.2, help='PPO clip epsilon')
-    parser.add_argument('--critic_coef', type=float, default=0.5, help='Critic loss coefficient')
+    parser.add_argument('--critic_coef', type=float, default=0.7, help='Critic loss coefficient')
     parser.add_argument('--entropy_coef', type=float, default=0.01, help='Entropy coefficient')
     parser.add_argument('--max_grad_norm', type=float, default=0.5, help='Maximum gradient norm for clipping')
     parser.add_argument('--ppo_epochs', type=int, default=10, help='Number of PPO epochs per update')
@@ -540,15 +540,61 @@ if __name__ == "__main__":
 
     if args.model:
         try:
-            # Load a pre-trained model.
-            temp_trainer = PPOTrainer(  # Temporary trainer just for loading
-                actor=actor,
-                critic=critic,
-                device=device,
-                action_dim=action_space_dims
-            )
-            temp_trainer.load_models(args.model)
-            print(f"Successfully loaded model from {args.model}")
+            # Load checkpoint to inspect its structure
+            checkpoint = torch.load(args.model, map_location=device)
+
+            if args.debug:
+                print(f"[DEBUG] Loaded checkpoint from {args.model}")
+
+            # Extract model parameters if it's a combined checkpoint
+            if isinstance(checkpoint, dict) and 'actor' in checkpoint and 'critic' in checkpoint:
+                # Get dimensions from the actor model
+                actor_obs_shape, actor_hidden_dim, actor_action_shape, actor_num_blocks = extract_model_dimensions(checkpoint['actor'])
+                # Get dimensions from the critic model
+                critic_obs_shape, critic_hidden_dim, critic_action_shape, critic_num_blocks = extract_model_dimensions(checkpoint['critic'])
+
+                if args.debug:
+                    print(f"[DEBUG] Extracted model dimensions from checkpoint:")
+                    print(f"[DEBUG] Actor: obs_shape={actor_obs_shape}, hidden_dim={actor_hidden_dim}, action_shape={actor_action_shape}, num_blocks={actor_num_blocks}")
+                    print(f"[DEBUG] Critic: obs_shape={critic_obs_shape}, hidden_dim={critic_hidden_dim}, action_shape={critic_action_shape}, num_blocks={critic_num_blocks}")
+
+                # Recreate models with the correct dimensions
+                actor = SimBa(
+                    obs_shape=actor_obs_shape,
+                    action_shape=actor_action_shape,
+                    hidden_dim=actor_hidden_dim,
+                    num_blocks=actor_num_blocks
+                )
+
+                critic = SimBa(
+                    obs_shape=critic_obs_shape,
+                    action_shape=critic_action_shape,
+                    hidden_dim=critic_hidden_dim,
+                    num_blocks=critic_num_blocks
+                )
+
+                # Load a pre-trained model with the correct dimensions now
+                temp_trainer = PPOTrainer(
+                    actor=actor,
+                    critic=critic,
+                    device=device,
+                    action_dim=actor_action_shape,
+                    use_compile=False  # Don't compile before loading
+                )
+                temp_trainer.load_models(args.model)
+                print(f"Successfully loaded model from {args.model}")
+
+                # After loading, compile if needed
+                if args.compile:
+                    if hasattr(torch, 'compile'):
+                        try:
+                            actor = torch.compile(actor)
+                            critic = torch.compile(critic)
+                            print("Models compiled after loading")
+                        except Exception as e:
+                            print(f"Warning: Failed to compile models after loading: {e}")
+            else:
+                print(f"Error: Unsupported model format in {args.model}")
         except Exception as e:
             print(f"Error loading model: {e}")
             if args.debug:

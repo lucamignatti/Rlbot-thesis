@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical, Normal
 from torch.amp import autocast, GradScaler
+from models import fix_compiled_state_dict
 from typing import Union, Tuple
 import time
 import wandb
@@ -1438,20 +1439,26 @@ class PPOTrainer:
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Model file not found: {model_path}")
 
-        # Load the saved state.
+        # Load the saved state
         checkpoint = torch.load(model_path, map_location=self.device)
 
-        # Handle both new single-file format and legacy format.
+        # Handle both new single-file format and legacy format
         if isinstance(checkpoint, dict) and 'actor' in checkpoint and 'critic' in checkpoint:
-            # New format.
-            self.actor.load_state_dict(checkpoint['actor'])
-            self.critic.load_state_dict(checkpoint['critic'])
+            # New format - Fix the state dictionaries using the helper function
+            actor_state = fix_compiled_state_dict(checkpoint['actor'])
+            critic_state = fix_compiled_state_dict(checkpoint['critic'])
+
+            # Load the fixed state dictionaries
+            self.actor.load_state_dict(actor_state)
+            self.critic.load_state_dict(critic_state)
             self.debug_print(f"Loaded models from unified checkpoint: {model_path}")
             return True
         else:
-            # Legacy format - assume this is just the actor model.
+            # Legacy format - assume this is just the actor model
             try:
-                self.actor.load_state_dict(checkpoint)
+                # Fix the state dictionary before loading
+                fixed_state_dict = fix_compiled_state_dict(checkpoint)
+                self.actor.load_state_dict(fixed_state_dict)
                 self.debug_print(f"Loaded actor model from legacy format: {model_path}")
                 return False
             except Exception as e:

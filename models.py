@@ -9,20 +9,69 @@ def fix_compiled_state_dict(state_dict):
     """
     Fixes state dictionaries saved from compiled models.
 
-    Compiled models add the prefix '_orig_mod.' to keys. This function removes
-    that prefix, allowing the state dict to be loaded into non-compiled models.
+    This handles both simple cases (prefix '_orig_mod.') and
+    cases where there are multiple levels of compilation wrappers.
     """
+    # If no prefixes to fix, return as is
     if not any(k.startswith('_orig_mod.') for k in state_dict.keys()):
+        # Check if the keys match what a compiled model would expect
+        if any('.' in k for k in state_dict.keys()):
+            # This is likely a non-compiled state dict being loaded into a compiled model
+            # We need to add the '_orig_mod.' prefix
+            fixed_dict = {'_orig_mod.' + k: v for k, v in state_dict.items()}
+            return fixed_dict
         return state_dict  # No fix needed
 
+    # Remove one level of '_orig_mod.' prefix
     fixed_dict = {}
     for key, value in state_dict.items():
         if key.startswith('_orig_mod.'):
-            new_key = key[len('_orig_mod.'):] # Remove the prefix
+            new_key = key[len('_orig_mod.'):]
             fixed_dict[new_key] = value
         else:
             fixed_dict[key] = value
+
+    # Recursively fix in case of multiple levels
+    if any(k.startswith('_orig_mod.') for k in fixed_dict.keys()):
+        return fix_compiled_state_dict(fixed_dict)
+
     return fixed_dict
+
+def extract_model_dimensions(state_dict):
+    """
+    Extracts model dimensions from a saved state dictionary.
+
+    Returns:
+        tuple: (observation_shape, hidden_dim, action_shape, num_blocks)
+    """
+    # Remove _orig_mod prefix if present for easier access to keys
+    fixed_dict = fix_compiled_state_dict(state_dict)
+
+    # First, find embedding layer to get input shape and hidden dimension
+    hidden_dim = None
+    obs_shape = None
+    action_shape = None
+    num_blocks = 0
+
+    # Find key patterns to extract dimensions
+    for key in fixed_dict.keys():
+        if 'embedding.weight' in key:
+            if hidden_dim is None:
+                hidden_dim = fixed_dict[key].shape[0]  # First dimension is hidden_dim
+            if obs_shape is None:
+                obs_shape = fixed_dict[key].shape[1]   # Second dimension is input shape
+
+        if 'output_layer.weight' in key:
+            if action_shape is None:
+                action_shape = fixed_dict[key].shape[0]  # First dimension is output shape
+
+        # Count blocks by looking for block-specific parameters
+        if 'blocks.' in key:
+            block_num = int(key.split('.')[1])
+            num_blocks = max(num_blocks, block_num + 1)  # +1 because 0-indexed
+
+    return (obs_shape, hidden_dim, action_shape, num_blocks)
+
 
 class BasicModel(nn.Module):
     def __init__(self, input_size = 784, output_size = 10, hidden_size = 64, dropout_rate = 0.5):
@@ -55,7 +104,7 @@ class MPSFriendlyDropout(nn.Module):
         return x * mask
 
 class SimBa(nn.Module):
-    def __init__(self, obs_shape, action_shape, hidden_dim=512, num_blocks=2,
+    def __init__(self, obs_shape, action_shape, hidden_dim=1024, num_blocks=4,
                  dropout_rate=0.1, device="cpu"):
         super(SimBa, self).__init__()
         self.device = device
