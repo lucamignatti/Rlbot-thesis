@@ -72,7 +72,6 @@ def extract_model_dimensions(state_dict):
 
     return (obs_shape, hidden_dim, action_shape, num_blocks)
 
-
 class BasicModel(nn.Module):
     def __init__(self, input_size = 784, output_size = 10, hidden_size = 64, dropout_rate = 0.5):
         super(BasicModel, self).__init__()

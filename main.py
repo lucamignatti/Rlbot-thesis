@@ -20,7 +20,7 @@ from tqdm import tqdm
 import signal
 import sys
 
-def get_env():
+def get_env(renderer=None):
     """Creates a standardized RL environment for Rocket League.  This environment uses
     a combination of mutators, observations, actions, rewards, and termination conditions
     to define the learning task."""
@@ -43,7 +43,7 @@ def get_env():
             NoTouchTimeoutCondition(30.)  # No touch for 30 steps
         ),
         transition_engine=RocketSimEngine(),  # Use the default physics engine
-        renderer=RLViserRenderer()  # Use RLViser for visualization
+        renderer=renderer  # Use provided renderer if available (or None)
     )
 
 class VectorizedEnv:
@@ -54,18 +54,28 @@ class VectorizedEnv:
     speeding up the training process.
     """
     def __init__(self, num_envs, render=False):
-        self.envs = [get_env() for _ in range(num_envs)]  # Create multiple copies of the environment
-        self.num_envs = num_envs
         self.render = render
+        # Create a single shared renderer if rendering is enabled
+        self.renderer = RLViserRenderer() if render else None
 
+        # Create environments, passing the renderer to the one that will be rendered
+        self.envs = []
+        for i in range(num_envs):
+            # Only pass renderer to the first environment when rendering is enabled
+            env_renderer = self.renderer if (render and i == 0) else None
+            self.envs.append(get_env(renderer=env_renderer))
+
+        self.num_envs = num_envs
         self.render_env_idx = 0  # Only render the first environment
 
         self.obs_dicts = [env.reset() for env in self.envs]  # Reset all environments to get initial observations
 
+        # Explicitly trigger rendering after reset if enabled
+        if self.render:
+            self.envs[self.render_env_idx].render()
+
         self.dones = [False] * num_envs  # Track which environments have completed an episode
-
         self.episode_counts = [0] * num_envs
-
         self.is_discrete = True  # RLGYM Discrete actions
 
         # Use a thread pool to parallelize environment steps
@@ -88,10 +98,10 @@ class VectorizedEnv:
             else:
                 formatted_actions[agent_id] = np.array([int(action)])
 
-
+        # Only explicitly render if this is the environment we want to render
         if self.render and i == self.render_env_idx:
-            env.render()
-            time.sleep(6/120)
+            env.render()  # Make sure to call render explicitly
+            time.sleep(6/120)  # Slow down rendering to make it more visible
 
         next_obs_dict, reward_dict, terminated_dict, truncated_dict = env.step(formatted_actions)
 
@@ -99,9 +109,7 @@ class VectorizedEnv:
 
     def step(self, actions_dict_list):
         """
-        Steps all environments forward with their corresponding actions. This uses
-        a ThreadPoolExecutor to run each environment step in parallel, which can
-        significantly improve performance.
+        Steps all environments forward with their corresponding actions.
         """
         futures = []
         for i, (env, actions_dict) in enumerate(zip(self.envs, actions_dict_list)):
@@ -122,6 +130,9 @@ class VectorizedEnv:
             if self.dones[i]:
                 self.episode_counts[i] += 1
                 self.obs_dicts[i] = self.envs[i].reset()
+                # Re-trigger the render after reset for the rendering environment
+                if self.render and i == self.render_env_idx:
+                    self.envs[i].render()
             else:
                 self.obs_dicts[i] = next_obs_dict
 
@@ -134,6 +145,10 @@ class VectorizedEnv:
         self.executor.shutdown()
         for env in self.envs:
             env.close()
+
+        # Explicitly close the renderer if it exists
+        if self.renderer:
+            self.renderer.close()
 
 def run_training(
     actor,
