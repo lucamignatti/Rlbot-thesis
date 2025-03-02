@@ -13,7 +13,7 @@ from rlgym.rocket_league.reward_functions import CombinedReward, GoalReward, Tou
 from rlgym.rocket_league.sim import RocketSimEngine
 from rlgym.rocket_league.rlviser import RLViserRenderer
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
-from rewards import ProximityReward
+from rewards import BallProximityReward, BallNetProximityReward
 from models import BasicModel, SimBa, fix_compiled_state_dict
 from training import PPOTrainer
 import concurrent.futures
@@ -34,8 +34,9 @@ def get_env():
         action_parser=RepeatAction(LookupTableAction(), repeats=8),
         reward_fn=CombinedReward(
             (GoalReward(), 12.),
-            (TouchReward(), 3.),
-            (ProximityReward(), 1.),
+            (TouchReward(), 6.),
+            (BallNetProximityReward(), 3.),
+            (BallProximityReward(), 1.),
         ),
         termination_cond=GoalCondition(),
         truncation_cond=AnyCondition(
