@@ -399,6 +399,13 @@ if __name__ == "__main__":
     parser.add_argument('--no-amp', action='store_false', dest='amp', help='Disable automatic mixed precision')
     parser.set_defaults(amp=False)
 
+    parser.add_argument('--load_actor', type=str, default=None,
+                        help='Path to the actor.pth')
+
+    parser.add_argument('--load_critic', type=str, default=None,
+                        help='Path to the critic.pth')
+
+
 
     # For backwards compatibility
     parser.add_argument('-p', '--processes', type=int, default=None,
@@ -495,6 +502,28 @@ if __name__ == "__main__":
         print(f"[DEBUG] Actor model: {actor}")
         print(f"[DEBUG] Critic model: {critic}")
 
+
+    if args.load_actor or args.load_critic:
+        if args.load_actor:
+            try:
+                actor.load_state_dict(torch.load(args.load_actor, map_location=device))
+                print(f"Successfully loaded actor model from {args.load_actor}")
+            except Exception as e:
+                print(f"Error loading actor model: {e}")
+                if args.debug:
+                    import traceback
+                    traceback.print_exc()
+
+        if args.load_critic:
+            try:
+                critic.load_state_dict(torch.load(args.load_critic, map_location=device))
+                print(f"Successfully loaded critic model from {args.load_critic}")
+            except Exception as e:
+                print(f"Error loading critic model: {e}")
+                if args.debug:
+                    import traceback
+                    traceback.print_exc()
+
     # Start training with single-process vectorized approach
     trainer = run_training(
         actor=actor,
@@ -520,6 +549,8 @@ if __name__ == "__main__":
         ppo_epochs=args.ppo_epochs,
         batch_size=args.batch_size
     )
+
+
 
     # Create models directory and save models
     os.makedirs("models", exist_ok=True)
