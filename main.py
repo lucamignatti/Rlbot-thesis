@@ -1,8 +1,5 @@
 import os
 
-# Configure environment variables and settings for MPS backend compatibility
-# os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-
 import numpy as np
 import torch
 from rlgym.api import RLGym
@@ -24,65 +21,64 @@ import signal
 import sys
 
 def get_env():
-    """Creates a standardized RL environment for Rocket League."""
+    """Creates a standardized RL environment for Rocket League.  This environment uses
+    a combination of mutators, observations, actions, rewards, and termination conditions
+    to define the learning task."""
     return RLGym(
         state_mutator=MutatorSequence(
-            FixedTeamSizeMutator(blue_size=2, orange_size=2),
-            KickoffMutator()
+            FixedTeamSizeMutator(blue_size=2, orange_size=2),  # Forces 2v2 matches
+            KickoffMutator()  # Start each episode with a kickoff
         ),
-        obs_builder=DefaultObs(zero_padding=2),
-        action_parser=RepeatAction(LookupTableAction(), repeats=8),
-        reward_fn=CombinedReward(
-            (GoalReward(), 12.),
-            (TouchReward(), 6.),
-            (BallNetProximityReward(), 3.),
-            (BallProximityReward(), 1.),
+        obs_builder=DefaultObs(zero_padding=2),  # Use a basic observation builder, padding for a maximum of 4 players
+        action_parser=RepeatAction(LookupTableAction(), repeats=8),  # Use a discrete action space, repeating the chosen action 8 times
+        reward_fn=CombinedReward(  # Combine several reward functions to create a more comprehensive reward signal
+            (GoalReward(), 12.),  # Large reward for scoring goals
+            (TouchReward(), 6.),  # Moderate reward for touching the ball
+            (BallNetProximityReward(), 3.),  # Smaller reward for getting the ball closer to the opponent's net
+            (BallProximityReward(), 1.),  # Small reward for getting closer to the ball
         ),
-        termination_cond=GoalCondition(),
-        truncation_cond=AnyCondition(
-            TimeoutCondition(300.),
-            NoTouchTimeoutCondition(30.)
+        termination_cond=GoalCondition(),  # End the episode when a goal is scored
+        truncation_cond=AnyCondition(  # Truncate the episode if it goes on for too long or if the ball isn't touched
+            TimeoutCondition(300.),  # Max episode length of 300 steps (300/8 = 37.5 seconds)
+            NoTouchTimeoutCondition(30.)  # No touch for 30 steps
         ),
-        transition_engine=RocketSimEngine(),
-        renderer=RLViserRenderer()
+        transition_engine=RocketSimEngine(),  # Use the default physics engine
+        renderer=RLViserRenderer()  # Use RLViser for visualization
     )
 
 class VectorizedEnv:
     """
     Manages multiple independent environments for vectorized execution.
     This allows us to collect experiences from multiple environments in parallel,
-    while still performing a single forward pass for inference.
+    while still performing a single forward pass for inference, significantly
+    speeding up the training process.
     """
     def __init__(self, num_envs, render=False):
-        # Create multiple independent environments
-        self.envs = [get_env() for _ in range(num_envs)]
+        self.envs = [get_env() for _ in range(num_envs)]  # Create multiple copies of the environment
         self.num_envs = num_envs
         self.render = render
 
-        # Only render the first environment if rendering is enabled
-        self.render_env_idx = 0
+        self.render_env_idx = 0  # Only render the first environment
 
-        # Reset all environments to get initial observations
-        self.obs_dicts = [env.reset() for env in self.envs]
+        self.obs_dicts = [env.reset() for env in self.envs]  # Reset all environments to get initial observations
 
-        # Track which environments need resetting
-        self.dones = [False] * num_envs
+        self.dones = [False] * num_envs  # Track which environments have completed an episode
 
-        # Track episodes per environment
         self.episode_counts = [0] * num_envs
 
-        # Get action space information for proper formatting
-        self.is_discrete = True  # LookupTableAction uses discrete actions
+        self.is_discrete = True  # RLGYM Discrete actions
 
-        # Initialize thread pool
-        self.max_workers = min(32, num_envs)  # Cap max threads
+        # Use a thread pool to parallelize environment steps
+        self.max_workers = min(32, num_envs)  # Limit the number of threads to avoid excessive overhead
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
 
     def _step_env(self, args):
-        """Process a single environment step in parallel"""
+        """
+        Handles a single environment step. Designed to be run in parallel.
+        """
         i, env, actions_dict = args
 
-        # Format actions
+        # Format actions for the RLGym API.
         formatted_actions = {}
         for agent_id, action in actions_dict.items():
             if isinstance(action, np.ndarray):
@@ -92,37 +88,37 @@ class VectorizedEnv:
             else:
                 formatted_actions[agent_id] = np.array([int(action)])
 
-        # Handle rendering
+
         if self.render and i == self.render_env_idx:
             env.render()
-            time.sleep(6/120)  # ~120 FPS limit
+            time.sleep(6/120)
 
-        # Step environment
         next_obs_dict, reward_dict, terminated_dict, truncated_dict = env.step(formatted_actions)
 
         return i, (next_obs_dict, reward_dict, terminated_dict, truncated_dict)
 
     def step(self, actions_dict_list):
-        """Step all environments with their corresponding actions using parallel threads."""
-        # Submit all environment steps to thread pool
+        """
+        Steps all environments forward with their corresponding actions. This uses
+        a ThreadPoolExecutor to run each environment step in parallel, which can
+        significantly improve performance.
+        """
         futures = []
         for i, (env, actions_dict) in enumerate(zip(self.envs, actions_dict_list)):
             future = self.executor.submit(self._step_env, (i, env, actions_dict))
             futures.append(future)
 
-        # Collect results maintaining original order
+        # Wait for all steps to complete and collect results in original order
         results = [None] * self.num_envs
         for future in concurrent.futures.as_completed(futures):
             i, result = future.result()
             results[i] = result
 
-            # Process results
             next_obs_dict, reward_dict, terminated_dict, truncated_dict = result
 
-            # Update done status
+            # If an episode is done, we need to reset the environment.
             self.dones[i] = any(terminated_dict.values()) or any(truncated_dict.values())
 
-            # Update episode count and reset if needed
             if self.dones[i]:
                 self.episode_counts[i] += 1
                 self.obs_dicts[i] = self.envs[i].reset()
@@ -132,7 +128,9 @@ class VectorizedEnv:
         return results, self.dones.copy(), self.episode_counts.copy()
 
     def close(self):
-        """Close all environments and thread pool."""
+        """
+        Cleanly shuts down the environments and the thread pool.
+        """
         self.executor.shutdown()
         for env in self.envs:
             env.close()
@@ -150,6 +148,7 @@ def run_training(
     use_compile: bool = True,
     use_amp: bool = True,
     save_interval: int = 200,
+    output_path: str = None,
     # Hyperparameters
     lr_actor: float = 3e-4,
     lr_critic: float = 1e-3,
@@ -163,14 +162,13 @@ def run_training(
     batch_size: int = 64
 ):
     """
-    Single-process vectorized training loop that maximizes GPU efficiency.
-    Uses multiple environments and batched inference for optimal performance.
+    Runs the main training loop using a vectorized environment approach.
+    This function orchestrates the data collection, policy updates, and model saving.
     """
-    # Move models to the target device (GPU) for faster inference and training
     actor.to(device)
     critic.to(device)
 
-    # Create trainer instance
+    # Initialize the PPO trainer with the specified hyperparameters.
     trainer = PPOTrainer(
         actor,
         critic,
@@ -192,10 +190,10 @@ def run_training(
         use_amp=use_amp
     )
 
-    # Create vectorized environment
+    # Set up the vectorized environment to run multiple instances in parallel.
     vec_env = VectorizedEnv(num_envs=num_envs, render=render)
 
-    # Set up progress tracking
+    # Use tqdm to show a progress bar during training.
     progress_bar = tqdm(
         total=total_episodes,
         desc="Episodes",
@@ -203,7 +201,7 @@ def run_training(
         dynamic_ncols=True
     )
 
-    # Initialize stats dictionary for progress bar
+    # Initialize a dictionary to hold various statistics for display.
     stats_dict = {
         "Device": device,
         "Envs": num_envs,
@@ -215,7 +213,7 @@ def run_training(
     }
     progress_bar.set_postfix(stats_dict)
 
-    # Tracking variables
+    # Initialize variables for tracking training progress.
     collected_experiences = 0
     total_episodes_so_far = 0
     last_update_time = time.time()
@@ -223,100 +221,104 @@ def run_training(
     episode_rewards = {i: {agent_id: 0 for agent_id in vec_env.obs_dicts[i]} for i in range(num_envs)}
 
     try:
-        # Main training loop
+        # Main training loop, continues until the target number of episodes is reached.
         while total_episodes_so_far < total_episodes:
-            # Group observations from all environments for batched inference
-            # This maximizes GPU throughput by processing all observations at once
+            # Collect observations from all environments for batched inference
             all_obs = []
             all_env_indices = []
             all_agent_ids = []
 
-            # Organize observations for batched processing
+            # Organize observations for more efficient processing
             for env_idx, obs_dict in enumerate(vec_env.obs_dicts):
                 for agent_id, obs in obs_dict.items():
                     all_obs.append(obs)
                     all_env_indices.append(env_idx)
                     all_agent_ids.append(agent_id)
 
-            # Run batched inference for all observations
-            # This is a major performance optimization as we run a single forward pass
-            # through the network for all observations across all environments
-            if len(all_obs) > 0:  # Make sure we have observations
+            # Only proceed if there are observations.  The length could be 0
+            # if all environments terminated at the same time
+            if len(all_obs) > 0:
                 obs_batch = torch.FloatTensor(np.stack(all_obs)).to(device)
                 with torch.no_grad():
-                    # Single batched forward pass for both actor and critic
+                    # Get actions, log probabilities, and values for all observations at once.
                     action_batch, log_prob_batch, value_batch = trainer.get_action(obs_batch)
 
-                # Organize actions back into per-environment dictionaries
+                # Organize actions back into per-environment dictionaries for the step function.
                 actions_dict_list = [{} for _ in range(num_envs)]
                 for i, (action, log_prob, value) in enumerate(zip(action_batch, log_prob_batch, value_batch)):
                     env_idx = all_env_indices[i]
                     agent_id = all_agent_ids[i]
                     actions_dict_list[env_idx][agent_id] = action
 
-                    # Store experience in trainer memory
+                    # Store experience. Reward and done are placeholders, updated after the env step.
                     trainer.store_experience(
                         all_obs[i],
                         action,
                         log_prob,
-                        0,  # Placeholder for reward, will be updated after environment step
+                        0,
                         value,
-                        False  # Placeholder for done, will be updated after environment step
+                        False
                     )
 
                     collected_experiences += 1
 
-                # Step all environments with their corresponding actions
+                # Step all environments in parallel.
                 results, dones, episode_counts = vec_env.step(actions_dict_list)
 
-                # Process results and update experiences with rewards and dones
+                # Process results from each environment.
                 exp_idx = 0
                 for env_idx, (next_obs_dict, reward_dict, terminated_dict, truncated_dict) in enumerate(results):
-                    for agent_id in reward_dict.keys():  # Use reward_dict to get valid agent_ids
-                        # Update rewards in trainer's memory
+                    for agent_id in reward_dict.keys():  # Iterate using reward_dict to ensure correct agent IDs
+                        # Retrieve reward and done status for the agent.
                         reward = reward_dict[agent_id]
                         done = terminated_dict[agent_id] or truncated_dict[agent_id]
 
-                        # Update the last stored experience with actual reward and done status
-                        # Need to handle cases where the order might be different
+                        # Correctly update the stored experience with the actual reward and done status.
                         mem_idx = trainer.memory.pos - len(all_obs) + exp_idx
-                        if mem_idx < 0:  # Handle wraparound in circular buffer
+                        if mem_idx < 0:  # Wrap around circular buffer
                             mem_idx += trainer.memory.buffer_size
 
                         trainer.store_experience_at_idx(mem_idx, None, None, None, reward, None, done)
 
-                        # Track episode rewards
+                        # Accumulate rewards for this episode.
                         episode_rewards[env_idx][agent_id] += reward
                         exp_idx += 1
 
-                # Count completed episodes
+                # Check for completed episodes.
                 newly_completed_episodes = sum(dones)
                 if newly_completed_episodes > 0:
-                    # Update progress bar for completed episodes
+
                     progress_bar.update(newly_completed_episodes)
                     total_episodes_so_far += newly_completed_episodes
 
-                    # Check if it's time to save the models
+                    # Check if it's time to save the model.
                     if save_interval > 0 and (total_episodes_so_far - last_save_episode) >= save_interval:
-                        # Create checkpoint directory if it doesn't exist
-                        os.makedirs("checkpoints", exist_ok=True)
+                        # Use a "checkpoints" subdirectory under the output path
+                        checkpoint_dir = "checkpoints"
+                        if output_path:
+                            if os.path.isdir(output_path):
+                                checkpoint_dir = os.path.join(output_path, "checkpoints")
+                            else:
+                                # If output path is a file, use its directory
+                                output_dir = os.path.dirname(output_path)
+                                checkpoint_dir = os.path.join(output_dir if output_dir else ".", "checkpoints")
 
-                        # Save models with episode number in filename
-                        trainer.save_models(
-                            f"checkpoints/actor_ep{total_episodes_so_far}.pth",
-                            f"checkpoints/critic_ep{total_episodes_so_far}.pth"
-                        )
+                        os.makedirs(checkpoint_dir, exist_ok=True)
 
-                        # Also save as latest for easy loading
-                        trainer.save_models("checkpoints/actor_latest.pth", "checkpoints/critic_latest.pth")
+                        # Save with episode number
+                        checkpoint_path = os.path.join(checkpoint_dir, f"model_ep{total_episodes_so_far}.pt")
+                        trainer.save_models(checkpoint_path)
+
+                        # Save "latest" model for easy loading
+                        latest_path = os.path.join(checkpoint_dir, "model_latest.pt")
+                        trainer.save_models(latest_path)
 
                         if debug:
-                            print(f"[DEBUG] Saved checkpoint at episode {total_episodes_so_far}")
+                            print(f"[DEBUG] Saved checkpoint at episode {total_episodes_so_far} to {checkpoint_path}")
 
-                        # Update last save counter
                         last_save_episode = total_episodes_so_far
 
-                    # Reset episode rewards for completed episodes
+                    # Reset episode rewards for completed episodes, for tracking the average reward.
                     for env_idx, done in enumerate(dones):
                         if done:
                             avg_reward = sum(episode_rewards[env_idx].values()) / len(episode_rewards[env_idx])
@@ -324,36 +326,34 @@ def run_training(
                                 print(f"Episode {episode_counts[env_idx]} in env {env_idx} completed with avg reward: {avg_reward:.2f}")
                             episode_rewards[env_idx] = {agent_id: 0 for agent_id in vec_env.obs_dicts[env_idx]}
 
-                # Update policy when enough experiences are collected or enough time has passed
+                # Determine if it's time to update the policy.
                 time_since_update = time.time() - last_update_time
                 enough_experiences = collected_experiences >= update_interval
 
+                # We update if enough experiences have been collected OR if enough time has passed
                 if enough_experiences or (collected_experiences > 100 and time_since_update > 30):
                     if debug:
                         print(f"[DEBUG] Updating policy with {collected_experiences} experiences after {time_since_update:.2f}s")
 
-                    # Update policy using collected experiences
+                    # Perform the policy update.
                     stats = trainer.update()
 
-                    # Update stats dictionary
+                    # Update the stats dictionary for the progress bar.
                     stats_dict.update({
                         "Device": device,
                         "Envs": num_envs,
-                        "Exp": f"0/{update_interval}",  # Reset after update
+                        "Exp": f"0/{update_interval}",  # Reset experience count
                         "Reward": f"{stats.get('mean_episode_reward', 0):.2f}",
                         "PLoss": f"{stats.get('actor_loss', 0):.4f}",
                         "VLoss": f"{stats.get('critic_loss', 0):.4f}",
                         "Entropy": f"{stats.get('entropy_loss', 0):.4f}"
                     })
-
-                    # Update progress bar with all stats
                     progress_bar.set_postfix(stats_dict)
 
-                    # Reset counters
                     collected_experiences = 0
                     last_update_time = time.time()
 
-                # Update experience count in progress bar
+                # Update the "Exp" (experiences) count in the progress bar.
                 stats_dict["Exp"] = f"{collected_experiences}/{update_interval}"
                 progress_bar.set_postfix(stats_dict)
 
@@ -365,16 +365,16 @@ def run_training(
         traceback.print_exc()
 
     finally:
-        # Clean up resources
+        # Always clean up environments and progress bar.
         vec_env.close()
         progress_bar.close()
 
-        # Final update with any remaining experiences
+        # Perform a final policy update if any experiences remain.
         if collected_experiences > 0:
             if debug:
                 print(f"[DEBUG] Final update with {collected_experiences} experiences")
             try:
-                trainer.update()
+                trainer.update()  # Final update
             except Exception as e:
                 print(f"Error during final update: {str(e)}")
                 import traceback
@@ -388,7 +388,7 @@ def signal_handler(sig, frame):
 
 if __name__ == "__main__":
 
-    # Register signal handler for clean exit
+    # Register a signal handler for SIGINT (Ctrl+C) to allow graceful termination.
     signal.signal(signal.SIGINT, signal_handler)
 
     parser = argparse.ArgumentParser(description='RLBot Training Script')
@@ -403,16 +403,18 @@ if __name__ == "__main__":
     parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
     parser.add_argument('--debug', action='store_true', help='Enable verbose debug logging')
 
+
+    # Hyperparameter arguments
     parser.add_argument('--lra', type=float, default=3e-4, help='Learning rate for actor network')
-    parser.add_argument('--lrc', type=float, default=1e-3, help='Learning rate for critic network')
+    parser.add_argument('--lrc', type=float, default=3e-3, help='Learning rate for critic network')
     parser.add_argument('--gamma', type=float, default=0.99, help='Discount factor')
-    parser.add_argument('--gae_lambda', type=float, default=0.95, help='GAE lambda parameter')
+    parser.add_argument('--gae_lambda', type=float, default=0.97, help='GAE lambda parameter')
     parser.add_argument('--clip_epsilon', type=float, default=0.2, help='PPO clip epsilon')
     parser.add_argument('--critic_coef', type=float, default=0.5, help='Critic loss coefficient')
     parser.add_argument('--entropy_coef', type=float, default=0.01, help='Entropy coefficient')
     parser.add_argument('--max_grad_norm', type=float, default=0.5, help='Maximum gradient norm for clipping')
     parser.add_argument('--ppo_epochs', type=int, default=10, help='Number of PPO epochs per update')
-    parser.add_argument('--batch_size', type=int, default=64, help='Batch size for PPO updates')
+    parser.add_argument('--batch_size', type=int, default=256, help='Batch size for PPO updates')
 
     parser.add_argument('--compile', action='store_true', help='Use torch.compile for model optimization')
     parser.add_argument('--no-compile', action='store_false', dest='compile', help='Disable torch.compile')
@@ -422,11 +424,11 @@ if __name__ == "__main__":
     parser.add_argument('--no-amp', action='store_false', dest='amp', help='Disable automatic mixed precision')
     parser.set_defaults(amp=False)
 
-    parser.add_argument('--load_actor', type=str, default=None,
-                        help='Path to the actor.pth')
+    parser.add_argument('-m', '--model', type=str, default=None,
+                        help='Path to the model file to load (contains both actor and critic)')
 
-    parser.add_argument('--load_critic', type=str, default=None,
-                        help='Path to the critic.pth')
+    parser.add_argument('-o', '--out', type=str, default=None,
+                    help='Output path where to save the trained model')
 
     parser.add_argument('--test', action='store_true',
                         help='Enable test mode: enables rendering and limits to 1 environment')
@@ -436,7 +438,7 @@ if __name__ == "__main__":
                        help='Save models every N episodes')
 
 
-    # For backwards compatibility
+    # For backwards compatibility with older versions
     parser.add_argument('-p', '--processes', type=int, default=None,
                         help='Legacy parameter; use --num_envs instead')
 
@@ -447,24 +449,24 @@ if __name__ == "__main__":
         args.num_envs = 1
         print("Test mode enabled: Rendering ON, using 1 environment")
 
-    # If processes is specified but num_envs isn't, use processes value
+    # Handle legacy --processes argument
     if args.processes is not None and args.num_envs == 4:  # 4 is the default for num_envs
         args.num_envs = args.processes
         if args.debug:
             print(f"[DEBUG] Using --processes value ({args.processes}) for number of environments")
 
-    # Initialize environment to get dimensions
+    # Initialize environment to get observation and action space dimensions.
     env = get_env()
     env.reset()
     obs_space_dims = env.observation_space(env.agents[0])[1]
     action_space_dims = env.action_space(env.agents[0])[1]
     env.close()
 
-    # Initialize models
+    # Initialize actor and critic networks.
     actor = SimBa(obs_shape=obs_space_dims, action_shape=action_space_dims)
     critic = SimBa(obs_shape=obs_space_dims, action_shape=1)
 
-    # Determine device
+    # Determine the best available device.
     device = args.device
     if device is None:
         if torch.cuda.is_available():
@@ -478,28 +480,27 @@ if __name__ == "__main__":
     torch.set_printoptions(precision=10)
 
     if "cuda" in str(device):
-        # Performance optimization for CUDA device
+        # Optimize for CUDA performance.
         torch.set_float32_matmul_precision('high')
-        # Enable TF32 precision for faster computations on Ampere GPUs
+        # Enable TF32 for faster computations on Ampere GPUs and above.
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
-        # Configure for safe CUDA graphs
+        # Settings to improve safety with CUDA graphs.
         torch._C._jit_set_bailout_depth(20)
 
-        # Configure CUDA device for optimal performance
+        # Use current CUDA device.
         torch.cuda.set_device(torch.cuda.current_device())
 
-        # For tensor safety in cuda graphs
+        # Improve tensor allocation for CUDA graphs.
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
-        # Configure PyTorch dynamo for safer CUDA graphs
+        # Dynamo settings for safer CUDA graphs, if available.
         if hasattr(torch, '_dynamo'):
-            # Use more conservative dynamo settings
-            torch._dynamo.config.cache_size_limit = 16  # Smaller cache to avoid memory issues
+            torch._dynamo.config.cache_size_limit = 16  # Reduce cache size
             torch._dynamo.config.suppress_errors = True
 
-    # Initialize wandb if requested
+    # Initialize Weights & Biases for experiment tracking, if enabled.
     if args.wandb:
         import wandb
         wandb.init(
@@ -517,18 +518,18 @@ if __name__ == "__main__":
                 "ppo_epochs": args.ppo_epochs,
                 "batch_size": args.batch_size,
 
-                # Environment
+                # Environment details
                 "action_repeat": 8,
                 "num_agents": 4,  # 2 per team
 
-                # System
+                # System configuration
                 "episodes": args.episodes,
                 "num_envs": args.num_envs,
                 "update_interval": args.update_interval,
                 "device": device,
             },
             name=f"PPO_{time.strftime('%Y%m%d-%H%M%S')}",
-            monitor_gym=False,
+            monitor_gym=False,  # Disable default gym monitoring
         )
 
     if args.debug:
@@ -537,35 +538,24 @@ if __name__ == "__main__":
         print(f"[DEBUG] Critic model: {critic}")
 
 
-    if args.load_actor or args.load_critic:
-        if args.load_actor:
-            try:
-                actor_state_dict = torch.load(args.load_actor, map_location=device)
-                # Fix compiled state dict
-                from models import fix_compiled_state_dict
-                actor_state_dict = fix_compiled_state_dict(actor_state_dict)
-                actor.load_state_dict(actor_state_dict)
-                print(f"Successfully loaded actor model from {args.load_actor}")
-            except Exception as e:
-                print(f"Error loading actor model: {e}")
-                if args.debug:
-                    import traceback
-                    traceback.print_exc()
+    if args.model:
+        try:
+            # Load a pre-trained model.
+            temp_trainer = PPOTrainer(  # Temporary trainer just for loading
+                actor=actor,
+                critic=critic,
+                device=device,
+                action_dim=action_space_dims
+            )
+            temp_trainer.load_models(args.model)
+            print(f"Successfully loaded model from {args.model}")
+        except Exception as e:
+            print(f"Error loading model: {e}")
+            if args.debug:
+                import traceback
+                traceback.print_exc()
 
-        if args.load_critic:
-            try:
-                critic_state_dict = torch.load(args.load_critic, map_location=device)
-                # Fix compiled state dict
-                critic_state_dict = fix_compiled_state_dict(critic_state_dict)
-                critic.load_state_dict(critic_state_dict)
-                print(f"Successfully loaded critic model from {args.load_critic}")
-            except Exception as e:
-                print(f"Error loading critic model: {e}")
-                if args.debug:
-                    import traceback
-                    traceback.print_exc()
-
-    # Start training with single-process vectorized approach
+    # Start the training process.
     trainer = run_training(
         actor=actor,
         critic=critic,
@@ -579,6 +569,7 @@ if __name__ == "__main__":
         use_compile=args.compile,
         use_amp=args.amp,
         save_interval=args.save_interval,
+        output_path=args.out,
         # Hyperparameters
         lr_actor=args.lra,
         lr_critic=args.lrc,
@@ -594,11 +585,10 @@ if __name__ == "__main__":
 
 
 
-    # Create models directory and save models
-    if not args.test:
-        os.makedirs("models", exist_ok=True)
-        if trainer is not None:
-            trainer.save_models("models/actor.pth", "models/critic.pth")
-            print("Training complete - Models saved")
-        else:
-            print("Training failed.")
+    # Save final models
+    if not args.test and trainer is not None:
+        output_path = args.out if args.out else None
+        saved_path = trainer.save_models(output_path)
+        print(f"Training complete - Model saved to {saved_path}")
+    else:
+        print("Training failed or in test mode - no model saved.")

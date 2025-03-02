@@ -11,3 +11,4 @@ rlut_meshes/
 # outputs
 wandb/
 models/
+checkpoints/
