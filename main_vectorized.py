@@ -397,7 +397,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--amp', action='store_true', help='Use automatic mixed precision')
     parser.add_argument('--no-amp', action='store_false', dest='amp', help='Disable automatic mixed precision')
-    parser.set_defaults(amp=True)
+    parser.set_defaults(amp=False)
 
 
     # For backwards compatibility

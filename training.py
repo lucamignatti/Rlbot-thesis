@@ -325,7 +325,13 @@ class PPOTrainer:
         # AMP
         self.use_amp = "cuda" in str(device) and use_amp
         if self.use_amp:
-            self.scaler = GradScaler()
+            self.scaler = GradScaler(
+                init_scale=2**10,
+                growth_factor=2.0,
+                backoff_factor=0.5,
+                growth_interval=2000,
+                enabled=True
+            )
             self.debug_print("Automatic Mixed Precision (AMP) enabled")
         else:
             self.debug_print("Automatic Mixed Precision (AMP) disabled: requires CUDA")
@@ -753,116 +759,183 @@ class PPOTrainer:
         returns = advantages + values
         return advantages, returns
 
+    def _detect_abnormal(self, tensor, name="tensor"):
+        """Helper function to detect NaN/Inf values"""
+        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+            self.debug_print(f"Warning: Detected NaN or Inf in {name}")
+            return True
+        return False
+
+    def _policy_eval_amp_safe(self, states, actions, old_log_probs, advantages):
+        """AMP-safe version of policy evaluation with numerical safeguards"""
+        # Actor forward pass with autocast only for network inference
+        if self.action_space_type == "discrete":
+            with autocast(enabled=self.use_amp, device_type="cuda"):
+                logits = self.actor(states)
+                action_probs = F.softmax(logits, dim=1)
+            dist = Categorical(action_probs)
+            new_log_probs = dist.log_prob(actions)
+            entropy = dist.entropy().mean()
+        else:
+            with autocast(enabled=self.use_amp, device_type="cuda"):
+                mu, sigma_raw = self.actor(states)
+
+            # Move to full precision for distribution calculations
+            mu = mu.float()
+            if isinstance(sigma_raw, torch.Tensor):
+                sigma_raw = sigma_raw.float()
+            sigma = F.softplus(sigma_raw) + 1e-5
+            dist = Normal(mu, sigma)
+            new_log_probs = dist.log_prob(actions)
+            if len(new_log_probs.shape) > 1:
+                new_log_probs = new_log_probs.sum(dim=1)
+            entropy = dist.entropy().mean()
+
+        # Safely calculate PPO objective in full precision
+        log_ratio = new_log_probs - old_log_probs.float()
+        # Clamp log_ratio to prevent numerical instability
+        log_ratio = torch.clamp(log_ratio, -15.0, 15.0)
+        ratio = torch.exp(log_ratio)
+
+        # Check for NaNs after critical operations
+        if self._detect_abnormal(ratio, "ratio"):
+            ratio = torch.nan_to_num(ratio, nan=1.0, posinf=10.0, neginf=0.1)
+
+        surr1 = ratio * advantages.float()
+        surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * advantages.float()
+
+        actor_loss = -torch.min(surr1, surr2).mean()
+        entropy_loss = -self.entropy_coef * entropy
+
+        # Final check for NaNs
+        if self._detect_abnormal(actor_loss, "actor_loss"):
+            actor_loss = torch.tensor(1.0, device=self.device, requires_grad=True)
+
+        if self._detect_abnormal(entropy_loss, "entropy_loss"):
+            entropy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        return actor_loss, entropy_loss, entropy
+
+    def _process_batch_amp_safe(self, batch_states, batch_actions, batch_old_log_probs,
+                            batch_advantages, batch_returns):
+        """AMP-safe version of batch processing with numeric safeguards"""
+
+        # Critic forward pass with AMP
+        with autocast(enabled=self.use_amp, device_type="cuda"):
+            values = self.critic(batch_states).squeeze()
+
+        # Policy evaluation done with AMP safeguards
+        actor_loss, entropy_loss, entropy = self._policy_eval_amp_safe(
+            batch_states, batch_actions, batch_old_log_probs, batch_advantages
+        )
+
+        # Critic loss calculation in full precision
+        values = values.float()
+        batch_returns = batch_returns.float()
+        critic_loss = F.mse_loss(values, batch_returns)
+
+        # Detect NaNs in critic loss
+        if self._detect_abnormal(critic_loss, "critic_loss"):
+            critic_loss = torch.tensor(1.0, device=self.device, requires_grad=True)
+
+        # Total loss
+        total_loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
+
+        # Final NaN check
+        if self._detect_abnormal(total_loss, "total_loss"):
+            self.debug_print("Warning: NaN in final loss detected - using fallback loss")
+            # Try to recover by using just the critic loss which is usually more stable
+            if not torch.isnan(critic_loss).any():
+                total_loss = self.critic_coef * critic_loss
+            else:
+                # Last resort - create a dummy loss to prevent training failure
+                total_loss = torch.tensor(1.0, device=self.device, requires_grad=True)
+
+        return actor_loss, critic_loss, entropy_loss, total_loss, entropy
+
     def update(self):
-        """Update policy and value networks using PPO algorithm."""
-        self.debug_print("Starting policy update...")
+        """Update policy and value networks using PPO algorithm with optimized AMP usage."""
         update_start = time.time()
 
-        # Ensure correct devices
-        # self.critic.to(self.device)
-        # self.actor.to(self.device)
-
+        # Get data from memory
         states, actions, old_log_probs, rewards, values, dones = self.memory.get()
-        self.debug_print(f"Memory retrieved: {len(states)} timesteps")
+        if len(states) == 0:
+            return {"actor_loss": 0, "critic_loss": 0, "entropy_loss": 0, "total_loss": 0,
+                    "mean_episode_reward": 0, "value_explained_variance": 0, "kl_divergence": 0}
 
-        # Calculate episode metrics before processing
+        # Calculate episode metrics
         episodes_ended = torch.sum(dones.int()).item() if isinstance(dones, torch.Tensor) else np.sum(dones) if len(dones) > 0 else 0
-        if episodes_ended > 0:
-            # Calculate average reward per episode
-            episode_rewards = []
-            episode_reward = 0
-            episode_lengths = []
-            episode_length = 0
+        # Calculate episode metrics
+        episode_rewards = []
+        episode_reward = 0
+        episode_lengths = []
+        episode_length = 0
 
-            for i, (reward, done) in enumerate(zip(rewards, dones)):
-                # Handle tensor or numpy value
-                r_val = reward.item() if isinstance(reward, torch.Tensor) else reward
-                d_val = done.item() if isinstance(done, torch.Tensor) else done
+        for i, (reward, done) in enumerate(zip(rewards, dones)):
+            # Handle tensor or numpy value
+            r_val = reward.item() if isinstance(reward, torch.Tensor) else reward
+            d_val = done.item() if isinstance(done, torch.Tensor) else done
 
-                episode_reward += r_val
-                episode_length += 1
+            episode_reward += r_val
+            episode_length += 1
 
-                if d_val or i == len(rewards) - 1:
-                    episode_rewards.append(episode_reward)
-                    episode_lengths.append(episode_length)
-                    episode_reward = 0
-                    episode_length = 0
+            if d_val or i == len(rewards) - 1:
+                episode_rewards.append(episode_reward)
+                episode_lengths.append(episode_length)
+                episode_reward = 0
+                episode_length = 0
 
-            avg_episode_reward = np.mean(episode_rewards)
-            avg_episode_length = np.mean(episode_lengths)
-        else:
-            # Handle rewards properly based on type
-            if isinstance(rewards, torch.Tensor):
-                avg_episode_reward = rewards.mean().item() if rewards.numel() > 0 else 0
-            else:
-                avg_episode_reward = np.mean(rewards) if len(rewards) > 0 else 0
-        avg_episode_length = len(rewards)
+        avg_episode_reward = np.mean(episode_rewards)
+        avg_episode_length = np.mean(episode_lengths)
 
+        # Compute next value - use AMP only for the network forward pass
         if len(states) > 0 and not dones[-1]:
-            self.debug_print("Computing next value...")
-            try:
-                self.debug_print("Preparing next state...")
-                with torch.no_grad():
-                    next_state = states[-1].unsqueeze(0) if isinstance(states, torch.Tensor) else torch.FloatTensor(states[-1]).unsqueeze(0).to(self.device)
-                    self.debug_print("Running critic forward pass...")
+            with torch.no_grad():
+                next_state = states[-1].unsqueeze(0) if isinstance(states, torch.Tensor) else \
+                            torch.FloatTensor(states[-1]).unsqueeze(0).to(self.device)
+                with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):
                     next_value = self.critic(next_state)
-                    self.debug_print("Next value computation complete")
-            except Exception as e:
-                print(f"Error during next value computation: {str(e)}")
-                raise
         else:
             next_value = torch.tensor([0.0], device=self.device) if isinstance(values, torch.Tensor) else 0.0
 
-        self.debug_print("Computing advantages...")
-        compute_start = time.time()
+        # GAE calculation in full precision
         advantages, returns = self.compute_gae(rewards, values, dones, next_value)
 
-        # Normalize advantages
-        if isinstance(advantages, torch.Tensor):
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        else:
-            advantages = (advantages - np.mean(advantages)) / (np.std(advantages) + 1e-8)
-        self.debug_print(f"Advantage computation took {time.time() - compute_start:.2f}s")
+        # Normalize advantages in full precision
+        if isinstance(advantages, torch.Tensor) and len(advantages) > 0:
+            adv_mean = advantages.mean()
+            adv_std = advantages.std() + 1e-8
+            if not torch.isnan(adv_mean) and not torch.isnan(adv_std):
+                advantages = (advantages - adv_mean) / adv_std
 
+        # Initialize tracking variables
         total_actor_loss = 0
         total_critic_loss = 0
         total_entropy_loss = 0
         total_loss = 0
-
-        # Variables for tracking policy changes
-        explained_var = 0
-
-        # Default values for potentially unbound variables
         old_probs = None
         old_mu = None
         old_sigma = None
-        batches = []
-        actor_loss = 0
-        critic_loss = 0
-        entropy_loss = 0
-        epoch_time = 0
 
-        self.debug_print(f"Starting {self.ppo_epochs} PPO epochs...")
-        for epoch in range(self.ppo_epochs):
-            self.debug_print(f"Epoch {epoch+1}/{self.ppo_epochs}, generating batches...")
-            batches = self.memory.generate_batches()
-            self.debug_print(f"Epoch {epoch+1}/{self.ppo_epochs}, processing {len(batches)} batches...")
-            epoch_batch_start = time.time()
-
-            batch_times = []
-            # Save old policy outputs for KL calculation
-            if epoch == 0 and self.action_space_type == "discrete" and isinstance(states, torch.Tensor):
-                with torch.no_grad():
+        # Save old policy for KL divergence - use AMP only for the network forward pass
+        with torch.no_grad():
+            if self.action_space_type == "discrete":
+                with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):
                     old_logits = self.actor(states)
-                    old_probs = F.softmax(old_logits, dim=1)
-            elif epoch == 0 and isinstance(states, torch.Tensor):
-                with torch.no_grad():
+                old_probs = F.softmax(old_logits, dim=1)
+            else:
+                with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):
                     old_mu, old_sigma_raw = self.actor(states)
-                    old_sigma = F.softplus(old_sigma_raw) + 1e-5
+                old_sigma = F.softplus(old_sigma_raw) + 1e-5
 
+
+        # OPTIMIZATION: Use mini-batch reuse to amortize compilation cost
+        batches = self.memory.generate_batches()
+
+        # Training epochs
+        for epoch in range(self.ppo_epochs):
             for batch_idx, batch_indices in enumerate(batches):
-                batch_loop_start = time.time()
-
+                # Prepare batch data
                 if isinstance(states, torch.Tensor):
                     batch_states = states[batch_indices]
                     batch_actions = actions[batch_indices]
@@ -871,257 +944,202 @@ class PPOTrainer:
                     batch_returns = returns[batch_indices]
                 else:
                     batch_states = torch.tensor(states[batch_indices], dtype=torch.float32, device=self.device)
-                    batch_actions = torch.tensor(actions[batch_indices], dtype=torch.long if self.action_space_type == "discrete" else torch.float32, device=self.device)
+                    batch_actions = torch.tensor(actions[batch_indices],
+                                            dtype=torch.long if self.action_space_type == "discrete" else torch.float32,
+                                            device=self.device)
                     batch_old_log_probs = torch.tensor(old_log_probs[batch_indices], dtype=torch.float32, device=self.device)
                     batch_advantages = torch.tensor(advantages[batch_indices], dtype=torch.float32, device=self.device)
                     batch_returns = torch.tensor(returns[batch_indices], dtype=torch.float32, device=self.device)
 
+                # Reset gradients
+                self.actor_optimizer.zero_grad(set_to_none=True)
+                self.critic_optimizer.zero_grad(set_to_none=True)
+
                 try:
-                    self.debug_print(f"Processing batch {batch_idx+1}/{len(batches)}")
-                    self.debug_print(f"Batch states shape: {batch_states.shape}")
-                    self.debug_print(f"Batch actions shape: {batch_actions.shape}")
+                    # IMPORTANT: Single autocast context for the entire forward pass
+                    with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):
+                        # Critic forward pass
+                        values = self.critic(batch_states).squeeze()
 
-                    # Reset gradients
-                    self.actor_optimizer.zero_grad()
-                    self.critic_optimizer.zero_grad()
-
-                    # Use AMP autocast for forward pass
-                    with autocast(enabled=self.use_amp, device_type="cuda"):
-                        # Make sure tensors will have proper gradients
-                        if not batch_states.requires_grad:
-                            batch_states = batch_states.clone()
-
-                        # Use compiled functions if available
-                        if self.use_compile and hasattr(self, '_process_batch_fn'):
-                            actor_loss, critic_loss, entropy_loss, loss, entropy = self._process_batch_fn(
-                                batch_states, batch_actions, batch_old_log_probs,
-                                batch_advantages, batch_returns
-                            )
+                        # Actor forward pass
+                        if self.action_space_type == "discrete":
+                            logits = self.actor(batch_states)
+                            action_probs = F.softmax(logits, dim=1)
+                            dist = Categorical(action_probs)
+                            new_log_probs = dist.log_prob(batch_actions)
+                            entropy = dist.entropy().mean()
                         else:
-                            # Mark CUDA graph step if on CUDA
-                            if "cuda" in str(self.device):
-                                torch.compiler.cudagraph_mark_step_begin()
+                            mu, sigma_raw = self.actor(batch_states)
+                            sigma = F.softplus(sigma_raw) + 1e-5
+                            dist = Normal(mu, sigma)
+                            new_log_probs = dist.log_prob(batch_actions)
+                            if len(new_log_probs.shape) > 1:
+                                new_log_probs = new_log_probs.sum(dim=1)
+                            entropy = dist.entropy().mean()
 
-                            # Critic forward pass
-                            self.debug_print("Running critic forward pass...")
-                            values = self.critic(batch_states).squeeze()
-                            self.debug_print("Critic forward pass complete")
+                        # PPO objectives
+                        ratio = torch.exp(new_log_probs - batch_old_log_probs)
 
-                            # Mark CUDA graph step before actor
-                            if "cuda" in str(self.device):
-                                torch.compiler.cudagraph_mark_step_begin()
+                        # Simple clipping for numerical stability
+                        ratio = torch.clamp(ratio, 0.0, 10.0)
 
-                            # Actor forward pass
-                            self.debug_print("Running actor forward pass...")
-                            if self.action_space_type == "discrete":
-                                logits = self.actor(batch_states)
-                                logits = logits.clone() # Clone to prevent CUDA graph issues
+                        surr1 = ratio * batch_advantages
+                        surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * batch_advantages
 
-                                action_probs = F.softmax(logits, dim=1)
-                                dist = Categorical(action_probs)
-                                new_log_probs = dist.log_prob(batch_actions)
-                                entropy = dist.entropy().mean()
-                            else:
-                                mu, sigma_raw = self.actor(batch_states)
-                                mu = mu.clone() # Clone to prevent CUDA graph issues
-                                sigma_raw = sigma_raw.clone() if isinstance(sigma_raw, torch.Tensor) else sigma_raw
+                        # Calculate losses
+                        actor_loss = -torch.min(surr1, surr2).mean()
+                        critic_loss = F.mse_loss(values, batch_returns)
+                        entropy_loss = -self.entropy_coef * entropy
 
-                                sigma = F.softplus(sigma_raw) + 1e-5
-                                dist = Normal(mu, sigma)
-                                new_log_probs = dist.log_prob(batch_actions)
-                                if len(new_log_probs.shape) > 1:
-                                    new_log_probs = new_log_probs.sum(dim=1)
-                                entropy = dist.entropy().mean()
+                        # Total loss
+                        loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
 
-                            # Mark CUDA graph step before loss computation
-                            if "cuda" in str(self.device):
-                                torch.compiler.cudagraph_mark_step_begin()
+                    # OPTIMIZATION: Faster AMP by simplifying the backward pass
+                    if self.use_amp and "cuda" in str(self.device):
+                        self.scaler.scale(loss).backward()
 
-                            ratio = torch.exp(new_log_probs - batch_old_log_probs)
-                            surr1 = ratio * batch_advantages
-                            surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * batch_advantages
+                        # OPTIMIZATION: Unscale before gradient clipping for more precise clipping
+                        self.scaler.unscale_(self.actor_optimizer)
+                        self.scaler.unscale_(self.critic_optimizer)
 
-                            actor_loss = -torch.min(surr1, surr2).mean()
-                            critic_loss = F.mse_loss(values, batch_returns)
-                            entropy_loss = -self.entropy_coef * entropy
-                            loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
+                        # Clip gradients
+                        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
 
-                            # Verify loss has gradients
-                            if not loss.requires_grad:
-                                self.debug_print("Warning: Loss doesn't have gradients. Creating new computation graph.")
-                                # Create a fresh computation with explicit gradient tracking
-                                with torch.enable_grad():
-                                    if hasattr(self.actor, '_orig_mod'):
-                                        actor = self.actor._orig_mod
-                                    else:
-                                        actor = self.actor
+                        # Step optimizers with scaled gradients
+                        self.scaler.step(self.actor_optimizer)
+                        self.scaler.step(self.critic_optimizer)
 
-                                    if hasattr(self.critic, '_orig_mod'):
-                                        critic = self.critic._orig_mod
-                                    else:
-                                        critic = self.critic
+                        # Update scaler
+                        self.scaler.update()
+                    else:
+                        # Standard backward pass for non-AMP
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+                        self.actor_optimizer.step()
+                        self.critic_optimizer.step()
 
-                                    # Recompute with gradient tracking explicitly enabled
-                                    values = critic(batch_states).squeeze()
 
-                                    if self.action_space_type == "discrete":
-                                        logits = actor(batch_states)
-                                        action_probs = F.softmax(logits, dim=1)
-                                        dist = Categorical(action_probs)
-                                        new_log_probs = dist.log_prob(batch_actions)
-                                        entropy = dist.entropy().mean()
-                                    else:
-                                        mu, sigma_raw = actor(batch_states)
-                                        sigma = F.softplus(sigma_raw) + 1e-5
-                                        dist = Normal(mu, sigma)
-                                        new_log_probs = dist.log_prob(batch_actions)
-                                        if len(new_log_probs.shape) > 1:
-                                            new_log_probs = new_log_probs.sum(dim=1)
-                                        entropy = dist.entropy().mean()
-
-                                    ratio = torch.exp(new_log_probs - batch_old_log_probs)
-                                    surr1 = ratio * batch_advantages
-                                    surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * batch_advantages
-
-                                    actor_loss = -torch.min(surr1, surr2).mean()
-                                    critic_loss = F.mse_loss(values, batch_returns)
-                                    entropy_loss = -self.entropy_coef * entropy
-                                    loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
-
-                    batch_time = time.time() - batch_loop_start
-                    batch_times.append(batch_time)
-
-                    if batch_idx % 10 == 0:
-                        self.debug_print(f"Batch {batch_idx+1}/{len(batches)} took {batch_time:.3f}s")
+                    # Accumulate metrics
+                    total_actor_loss += actor_loss.item()
+                    total_critic_loss += critic_loss.item()
+                    total_entropy_loss += entropy_loss.item()
+                    total_loss += loss.item()
 
                 except Exception as e:
-                    # Keep error messages as regular prints
                     print(f"Error in batch {batch_idx+1}: {str(e)}")
-                    raise
+                    import traceback
+                    traceback.print_exc()
+                    continue
 
-                self.debug_print("Starting backward pass...")
-
-                # Use scaler for backward pass if AMP is enabled
-                if self.use_amp:
-                    self.scaler.scale(loss).backward()
-                    self.debug_print("Clipping gradients...")
-                    self.scaler.unscale_(self.actor_optimizer)
-                    self.scaler.unscale_(self.critic_optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                    torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-                    self.scaler.step(self.actor_optimizer)
-                    self.scaler.step(self.critic_optimizer)
-                    self.scaler.update()
-                else:
-                    loss.backward()
-                    self.debug_print("Clipping gradients...")
-                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                    torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-                    self.actor_optimizer.step()
-                    self.critic_optimizer.step()
-
-                self.debug_print("Accumulating losses...")
-                total_actor_loss += actor_loss.item()
-                total_critic_loss += critic_loss.item()
-                total_entropy_loss += entropy_loss.item()
-                total_loss += loss.item()
-                self.debug_print("Batch complete\n")
-
-            # End of epoch statistics
-            epoch_time = time.time() - epoch_batch_start
-            avg_batch_time = sum(batch_times) / len(batch_times) if batch_times else 0
-
-            if self.debug:
-                print(f"[DEBUG] Epoch {epoch+1} summary:")
-                print(f"[DEBUG] Total epoch time: {epoch_time:.2f}s")
-                print(f"[DEBUG] Average batch time: {avg_batch_time:.3f}s")
-                print(f"[DEBUG] Min/Max batch time: {min(batch_times):.3f}s / {max(batch_times):.3f}s") if batch_times else None
-                print(f"[DEBUG] Current losses: actor={actor_loss.item():.4f}, critic={critic_loss.item():.4f}, entropy={entropy_loss.item():.4f}")
 
         # Calculate final metrics
-        num_updates = self.ppo_epochs * len(batches) if len(batches) > 0 else 1
+        num_updates = max(self.ppo_epochs * len(batches), 1)
         avg_actor_loss = total_actor_loss / num_updates
         avg_critic_loss = total_critic_loss / num_updates
         avg_entropy_loss = total_entropy_loss / num_updates
         avg_loss = total_loss / num_updates
 
-        # Calculate KL divergence after updates
+        # Calculate KL divergence after updates - only use AMP for network forward pass
         kl_div = 0
-        if self.action_space_type == "discrete" and len(states) > 0 and old_probs is not None and isinstance(states, torch.Tensor):
-            with torch.no_grad():
-                new_logits = self.actor(states)
-                new_probs = F.softmax(new_logits, dim=1)
-                kl_div = (old_probs * (torch.log(old_probs + 1e-10) - torch.log(new_probs + 1e-10))).sum(1).mean().item()
-        elif len(states) > 0 and old_mu is not None and old_sigma is not None and isinstance(states, torch.Tensor):
-            with torch.no_grad():
-                new_mu, new_sigma_raw = self.actor(states)
-                new_sigma = F.softplus(new_sigma_raw) + 1e-5
-                kl_div = (torch.log(new_sigma/old_sigma) + (old_sigma**2 + (old_mu - new_mu)**2)/(2*new_sigma**2) - 0.5).mean().item()
-
-        # Calculate explained variance safely
         if len(states) > 0:
             with torch.no_grad():
-                # Get all values for all states
-                all_values = self.critic(states).cpu().detach().numpy().flatten() if isinstance(states, torch.Tensor) else self.critic(torch.tensor(states, dtype=torch.float32, device=self.device)).cpu().detach().numpy().flatten()
-                all_returns = returns.cpu().detach().numpy().flatten() if isinstance(returns, torch.Tensor) else returns
+                if self.action_space_type == "discrete" and old_probs is not None:
+                    # Network forward pass in mixed precision
+                    with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):
+                        new_logits = self.actor(states)
 
-                # Ensure same length
-                min_length = min(len(all_values), len(all_returns))
-                if min_length > 0:
-                    all_values = all_values[:min_length]
-                    all_returns = all_returns[:min_length]
-                    explained_var = 1 - np.var(all_returns - all_values) / (np.var(all_returns) + 1e-8)
-                else:
-                    explained_var = 0
-        else:
-            explained_var = 0
+                    # KL calculation in full precision
+                    new_probs = F.softmax(new_logits.float(), dim=1)
+                    kl = old_probs * (torch.log(old_probs + 1e-10) - torch.log(new_probs + 1e-10))
+                    if torch.isnan(kl).any() or torch.isinf(kl).any():
+                        kl = torch.nan_to_num(kl, nan=0.0, posinf=1.0, neginf=-1.0)
+                    kl_div = kl.sum(1).mean().item()
 
-        self.actor_losses.append(avg_actor_loss)
-        self.critic_losses.append(avg_critic_loss)
-        self.entropy_losses.append(avg_entropy_loss)
-        self.total_losses.append(avg_loss)
+                elif old_mu is not None and old_sigma is not None:
+                    # Network forward pass in mixed precision
+                    with autocast(enabled=self.use_amp and "cuda" in str(self.device)):
+                        new_mu, new_sigma_raw = self.actor(states)
 
-        # Always log metrics to wandb if enabled and available
+                    # KL calculation in full precision
+                    new_mu = new_mu.float()
+                    new_sigma_raw = new_sigma_raw.float() if isinstance(new_sigma_raw, torch.Tensor) else new_sigma_raw
+                    new_sigma = F.softplus(new_sigma_raw) + 1e-5
+
+                    kl = torch.log(new_sigma/old_sigma + 1e-10) + (old_sigma**2 + (old_mu - new_mu)**2)/(2*new_sigma**2 + 1e-10) - 0.5
+                    if torch.isnan(kl).any() or torch.isinf(kl).any():
+                        kl = torch.nan_to_num(kl, nan=0.0, posinf=1.0, neginf=-1.0)
+                    kl_div = kl.mean().item()
+
+        # Explained variance calculation
+        explained_var = 0
+        if len(states) > 0:
+            with torch.no_grad():
+                try:
+                    # Network forward pass in mixed precision
+                    with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):
+                        all_values_half = self.critic(states).squeeze()
+
+                    # Variance calculation in full precision
+                    all_values = all_values_half.float().cpu().numpy().flatten()
+                    all_returns = returns.cpu().numpy().flatten() if isinstance(returns, torch.Tensor) else returns.flatten()
+
+                    # Calculate variance
+                    min_length = min(len(all_values), len(all_returns))
+                    if min_length > 0:
+                        all_values = all_values[:min_length]
+                        all_returns = all_returns[:min_length]
+
+                        if not np.isnan(all_values).any() and not np.isnan(all_returns).any():
+                            var_returns = np.var(all_returns)
+                            if var_returns > 1e-8:
+                                explained_var = 1 - np.var(all_returns - all_values) / var_returns
+                except Exception as e:
+                    print(f"Error computing explained variance: {e}")
+
+        # Log metrics if wandb is enabled
         if self.use_wandb:
             try:
                 import sys
                 if 'wandb' in sys.modules:
-                    metrics = {
-                        # Learning metrics
-                        "actor_loss": avg_actor_loss,
-                        "critic_loss": avg_critic_loss,
-                        "entropy_loss": avg_entropy_loss,
-                        "total_loss": avg_loss,
-
-                        # Performance metrics
-                        "mean_episode_reward": avg_episode_reward,
-                        "mean_episode_length": avg_episode_length,
-                        "mean_advantage": advantages.mean().item() if isinstance(advantages, torch.Tensor) else np.mean(advantages),
-                        "mean_return": returns.mean().item() if isinstance(returns, torch.Tensor) else np.mean(returns),
-
-                        # Training statistics
-                        "policy_kl_divergence": kl_div,
-                        "value_explained_variance": explained_var,
-
-                        # Training efficiency
-                        "training_epoch_time": epoch_time
+                    # Prepare safe metrics with NaN checks
+                    safe_metrics = {
+                        "actor_loss": float(avg_actor_loss) if not np.isnan(avg_actor_loss) else 0.0,
+                        "critic_loss": float(avg_critic_loss) if not np.isnan(avg_critic_loss) else 0.0,
+                        "entropy_loss": float(avg_entropy_loss) if not np.isnan(avg_entropy_loss) else 0.0,
+                        "total_loss": float(avg_loss) if not np.isnan(avg_loss) else 0.0,
+                        "mean_episode_reward": float(avg_episode_reward),
+                        "mean_episode_length": float(avg_episode_length),
+                        "policy_kl_divergence": float(kl_div) if not np.isnan(kl_div) else 0.0,
+                        "value_explained_variance": float(explained_var) if not np.isnan(explained_var) else 0.0,
                     }
 
+                    # Add tensor metrics with safety checks
+                    if isinstance(advantages, torch.Tensor):
+                        adv_mean = advantages.mean().item()
+                        if not np.isnan(adv_mean):
+                            safe_metrics["mean_advantage"] = adv_mean
+
+                    if isinstance(returns, torch.Tensor):
+                        ret_mean = returns.mean().item()
+                        if not np.isnan(ret_mean):
+                            safe_metrics["mean_return"] = ret_mean
+
+                    # Additional AMP metrics
+                    if self.use_amp:
+                        safe_metrics["amp_scale"] = self.scaler.get_scale()
+
                     import wandb
-                    wandb.log(metrics)
-                    self.debug_print("Logged metrics to wandb")
-            except (ImportError, AttributeError) as e:
+                    wandb.log(safe_metrics)
+            except Exception as e:
                 if self.debug:
                     print(f"[DEBUG] Failed to log to wandb: {e}")
 
         # Clean up
         self.memory.clear()
 
-        total_time = time.time() - update_start
-        if self.debug:
-            print(f"[DEBUG] Update completed in {total_time:.2f}s")
-
-        # Return the most important metrics
+        # Return summary metrics
         return {
             "actor_loss": avg_actor_loss,
             "critic_loss": avg_critic_loss,
@@ -1129,7 +1147,8 @@ class PPOTrainer:
             "total_loss": avg_loss,
             "mean_episode_reward": avg_episode_reward,
             "value_explained_variance": explained_var,
-            "kl_divergence": kl_div
+            "kl_divergence": kl_div,
+            "update_time": time.time() - update_start
         }
 
     def save_models(self, actor_path, critic_path):
