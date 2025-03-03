@@ -21,29 +21,31 @@ import signal
 import sys
 
 def get_env(renderer=None):
-    """Creates a standardized RL environment for Rocket League.  This environment uses
-    a combination of mutators, observations, actions, rewards, and termination conditions
-    to define the learning task."""
+    """
+    Sets up the Rocket League environment.  We configure things like the
+    size of the teams, the initial state (kickoff), how we observe the game,
+    what actions the agent can take, what rewards it gets, and when an episode ends.
+    """
     return RLGym(
         state_mutator=MutatorSequence(
-            FixedTeamSizeMutator(blue_size=2, orange_size=2),  # Forces 2v2 matches
-            KickoffMutator()  # Start each episode with a kickoff
+            FixedTeamSizeMutator(blue_size=2, orange_size=2),  # Forces 2v2 matches for consistency.
+            KickoffMutator()  # Start each episode with a kickoff for standardized training.
         ),
-        obs_builder=DefaultObs(zero_padding=2),  # Use a basic observation builder, padding for a maximum of 4 players
-        action_parser=RepeatAction(LookupTableAction(), repeats=8),  # Use a discrete action space, repeating the chosen action 8 times
-        reward_fn=CombinedReward(  # Combine several reward functions to create a more comprehensive reward signal
-            (GoalReward(), 12.),  # Large reward for scoring goals
-            (TouchReward(), 6.),  # Moderate reward for touching the ball
-            (BallNetProximityReward(), 3.),  # Smaller reward for getting the ball closer to the opponent's net
-            (BallProximityReward(), 1.),  # Small reward for getting closer to the ball
+        obs_builder=DefaultObs(zero_padding=2),  # Padding for up to 4 players, even though we're using 2v2.
+        action_parser=RepeatAction(LookupTableAction(), repeats=8),  # Repeat each action 8 times for smoother control.
+        reward_fn=CombinedReward(  # Combine multiple rewards for a more complete training signal.
+            (GoalReward(), 12.),  # Large reward for scoring, since that's the main objective.
+            (TouchReward(), 6.),  # Moderate reward for touching the ball, encourages interaction.
+            (BallNetProximityReward(), 3.),  # Smaller reward for getting the ball towards the opponent's goal.
+            (BallProximityReward(), 1.),  # Small reward for just getting closer to the ball.
         ),
-        termination_cond=GoalCondition(),  # End the episode when a goal is scored
-        truncation_cond=AnyCondition(  # Truncate the episode if it goes on for too long or if the ball isn't touched
-            TimeoutCondition(300.),  # Max episode length of 300 steps (300/8 = 37.5 seconds)
-            NoTouchTimeoutCondition(30.)  # No touch for 30 steps
+        termination_cond=GoalCondition(),  # End the episode when a goal is scored.
+        truncation_cond=AnyCondition(  # But also end the episode if things get stuck.
+            TimeoutCondition(300.),  # Max episode length of 37.5 seconds (300 steps / 8 repeats).
+            NoTouchTimeoutCondition(30.)  # Or if the ball hasn't been touched for a while.
         ),
-        transition_engine=RocketSimEngine(),  # Use the default physics engine
-        renderer=renderer  # Use provided renderer if available (or None)
+        transition_engine=RocketSimEngine(),  # Use the default physics engine.
+        renderer=renderer  # Use the renderer if one was provided.
     )
 
 
@@ -75,18 +77,18 @@ def run_training(
     batch_size: int = 64
 ):
     """
-    Runs the main training loop using a vectorized environment approach.
-    This function orchestrates the data collection, policy updates, and model saving.
-    Training can be limited by episodes (total_episodes) or time (training_time in seconds).
+    Main training loop.  This sets up the agent, environment, and training process,
+    then runs the training loop until either a specified number of episodes have
+    been completed, or a specified amount of time has passed.
     """
-    # Verify that at least one termination condition is provided
+    # We need at least one way to know when to stop training.
     if total_episodes is None and training_time is None:
         raise ValueError("Either total_episodes or training_time must be provided")
 
     actor.to(device)
     critic.to(device)
 
-    # Initialize the PPO trainer with the specified hyperparameters.
+    # Initialize the PPO trainer, which handles the core learning algorithm.
     trainer = PPOTrainer(
         actor,
         critic,
@@ -108,15 +110,14 @@ def run_training(
         use_amp=use_amp
     )
 
-    # Set up the vectorized environment to run multiple instances in parallel.
+    # Use a vectorized environment for parallel data collection.
     vec_env = VectorizedEnv(num_envs=num_envs, render=render)
 
-    # Record the start time for time-based training
+    # For time-based training, we'll need to know when we started.
     start_time = time.time()
 
-    # Create the appropriate progress bar based on the training mode
+    # Set up the progress bar. It'll track episodes or time, depending on how we're training.
     if training_time is not None:
-        # For time-based training, use the time in seconds as total with a different format
         progress_bar = tqdm(
             total=int(training_time),
             desc="Time",
@@ -124,7 +125,6 @@ def run_training(
             dynamic_ncols=True
         )
     else:
-        # For episode-based training, use the traditional format
         progress_bar = tqdm(
             total=total_episodes,
             desc="Episodes",
@@ -132,77 +132,78 @@ def run_training(
             dynamic_ncols=True
         )
 
-    # Initialize a dictionary to hold various statistics for display.
+    # This dictionary holds statistics we'll display in the progress bar.
     stats_dict = {
         "Device": device,
         "Envs": num_envs,
-        "Exp": "0/0",
-        "Episodes": 0,
-        "Reward": "0.0",
-        "PLoss": "0.0",
-        "VLoss": "0.0",
-        "Entropy": "0.0"
+        "Exp": "0/0",  # Experiences collected / experiences per update
+        "Episodes": 0,  # Total episodes completed
+        "Reward": "0.0",  # Average reward per episode
+        "PLoss": "0.0",  # Actor loss
+        "VLoss": "0.0",  # Critic loss
+        "Entropy": "0.0"  # Entropy loss
     }
     progress_bar.set_postfix(stats_dict)
 
-    # Initialize variables for tracking training progress.
-    collected_experiences = 0
-    total_episodes_so_far = 0
-    last_update_time = time.time()
-    last_save_episode = 0
-    episode_rewards = {i: {agent_id: 0 for agent_id in vec_env.obs_dicts[i]} for i in range(num_envs)}
-    last_progress_update = start_time
+    # Initialize variables to track training progress.
+    collected_experiences = 0  # Experiences since last policy update
+    total_episodes_so_far = 0  # Total episodes completed
+    last_update_time = time.time()  # When did we last update the policy?
+    last_save_episode = 0  # When did we last save the model?
+    episode_rewards = {i: {agent_id: 0 for agent_id in vec_env.obs_dicts[i]} for i in range(num_envs)}  # Track rewards per episode, per agent
+    last_progress_update = start_time  # For updating time-based progress bar
 
     try:
-        # Main training loop, continues until the target number of episodes is reached or time is up.
+        # Main training loop.
         should_continue = True
         while should_continue:
             current_time = time.time()
             elapsed = current_time - start_time
 
-            # Check termination conditions
+            # Check if we should stop training.
             if training_time is not None:
-                # Update progress bar for time-based training (update once per second to avoid overhead)
+                # If training based on time, update progress bar once per second.
                 if current_time - last_progress_update >= 1.0:
-                    progress_bar.n = min(int(elapsed), int(training_time))
-                    progress_bar.refresh()
+                    progress_bar.n = min(int(elapsed), int(training_time))  # Update progress
+                    progress_bar.refresh()  # Force redraw
                     last_progress_update = current_time
 
-                should_continue = elapsed < training_time
+                should_continue = elapsed < training_time  # Stop if elapsed time exceeds training time.
             else:
-                should_continue = total_episodes_so_far < total_episodes
+                should_continue = total_episodes_so_far < total_episodes  # Stop if episode count exceeds limit.
 
             if not should_continue:
                 break
 
-            # Collect observations from all environments for batched inference
+            # Collect observations from all environments.  We'll do a single forward pass
+            # with all observations, which is more efficient than doing them one at a time.
             all_obs = []
             all_env_indices = []
             all_agent_ids = []
 
-            # Organize observations for more efficient processing
+            # Organize observations into lists for batch processing.
             for env_idx, obs_dict in enumerate(vec_env.obs_dicts):
                 for agent_id, obs in obs_dict.items():
                     all_obs.append(obs)
                     all_env_indices.append(env_idx)
                     all_agent_ids.append(agent_id)
 
-            # Only proceed if there are observations.  The length could be 0
-            # if all environments terminated at the same time
+            # Only proceed if we have observations. (It's possible all environments ended at the same time.)
             if len(all_obs) > 0:
                 obs_batch = torch.FloatTensor(np.stack(all_obs)).to(device)
                 with torch.no_grad():
-                    # Get actions, log probabilities, and values for all observations at once.
+                    # Get actions and values from the networks.
                     action_batch, log_prob_batch, value_batch = trainer.get_action(obs_batch)
 
-                # Organize actions back into per-environment dictionaries for the step function.
+                # Organize actions into a list of dictionaries, one for each environment.
                 actions_dict_list = [{} for _ in range(num_envs)]
                 for i, (action, log_prob, value) in enumerate(zip(action_batch, log_prob_batch, value_batch)):
                     env_idx = all_env_indices[i]
                     agent_id = all_agent_ids[i]
                     actions_dict_list[env_idx][agent_id] = action
 
-                    # Store experience. Reward and done are placeholders, updated after the env step.
+                    # Store the experience (observations, actions, etc.).
+                    # Reward and done are placeholders for now; we'll update them after the environment step.
                     trainer.store_experience(
                         all_obs[i],
                         action,
@@ -214,105 +215,104 @@ def run_training(
 
                     collected_experiences += 1
 
-                # Step all environments in parallel.
-                results, dones, episode_counts = vec_env.step(actions_dict_list)
+            # Step all environments forward in parallel.
+            results, dones, episode_counts = vec_env.step(actions_dict_list)
 
-                # Process results from each environment.
-                exp_idx = 0
-                for env_idx, (next_obs_dict, reward_dict, terminated_dict, truncated_dict) in enumerate(results):
-                    for agent_id in reward_dict.keys():  # Iterate using reward_dict to ensure correct agent IDs
-                        # Retrieve reward and done status for the agent.
-                        reward = reward_dict[agent_id]
-                        done = terminated_dict[agent_id] or truncated_dict[agent_id]
+            # Process the results from each environment.
+            exp_idx = 0  # Index into our experience buffer.
+            for env_idx, (next_obs_dict, reward_dict, terminated_dict, truncated_dict) in enumerate(results):
+                for agent_id in reward_dict.keys():  # Use reward_dict to ensure we get the correct agent ID.
+                    # Get the actual reward and done flag for this agent in this environment.
+                    reward = reward_dict[agent_id]
+                    done = terminated_dict[agent_id] or truncated_dict[agent_id]
 
-                        # Correctly update the stored experience with the actual reward and done status.
-                        mem_idx = trainer.memory.pos - len(all_obs) + exp_idx
-                        if mem_idx < 0:  # Wrap around circular buffer
-                            mem_idx += trainer.memory.buffer_size
+                    # Update the stored experience with the correct reward and done flag.
+                    mem_idx = trainer.memory.pos - len(all_obs) + exp_idx
+                    if mem_idx < 0:  # Handle wrap-around in the circular buffer.
+                        mem_idx += trainer.memory.buffer_size
 
-                        trainer.store_experience_at_idx(mem_idx, None, None, None, reward, None, done)
+                    trainer.store_experience_at_idx(mem_idx, None, None, None, reward, None, done)
 
-                        # Accumulate rewards for this episode.
-                        episode_rewards[env_idx][agent_id] += reward
-                        exp_idx += 1
+                    # Accumulate rewards.
+                    episode_rewards[env_idx][agent_id] += reward
+                    exp_idx += 1
 
-                # Check for completed episodes.
-                newly_completed_episodes = sum(dones)
-                if newly_completed_episodes > 0:
-                    # For episode-based training, update the progress bar
-                    if training_time is None:
-                        progress_bar.update(newly_completed_episodes)
+            # Check if any episodes have completed.
+            newly_completed_episodes = sum(dones)
+            if newly_completed_episodes > 0:
+                # Update progress bar for episodes-based training
+                if training_time is None:
+                    progress_bar.update(newly_completed_episodes)
 
-                    total_episodes_so_far += newly_completed_episodes
-                    stats_dict["Episodes"] = total_episodes_so_far
+                total_episodes_so_far += newly_completed_episodes
+                stats_dict["Episodes"] = total_episodes_so_far
 
-                    # Check if it's time to save the model.
-                    if save_interval > 0 and (total_episodes_so_far - last_save_episode) >= save_interval:
-                        # Use a "checkpoints" subdirectory under the output path
-                        checkpoint_dir = "checkpoints"
-                        if output_path:
-                            if os.path.isdir(output_path):
-                                checkpoint_dir = os.path.join(output_path, "checkpoints")
-                            else:
-                                # If output path is a file, use its directory
-                                output_dir = os.path.dirname(output_path)
-                                checkpoint_dir = os.path.join(output_dir if output_dir else ".", "checkpoints")
+                # Check if we should save the model.
+                if save_interval > 0 and (total_episodes_so_far - last_save_episode) >= save_interval:
+                    checkpoint_dir = "checkpoints"
+                    if output_path:
+                        if os.path.isdir(output_path):
+                            checkpoint_dir = os.path.join(output_path, "checkpoints")
+                        else:
+                            # If output path is a file, use its directory
+                            output_dir = os.path.dirname(output_path)
+                            checkpoint_dir = os.path.join(output_dir if output_dir else ".", "checkpoints")
 
-                        os.makedirs(checkpoint_dir, exist_ok=True)
+                    os.makedirs(checkpoint_dir, exist_ok=True)
 
-                        # Save with episode number
-                        checkpoint_path = os.path.join(checkpoint_dir, f"model_ep{total_episodes_so_far}.pt")
-                        trainer.save_models(checkpoint_path)
+                    # Save with episode number for tracking
+                    checkpoint_path = os.path.join(checkpoint_dir, f"model_ep{total_episodes_so_far}.pt")
+                    trainer.save_models(checkpoint_path)
 
-                        # Save "latest" model for easy loading
-                        latest_path = os.path.join(checkpoint_dir, "model_latest.pt")
-                        trainer.save_models(latest_path)
+                    # Also save as "latest" for easy loading
+                    latest_path = os.path.join(checkpoint_dir, "model_latest.pt")
+                    trainer.save_models(latest_path)
 
-                        if debug:
-                            print(f"[DEBUG] Saved checkpoint at episode {total_episodes_so_far} to {checkpoint_path}")
-
-                        last_save_episode = total_episodes_so_far
-
-                    # Reset episode rewards for completed episodes, for tracking the average reward.
-                    for env_idx, done in enumerate(dones):
-                        if done:
-                            avg_reward = sum(episode_rewards[env_idx].values()) / len(episode_rewards[env_idx])
-                            if debug:
-                                print(f"Episode {episode_counts[env_idx]} in env {env_idx} completed with avg reward: {avg_reward:.2f}")
-                            episode_rewards[env_idx] = {agent_id: 0 for agent_id in vec_env.obs_dicts[env_idx]}
-
-                # Determine if it's time to update the policy.
-                time_since_update = time.time() - last_update_time
-                enough_experiences = collected_experiences >= update_interval
-
-                # We update if enough experiences have been collected OR if enough time has passed
-                if enough_experiences or (collected_experiences > 100 and time_since_update > 30):
                     if debug:
-                        print(f"[DEBUG] Updating policy with {collected_experiences} experiences after {time_since_update:.2f}s")
+                        print(f"[DEBUG] Saved checkpoint at episode {total_episodes_so_far} to {checkpoint_path}")
 
-                    # Perform the policy update.
-                    stats = trainer.update()
+                    last_save_episode = total_episodes_so_far
 
-                    # Update the stats dictionary for the progress bar.
-                    stats_dict.update({
-                        "Device": device,
-                        "Envs": num_envs,
-                        "Exp": f"0/{update_interval}",  # Reset experience count
-                        "Episodes": total_episodes_so_far,
-                        "Reward": f"{stats.get('mean_episode_reward', 0):.2f}",
-                        "PLoss": f"{stats.get('actor_loss', 0):.4f}",
-                        "VLoss": f"{stats.get('critic_loss', 0):.4f}",
-                        "Entropy": f"{stats.get('entropy_loss', 0):.4f}"
-                    })
+                # Reset episode rewards for the environments that finished an episode.
+                for env_idx, done in enumerate(dones):
+                    if done:
+                        avg_reward = sum(episode_rewards[env_idx].values()) / len(episode_rewards[env_idx])
+                        if debug:
+                            print(f"Episode {episode_counts[env_idx]} in env {env_idx} completed with avg reward: {avg_reward:.2f}")
+                        episode_rewards[env_idx] = {agent_id: 0 for agent_id in vec_env.obs_dicts[env_idx]}
 
-                    progress_bar.set_postfix(stats_dict)
+            # Check if it's time to update the policy.
+            time_since_update = time.time() - last_update_time
+            enough_experiences = collected_experiences >= update_interval
 
-                    collected_experiences = 0
-                    last_update_time = time.time()
+            # Update if we've collected enough experiences, or if some time has passed and we have at least a few experiences.
+            if enough_experiences or (collected_experiences > 100 and time_since_update > 30):
+                if debug:
+                    print(f"[DEBUG] Updating policy with {collected_experiences} experiences after {time_since_update:.2f}s")
 
-                # Update the "Exp" (experiences) count in the progress bar.
-                stats_dict["Exp"] = f"{collected_experiences}/{update_interval}"
+                # Perform the policy update.
+                stats = trainer.update()
+
+                # Update the statistics displayed in the progress bar.
+                stats_dict.update({
+                    "Device": device,
+                    "Envs": num_envs,
+                    "Exp": f"0/{update_interval}",  # Reset experience count
+                    "Episodes": total_episodes_so_far,
+                    "Reward": f"{stats.get('mean_episode_reward', 0):.2f}",
+                    "PLoss": f"{stats.get('actor_loss', 0):.4f}",
+                    "VLoss": f"{stats.get('critic_loss', 0):.4f}",
+                    "Entropy": f"{stats.get('entropy_loss', 0):.4f}"
+                })
+
                 progress_bar.set_postfix(stats_dict)
+
+                collected_experiences = 0
+                last_update_time = time.time()
+
+            # Update the experience count in the progress bar.
+            stats_dict["Exp"] = f"{collected_experiences}/{update_interval}"
+            progress_bar.set_postfix(stats_dict)
 
     except KeyboardInterrupt:
         print("\nTraining interrupted. Cleaning up...")
@@ -322,11 +322,11 @@ def run_training(
         traceback.print_exc()
 
     finally:
-        # Always clean up environments and progress bar.
+        # Always clean up the environments and progress bar.
         vec_env.close()
         progress_bar.close()
 
-        # Perform a final policy update if any experiences remain.
+        # Perform a final policy update if there are any remaining experiences.
         if collected_experiences > 0:
             if debug:
                 print(f"[DEBUG] Final update with {collected_experiences} experiences")
@@ -341,12 +341,12 @@ def run_training(
 
 def parse_time(time_str):
     """
-    Parse a time string in format like '5m', '2h', '1d' to seconds
+    Parses a string representing a time duration (e.g., '5m', '2h', '1d') and converts it to seconds.
     """
     if not time_str:
         return None
 
-    # Extract number and unit
+    # Get the number and the unit (minutes, hours, or days).
     time_str = time_str.lower().strip()
     if len(time_str) < 2:
         raise ValueError(f"Invalid time format: {time_str}. Use format like '5m', '2h', '1d'")
@@ -355,7 +355,7 @@ def parse_time(time_str):
         value = float(time_str[:-1])
         unit = time_str[-1]
 
-        # Convert to seconds based on unit
+        # Convert to seconds.
         if unit == 'm':  # minutes
             return value * 60
         elif unit == 'h':  # hours
@@ -371,47 +371,48 @@ def parse_time(time_str):
 
 class VectorizedEnv:
     """
-    Manages multiple independent environments for vectorized execution.
-    This allows us to collect experiences from multiple environments in parallel,
-    while still performing a single forward pass for inference, significantly
-    speeding up the training process.
+    Runs multiple RLGym environments in parallel.  This speeds up training by
+    collecting data from several games at once. The class handles stepping the
+    environments, resetting them when they're done, and rendering one of them
+    if desired.
     """
     def __init__(self, num_envs, render=False):
         self.render = render
-        # Create a single shared renderer if rendering is enabled
+        # Create a single renderer. If rendering is enabled, we only render one environment.
         self.renderer = RLViserRenderer() if render else None
 
-        # Create environments, passing the renderer to the one that will be rendered
+        # Create the environments.
         self.envs = []
         for i in range(num_envs):
-            # Only pass renderer to the first environment when rendering is enabled
+            # Only pass the renderer to the first environment if we're rendering.
             env_renderer = self.renderer if (render and i == 0) else None
             self.envs.append(get_env(renderer=env_renderer))
 
         self.num_envs = num_envs
-        self.render_env_idx = 0  # Only render the first environment
+        self.render_env_idx = 0  # Index of the environment we'll render.
 
-        self.obs_dicts = [env.reset() for env in self.envs]  # Reset all environments to get initial observations
+        # Reset all environments to get initial observations.
+        self.obs_dicts = [env.reset() for env in self.envs]
 
-        # Explicitly trigger rendering after reset if enabled
+        # Explicitly trigger rendering after the initial reset, if enabled.
         if self.render:
             self.envs[self.render_env_idx].render()
 
-        self.dones = [False] * num_envs  # Track which environments have completed an episode
-        self.episode_counts = [0] * num_envs
-        self.is_discrete = True  # RLGYM Discrete actions
+        self.dones = [False] * num_envs  # Track which environments are done.
+        self.episode_counts = [0] * num_envs  # Track episode counts for each environment.
+        self.is_discrete = True  # RLGym uses discrete actions.
 
-        # Use a thread pool to parallelize environment steps
-        self.max_workers = min(32, num_envs)  # Limit the number of threads to avoid excessive overhead
+        # Use a thread pool to run environment steps in parallel.
+        self.max_workers = min(32, num_envs)  # Limit threads to avoid excessive overhead.
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
 
     def _step_env(self, args):
         """
-        Handles a single environment step. Designed to be run in parallel.
+        Steps a single environment.  This function is designed to be run in a thread pool.
         """
         i, env, actions_dict = args
 
-        # Format actions for the RLGym API.
+        # Format actions for the RLGym API.  RLGym expects numpy arrays.
         formatted_actions = {}
         for agent_id, action in actions_dict.items():
             if isinstance(action, np.ndarray):
@@ -421,10 +422,10 @@ class VectorizedEnv:
             else:
                 formatted_actions[agent_id] = np.array([int(action)])
 
-        # Only explicitly render if this is the environment we want to render
+        # Render only the selected environment.
         if self.render and i == self.render_env_idx:
-            env.render()  # Make sure to call render explicitly
-            time.sleep(6/120)  # Slow down rendering to make it more visible
+            env.render()
+            time.sleep(6/120)  # Slow down rendering slightly to make it easier to see.
 
         next_obs_dict, reward_dict, terminated_dict, truncated_dict = env.step(formatted_actions)
 
@@ -432,119 +433,124 @@ class VectorizedEnv:
 
     def step(self, actions_dict_list):
         """
-        Steps all environments forward with their corresponding actions.
+        Steps all environments forward.
         """
         futures = []
         for i, (env, actions_dict) in enumerate(zip(self.envs, actions_dict_list)):
+            # Submit the step function to the thread pool.
             future = self.executor.submit(self._step_env, (i, env, actions_dict))
             futures.append(future)
 
-        # Wait for all steps to complete and collect results in original order
+        # Wait for all steps to complete and collect the results.
         results = [None] * self.num_envs
         for future in concurrent.futures.as_completed(futures):
             i, result = future.result()
-            results[i] = result
+            results[i] = result  # Store results in the correct order.
 
             next_obs_dict, reward_dict, terminated_dict, truncated_dict = result
 
-            # If an episode is done, we need to reset the environment.
+            # Check if the episode is done in this environment.
             self.dones[i] = any(terminated_dict.values()) or any(truncated_dict.values())
 
             if self.dones[i]:
+                # If done, reset the environment.
                 self.episode_counts[i] += 1
                 self.obs_dicts[i] = self.envs[i].reset()
-                # Re-trigger the render after reset for the rendering environment
+                # If rendering, trigger a render after the reset.
                 if self.render and i == self.render_env_idx:
                     self.envs[i].render()
             else:
+                # If not done, just update the observations.
                 self.obs_dicts[i] = next_obs_dict
 
         return results, self.dones.copy(), self.episode_counts.copy()
 
     def close(self):
         """
-        Cleanly shuts down the environments and the thread pool.
+        Closes the environments and shuts down the thread pool.
         """
         self.executor.shutdown()
         for env in self.envs:
             env.close()
 
-        # Explicitly close the renderer if it exists
+        # Close the renderer if it exists.
         if self.renderer:
             self.renderer.close()
 
 
 
 
+
 def signal_handler(sig, frame):
+    """Handles Ctrl+C gracefully, so the program exits cleanly."""
     print("\nInterrupted by user. Cleaning up...")
     sys.exit(0)
 
 if __name__ == "__main__":
 
-    # Register a signal handler for SIGINT (Ctrl+C) to allow graceful termination.
+    # Set up Ctrl+C handler to exit gracefully.
     signal.signal(signal.SIGINT, signal_handler)
 
     parser = argparse.ArgumentParser(description='RLBot Training Script')
-    parser.add_argument('--render', action='store_true', help='Enable rendering')
+    parser.add_argument('--render', action='store_true', help='Enable rendering of the game environment')
 
-    # Create a mutually exclusive group for episode count vs time-based training
+    # Allow user to specify training duration either by episode count OR by time.
     training_duration = parser.add_mutually_exclusive_group()
     training_duration.add_argument('-e', '--episodes', type=int, default=5000, help='Number of episodes to run')
     training_duration.add_argument('-t', '--time', type=str, default=None,
                                   help='Training duration in format: 5m (minutes), 5h (hours), 5d (days)')
 
     parser.add_argument('-n', '--num_envs', type=int, default=os.cpu_count(),
-                        help='Number of parallel environments')
+                        help='Number of parallel environments to run for faster data collection')
     parser.add_argument('--update_interval', type=int, default=min(1000 * (os.cpu_count() or 4), 6000),
-                        help='Experiences before policy update')
+                        help='Number of experiences to collect before updating the policy')
     parser.add_argument('--device', type=str, default=None,
-                       help='Device to use (cuda/mps/cpu). If not specified, will use best available.')
-    parser.add_argument('--wandb', action='store_true', help='Enable Weights & Biases logging')
+                       help='Device to use for training (cuda/mps/cpu).  Autodetects if not specified.')
+    parser.add_argument('--wandb', action='store_true', help='Enable logging to Weights & Biases')
     parser.add_argument('--debug', action='store_true', help='Enable verbose debug logging')
 
 
-    # Hyperparameter arguments
+    # Hyperparameter arguments (these can be tuned to improve performance)
     parser.add_argument('--lra', type=float, default=3e-4, help='Learning rate for actor network')
     parser.add_argument('--lrc', type=float, default=3e-3, help='Learning rate for critic network')
-    parser.add_argument('--gamma', type=float, default=0.997, help='Discount factor')
-    parser.add_argument('--gae_lambda', type=float, default=0.97, help='GAE lambda parameter')
-    parser.add_argument('--clip_epsilon', type=float, default=0.2, help='PPO clip epsilon')
-    parser.add_argument('--critic_coef', type=float, default=0.7, help='Critic loss coefficient')
-    parser.add_argument('--entropy_coef', type=float, default=0.01, help='Entropy coefficient')
+    parser.add_argument('--gamma', type=float, default=0.997, help='Discount factor for future rewards')
+    parser.add_argument('--gae_lambda', type=float, default=0.97, help='Lambda parameter for Generalized Advantage Estimation')
+    parser.add_argument('--clip_epsilon', type=float, default=0.2, help='PPO clipping parameter')
+    parser.add_argument('--critic_coef', type=float, default=0.7, help='Weight of the critic loss')
+    parser.add_argument('--entropy_coef', type=float, default=0.01, help='Weight of the entropy bonus (encourages exploration)')
     parser.add_argument('--max_grad_norm', type=float, default=0.5, help='Maximum gradient norm for clipping')
     parser.add_argument('--ppo_epochs', type=int, default=10, help='Number of PPO epochs per update')
     parser.add_argument('--batch_size', type=int, default=256, help='Batch size for PPO updates')
 
-    parser.add_argument('--compile', action='store_true', help='Use torch.compile for model optimization')
+    parser.add_argument('--compile', action='store_true', help='Use torch.compile for model optimization (if available)')
     parser.add_argument('--no-compile', action='store_false', dest='compile', help='Disable torch.compile')
     parser.set_defaults(compile=True)
 
-    parser.add_argument('--amp', action='store_true', help='Use automatic mixed precision')
+    parser.add_argument('--amp', action='store_true', help='Use automatic mixed precision for faster training (requires CUDA)')
     parser.add_argument('--no-amp', action='store_false', dest='amp', help='Disable automatic mixed precision')
     parser.set_defaults(amp=False)
 
     parser.add_argument('-m', '--model', type=str, default=None,
-                        help='Path to the model file to load (contains both actor and critic)')
+                        help='Path to a pre-trained model file to load')
 
     parser.add_argument('-o', '--out', type=str, default=None,
-                    help='Output path where to save the trained model')
+                    help='Path where the trained model will be saved')
 
     parser.add_argument('--test', action='store_true',
-                        help='Enable test mode: enables rendering and limits to 1 environment')
+                        help='Enable test mode (enables rendering and limits to 1 environment)')
 
 
     parser.add_argument('--save_interval', type=int, default=200,
-                       help='Save models every N episodes')
+                       help='Save the model every N episodes')
 
 
-    # For backwards compatibility with older versions
+    # Backwards compatibility.
     parser.add_argument('-p', '--processes', type=int, default=None,
                         help='Legacy parameter; use --num_envs instead')
 
     args = parser.parse_args()
 
-    # Parse the time argument if provided
+    # If a training time is provided, parse it into seconds.
     training_time_seconds = None
     if args.time is not None:
         try:
@@ -560,24 +566,24 @@ if __name__ == "__main__":
         args.num_envs = 1
         print("Test mode enabled: Rendering ON, using 1 environment")
 
-    # Handle legacy --processes argument
+    # Handle legacy --processes argument.
     if args.processes is not None and args.num_envs == 4:  # 4 is the default for num_envs
         args.num_envs = args.processes
         if args.debug:
             print(f"[DEBUG] Using --processes value ({args.processes}) for number of environments")
 
-    # Initialize environment to get observation and action space dimensions.
+    # Get the dimensions of the observation and action spaces.
     env = get_env()
     env.reset()
     obs_space_dims = env.observation_space(env.agents[0])[1]
     action_space_dims = env.action_space(env.agents[0])[1]
     env.close()
 
-    # Initialize actor and critic networks.
+    # Initialize the actor (policy) and critic (value function) networks.
     actor = SimBa(obs_shape=obs_space_dims, action_shape=action_space_dims)
     critic = SimBa(obs_shape=obs_space_dims, action_shape=1)
 
-    # Determine the best available device.
+    # Use the best available device (CUDA if available, then MPS, then CPU).
     device = args.device
     if device is None:
         if torch.cuda.is_available():
@@ -591,35 +597,33 @@ if __name__ == "__main__":
     torch.set_printoptions(precision=10)
 
     if "cuda" in str(device):
-        # Optimize for CUDA performance.
-        torch.set_float32_matmul_precision('high')
-        # Enable TF32 for faster computations on Ampere GPUs and above.
-        torch.backends.cuda.matmul.allow_tf32 = True
+        # CUDA-specific optimizations.
+        torch.set_float32_matmul_precision('high')  # Use Tensor Cores
+        torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 on Ampere and newer
         torch.backends.cudnn.allow_tf32 = True
 
-        # Settings to improve safety with CUDA graphs.
+        # Try to set bailout depth for CUDA graphs.
         try:
             torch._C._jit_set_bailout_depth(20)
         except AttributeError:
             if args.debug:
                 print("[DEBUG] _jit_set_bailout_depth not available in this PyTorch version")
 
-        # Use current CUDA device.
         torch.cuda.set_device(torch.cuda.current_device())
 
-        # Improve tensor allocation for CUDA graphs.
+        # Improve CUDA graph memory allocation.
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
-        # Dynamo settings for safer CUDA graphs, if available.
+        # Try to configure Dynamo for safer CUDA graphs.
         if hasattr(torch, '_dynamo'):
             try:
-                torch._dynamo.config.cache_size_limit = 16  # Reduce cache size
+                torch._dynamo.config.cache_size_limit = 16  # Limit cache size
                 torch._dynamo.config.suppress_errors = True
             except AttributeError:
                 if args.debug:
                     print("[DEBUG] torch._dynamo.config not available in this PyTorch version")
 
-    # Initialize Weights & Biases for experiment tracking, if enabled.
+    # Set up Weights & Biases for experiment tracking, if enabled.
     if args.wandb:
         import wandb
         wandb.init(
@@ -639,7 +643,7 @@ if __name__ == "__main__":
 
                 # Environment details
                 "action_repeat": 8,
-                "num_agents": 4,  # 2 per team
+                "num_agents": 4,  # 2v2
 
                 # System configuration
                 "episodes": args.episodes,
@@ -649,7 +653,7 @@ if __name__ == "__main__":
                 "device": device,
             },
             name=f"PPO_{time.strftime('%Y%m%d-%H%M%S')}",
-            monitor_gym=False,  # Disable default gym monitoring
+            monitor_gym=False,  # Don't use wandb's default gym monitoring
         )
 
     if args.debug:
@@ -664,17 +668,15 @@ if __name__ == "__main__":
 
     if args.model:
         try:
-            # Load checkpoint to inspect its structure
+            # Load a pre-trained model.
             checkpoint = torch.load(args.model, map_location=device)
 
             if args.debug:
                 print(f"[DEBUG] Loaded checkpoint from {args.model}")
 
-            # Extract model parameters if it's a combined checkpoint
+            # If the checkpoint contains both actor and critic, extract their parameters.
             if isinstance(checkpoint, dict) and 'actor' in checkpoint and 'critic' in checkpoint:
-                # Get dimensions from the actor model
                 actor_obs_shape, actor_hidden_dim, actor_action_shape, actor_num_blocks = extract_model_dimensions(checkpoint['actor'])
-                # Get dimensions from the critic model
                 critic_obs_shape, critic_hidden_dim, critic_action_shape, critic_num_blocks = extract_model_dimensions(checkpoint['critic'])
 
                 if args.debug:
@@ -682,7 +684,7 @@ if __name__ == "__main__":
                     print(f"[DEBUG] Actor: obs_shape={actor_obs_shape}, hidden_dim={actor_hidden_dim}, action_shape={actor_action_shape}, num_blocks={actor_num_blocks}")
                     print(f"[DEBUG] Critic: obs_shape={critic_obs_shape}, hidden_dim={critic_hidden_dim}, action_shape={critic_action_shape}, num_blocks={critic_num_blocks}")
 
-                # Recreate models with the correct dimensions
+                # Recreate the models with the correct dimensions, providing default dims if required.
                 actor = SimBa(
                     obs_shape=actor_obs_shape,
                     action_shape=actor_action_shape,
@@ -697,18 +699,18 @@ if __name__ == "__main__":
                     num_blocks=critic_num_blocks if critic_num_blocks is not None else 4
                 )
 
-                # Load a pre-trained model with the correct dimensions now
+                # Load the pre-trained weights into a temporary trainer (don't compile before loading)
                 temp_trainer = PPOTrainer(
                     actor=actor,
                     critic=critic,
                     device=device,
                     action_dim=int(actor_action_shape) if actor_action_shape is not None else action_space_dims,
-                    use_compile=False  # Don't compile before loading
+                    use_compile=False
                 )
                 temp_trainer.load_models(args.model)
                 print(f"Successfully loaded model from {args.model}")
 
-                # After loading, compile if needed
+                # Compile the models after loading, if requested.
                 if args.compile:
                     if hasattr(torch, 'compile'):
                         try:
@@ -725,7 +727,8 @@ if __name__ == "__main__":
                 import traceback
                 traceback.print_exc()
 
-    # Start the training process.
+    # Start the main training process.  Pass in parameters based on whether we're
+    # training for a set number of episodes or a fixed amount of time.
     trainer = run_training(
         actor=actor,
         critic=critic,
@@ -756,7 +759,7 @@ if __name__ == "__main__":
 
 
 
-    # Save final models
+    # Save the final trained models, unless we're in test mode or training failed.
     if not args.test and trainer is not None:
         output_path = args.out if args.out else None
         saved_path = trainer.save_models(output_path)
