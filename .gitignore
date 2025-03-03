@@ -12,3 +12,5 @@ rlut_meshes/
 wandb/
 models/
 checkpoints/
+models # Useful if symlinked
+checkpoints # Useful if symlinked

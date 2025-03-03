@@ -422,7 +422,6 @@ class PPOTrainer:
 
         print_model_info(self.critic, model_name="Critic", print_amp=self.use_amp)
 
-
     def _create_compiled_gae(self):
         """Create a compiled version of GAE computation for tensor inputs."""
         def _tensor_gae(rewards, values, dones, next_value):

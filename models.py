@@ -227,7 +227,8 @@ class SimBa(nn.Module):
 
         # Initial embedding and dropout.
         h = self.embedding(x_normalized)
-        h = self.dropout(h)
+        if self.training:
+            h = self.dropout(h)
 
         # Apply the residual blocks.
         for i, block in enumerate(self.blocks):
@@ -303,7 +304,8 @@ class ResidualFFBlock(nn.Module):
         # First linear layer, ReLU activation, and dropout.
         h = self.linear1(norm_x)
         h = F.relu(h)
-        h = self.dropout1(h)
+        if self.training:
+            h = self.dropout1(h)
 
         # Mark step between linear layers.
         if self.device and "cuda" in str(self.device):
@@ -311,7 +313,8 @@ class ResidualFFBlock(nn.Module):
 
         # Second linear layer and dropout.
         h = self.linear2(h)
-        h = self.dropout2(h)
+        if self.training:
+            h = self.dropout2(h)
 
         # Mark step before residual connection.
         if self.device and "cuda" in str(self.device):

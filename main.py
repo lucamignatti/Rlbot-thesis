@@ -109,6 +109,14 @@ def run_training(
         use_amp=use_amp
     )
 
+    #  Use train mode for training and eval for testing
+    if args.test:
+        trainer.actor.eval()
+        trainer.critic.eval()
+    else:
+        trainer.actor.train()
+        trainer.critic.train()
+
     # Use a vectorized environment for parallel data collection.
     vec_env = VectorizedEnv(num_envs=num_envs, render=render)
 
@@ -284,8 +292,8 @@ def run_training(
             time_since_update = time.time() - last_update_time
             enough_experiences = collected_experiences >= update_interval
 
-            # Update if we've collected enough experiences, or if some time has passed and we have at least a few experiences.
-            if enough_experiences or (collected_experiences > 100 and time_since_update > 30):
+            # Update if we've collected enough experiences, or if some time has passed and we have at least a few experiences. skip if testing.
+            if (enough_experiences or (collected_experiences > 100 and time_since_update > 30)) and not args.test:
                 if debug:
                     print(f"[DEBUG] Updating policy with {collected_experiences} experiences after {time_since_update:.2f}s")
 
