@@ -10,7 +10,7 @@ rlut_meshes/
 
 # outputs
 wandb/
+/models
+/checkpoints
 models/
 checkpoints/
-models # Useful if symlinked
-checkpoints # Useful if symlinked
