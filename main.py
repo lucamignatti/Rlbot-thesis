@@ -546,6 +546,13 @@ if __name__ == "__main__":
     parser.add_argument('--save_interval', type=int, default=200,
                        help='Save the model every N episodes')
 
+    parser.add_argument('--hidden_dim', type=int, default=1536, help='Hidden dimension for the network')
+    parser.add_argument('--num_blocks', type=int, default=6, help='Number of residual blocks in the network')
+    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate for regularization')
+    parser.add_argument('--model_type', type=str, default='simba', choices=['simba', 'basic'],
+                       help='Type of model to use (simba or basic)')
+
+
 
     # Backwards compatibility.
     parser.add_argument('-p', '--processes', type=int, default=None,
@@ -582,9 +589,6 @@ if __name__ == "__main__":
     action_space_dims = env.action_space(env.agents[0])[1]
     env.close()
 
-    # Initialize the actor (policy) and critic (value function) networks.
-    actor = SimBa(obs_shape=obs_space_dims, action_shape=action_space_dims)
-    critic = SimBa(obs_shape=obs_space_dims, action_shape=1)
     # Use the best available device (CUDA if available, then MPS, then CPU).
     device = args.device
     if device is None:
@@ -595,6 +599,19 @@ if __name__ == "__main__":
         else:
             device = "cpu"
 
+    # Initialize the actor (policy) and critic (value function) networks.
+    if args.model_type == 'simba':
+        actor = SimBa(obs_shape=obs_space_dims, action_shape=action_space_dims,
+                      hidden_dim=args.hidden_dim, num_blocks=args.num_blocks,
+                      dropout_rate=args.dropout, device=device)
+        critic = SimBa(obs_shape=obs_space_dims, action_shape=1,
+                      hidden_dim=args.hidden_dim, num_blocks=args.num_blocks,
+                      dropout_rate=args.dropout, device=device)
+    else:
+        actor = BasicModel(input_size=obs_space_dims, output_size=action_space_dims,
+                          hidden_size=args.hidden_dim, dropout_rate=args.dropout)
+        critic = BasicModel(input_size=obs_space_dims, output_size=1,
+                          hidden_size=args.hidden_dim, dropout_rate=args.dropout)
 
     torch.set_printoptions(precision=10)
 
@@ -642,6 +659,12 @@ if __name__ == "__main__":
                 "max_grad_norm": args.max_grad_norm,
                 "ppo_epochs": args.ppo_epochs,
                 "batch_size": args.batch_size,
+
+                # Model Details
+                "hidden_dim": args.hidden_dim,
+                "num_blocks": args.num_blocks,
+                "dropout": args.dropout,
+                "model_type": args.model_type,
 
                 # Environment details
                 "action_repeat": 8,
@@ -754,9 +777,76 @@ if __name__ == "__main__":
 
 
     # Save the final trained models, unless we're in test mode or training failed.
+    saved_path = None
     if not args.test and trainer is not None:
         output_path = args.out if args.out else None
         saved_path = trainer.save_models(output_path)
         print(f"Training complete - Model saved to {saved_path}")
     else:
         print("Training failed or in test mode - no model saved.")
+
+    # Upload the saved model to WandB as an artifact
+    if args.wandb and saved_path and os.path.exists(saved_path):
+        try:
+            import wandb
+            if wandb.run is not None:
+                # Create a name for the artifact
+                artifact_name = f"model_{wandb.run.id}"
+                if args.time is not None:
+                    artifact_name += f"_t{int(parse_time(args.time) if args.time else 0)}s"
+                else:
+                    artifact_name += f"_ep{args.episodes}"
+
+                # Log the model as an artifact with metadata
+                artifact = wandb.Artifact(
+                    name=artifact_name,
+                    type="model",
+                    description=f"RL model trained for {args.episodes if args.time is None else args.time}"
+                )
+
+                # Add the model file
+                artifact.add_file(saved_path)
+
+                # Add metadata
+                metadata = {
+                    "episodes": args.episodes if args.time is None else None,
+                    "training_time": args.time,
+                    "device": str(device),
+                    "lr_actor": args.lra,
+                    "lr_critic": args.lrc,
+                    "gamma": args.gamma,
+                    "gae_lambda": args.gae_lambda,
+                    "clip_epsilon": args.clip_epsilon,
+                    "critic_coef": args.critic_coef,
+                    "entropy_coef": args.entropy_coef,
+                    "model_type": type(actor).__name__,
+                    "num_envs": args.num_envs,
+                    "update_interval": args.update_interval,
+                    "saved_path": saved_path,
+                    'model_config': {
+                        'model_type': args.model_type,
+                        'hidden_dim': args.hidden_dim,
+                        'num_blocks': args.num_blocks,
+                        'dropout': args.dropout
+                    },
+                }
+
+                # Add metadata to the artifact
+                for key, value in metadata.items():
+                    if value is not None:  # Only add non-None values
+                        artifact.metadata[key] = value
+
+                # Log the artifact to wandb
+                wandb.log_artifact(artifact)
+
+                if args.debug:
+                    print(f"[DEBUG] Uploaded model to WandB as artifact '{artifact_name}'")
+                else:
+                    print(f"Uploaded model to WandB as artifact '{artifact_name}'")
+        except ImportError:
+            print("WandB not available, skipping artifact upload")
+        except Exception as e:
+            print(f"Error uploading model to WandB: {str(e)}")
+            if args.debug:
+                import traceback
+                traceback.print_exc()
