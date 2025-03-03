@@ -48,7 +48,6 @@ def get_env(renderer=None):
         renderer=renderer  # Use the renderer if one was provided.
     )
 
-
 def run_training(
     actor,
     critic,
@@ -477,10 +476,6 @@ class VectorizedEnv:
         if self.renderer:
             self.renderer.close()
 
-
-
-
-
 def signal_handler(sig, frame):
     """Handles Ctrl+C gracefully, so the program exits cleanly."""
     print("\nInterrupted by user. Cleaning up...")
@@ -582,7 +577,6 @@ if __name__ == "__main__":
     # Initialize the actor (policy) and critic (value function) networks.
     actor = SimBa(obs_shape=obs_space_dims, action_shape=action_space_dims)
     critic = SimBa(obs_shape=obs_space_dims, action_shape=1)
-
     # Use the best available device (CUDA if available, then MPS, then CPU).
     device = args.device
     if device is None:

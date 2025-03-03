@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical, Normal
 from torch.amp import autocast, GradScaler
-from models import fix_compiled_state_dict
+from models import fix_compiled_state_dict, print_model_info
 from typing import Union, Tuple
 import time
 import wandb
@@ -418,6 +418,11 @@ class PPOTrainer:
 
         if self.use_wandb:
             wandb.log({"device": self.device})
+
+        print_model_info(self.actor, model_name="Actor", print_amp=self.use_amp)
+
+        print_model_info(self.critic, model_name="Critic", print_amp=self.use_amp)
+
 
     def _create_compiled_gae(self):
         """Create a compiled version of GAE computation for tensor inputs."""
@@ -1370,8 +1375,20 @@ class PPOTrainer:
                         safe_metrics["reward_mean"] = float(self.ret_rms.mean)
                         safe_metrics["reward_var"] = float(self.ret_rms.var)
 
+                    # Initialize step counters if they don't exist
+                    if not hasattr(self, 'training_steps'):
+                        self.training_steps = 0
+                    if not hasattr(self, 'training_step_offset'):
+                        self.training_step_offset = 0
+
+                    # Increment step counter
+                    self.training_steps += 1
+
+                    # Use combined step count for logging
+                    global_step = self.training_steps + self.training_step_offset
+
                     import wandb
-                    wandb.log(safe_metrics)
+                    wandb.log(safe_metrics, step=global_step)
             except Exception as e:
                 if self.debug:
                     print(f"[DEBUG] Failed to log to wandb: {e}")
@@ -1419,12 +1436,25 @@ class PPOTrainer:
         actor_state = self.actor._orig_mod.state_dict() if hasattr(self.actor, '_orig_mod') else self.actor.state_dict()
         critic_state = self.critic._orig_mod.state_dict() if hasattr(self.critic, '_orig_mod') else self.critic.state_dict()
 
+        # Get the WandB run ID if available
+        wandb_run_id = None
+        if self.use_wandb:
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb_run_id = wandb.run.id
+            except ImportError:
+                pass
+
         # Save both models to a single file.
         torch.save({
             'actor': actor_state,
             'critic': critic_state,
+            'training_step': getattr(self, 'training_steps', 0) + getattr(self, 'training_step_offset', 0),
+            'total_episodes': getattr(self, 'total_episodes', 0) + getattr(self, 'total_episodes_offset', 0),
             'timestamp': time.time(),
-            'version': '1.0'
+            'version': '1.0',
+            'wandb_run_id': wandb_run_id
         }, model_path)
 
         return model_path
@@ -1451,6 +1481,20 @@ class PPOTrainer:
             # Load the fixed state dictionaries
             self.actor.load_state_dict(actor_state)
             self.critic.load_state_dict(critic_state)
+
+            # Get training step count if available, defaulting to 0 if not found
+            self.training_step_offset = checkpoint.get('training_step', 0)
+            self.total_episodes_offset = checkpoint.get('total_episodes', 0)
+
+            if self.use_wandb and 'wandb_run_id' in checkpoint:
+                # Resume the existing WandB run if possible
+                import wandb
+                if wandb.run is None:
+                    try:
+                        wandb.init(id=checkpoint['wandb_run_id'], resume="must")
+                    except Exception as e:
+                        self.debug_print(f"Could not resume WandB run: {e}. Starting new run.")
+
             self.debug_print(f"Loaded models from unified checkpoint: {model_path}")
             return True
         else:

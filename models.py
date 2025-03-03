@@ -5,6 +5,37 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 import numpy as np
 
+
+def print_model_info(model, model_name, print_amp=False):
+    """
+    Prints model information in a clean, multi-line format
+    """
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+
+    # Get device
+    device = next(model.parameters()).device
+
+    # Print in a consistent multi-line format
+    print(f"\n{model_name}:")
+    print(f"Parameters: {total_params:,}")
+
+    if hasattr(model, 'obs_shape'):
+        print(f"Obs Shape: {model.obs_shape}")
+
+    if hasattr(model, 'action_shape'):
+        print(f"Act Shape: {model.action_shape}")
+
+    print(f"Device: {device}")
+
+    if hasattr(model, '_orig_mod'):
+        print("Status: Compiled")
+    else:
+        print("Status: Not compiled")
+
+    print("AMP: Enabled" if print_amp else "AMP: Disabled")
+
+
 def fix_compiled_state_dict(state_dict):
     """
     Fixes state dictionaries saved from compiled models.
@@ -103,7 +134,7 @@ class MPSFriendlyDropout(nn.Module):
         return x * mask
 
 class SimBa(nn.Module):
-    def __init__(self, obs_shape, action_shape, hidden_dim=1024, num_blocks=4,
+    def __init__(self, obs_shape, action_shape, hidden_dim=1536, num_blocks=6,
                  dropout_rate=0.1, device="cpu"):
         super(SimBa, self).__init__()
         self.device = device
