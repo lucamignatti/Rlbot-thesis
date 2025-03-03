@@ -5,6 +5,38 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 import numpy as np
 
+def load_partial_state_dict(model, state_dict):
+    """
+    Loads parts of the state dictionary that match the model's
+    parameter names, skipping layers that don't match.
+    """
+    # Fix compiled state if needed
+    state_dict = fix_compiled_state_dict(state_dict)
+
+    model_dict = model.state_dict()
+
+    # Filter out mismatched keys
+    filtered_dict = {}
+    mismatched = []
+    for k, v in state_dict.items():
+        if k in model_dict:
+            if v.shape == model_dict[k].shape:
+                filtered_dict[k] = v
+            else:
+                mismatched.append(f"{k}: saved {v.shape}, model {model_dict[k].shape}")
+        else:
+            mismatched.append(f"{k}: not in model")
+
+    if mismatched:
+        print(f"Warning: Skipped {len(mismatched)} mismatched parameters:")
+        for msg in mismatched[:5]:  # Print first few mismatches
+            print(f"  - {msg}")
+        if len(mismatched) > 5:
+            print(f"  ... and {len(mismatched) - 5} more")
+
+    # Update the model with the filtered state dict
+    model.load_state_dict(filtered_dict, strict=False)
+    return len(mismatched)
 
 def print_model_info(model, model_name, print_amp=False):
     """
@@ -35,6 +67,42 @@ def print_model_info(model, model_name, print_amp=False):
 
     print("AMP: Enabled" if print_amp else "AMP: Disabled")
 
+def extract_model_dimensions(state_dict):
+    """
+    Extracts model dimensions from a saved state dictionary.
+
+    Returns:
+        tuple: (observation_shape, hidden_dim, action_shape, num_blocks)
+    """
+    # Remove _orig_mod prefix if present for easier access to keys
+    fixed_dict = fix_compiled_state_dict(state_dict)
+
+    # First, find embedding layer to get input shape and hidden dimension
+    hidden_dim = None
+    obs_shape = None
+    action_shape = None
+    num_blocks = 0
+
+    # Find key patterns to extract dimensions
+    for key in fixed_dict.keys():
+        if 'embedding.weight' in key:
+            if hidden_dim is None:
+                hidden_dim = fixed_dict[key].shape[0]  # First dimension is hidden_dim
+            if obs_shape is None:
+                obs_shape = fixed_dict[key].shape[1]   # Second dimension is input shape
+
+        if 'output_layer.weight' in key:
+            if action_shape is None:
+                action_shape = fixed_dict[key].shape[0]  # First dimension is output shape
+
+        # Count blocks by looking for block-specific parameters
+        if 'blocks.' in key:
+            parts = key.split('.')
+            if len(parts) > 2 and parts[0] == 'blocks' and parts[1].isdigit():
+                block_num = int(parts[1])
+                num_blocks = max(num_blocks, block_num + 1)  # +1 because 0-indexed
+
+    return (obs_shape, hidden_dim, action_shape, num_blocks)
 
 def fix_compiled_state_dict(state_dict):
     """
@@ -67,41 +135,6 @@ def fix_compiled_state_dict(state_dict):
         return fix_compiled_state_dict(fixed_dict)
 
     return fixed_dict
-
-def extract_model_dimensions(state_dict):
-    """
-    Extracts model dimensions from a saved state dictionary.
-
-    Returns:
-        tuple: (observation_shape, hidden_dim, action_shape, num_blocks)
-    """
-    # Remove _orig_mod prefix if present for easier access to keys
-    fixed_dict = fix_compiled_state_dict(state_dict)
-
-    # First, find embedding layer to get input shape and hidden dimension
-    hidden_dim = None
-    obs_shape = None
-    action_shape = None
-    num_blocks = 0
-
-    # Find key patterns to extract dimensions
-    for key in fixed_dict.keys():
-        if 'embedding.weight' in key:
-            if hidden_dim is None:
-                hidden_dim = fixed_dict[key].shape[0]  # First dimension is hidden_dim
-            if obs_shape is None:
-                obs_shape = fixed_dict[key].shape[1]   # Second dimension is input shape
-
-        if 'output_layer.weight' in key:
-            if action_shape is None:
-                action_shape = fixed_dict[key].shape[0]  # First dimension is output shape
-
-        # Count blocks by looking for block-specific parameters
-        if 'blocks.' in key:
-            block_num = int(key.split('.')[1])
-            num_blocks = max(num_blocks, block_num + 1)  # +1 because 0-indexed
-
-    return (obs_shape, hidden_dim, action_shape, num_blocks)
 
 class BasicModel(nn.Module):
     def __init__(self, input_size = 784, output_size = 10, hidden_size = 64, dropout_rate = 0.5):
@@ -299,84 +332,72 @@ class RSNorm(nn.Module):
         super(RSNorm, self).__init__()
         self.num_features = num_features
         self.eps = eps  # Small constant to avoid division by zero.
-        self.momentum = momentum # Momentum for updating running statistics.
+        self.momentum = momentum  # Momentum for updating running statistics.
 
         # Initialize running statistics (mean and variance) as buffers.
-        # Buffers are not updated during backpropagation, but are moved to the device with the model.
         self.register_buffer('running_mean', torch.zeros(num_features))
         self.register_buffer('running_var', torch.ones(num_features))
         self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
 
     def forward(self, x):
-        device = x.device
+        # Disable compilation on MPS device - it's causing issues
+        if "mps" in str(x.device):
+            torch._dynamo.config.suppress_errors = True
 
         # Clone to avoid in-place modifications.
         x = x.clone()
 
         # Ensure running statistics are on the same device as the input.
-        if self.running_mean.device != device:
-            self.running_mean = self.running_mean.to(device)
-            self.running_var = self.running_var.to(device)
-            self.num_batches_tracked = self.num_batches_tracked.to(device)
+        device = x.device
+        self.running_mean = self.running_mean.to(device)
+        self.running_var = self.running_var.to(device)
+        self.num_batches_tracked = self.num_batches_tracked.to(device)
 
-        # Mark CUDA graph step if on CUDA device
-        if "cuda" in str(device):
-            torch.compiler.cudagraph_mark_step_begin()
+        # Get batch size and feature dimensions
+        if x.dim() == 1:  # Case for single vector input
+            batch_size = 1
+            feature_dim = x.size(0)
+            x = x.view(1, -1)  # Add batch dimension for consistency
+        else:  # Case for batched input
+            batch_size = x.size(0)
+            feature_dim = x.size(1)
+
+        # Ensure feature dimensions match
+        if feature_dim != self.num_features:
+            # If feature dimensions don't match, try to handle it gracefully
+            if self.training:
+                # During training, resize running stats to match input
+                self.num_features = feature_dim
+                self.running_mean = torch.zeros(feature_dim, device=device)
+                self.running_var = torch.ones(feature_dim, device=device)
+            else:
+                # During evaluation, this is an error
+                raise ValueError(f"Expected input features {self.num_features}, got {feature_dim}")
 
         if self.training:
-            # Calculate batch statistics (mean and variance).
-            batch_mean = x.mean(dim=0, keepdim=True)
-            batch_var = x.var(dim=0, unbiased=False, keepdim=True)
+            # Calculate batch statistics
+            batch_mean = x.mean(dim=0)
+            batch_var = x.var(dim=0, unbiased=False)
 
-            # Mark step before modifying buffers
-            if "cuda" in str(device):
-                torch.compiler.cudagraph_mark_step_begin()
+            # Update tracker count
+            with torch.no_grad():
+                self.num_batches_tracked += 1
 
-            # Update the count of batches seen.  We clone to keep the graph intact.
-            cloned_num_batches = self.num_batches_tracked.clone()
-            cloned_num_batches += 1
-
-            # Mark step before updating buffer
-            if "cuda" in str(device):
-                torch.compiler.cudagraph_mark_step_begin()
-
-            self.num_batches_tracked.copy_(cloned_num_batches)
-
-            # Determine the update factor for the running statistics.
+            # Update factor depends on whether this is the first batch
             update_factor = self.momentum
-            # If it's the first batch, use the batch statistics directly.
             if self.num_batches_tracked == 1:
                 update_factor = 1.0
 
-            # Mark step before modifying running stats
-            if "cuda" in str(device):
-                torch.compiler.cudagraph_mark_step_begin()
+            # Update running statistics with safe operations
+            with torch.no_grad():
+                self.running_mean = (1 - update_factor) * self.running_mean + update_factor * batch_mean.detach()
+                self.running_var = (1 - update_factor) * self.running_var + update_factor * batch_var.detach()
 
-            # Update running statistics using exponential moving average.
-            new_running_mean = (1 - update_factor) * self.running_mean + update_factor * batch_mean.squeeze()
-            new_running_var = (1 - update_factor) * self.running_var + update_factor * batch_var.squeeze()
-
-            # Mark step before updating buffers
-            if "cuda" in str(device):
-                torch.compiler.cudagraph_mark_step_begin()
-
-            # Copy the new running statistics to the buffers.
-            self.running_mean.copy_(new_running_mean)
-            self.running_var.copy_(new_running_var)
-
-            # Mark step after buffer updates.
-            if "cuda" in str(device):
-                torch.compiler.cudagraph_mark_step_begin()
-
-            # Normalize using batch statistics.
-            normalized = (x - batch_mean) / torch.sqrt(batch_var + self.eps)
+            # Normalize using batch statistics
+            normalized = (x - batch_mean.unsqueeze(0)) / torch.sqrt(batch_var.unsqueeze(0) + self.eps)
         else:
-            # Normalize using running statistics during evaluation.
+            # Normalize using running statistics
             normalized = (x - self.running_mean.unsqueeze(0)) / torch.sqrt(self.running_var.unsqueeze(0) + self.eps)
 
-        # Mark step after normalization.
-        if "cuda" in str(device):
-            torch.compiler.cudagraph_mark_step_begin()
-
         # Return a clone to prevent in-place operations but still maintain gradient information.
-        return normalized.clone()
+        return normalized

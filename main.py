@@ -11,7 +11,7 @@ from rlgym.rocket_league.sim import RocketSimEngine
 from rlgym.rocket_league.rlviser import RLViserRenderer
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
 from rewards import BallProximityReward, BallNetProximityReward
-from models import BasicModel, SimBa, fix_compiled_state_dict, extract_model_dimensions
+from models import BasicModel, SimBa, fix_compiled_state_dict, extract_model_dimensions, load_partial_state_dict
 from training import PPOTrainer
 import concurrent.futures
 import time
@@ -673,12 +673,19 @@ if __name__ == "__main__":
                 actor_obs_shape, actor_hidden_dim, actor_action_shape, actor_num_blocks = extract_model_dimensions(checkpoint['actor'])
                 critic_obs_shape, critic_hidden_dim, critic_action_shape, critic_num_blocks = extract_model_dimensions(checkpoint['critic'])
 
+                # Validate and fix observation shape if needed
+                if actor_obs_shape != obs_space_dims:
+                    print(f"Warning: Model expects observation shape {actor_obs_shape}, but environment has {obs_space_dims}.")
+                    print("Using environment's observation shape for model.")
+                    actor_obs_shape = obs_space_dims
+                    critic_obs_shape = obs_space_dims
+
                 if args.debug:
                     print("[DEBUG] Extracted model dimensions from checkpoint:")
                     print(f"[DEBUG] Actor: obs_shape={actor_obs_shape}, hidden_dim={actor_hidden_dim}, action_shape={actor_action_shape}, num_blocks={actor_num_blocks}")
                     print(f"[DEBUG] Critic: obs_shape={critic_obs_shape}, hidden_dim={critic_hidden_dim}, action_shape={critic_action_shape}, num_blocks={critic_num_blocks}")
 
-                # Recreate the models with the correct dimensions, providing default dims if required.
+                # Recreate the models with the correct dimensions
                 actor = SimBa(
                     obs_shape=actor_obs_shape,
                     action_shape=actor_action_shape,
@@ -693,26 +700,11 @@ if __name__ == "__main__":
                     num_blocks=critic_num_blocks if critic_num_blocks is not None else 4
                 )
 
-                # Load the pre-trained weights into a temporary trainer (don't compile before loading)
-                temp_trainer = PPOTrainer(
-                    actor=actor,
-                    critic=critic,
-                    device=device,
-                    action_dim=int(actor_action_shape) if actor_action_shape is not None else action_space_dims,
-                    use_compile=False
-                )
-                temp_trainer.load_models(args.model)
-                print(f"Successfully loaded model from {args.model}")
+                # Load the model weights, skipping mismatched layers
+                load_partial_state_dict(actor, checkpoint['actor'])
+                load_partial_state_dict(critic, checkpoint['critic'])
+                print(f"Successfully loaded model from {args.model} with adjusted dimensions")
 
-                # Compile the models after loading, if requested.
-                if args.compile:
-                    if hasattr(torch, 'compile'):
-                        try:
-                            actor = torch.compile(actor)
-                            critic = torch.compile(critic)
-                            print("Models compiled after loading")
-                        except Exception as e:
-                            print(f"Warning: Failed to compile models after loading: {e}")
             else:
                 print(f"Error: Unsupported model format in {args.model}")
         except Exception as e:
