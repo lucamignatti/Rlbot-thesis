@@ -10,7 +10,7 @@ from rlgym.rocket_league.reward_functions import CombinedReward, GoalReward, Tou
 from rlgym.rocket_league.sim import RocketSimEngine
 from rlgym.rocket_league.rlviser import RLViserRenderer
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
-from rewards import BallProximityReward, BallNetProximityReward
+from rewards import BallProximityReward, BallToGoalDistanceReward, BallVelocityToGoalReward, TouchBallReward, TouchBallToGoalAccelerationReward, AlignBallToGoalReward, PlayerVelocityTowardBallReward, KRCReward
 from models import BasicModel, SimBa, fix_compiled_state_dict, extract_model_dimensions, load_partial_state_dict
 from training import PPOTrainer
 import concurrent.futures
@@ -28,24 +28,53 @@ def get_env(renderer=None):
     """
     return RLGym(
         state_mutator=MutatorSequence(
-            FixedTeamSizeMutator(blue_size=2, orange_size=2),  # Forces 2v2 matches for consistency.
-            KickoffMutator()  # Start each episode with a kickoff for standardized training.
+            FixedTeamSizeMutator(blue_size=2, orange_size=2),
+            KickoffMutator()
         ),
-        obs_builder=DefaultObs(zero_padding=2),  # Padding for up to 4 players, even though we're using 2v2.
-        action_parser=RepeatAction(LookupTableAction(), repeats=8),  # Repeat each action 8 times for smoother control.
-        reward_fn=CombinedReward(  # Combine multiple rewards for a more complete training signal.
-            (GoalReward(), 12.),  # Large reward for scoring, since that's the main objective.
-            (TouchReward(), 6.),  # Moderate reward for touching the ball, encourages interaction.
-            (BallNetProximityReward(), 3.),  # Smaller reward for getting the ball towards the opponent's goal.
-            (BallProximityReward(), 1.),  # Small reward for just getting closer to the ball.
+        obs_builder=DefaultObs(zero_padding=2),
+        action_parser=RepeatAction(LookupTableAction(), repeats=8),
+        reward_fn=CombinedReward(
+            # Primary objective rewards - slightly increased to emphasize scoring
+            (GoalReward(), 15.0),
+
+            # Offensive Potential KRC group (from paper)
+            (KRCReward([
+                (AlignBallToGoalReward(dispersion=1.1, density=1.0), 1.0),
+                (BallProximityReward(dispersion=0.8, density=1.2), 0.8),
+                (PlayerVelocityTowardBallReward(), 0.6)
+            ], team_spirit=0.3), 8.0),
+
+            # Ball Control KRC group
+            (KRCReward([
+                (TouchBallToGoalAccelerationReward(), 1.0),
+                (TouchBallReward(), 0.8),
+                (BallVelocityToGoalReward(), 0.6)
+            ], team_spirit=0.3), 6.0),
+
+            # Distance-weighted Alignment KRC group (from paper)
+            (KRCReward([
+                (AlignBallToGoalReward(dispersion=1.1, density=1.0), 1.0),
+                (BallProximityReward(dispersion=0.8, density=1.2), 0.8)
+            ], team_spirit=0.3), 4.0),
+
+            # Strategic Ball Positioning
+            (KRCReward([
+                (BallToGoalDistanceReward(
+                    offensive_dispersion=0.6,
+                    defensive_dispersion=0.4,
+                    offensive_density=1.0,
+                    defensive_density=1.0
+                ), 1.0),
+                (BallProximityReward(dispersion=0.7, density=1.0), 0.4)
+            ], team_spirit=0.3), 2.0),
         ),
-        termination_cond=GoalCondition(),  # End the episode when a goal is scored.
-        truncation_cond=AnyCondition(  # But also end the episode if things get stuck.
-            TimeoutCondition(300.),  # Max episode length of 37.5 seconds (300 steps / 8 repeats).
-            NoTouchTimeoutCondition(30.)  # Or if the ball hasn't been touched for a while.
+        termination_cond=GoalCondition(),
+        truncation_cond=AnyCondition(
+            TimeoutCondition(300.),
+            NoTouchTimeoutCondition(30.)
         ),
-        transition_engine=RocketSimEngine(),  # Use the default physics engine.
-        renderer=renderer  # Use the renderer if one was provided.
+        transition_engine=RocketSimEngine(),
+        renderer=renderer
     )
 
 def run_training(
@@ -514,16 +543,16 @@ if __name__ == "__main__":
 
 
     # Hyperparameter arguments (these can be tuned to improve performance)
-    parser.add_argument('--lra', type=float, default=3e-4, help='Learning rate for actor network')
+    parser.add_argument('--lra', type=float, default=1e-4, help='Learning rate for actor network')
     parser.add_argument('--lrc', type=float, default=3e-3, help='Learning rate for critic network')
-    parser.add_argument('--gamma', type=float, default=0.997, help='Discount factor for future rewards')
-    parser.add_argument('--gae_lambda', type=float, default=0.97, help='Lambda parameter for Generalized Advantage Estimation')
+    parser.add_argument('--gamma', type=float, default=0.999, help='Discount factor for future rewards')
+    parser.add_argument('--gae_lambda', type=float, default=0.98, help='Lambda parameter for Generalized Advantage Estimation')
     parser.add_argument('--clip_epsilon', type=float, default=0.2, help='PPO clipping parameter')
-    parser.add_argument('--critic_coef', type=float, default=0.7, help='Weight of the critic loss')
+    parser.add_argument('--critic_coef', type=float, default=0.85, help='Weight of the critic loss')
     parser.add_argument('--entropy_coef', type=float, default=0.01, help='Weight of the entropy bonus (encourages exploration)')
     parser.add_argument('--max_grad_norm', type=float, default=0.5, help='Maximum gradient norm for clipping')
     parser.add_argument('--ppo_epochs', type=int, default=10, help='Number of PPO epochs per update')
-    parser.add_argument('--batch_size', type=int, default=256, help='Batch size for PPO updates')
+    parser.add_argument('--batch_size', type=int, default=1024, help='Batch size for PPO updates')
 
     parser.add_argument('--compile', action='store_true', help='Use torch.compile for model optimization (if available)')
     parser.add_argument('--no-compile', action='store_false', dest='compile', help='Disable torch.compile')
@@ -549,9 +578,6 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_dim', type=int, default=1536, help='Hidden dimension for the network')
     parser.add_argument('--num_blocks', type=int, default=6, help='Number of residual blocks in the network')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate for regularization')
-    parser.add_argument('--model_type', type=str, default='simba', choices=['simba', 'basic'],
-                       help='Type of model to use (simba or basic)')
-
 
 
     # Backwards compatibility.
@@ -599,19 +625,12 @@ if __name__ == "__main__":
         else:
             device = "cpu"
 
-    # Initialize the actor (policy) and critic (value function) networks.
-    if args.model_type == 'simba':
-        actor = SimBa(obs_shape=obs_space_dims, action_shape=action_space_dims,
-                      hidden_dim=args.hidden_dim, num_blocks=args.num_blocks,
-                      dropout_rate=args.dropout, device=device)
-        critic = SimBa(obs_shape=obs_space_dims, action_shape=1,
-                      hidden_dim=args.hidden_dim, num_blocks=args.num_blocks,
-                      dropout_rate=args.dropout, device=device)
-    else:
-        actor = BasicModel(input_size=obs_space_dims, output_size=action_space_dims,
-                          hidden_size=args.hidden_dim, dropout_rate=args.dropout)
-        critic = BasicModel(input_size=obs_space_dims, output_size=1,
-                          hidden_size=args.hidden_dim, dropout_rate=args.dropout)
+    actor = SimBa(obs_shape=obs_space_dims, action_shape=action_space_dims,
+                    hidden_dim=args.hidden_dim, num_blocks=args.num_blocks,
+                    dropout_rate=args.dropout, device=device)
+    critic = SimBa(obs_shape=obs_space_dims, action_shape=1,
+                    hidden_dim=args.hidden_dim, num_blocks=args.num_blocks,
+                    dropout_rate=args.dropout, device=device)
 
     torch.set_printoptions(precision=10)
 
