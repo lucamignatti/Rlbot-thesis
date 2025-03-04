@@ -710,6 +710,19 @@ class PPOTrainer:
         else:
             self.memory.store(state, action, log_prob, reward, value, done)
 
+        # Update auxiliary task history
+        if self.use_auxiliary_tasks and state is not None and reward is not None:
+            state_tensor = torch.FloatTensor(state).to(self.device) if not isinstance(state, torch.Tensor) else state
+            reward_tensor = torch.tensor(reward, dtype=torch.float32, device=self.device)
+
+            # Add batch dimension if needed
+            if state_tensor.dim() == 1:
+                state_tensor = state_tensor.unsqueeze(0)
+            if not isinstance(reward_tensor, torch.Tensor) or reward_tensor.dim() == 0:
+                reward_tensor = reward_tensor.unsqueeze(0)
+
+            self.aux_task_manager.update(state_tensor, reward_tensor)
+
     def store_experience_at_idx(self, idx, state, action, log_prob, reward, value, done):
         """
         Update specific fields of an existing experience entry.
@@ -1312,6 +1325,11 @@ class PPOTrainer:
                             aux_loss = sr_loss + rp_loss
                             total_aux_loss += aux_loss.item()
 
+                            aux_metrics = {
+                                'sr_loss': float(sr_loss.item()) if isinstance(sr_loss, torch.Tensor) else 0.0,
+                                'rp_loss': float(rp_loss.item()) if isinstance(rp_loss, torch.Tensor) else 0.0
+                            }
+
                             # Store previous loss if not exists
                             if not hasattr(self, 'previous_aux_loss'):
                                 self.previous_aux_loss = aux_loss.item()
@@ -1563,8 +1581,8 @@ class PPOTrainer:
             "kl_divergence": kl_div,
             "effective_clip_epsilon": effective_clip_epsilon,
             "update_time": time.time() - update_start,
-            "sr_loss": aux_metrics.get('sr_loss', 0.0), # From aux_metrics
-            "rp_loss": aux_metrics.get('rp_loss', 0.0),  # From aux_metrics
+            "sr_loss": aux_metrics.get('sr_loss', 0.0),
+            "rp_loss": aux_metrics.get('rp_loss', 0.0),
             "aux_loss": avg_aux_loss
         }
 

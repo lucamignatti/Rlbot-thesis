@@ -461,18 +461,38 @@ class VectorizedEnv:
         # Set CPU affinity if available
         if hasattr(os, 'sched_getaffinity'):
             try:
-                cpu_count = len(os.sched_getaffinity(0))
-                self.max_workers = min(cpu_count, num_envs)
+                # Get the available CPU cores
+                cpu_cores = list(os.sched_getaffinity(0))
+                self.max_workers = min(len(cpu_cores), num_envs)
+
+                # Try to set thread affinity
+                if hasattr(os, 'sched_setaffinity'):
+                    for i in range(self.max_workers):
+                        core = cpu_cores[i % len(cpu_cores)]
+                        os.sched_setaffinity(0, {core})
             except AttributeError:
                 self.max_workers = min(32, num_envs)
         else:
             self.max_workers = min(32, num_envs)
 
-        # Prepare for asyncio
-        self.pending_results = []
+        # Create async event loop and executor
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
         self.executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=self.max_workers,
             thread_name_prefix='RL-Env'
+        )
+
+        # Initialize async state
+        self.pending_results = []
+        self.futures = []
+
+    async def _step_env_async(self, i, env, actions_dict):
+        """Asynchronous version of environment stepping"""
+        return await self.loop.run_in_executor(
+            self.executor,
+            self._step_env,
+            (i, env, actions_dict)
         )
 
     def _step_env(self, args):
@@ -506,20 +526,21 @@ class VectorizedEnv:
 
     def step(self, actions_dict_list):
         """
-        Steps all environments forward.
+        Steps all environments forward asynchronously.
         """
-        # Submit all steps asynchronously
-        self.pending_results = []
-        for i, (env, actions_dict) in enumerate(zip(self.envs, actions_dict_list)):
-            future = self.executor.submit(self._step_env, (i, env, actions_dict))
-            self.pending_results.append(future)
+        # Create and run async tasks for each environment
+        async def run_steps():
+            tasks = [
+                self._step_env_async(i, env, actions_dict)
+                for i, (env, actions_dict) in enumerate(zip(self.envs, actions_dict_list))
+            ]
+            return await asyncio.gather(*tasks)
 
-        # Wait for all steps to complete and collect results
-        results = [None] * self.num_envs
-        for future in concurrent.futures.as_completed(self.pending_results):
-            i, result = future.result()
-            results[i] = result
+        # Run the async tasks in the event loop
+        results = self.loop.run_until_complete(run_steps())
 
+        # Process results in order
+        for i, result in results:
             next_obs_dict, reward_dict, terminated_dict, truncated_dict = result
 
             # Check if the episode is done in this environment.
@@ -551,6 +572,9 @@ class VectorizedEnv:
         self.executor.shutdown()
         for env in self.envs:
             env.close()
+
+        # Close the event loop
+        self.loop.close()
 
         # Close the renderer if it exists.
         if self.renderer:
@@ -603,7 +627,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--amp', action='store_true', help='Use automatic mixed precision for faster training (requires CUDA)')
     parser.add_argument('--no-amp', action='store_false', dest='amp', help='Disable automatic mixed precision')
-    parser.set_defaults(amp=False)
+    parser.set_defaults(amp=True)
 
     parser.add_argument('-m', '--model', type=str, default=None,
                         help='Path to a pre-trained model file to load')

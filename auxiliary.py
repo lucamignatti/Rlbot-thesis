@@ -229,9 +229,12 @@ class AuxiliaryTaskManager:
         sr_reconstruction = self.sr_head(features)
         sr_loss = self.sr_weight * F.smooth_l1_loss(sr_reconstruction, observations)
 
-        # RP task
+        # RP task - add reasonable default thresholds
+        rp_pos_threshold = 0.009
+        rp_neg_threshold = -0.009
         rp_loss = torch.tensor(0.0, device=self.device)
-        if rewards_sequence is not None:
+
+        if rewards_sequence is not None and rewards_sequence.numel() > 0:
             # Create features sequence by passing observations through the actor
             with torch.no_grad():
                 # For sequence handling, we need to ensure proper dimensions:
@@ -251,9 +254,9 @@ class AuxiliaryTaskManager:
             # Convert rewards to classification labels (last rewards in sequence)
             last_rewards = rewards_sequence[:, -1]  # Get the latest reward in each sequence
             labels = torch.zeros_like(last_rewards, dtype=torch.long, device=self.device)
-            labels[last_rewards > self.pos_threshold] = 2  # Positive reward
-            labels[last_rewards < self.neg_threshold] = 0  # Negative reward
-            labels[(last_rewards >= self.neg_threshold) & (last_rewards <= self.pos_threshold)] = 1  # Near-zero reward
+            labels[last_rewards > rp_pos_threshold] = 2  # Positive reward
+            labels[last_rewards < rp_neg_threshold] = 0  # Negative reward
+            labels[(last_rewards >= rp_neg_threshold) & (last_rewards <= rp_pos_threshold)] = 1  # Near-zero reward
 
             # Calculate cross entropy loss
             rp_loss = self.rp_weight * F.cross_entropy(rp_logits, labels)
