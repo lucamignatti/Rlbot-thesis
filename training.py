@@ -6,6 +6,7 @@ from torch.distributions import Categorical, Normal
 from torch.amp import autocast, GradScaler
 from models import fix_compiled_state_dict, print_model_info
 from typing import Union, Tuple
+from auxiliary import AuxiliaryTaskManager
 import time
 import wandb
 import os
@@ -283,6 +284,9 @@ class PPOTrainer:
         debug: bool = False,
         use_compile: bool = True,
         use_amp: bool = True,
+        use_auxiliary_tasks: bool = True,
+        sr_weight: float = 1.0,
+        rp_weight: float = 1.0
     ):
 
         self.use_wandb = use_wandb
@@ -386,6 +390,27 @@ class PPOTrainer:
         self.critic_losses = []
         self.entropy_losses = []
         self.total_losses = []
+
+        # Initialize auxiliary tasks if enabled
+        self.use_auxiliary_tasks = use_auxiliary_tasks
+        if self.use_auxiliary_tasks:
+            # Extract observation dimension from actor
+            if hasattr(self.actor, 'obs_shape'):
+                obs_dim = self.actor.obs_shape
+            else:
+                obs_dim = 542  # Default size
+                if self.debug:
+                    print(f"[DEBUG] Could not determine observation dimension, using default: {obs_dim}")
+
+            # Initialize auxiliary task manager
+            self.aux_task_manager = AuxiliaryTaskManager(
+                actor=actor,
+                obs_dim=obs_dim,
+                sr_weight=sr_weight,
+                rp_weight=rp_weight,
+                device=self.device
+            )
+            self.debug_print("Auxiliary tasks initialized")
 
         if self.debug:
             print(f"[DEBUG] PPOTrainer initialized with target device: {self.device}")
@@ -1073,6 +1098,7 @@ class PPOTrainer:
         total_actor_loss = 0
         total_critic_loss = 0
         total_entropy_loss = 0
+        total_aux_loss = 0 # For auxiliary tasks
         total_loss = 0
         old_probs = None
         old_mu = None
@@ -1111,6 +1137,21 @@ class PPOTrainer:
                 T_max=1000000,  # Adjust based on expected training steps.
                 eta_min=3e-5
             )
+
+        if self.use_auxiliary_tasks:
+            if not hasattr(self.aux_task_manager, 'sr_scheduler'):
+                self.aux_task_manager.sr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    self.aux_task_manager.sr_optimizer,
+                    T_max=1000000,
+                    eta_min=1e-5
+                )
+            if not hasattr(self.aux_task_manager, 'rp_scheduler'):
+                self.aux_task_manager.rp_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                    self.aux_task_manager.rp_optimizer,
+                    T_max=1000000,
+                    eta_min=1e-5
+                )
+
 
         # Initialize reward normalizer.
         if not hasattr(self, 'ret_rms'):
@@ -1161,9 +1202,10 @@ class PPOTrainer:
                     batch_returns = returns[batch_indices]
                 else:
                     batch_states = torch.tensor(states[batch_indices], dtype=torch.float32, device=self.device)
+                    # Ensure actions are tensors, with correct type based on action space
                     batch_actions = torch.tensor(actions[batch_indices],
-                                            dtype=torch.long if self.action_space_type == "discrete" else torch.float32,
-                                            device=self.device)
+                                                 dtype=torch.long if self.action_space_type == "discrete" else torch.float32,
+                                                 device=self.device)
                     batch_old_log_probs = torch.tensor(old_log_probs[batch_indices], dtype=torch.float32, device=self.device)
                     batch_advantages = torch.tensor(advantages[batch_indices], dtype=torch.float32, device=self.device)
                     batch_returns = torch.tensor(returns[batch_indices], dtype=torch.float32, device=self.device)
@@ -1171,6 +1213,9 @@ class PPOTrainer:
                 # Reset the gradients of the optimizers.  We use set_to_none=True for a slight performance boost.
                 self.actor_optimizer.zero_grad(set_to_none=True)
                 self.critic_optimizer.zero_grad(set_to_none=True)
+                if self.use_auxiliary_tasks:
+                    self.aux_task_manager.sr_optimizer.zero_grad(set_to_none=True)
+                    self.aux_task_manager.rp_optimizer.zero_grad(set_to_none=True)
 
                 try:
                     # Use a single autocast context for the entire forward pass.  This improves efficiency.
@@ -1180,13 +1225,20 @@ class PPOTrainer:
 
                         # Forward pass through the actor network. This is different for discrete vs. continuous action spaces.
                         if self.action_space_type == "discrete":
-                            logits = self.actor(batch_states)
+                            logits, features = self.actor(batch_states, return_features=True)
                             action_probs = F.softmax(logits, dim=1)  # Convert logits to probabilities.
                             dist = Categorical(action_probs)  # Create a categorical distribution.
                             new_log_probs = dist.log_prob(batch_actions)  # Get log probabilities of the actions.
                             entropy = dist.entropy().mean()  # Calculate the entropy of the distribution.
                         else:
-                            mu, sigma_raw = self.actor(batch_states)  # Get mean and raw standard deviation.
+                            output, features = self.actor(batch_states, return_features=True)
+                            if isinstance(output, tuple):
+                                mu, sigma_raw = output
+                            else:
+                                # Split output into mu and sigma if combined
+                                split_size = output.shape[-1] // 2
+                                mu, sigma_raw = output[:, :split_size], output[:, split_size:]
+
                             sigma = F.softplus(sigma_raw) + 1e-5   # Ensure standard deviation is positive.
                             dist = Normal(mu, sigma)  # Create a normal distribution.
                             new_log_probs = dist.log_prob(batch_actions)  # Log probability of the actions.
@@ -1211,8 +1263,46 @@ class PPOTrainer:
                         # Entropy loss encourages exploration.
                         entropy_loss = -self.entropy_coef * entropy
 
-                        # The total loss is a weighted sum of the actor, critic, and entropy losses.
-                        loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
+                        # Auxiliary task losses
+                        if self.use_auxiliary_tasks:
+                            # Get a subsequence for RP
+                            if len(self.aux_task_manager.obs_history) >= self.aux_task_manager.rp_sequence_length:
+                                obs_seq = torch.stack(self.aux_task_manager.obs_history, dim=1)
+                                rewards_seq = torch.stack(self.aux_task_manager.rewards_history, dim=0)
+                                # Now slice to use only current batch indices
+                                obs_seq_batch = obs_seq[batch_indices]
+                                rewards_seq_batch = rewards_seq[batch_indices] if rewards_seq.size(0) > 1 else rewards_seq
+                            else:
+                                obs_seq_batch = None
+                                rewards_seq_batch = None
+
+                            sr_loss, rp_loss = self.aux_task_manager.compute_losses(
+                                features, batch_states, rewards_seq_batch
+                            )
+
+                            # Combine auxiliary losses
+                            aux_loss = sr_loss + rp_loss
+                            total_aux_loss += aux_loss.item()
+
+                            # Store previous loss if not exists
+                            if not hasattr(self, 'previous_aux_loss'):
+                                self.previous_aux_loss = aux_loss.item()
+
+                            # Check for significant increase
+                            if aux_loss.item() > self.previous_aux_loss * 2:  # Threshold of 2x increase
+                                if self.debug:
+                                    self.debug_print("Auxiliary loss increased significantly, skipping auxiliary update")
+                                aux_loss = torch.tensor(0.0, device=self.device)  # Skip auxiliary update
+
+                            self.previous_aux_loss = aux_loss.item()  # Update previous loss
+                            total_aux_loss += aux_loss.item()
+
+
+                        else:
+                            aux_loss = torch.tensor(0.0, device=self.device)
+
+                        # The total loss is a weighted sum of the actor, critic, entropy and auxiliary losses.
+                        loss = actor_loss + self.critic_coef * critic_loss + entropy_loss + aux_loss
 
                     # If using AMP, scale the loss and perform the backward pass.
                     if self.use_amp and "cuda" in str(self.device):
@@ -1221,6 +1311,14 @@ class PPOTrainer:
                         # Unscale the gradients before clipping.  This is important for AMP.
                         self.scaler.unscale_(self.actor_optimizer)
                         self.scaler.unscale_(self.critic_optimizer)
+                        if self.use_auxiliary_tasks:
+                            self.scaler.unscale_(self.aux_task_manager.sr_optimizer)
+                            self.scaler.unscale_(self.aux_task_manager.rp_optimizer)
+
+                        if self.use_auxiliary_tasks:
+                            torch.nn.utils.clip_grad_norm_(self.aux_task_manager.sr_head.parameters(), self.max_grad_norm)
+                            torch.nn.utils.clip_grad_norm_(self.aux_task_manager.rp_head.parameters(), self.max_grad_norm)
+
 
                         # Clip gradients by value first for stability.
                         for param in self.actor.parameters():
@@ -1237,6 +1335,9 @@ class PPOTrainer:
                         # Step the optimizers (with scaled gradients).
                         self.scaler.step(self.actor_optimizer)
                         self.scaler.step(self.critic_optimizer)
+                        if self.use_auxiliary_tasks:
+                            self.scaler.step(self.aux_task_manager.sr_optimizer)
+                            self.scaler.step(self.aux_task_manager.rp_optimizer)
 
                         # Update the gradient scaler.
                         self.scaler.update()
@@ -1256,8 +1357,16 @@ class PPOTrainer:
                         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
 
+                        if self.use_auxiliary_tasks:
+                            torch.nn.utils.clip_grad_norm_(self.aux_task_manager.sr_head.parameters(), self.max_grad_norm)
+                            torch.nn.utils.clip_grad_norm_(self.aux_task_manager.rp_head.parameters(), self.max_grad_norm)
+
+
                         self.actor_optimizer.step()
                         self.critic_optimizer.step()
+                        if self.use_auxiliary_tasks:
+                            self.aux_task_manager.sr_optimizer.step()
+                            self.aux_task_manager.rp_optimizer.step()
 
                     # Keep track of the total losses.
                     total_actor_loss += actor_loss.item()
@@ -1275,12 +1384,16 @@ class PPOTrainer:
         # Step the learning rate schedulers.
         self.actor_scheduler.step()
         self.critic_scheduler.step()
+        if self.use_auxiliary_tasks:
+            self.aux_task_manager.sr_scheduler.step()
+            self.aux_task_manager.rp_scheduler.step()
 
         # Calculate the average losses across all epochs and batches.
         num_updates = max(self.ppo_epochs * len(batches), 1)  # Avoid division by zero.
         avg_actor_loss = total_actor_loss / num_updates
         avg_critic_loss = total_critic_loss / num_updates
         avg_entropy_loss = total_entropy_loss / num_updates
+        avg_aux_loss = total_aux_loss / num_updates
         avg_loss = total_loss / num_updates
 
         # Calculate the KL divergence between the old and new policies.  This is a measure of how much the policy changed.
@@ -1310,7 +1423,7 @@ class PPOTrainer:
                     new_sigma_raw = new_sigma_raw.float() if isinstance(new_sigma_raw, torch.Tensor) else new_sigma_raw
                     new_sigma = F.softplus(new_sigma_raw) + 1e-5
 
-                    kl = torch.log(new_sigma/old_sigma + 1e-10) + (old_sigma**2 + (old_mu - new_mu)**2)/(2*new_sigma**2 + 1e-10) - 0.5
+                    kl = torch.log(new_sigma/(old_sigma + 1e-10)) + (old_sigma**2 + (old_mu - new_mu)**2)/(2*new_sigma**2 + 1e-10) - 0.5
                     # Handle potential numerical issues.
                     if torch.isnan(kl).any() or torch.isinf(kl).any():
                         kl = torch.nan_to_num(kl, nan=0.0, posinf=1.0, neginf=-1.0)
@@ -1341,6 +1454,9 @@ class PPOTrainer:
                                 explained_var = 1 - np.var(all_returns - all_values) / var_returns
                 except Exception as e:
                     print(f"Error computing explained variance: {e}")
+
+        # Update auxiliary tasks if enabled
+        aux_metrics = {}
 
         # Log the training metrics using wandb, if it's enabled.
         if self.use_wandb:
@@ -1394,6 +1510,11 @@ class PPOTrainer:
                     # Use combined step count for logging
                     global_step = self.training_steps + self.training_step_offset
 
+                    # Add auxiliary task metrics
+                    # safe_metrics.update(aux_metrics) # <- Removed: aux metrics are now in main return dict
+                    safe_metrics["aux_loss"] = float(avg_aux_loss)
+
+
                     import wandb
                     wandb.log(safe_metrics, step=global_step)
             except Exception as e:
@@ -1404,7 +1525,7 @@ class PPOTrainer:
         self.memory.clear()
 
         # Return a dictionary containing all the important training metrics.
-        return {
+        return_metrics = {
             "actor_loss": avg_actor_loss,
             "critic_loss": avg_critic_loss,
             "entropy_loss": avg_entropy_loss,
@@ -1413,8 +1534,18 @@ class PPOTrainer:
             "value_explained_variance": explained_var,
             "kl_divergence": kl_div,
             "effective_clip_epsilon": effective_clip_epsilon,
-            "update_time": time.time() - update_start
+            "update_time": time.time() - update_start,
+            "sr_loss": aux_metrics.get('sr_loss', 0.0), # From aux_metrics
+            "rp_loss": aux_metrics.get('rp_loss', 0.0),  # From aux_metrics
+            "aux_loss": avg_aux_loss
         }
+
+        return return_metrics
+
+    def reset_auxiliary_tasks(self):
+        """Reset the auxiliary task history when episodes end"""
+        if self.use_auxiliary_tasks:
+            self.aux_task_manager.reset()
 
     def save_models(self, model_path=None):
         """

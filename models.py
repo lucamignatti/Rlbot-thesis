@@ -200,7 +200,8 @@ class SimBa(nn.Module):
 
         self.to(self.device)
 
-    def forward(self, x):
+    def forward(self, x, return_features=False):
+        """Forward pass through the network, with option to return intermediate features"""
         # For CUDA graphs, explicitly mark step before we begin.
         if "cuda" in str(self.device):
             torch.compiler.cudagraph_mark_step_begin()
@@ -255,7 +256,9 @@ class SimBa(nn.Module):
         if "cuda" in str(self.device):
             torch.compiler.cudagraph_mark_step_begin()
 
-        # Clone the output for CUDA graph safety, preserving gradients.
+        # Return features if requested, otherwise just output
+        if return_features:
+            return output.clone(), h.clone()
         return output.clone()
 
     def to(self, device=None, dtype=None, non_blocking=False):

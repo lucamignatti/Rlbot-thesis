@@ -139,7 +139,10 @@ def run_training(
         use_wandb=use_wandb,
         debug=debug,
         use_compile=use_compile,
-        use_amp=use_amp
+        use_amp=use_amp,
+        use_auxiliary_tasks=args.auxiliary,
+        sr_weight=args.sr_weight,
+        rp_weight=args.rp_weight
     )
 
     #  Use train mode for training and eval for testing
@@ -272,6 +275,7 @@ def run_training(
                     # Reset action history if episode is done
                     if done:
                         action_stacker.reset_agent(agent_id)
+                        trainer.reset_auxiliary_tasks()
 
                     # Update the stored experience with the correct reward and done flag.
                     mem_idx = trainer.memory.pos - len(all_obs) + exp_idx
@@ -349,7 +353,9 @@ def run_training(
                     "Reward": f"{stats.get('mean_episode_reward', 0):.2f}",
                     "PLoss": f"{stats.get('actor_loss', 0):.4f}",
                     "VLoss": f"{stats.get('critic_loss', 0):.4f}",
-                    "Entropy": f"{stats.get('entropy_loss', 0):.4f}"
+                    "Entropy": f"{stats.get('entropy_loss', 0):.4f}",
+                    "SR_Loss": f"{stats.get('sr_loss', 0):.4f}",
+                    "RP_Loss": f"{stats.get('rp_loss', 0):.4f}"
                 })
 
                 progress_bar.set_postfix(stats_dict)
@@ -605,6 +611,14 @@ if __name__ == "__main__":
     # Action stacking parameters
     parser.add_argument('--stack_size', type=int, default=5, help='Number of previous actions to stack')
 
+    # Auxiliary learning parameters
+    parser.add_argument('--auxiliary', action='store_true',
+                        help='Enable auxiliary task learning (SR and RP tasks)')
+    parser.add_argument('--sr_weight', type=float, default=1.0,
+                        help='Weight for the State Representation auxiliary task')
+    parser.add_argument('--rp_weight', type=float, default=1.0,
+                        help='Weight for the Reward Prediction auxiliary task')
+
 
     # Backwards compatibility.
     parser.add_argument('-p', '--processes', type=int, default=None,
@@ -715,6 +729,9 @@ if __name__ == "__main__":
                 "dropout": args.dropout,
                 "model_type": args.model_type,
                 "action_stack_size": args.stack_size,
+                "auxiliary_tasks": args.auxiliary_tasks,
+                "sr_weight": args.sr_weight,
+                "rp_weight": args.rp_weight,
 
                 # Environment details
                 "action_repeat": 8,
