@@ -20,6 +20,7 @@ import argparse
 from tqdm import tqdm
 import signal
 import sys
+import asyncio
 
 def get_env(renderer=None, action_stacker=None):
     """
@@ -457,9 +458,22 @@ class VectorizedEnv:
         self.episode_counts = [0] * num_envs  # Track episode counts for each environment.
         self.is_discrete = True  # RLGym uses discrete actions.
 
-        # Use a thread pool to run environment steps in parallel.
-        self.max_workers = min(32, num_envs)  # Limit threads to avoid excessive overhead.
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
+        # Set CPU affinity if available
+        if hasattr(os, 'sched_getaffinity'):
+            try:
+                cpu_count = len(os.sched_getaffinity(0))
+                self.max_workers = min(cpu_count, num_envs)
+            except AttributeError:
+                self.max_workers = min(32, num_envs)
+        else:
+            self.max_workers = min(32, num_envs)
+
+        # Prepare for asyncio
+        self.pending_results = []
+        self.executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.max_workers,
+            thread_name_prefix='RL-Env'
+        )
 
     def _step_env(self, args):
         """
@@ -494,17 +508,17 @@ class VectorizedEnv:
         """
         Steps all environments forward.
         """
-        futures = []
+        # Submit all steps asynchronously
+        self.pending_results = []
         for i, (env, actions_dict) in enumerate(zip(self.envs, actions_dict_list)):
-            # Submit the step function to the thread pool.
             future = self.executor.submit(self._step_env, (i, env, actions_dict))
-            futures.append(future)
+            self.pending_results.append(future)
 
-        # Wait for all steps to complete and collect the results.
+        # Wait for all steps to complete and collect results
         results = [None] * self.num_envs
-        for future in concurrent.futures.as_completed(futures):
+        for future in concurrent.futures.as_completed(self.pending_results):
             i, result = future.result()
-            results[i] = result  # Store results in the correct order.
+            results[i] = result
 
             next_obs_dict, reward_dict, terminated_dict, truncated_dict = result
 

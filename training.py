@@ -332,10 +332,20 @@ class PPOTrainer:
                 if hasattr(torch._dynamo, "config") and hasattr(torch._dynamo.config, "allow_cudagraph_ops"):
                     torch._dynamo.config.allow_cudagraph_ops = True
 
+                self.cuda_graphs_enabled = device == "cuda" and torch.cuda.is_available()
+                if self.cuda_graphs_enabled:
+                    self._setup_cuda_graphs()
+
                 backend = "inductor"
 
                 self.actor = torch.compile(self.actor, backend=backend, **compile_options)
                 self.critic = torch.compile(self.critic, backend=backend, **compile_options)
+            elif device == "cpu" and not use_compile:
+                try:
+                    self.actor = torch.jit.script(self.actor)
+                    self.critic = torch.jit.script(self.critic)
+                except Exception as e:
+                    self.debug_print(f"JIT compilation failed: {e}")
             else:
                 # For CPU, also use inductor.
                 self.actor = torch.compile(self.actor, backend="inductor", **compile_options)
@@ -446,6 +456,24 @@ class PPOTrainer:
         print_model_info(self.actor, model_name="Actor", print_amp=self.use_amp)
 
         print_model_info(self.critic, model_name="Critic", print_amp=self.use_amp)
+
+    def _setup_cuda_graphs(self):
+        # Create static input for policy evaluation graph
+        self.static_batch = torch.zeros((64, self.actor.obs_shape), device=self.device)
+
+        # Capture forward pass
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):  # warmup
+                self.actor(self.static_batch)
+
+            # Capture the graph
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph):
+                self.static_output = self.actor(self.static_batch)
+
+        torch.cuda.current_stream().wait_stream(s)
 
     def _create_compiled_gae(self):
         """Create a compiled version of GAE computation for tensor inputs."""
@@ -1574,6 +1602,12 @@ class PPOTrainer:
         actor_state = self.actor._orig_mod.state_dict() if hasattr(self.actor, '_orig_mod') else self.actor.state_dict()
         critic_state = self.critic._orig_mod.state_dict() if hasattr(self.critic, '_orig_mod') else self.critic.state_dict()
 
+        # Get auxiliary task models if enabled
+        aux_state = {}
+        if self.use_auxiliary_tasks:
+            aux_state['sr_head'] = self.aux_task_manager.sr_head.state_dict()
+            aux_state['rp_head'] = self.aux_task_manager.rp_head.state_dict()
+
         # Get the WandB run ID if available
         wandb_run_id = None
         if self.use_wandb:
@@ -1584,10 +1618,11 @@ class PPOTrainer:
             except ImportError:
                 pass
 
-        # Save both models to a single file.
+        # Save all models to a single file.
         torch.save({
             'actor': actor_state,
             'critic': critic_state,
+            'auxiliary': aux_state,
             'training_step': getattr(self, 'training_steps', 0) + getattr(self, 'training_step_offset', 0),
             'total_episodes': getattr(self, 'total_episodes', 0) + getattr(self, 'total_episodes_offset', 0),
             'timestamp': time.time(),
@@ -1619,6 +1654,18 @@ class PPOTrainer:
             # Load the fixed state dictionaries
             self.actor.load_state_dict(actor_state)
             self.critic.load_state_dict(critic_state)
+
+            # Load auxiliary networks if they exist in the checkpoint and we're using auxiliary tasks
+            if self.use_auxiliary_tasks and 'auxiliary' in checkpoint:
+                if 'sr_head' in checkpoint['auxiliary']:
+                    sr_state = fix_compiled_state_dict(checkpoint['auxiliary']['sr_head'])
+                    self.aux_task_manager.sr_head.load_state_dict(sr_state)
+
+                if 'rp_head' in checkpoint['auxiliary']:
+                    rp_state = fix_compiled_state_dict(checkpoint['auxiliary']['rp_head'])
+                    self.aux_task_manager.rp_head.load_state_dict(rp_state)
+
+                self.debug_print("Loaded auxiliary task models from checkpoint")
 
             # Get training step count if available, defaulting to 0 if not found
             self.training_step_offset = checkpoint.get('training_step', 0)

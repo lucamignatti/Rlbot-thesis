@@ -121,10 +121,46 @@ class AuxiliaryTaskManager:
             nn.Linear(sr_hidden_dim, obs_dim)
         ).to(device)
 
+        # Apply compile to SR head if available
+        if hasattr(torch, 'compile'):
+            try:
+                compile_options = {
+                    "fullgraph": False,
+                    "dynamic": True,
+                }
+                if device == "mps":
+                    self.sr_head = torch.compile(self.sr_head, backend="aot_eager", **compile_options)
+                elif device == "cuda":
+                    if hasattr(torch._dynamo.config, "allow_cudagraph_ops"):
+                        torch._dynamo.config.allow_cudagraph_ops = True
+                    self.sr_head = torch.compile(self.sr_head, backend="inductor", **compile_options)
+                else:
+                    self.sr_head = torch.compile(self.sr_head, backend="inductor", **compile_options)
+            except:
+                pass
+
         self.rp_head = nn.Sequential(
             nn.LSTM(actor.hidden_dim, rp_hidden_dim, batch_first=True),
             nn.Linear(rp_hidden_dim, 3)
         ).to(device)
+
+        # Apply compile to RP head if available
+        if hasattr(torch, 'compile'):
+            try:
+                compile_options = {
+                    "fullgraph": False,
+                    "dynamic": True,
+                }
+                if device == "mps":
+                    self.rp_head = torch.compile(self.rp_head, backend="aot_eager", **compile_options)
+                elif device == "cuda":
+                    if hasattr(torch._dynamo.config, "allow_cudagraph_ops"):
+                        torch._dynamo.config.allow_cudagraph_ops = True
+                    self.rp_head = torch.compile(self.rp_head, backend="inductor", **compile_options)
+                else:
+                    self.rp_head = torch.compile(self.rp_head, backend="inductor", **compile_options)
+            except:
+                pass
 
         # Initialize observation history for RP task
         self.obs_history = []
