@@ -324,8 +324,8 @@ def run_training(
 
                     os.makedirs(checkpoint_dir, exist_ok=True)
 
-                    # Instead of creating episode-specific checkpoints, just save to a fixed filename
-                    checkpoint_path = os.path.join(checkpoint_dir, "model_checkpoint.pt")
+                    # save checkpoint
+                    checkpoint_path = os.path.join(checkpoint_dir, f"model_{total_episodes_so_far}.pt")
                     trainer.save_models(checkpoint_path)
 
                     # Also save as "latest" for easy loading (keep this for compatibility)
