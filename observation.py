@@ -5,32 +5,32 @@ import numpy as np
 
 
 class ActionStacker:
-    """Keeps track of previous actions to stack in observations"""
+    """Optimized ActionStacker with efficient operations"""
     def __init__(self, stack_size=5, action_size=8):
         self.stack_size = stack_size
         self.action_size = action_size
-        self.agent_action_history = {}  # Dictionary to store action history for each agent
+        self.agent_action_history = {}
 
     def reset_agent(self, agent_id):
         """Reset action history for an agent"""
         self.agent_action_history[agent_id] = np.zeros((self.stack_size, self.action_size), dtype=np.float32)
 
     def add_action(self, agent_id, action):
-        """Add new action to agent's history"""
+        """Add new action to agent's history - optimized version"""
         if agent_id not in self.agent_action_history:
             self.reset_agent(agent_id)
 
-        # Roll the history to make room for the new action
-        self.agent_action_history[agent_id] = np.roll(self.agent_action_history[agent_id], shift=-1, axis=0)
-
-        # Insert new action at the end
-        self.agent_action_history[agent_id][-1] = action
+        # Use direct array operations instead of np.roll
+        history = self.agent_action_history[agent_id]
+        history[:-1] = history[1:]
+        history[-1] = action
 
     def get_stacked_actions(self, agent_id):
         """Get stacked history for an agent"""
         if agent_id not in self.agent_action_history:
             self.reset_agent(agent_id)
-        return self.agent_action_history[agent_id].flatten()
+        # Using ravel() is faster than flatten() since it avoids copy when possible
+        return self.agent_action_history[agent_id].ravel()
 
 
 class StackedActionsObs(DefaultObs):

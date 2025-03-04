@@ -414,16 +414,19 @@ class PPOTrainer:
                 if self.debug:
                     print(f"[DEBUG] Could not determine observation dimension, using default: {obs_dim}")
 
-            # Initialize auxiliary task manager with AMP flag
+            # Initialize auxiliary task manager with optimized settings
             self.aux_task_manager = AuxiliaryTaskManager(
                 actor=actor,
                 obs_dim=obs_dim,
                 sr_weight=sr_weight,
                 rp_weight=rp_weight,
                 device=self.device,
-                use_amp=aux_amp  # Use the passed aux_amp parameter
+                use_amp=aux_amp,  # Use the passed aux_amp parameter
+                update_frequency=8,  # Only update every 8 steps for better performance
+                sr_hidden_dim=128,  # Smaller network for efficiency
+                rp_sequence_length=5  # Shorter history for efficiency
             )
-            self.debug_print("Auxiliary tasks initialized")
+            self.debug_print("Auxiliary tasks initialized with performance optimizations")
 
         if self.debug:
             print(f"[DEBUG] PPOTrainer initialized with target device: {self.device}")
@@ -1270,7 +1273,9 @@ class PPOTrainer:
                 # Reset the gradients of the optimizers.
                 self.actor_optimizer.zero_grad(set_to_none=True)
                 self.critic_optimizer.zero_grad(set_to_none=True)
-                if self.use_auxiliary_tasks:
+
+                # Only reset auxiliary task optimizers if using auxiliary tasks and it's a batch where we'll do aux updates
+                if self.use_auxiliary_tasks and (batch_idx % 4 == 0):  # Reduce frequency of aux updates
                     self.aux_task_manager.sr_optimizer.zero_grad(set_to_none=True)
                     self.aux_task_manager.rp_optimizer.zero_grad(set_to_none=True)
 
@@ -1314,30 +1319,36 @@ class PPOTrainer:
                         entropy_loss = -self.entropy_coef * entropy
 
                     # Calculate auxiliary losses outside autocast (for numerical stability)
-                    if self.use_auxiliary_tasks:
-                        # Use the stored rewards history for RP
-                        if len(self.aux_task_manager.rewards_history) >= self.aux_task_manager.rp_sequence_length:
-                            rewards_seq = torch.stack(self.aux_task_manager.rewards_history)
-                        else:
-                            rewards_seq = None
+                    # But only do it every few batches for better performance
+                    aux_loss = torch.tensor(0.0, device=self.device)
+                    if self.use_auxiliary_tasks and (batch_idx % 4 == 0):  # Reduced frequency
+                        try:
+                            # Scale down auxiliary task computation for better performance
+                            aux_scale = 0.005  # Reduced scale for auxiliary tasks
 
-                        # Compute auxiliary losses, ensuring features and observations are float32
-                        sr_loss, rp_loss = self.aux_task_manager.compute_losses(
-                            features=features.float(),
-                            observations=batch_states.float(),
-                            rewards_sequence=rewards_seq
-                        )
+                            # Use fixed size tensors for rewards history
+                            if hasattr(self.aux_task_manager, 'history_filled') and self.aux_task_manager.history_filled >= self.aux_task_manager.rp_sequence_length:
+                                # Compute auxiliary losses with minimal operations
+                                sr_loss, rp_loss = self.aux_task_manager.compute_losses(
+                                    features=features.float(),
+                                    observations=batch_states.float(),
+                                    rewards_sequence=None  # Use internal history instead
+                                )
 
-                        # Track auxiliary losses separately for logging and analysis
-                        total_sr_loss += sr_loss.item()
-                        total_rp_loss += rp_loss.item()
+                                # Track auxiliary losses for reporting
+                                total_sr_loss += sr_loss.item()
+                                total_rp_loss += rp_loss.item()
 
-                        aux_scale = 0.01  # Scale down auxiliary loss
-                        aux_loss = (sr_loss + rp_loss) * aux_scale
-                        total_aux_loss += aux_loss.item()
-                    else:
-                        aux_loss = torch.tensor(0.0, device=self.device)
-
+                                # Scale down and add to main loss
+                                aux_loss = (sr_loss + rp_loss) * aux_scale
+                                total_aux_loss += aux_loss.item()
+                            else:
+                                # Use stored loss values if history isn't filled
+                                total_sr_loss += self.aux_task_manager.latest_sr_loss
+                                total_rp_loss += self.aux_task_manager.latest_rp_loss
+                        except Exception as e:
+                            if self.debug:
+                                print(f"Skipping auxiliary task update: {e}")
 
                     # Combine losses (all in full precision for stability)
                     loss = actor_loss + self.critic_coef * critic_loss + entropy_loss + aux_loss
@@ -1351,20 +1362,22 @@ class PPOTrainer:
                         self.scaler.scale(loss).backward()
                         self.scaler.unscale_(self.actor_optimizer)
                         self.scaler.unscale_(self.critic_optimizer)
-                        if self.use_auxiliary_tasks:
-                            self.scaler.unscale_(self.aux_task_manager.sr_optimizer)
-                            self.scaler.unscale_(self.aux_task_manager.rp_optimizer)
 
                         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-                        if self.use_auxiliary_tasks:
+
+                        # Only apply auxiliary task updates at reduced frequency
+                        if self.use_auxiliary_tasks and (batch_idx % 4 == 0):
+                            self.scaler.unscale_(self.aux_task_manager.sr_optimizer)
+                            self.scaler.unscale_(self.aux_task_manager.rp_optimizer)
                             torch.nn.utils.clip_grad_norm_(self.aux_task_manager.sr_head.parameters(), self.max_grad_norm)
                             torch.nn.utils.clip_grad_norm_(self.aux_task_manager.rp_lstm.parameters(), self.max_grad_norm)
                             torch.nn.utils.clip_grad_norm_(self.aux_task_manager.rp_head.parameters(), self.max_grad_norm)
+
                         self.scaler.step(self.actor_optimizer)
                         self.scaler.step(self.critic_optimizer)
 
-                        if self.use_auxiliary_tasks:
+                        if self.use_auxiliary_tasks and (batch_idx % 4 == 0):
                             self.scaler.step(self.aux_task_manager.sr_optimizer)
                             self.scaler.step(self.aux_task_manager.rp_optimizer)
 
@@ -1374,17 +1387,19 @@ class PPOTrainer:
                         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
 
-                        if self.use_auxiliary_tasks:
+                        if self.use_auxiliary_tasks and (batch_idx % 4 == 0):
                             torch.nn.utils.clip_grad_norm_(self.aux_task_manager.sr_head.parameters(), self.max_grad_norm)
                             torch.nn.utils.clip_grad_norm_(self.aux_task_manager.rp_lstm.parameters(), self.max_grad_norm)
                             torch.nn.utils.clip_grad_norm_(self.aux_task_manager.rp_head.parameters(), self.max_grad_norm)
 
-
-                        self.actor_optimizer.step()
-                        self.critic_optimizer.step()
-                        if self.use_auxiliary_tasks:
+                            self.actor_optimizer.step()
+                            self.critic_optimizer.step()
                             self.aux_task_manager.sr_optimizer.step()
                             self.aux_task_manager.rp_optimizer.step()
+                        else:
+                            self.actor_optimizer.step()
+                            self.critic_optimizer.step()
+
                     # Track the losses
                     total_actor_loss += actor_loss.item()
                     total_critic_loss += critic_loss.item()

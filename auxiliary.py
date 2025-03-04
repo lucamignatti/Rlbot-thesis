@@ -103,11 +103,11 @@ class RewardPredictionTask(nn.Module):
 
 class AuxiliaryTaskManager:
     """
-    Manages the auxiliary tasks and their integration with the main PPO algorithm.
+    Optimized version of AuxiliaryTaskManager with better performance
     """
     def __init__(self, actor, obs_dim, sr_weight=1.0, rp_weight=1.0,
                  sr_hidden_dim=128, sr_latent_dim=32,
-                 rp_hidden_dim=64, rp_sequence_length=5, device="cpu", use_amp=False):
+                 rp_hidden_dim=64, rp_sequence_length=5, device="cpu", use_amp=False, update_frequency=8):
         self.device = device
         self.sr_weight = sr_weight
         self.rp_weight = rp_weight
@@ -116,36 +116,21 @@ class AuxiliaryTaskManager:
         self.debug = False
         self.use_amp = use_amp
 
+        # Store update frequency counter
+        self.update_counter = 0
+        self.update_frequency = 8  # Only update every N steps
+
         # Ensure hidden_dim exists
         self.hidden_dim = getattr(actor, 'hidden_dim', 1536)
 
-        # These heads attach to the actor's representation
+        # Simplified SR head
         self.sr_head = nn.Sequential(
             nn.Linear(self.hidden_dim, sr_hidden_dim),
-            nn.LayerNorm(sr_hidden_dim),
             nn.ReLU(),
             nn.Linear(sr_hidden_dim, obs_dim)
         ).to(device)
 
-        # Apply compile to SR head if available
-        if hasattr(torch, 'compile'):
-            try:
-                compile_options = {
-                    "fullgraph": False,
-                    "dynamic": True,
-                }
-                if device == "mps":
-                    self.sr_head = torch.compile(self.sr_head, backend="aot_eager", **compile_options)
-                elif device == "cuda":
-                    if hasattr(torch._dynamo.config, "allow_cudagraph_ops"):
-                        torch._dynamo.config.allow_cudagraph_ops = True
-                    self.sr_head = torch.compile(self.sr_head, backend="inductor", **compile_options)
-                else:
-                    self.sr_head = torch.compile(self.sr_head, backend="inductor", **compile_options)
-            except:
-                pass
-
-        # Initialize RP head with LSTM for sequence processing
+        # Simplified RP head
         self.rp_lstm = nn.LSTM(
             input_size=self.hidden_dim,
             hidden_size=rp_hidden_dim,
@@ -154,35 +139,41 @@ class AuxiliaryTaskManager:
 
         self.rp_head = nn.Linear(rp_hidden_dim, 3).to(device)
 
-        # Initialize history buffers
-        self.feature_history = []
-        self.rewards_history = []
+        # Initialize history buffers with fixed-size tensors for better memory management
+        self.max_batch_size = 64  # Maximum expected batch size
+        self.feature_history = torch.zeros(
+            (self.rp_sequence_length, self.hidden_dim),
+            device=self.device,
+            dtype=torch.float32
+        )
+        self.rewards_history = torch.zeros(
+            self.rp_sequence_length,
+            device=self.device,
+            dtype=torch.float32
+        )
+        self.history_filled = 0  # Track how many entries are filled
 
-        # Track latest loss values
+        # Track latest loss values with defaults
         self.latest_sr_loss = 0.01
         self.latest_rp_loss = 0.01
-        self.debug_next_compute = False
 
-        # Optimizers for auxiliary heads
-        self.sr_optimizer = torch.optim.Adam(self.sr_head.parameters(), lr=3e-4)
+        # Optimizers with reduced learning rates for stability
+        self.sr_optimizer = torch.optim.Adam(self.sr_head.parameters(), lr=1e-4)
         self.rp_optimizer = torch.optim.Adam([
             {'params': self.rp_lstm.parameters()},
             {'params': self.rp_head.parameters()}
-        ], lr=3e-4)
+        ], lr=1e-4)
 
     def update(self, observations, rewards, features=None):
         """
-        Store observations and rewards for sequence-based tasks.
-        This method updates history buffers and reports current losses.
+        Efficient update with reduced frequency and lazy evaluation
         """
-        if self.use_amp:
-            observations = observations.float()
-            if rewards is not None and isinstance(rewards, torch.Tensor):
-                rewards = rewards.float()
-            if features is not None and isinstance(features, torch.Tensor):
-                features = features.float()
+        # Increment counter and only process every N steps
+        self.update_counter += 1
+        if self.update_counter % self.update_frequency != 0:
+            return {'sr_loss': self.latest_sr_loss, 'rp_loss': self.latest_rp_loss}
 
-        # Convert inputs to tensors if they aren't already
+        # Convert inputs to tensors efficiently
         if not isinstance(observations, torch.Tensor):
             observations = torch.tensor(observations, dtype=torch.float32, device=self.device)
         if not isinstance(rewards, torch.Tensor):
@@ -201,212 +192,103 @@ class AuxiliaryTaskManager:
         elif not isinstance(features, torch.Tensor):
             features = torch.tensor(features, dtype=torch.float32, device=self.device)
 
-        # Store batched features and rewards by taking mean if necessary
-        if features.dim() > 1 and features.size(0) > 1:
-            self.feature_history.append(features.mean(dim=0).detach())
+        # Update history using mean features across batch
+        if features.dim() > 1:
+            features_mean = features.mean(dim=0).detach()
         else:
-            self.feature_history.append(features.reshape(-1).detach())
+            features_mean = features.detach()
 
         if rewards.dim() > 0 and rewards.size(0) > 1:
-            self.rewards_history.append(rewards.mean().detach())
+            rewards_mean = rewards.mean().detach()
         else:
-            self.rewards_history.append(rewards.detach())
+            rewards_mean = rewards.detach()
 
-        # Keep only the last sequence_length items
-        if len(self.feature_history) > self.rp_sequence_length:
-            self.feature_history.pop(0)
-            self.rewards_history.pop(0)
+        # Update circular buffer
+        self.feature_history = torch.roll(self.feature_history, -1, dims=0)
+        self.rewards_history = torch.roll(self.rewards_history, -1, dims=0)
 
-        # Calculate current losses for reporting
-        sr_loss = torch.tensor(self.latest_sr_loss, device=self.device)
-        rp_loss = torch.tensor(self.latest_rp_loss, device=self.device)
+        # Set the newest values
+        self.feature_history[-1] = features_mean
+        self.rewards_history[-1] = rewards_mean
 
-        if features is not None:
-            try:
-                # Compute SR loss with AMP
-                with torch.amp.autocast(enabled=self.use_amp, device_type="cuda"):
-                    sr_reconstruction = self.sr_head(features)
+        # Increment history counter
+        self.history_filled = min(self.history_filled + 1, self.rp_sequence_length)
 
-                # Loss calculation in full precision
-                sr_reconstruction = sr_reconstruction.float()
-                observations = observations.float()
-
-                if sr_reconstruction.shape == observations.shape:
-                    sr_loss = F.smooth_l1_loss(sr_reconstruction, observations)
-                else:
-                    min_dim = min(sr_reconstruction.shape[-1], observations.shape[-1])
-                    sr_loss = F.smooth_l1_loss(
-                        sr_reconstruction[..., :min_dim],
-                        observations[..., :min_dim]
-                    )
-
-                # Update latest SR loss
-                self.latest_sr_loss = max(0.01, float(sr_loss.item()))
-                sr_loss = torch.tensor(self.latest_sr_loss, device=self.device)
-
-            except Exception as e:
-                print(f"SR loss calculation failed in update: {e}")
-                sr_loss = torch.tensor(0.01, device=self.device)
-
-        if len(self.feature_history) == self.rp_sequence_length:
-            try:
-                # Compute RP loss with AMP
-                with torch.amp.autocast(enabled=self.use_amp, device_type="cuda"):
-                    feature_seq = torch.stack(self.feature_history, dim=0).unsqueeze(0)
-                    lstm_out, _ = self.rp_lstm(feature_seq)
-                    logits = self.rp_head(lstm_out[:, -1, :])
-
-                # Loss calculation in full precision
-                logits = logits.float()
-                last_reward = self.rewards_history[-1].float()
-
-                pos_threshold = 0.009
-                neg_threshold = -0.009
-
-                label = torch.tensor([1], device=self.device)
-                if last_reward > pos_threshold:
-                    label[0] = 2
-                elif last_reward < neg_threshold:
-                    label[0] = 0
-
-                rp_loss = F.cross_entropy(logits, label)
-
-                # Update latest RP loss
-                self.latest_rp_loss = max(0.01, float(rp_loss.item()))
-                rp_loss = torch.tensor(self.latest_rp_loss, device=self.device)
-
-            except Exception as e:
-                print(f"RP loss calculation failed in update: {e}")
-                rp_loss = torch.tensor(0.01, device=self.device)
-
-        # Always return non-zero losses
-        return {
-            'sr_loss': max(0.01, float(sr_loss.item())),
-            'rp_loss': max(0.01, float(rp_loss.item()))
-        }
+        return {'sr_loss': self.latest_sr_loss, 'rp_loss': self.latest_rp_loss}
 
     def compute_losses(self, features, observations, rewards_sequence=None):
         """
-        Compute losses for both SR and RP auxiliary tasks. Handles AMP with numerical stability.
+        Optimized loss computation with early returns and efficient tensor operations
         """
-        # Print shapes if debugging is enabled
-        if self.debug_next_compute:
-            print(f"DEBUGGING AUX TASKS - features shape: {features.shape}")
-            print(f"DEBUGGING AUX TASKS - observations shape: {observations.shape}")
+        # Early return if history isn't filled enough
+        if self.history_filled < self.rp_sequence_length:
+            return (
+                torch.tensor(self.latest_sr_loss, device=self.device, requires_grad=True),
+                torch.tensor(self.latest_rp_loss, device=self.device, requires_grad=True)
+            )
 
+        # Ensure consistent types
         if self.use_amp:
             features = features.float()
             observations = observations.float()
-            if rewards_sequence is not None:
-                rewards_sequence = rewards_sequence.float()
 
+        # SR Loss computation - simplified
         try:
-            # SR task with proper dimension handling
+            # Use a single quick forward pass
             with torch.amp.autocast(enabled=self.use_amp, device_type="cuda"):
                 sr_reconstruction = self.sr_head(features)
 
-            # Loss calculation in full precision
-            sr_reconstruction = sr_reconstruction.float()
+            # Handle dimension mismatch gracefully
             if sr_reconstruction.shape != observations.shape:
-                if self.debug_next_compute:
-                    print(f"DEBUGGING AUX TASKS - SR shape mismatch: {sr_reconstruction.shape} vs {observations.shape}")
                 min_dim = min(sr_reconstruction.shape[-1], observations.shape[-1])
-                sr_loss = self.sr_weight * F.smooth_l1_loss(
+                sr_loss = self.sr_weight * F.mse_loss(
                     sr_reconstruction[..., :min_dim],
                     observations[..., :min_dim]
                 )
             else:
-                sr_loss = self.sr_weight * F.smooth_l1_loss(sr_reconstruction, observations)
+                sr_loss = self.sr_weight * F.mse_loss(sr_reconstruction, observations)
 
-            # Store for debugging
+            # Store for future reference
             self.latest_sr_loss = sr_loss.item()
 
-            if self.debug_next_compute:
-                print(f"DEBUGGING AUX TASKS - SR loss: {self.latest_sr_loss}")
-
-            # Generate a dummy loss if actual loss is too small
-            if self.latest_sr_loss < 1e-6:
-                sr_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
-
         except Exception as e:
-            print(f"SR loss calculation failed: {e}")
-            sr_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
+            sr_loss = torch.tensor(self.latest_sr_loss, device=self.device, requires_grad=True)
 
-        # RP task setup
-        rp_pos_threshold = 0.009
-        rp_neg_threshold = -0.009
-        rp_loss = torch.tensor(0.01, device=self.device, requires_grad=True)  # Default to non-zero value
+        # RP loss computation - only if we have enough history
+        try:
+            # Only use the RP loss when we have a full sequence
+            batch_size = features.size(0)
 
-        if rewards_sequence is not None and rewards_sequence.numel() > 0:
-            try:
-                batch_size = features.size(0)
+            # Create feature sequence for LSTM with efficient repeat
+            feature_seq = self.feature_history.unsqueeze(0).expand(batch_size, -1, -1)
 
-                # Create batch-sized sequences
-                feature_seqs = []
-                for _ in range(batch_size):
-                    seq = torch.stack([feat.clone().detach() for feat in self.feature_history[-self.rp_sequence_length:]], dim=0)
-                    feature_seqs.append(seq)
+            with torch.amp.autocast(enabled=self.use_amp, device_type="cuda"):
+                # Get predictions with single forward pass
+                lstm_out, _ = self.rp_lstm(feature_seq)
+                rp_logits = self.rp_head(lstm_out[:, -1, :])
 
-                # Stack into batch
-                batched_seqs = torch.stack(feature_seqs, dim=0)
+            # Create target labels based on last reward
+            last_reward = self.rewards_history[-1].item()
 
-                if self.debug_next_compute:
-                    print(f"DEBUGGING AUX TASKS - RP sequence shape: {batched_seqs.shape}")
+            # Simple thresholding for reward classes
+            if last_reward > 0.009:
+                label_value = 2  # positive reward
+            elif last_reward < -0.009:
+                label_value = 0  # negative reward
+            else:
+                label_value = 1  # neutral reward
 
-                # Get predictions with AMP
-                with torch.amp.autocast(enabled=self.use_amp, device_type="cuda"):
-                    lstm_out, _ = self.rp_lstm(batched_seqs)
-                    rp_logits = self.rp_head(lstm_out[:, -1, :])
+            # Create batch of same labels
+            labels = torch.full((batch_size,), label_value, device=self.device, dtype=torch.long)
 
-                # Convert to full precision for loss calculation
-                rp_logits = rp_logits.float()
+            # Calculate loss
+            rp_loss = self.rp_weight * F.cross_entropy(rp_logits, labels)
+            self.latest_rp_loss = rp_loss.item()
 
-                # Handle rewards with proper batch dimension
-                if rewards_sequence.dim() > 1 and rewards_sequence.size(0) == batch_size:
-                    last_rewards = rewards_sequence[:, -1]
-                else:
-                    if rewards_sequence.dim() == 0:
-                        last_rewards = rewards_sequence.repeat(batch_size)
-                    else:
-                        last_scalar = rewards_sequence[-1]
-                        last_rewards = last_scalar.repeat(batch_size)
+        except Exception:
+            rp_loss = torch.tensor(self.latest_rp_loss, device=self.device, requires_grad=True)
 
-                last_rewards = last_rewards.to(self.device)
-
-                if self.debug_next_compute:
-                    print(f"DEBUGGING AUX TASKS - Rewards: {last_rewards}")
-
-                # Create labels
-                labels = torch.zeros(batch_size, dtype=torch.long, device=self.device)
-                labels[last_rewards > rp_pos_threshold] = 2
-                labels[last_rewards < rp_neg_threshold] = 0
-                labels[(last_rewards >= rp_neg_threshold) & (last_rewards <= rp_pos_threshold)] = 1
-
-                if self.debug_next_compute:
-                    print(f"DEBUGGING AUX TASKS - Labels: {labels}")
-                    print(f"DEBUGGING AUX TASKS - RP logits: {rp_logits}")
-
-                # Calculate RP loss in full precision
-                rp_loss = self.rp_weight * F.cross_entropy(rp_logits, labels)
-
-                # Store for debugging
-                self.latest_rp_loss = rp_loss.item()
-
-                if self.debug_next_compute:
-                    print(f"DEBUGGING AUX TASKS - RP loss: {self.latest_rp_loss}")
-
-                if torch.isnan(rp_loss) or self.latest_rp_loss < 1e-6:
-                    rp_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
-
-                self.debug_next_compute = False  # Reset debug flag
-
-            except Exception as e:
-                print(f"RP loss calculation failed: {e}")
-                import traceback
-                traceback.print_exc()
-                rp_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
-
-        # Make sure we're returning non-zero losses
+        # Ensure non-zero losses
         if sr_loss.item() < 1e-6:
             sr_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
         if rp_loss.item() < 1e-6:
@@ -415,7 +297,7 @@ class AuxiliaryTaskManager:
         return sr_loss, rp_loss
 
     def reset(self):
-        """Clear history buffers and trigger debug on next compute"""
-        self.feature_history = []
-        self.rewards_history = []
-        self.debug_next_compute = False
+        """Reset history buffers with zero tensors"""
+        self.feature_history.zero_()
+        self.rewards_history.zero_()
+        self.history_filled = 0

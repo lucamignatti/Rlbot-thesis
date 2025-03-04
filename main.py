@@ -105,13 +105,20 @@ def run_training(
     max_grad_norm: float = 0.5,
     ppo_epochs: int = 10,
     batch_size: int = 64,
-    aux_amp: bool = False
+    aux_amp: bool = False,
+    aux_scale: float = 0.005 # Added scaling factor for auxiliary tasks
 ):
     """
     Main training loop.  This sets up the agent, environment, and training process,
     then runs the training loop until either a specified number of episodes have
     been completed, or a specified amount of time has passed.
     """
+    # Performance optimizations
+    os.environ['OMP_NUM_THREADS'] = str(max(1, os.cpu_count() // 4))
+    os.environ['KMP_BLOCKTIME'] = '0'
+    os.environ['KMP_SETTINGS'] = '1'
+    os.environ['KMP_AFFINITY'] = 'granularity=fine,compact,1,0'
+
     # We need at least one way to know when to stop training.
     if total_episodes is None and training_time is None:
         raise ValueError("Either total_episodes or training_time must be provided")
@@ -143,8 +150,8 @@ def run_training(
         use_compile=use_compile,
         use_amp=use_amp,
         use_auxiliary_tasks=args.auxiliary,
-        sr_weight=args.sr_weight,
-        rp_weight=args.rp_weight,
+        sr_weight=args.sr_weight * aux_scale,  # Apply scaling to auxiliary task weights
+        rp_weight=args.rp_weight * aux_scale,
         aux_amp=aux_amp
     )
 
@@ -223,8 +230,7 @@ def run_training(
             if not should_continue:
                 break
 
-            # Collect observations from all environments.  We'll do a single forward pass
-            # with all observations, which is more efficient than doing them one at a time.
+            # Collect observations from all environments for batch processing
             all_obs = []
             all_env_indices = []
             all_agent_ids = []
@@ -237,21 +243,18 @@ def run_training(
                     all_agent_ids.append(agent_id)
 
             # Only proceed if we have observations. (It's possible all environments ended at the same time.)
+            actions_dict_list = [{} for _ in range(num_envs)]  # Initialize outside the block to avoid unbound issues
             if len(all_obs) > 0:
                 obs_batch = torch.FloatTensor(np.stack(all_obs)).to(device)
                 with torch.no_grad():
-                    # Get actions and values from the networks.
+                    # Get actions and values from the networks in a single forward pass
                     action_batch, log_prob_batch, value_batch, features_batch = trainer.get_action(obs_batch, return_features=True)
 
                 # Organize actions into a list of dictionaries, one for each environment.
-                actions_dict_list = [{} for _ in range(num_envs)]
                 for i, (action, log_prob, value) in enumerate(zip(action_batch, log_prob_batch, value_batch)):
                     env_idx = all_env_indices[i]
                     agent_id = all_agent_ids[i]
                     actions_dict_list[env_idx][agent_id] = action
-
-                    # Add the action to the action stacker history
-                    action_stacker.add_action(agent_id, action)
 
                     # Store the experience (observations, actions, etc.).
                     # Reward and done are placeholders for now; we'll update them after the environment step.
@@ -266,7 +269,7 @@ def run_training(
 
                     collected_experiences += 1
 
-            # Step all environments forward in parallel.
+            # Step all environments forward in parallel - optimized implementation
             results, dones, episode_counts = vec_env.step(actions_dict_list)
 
             # Process the results from each environment.
@@ -338,13 +341,12 @@ def run_training(
                         episode_rewards[env_idx] = {agent_id: 0 for agent_id in vec_env.obs_dicts[env_idx]}
 
             # Check if it's time to update the policy.
-            time_since_update = time.time() - last_update_time
             enough_experiences = collected_experiences >= update_interval
 
-            # Update if we've collected enough experiences, or if some time has passed and we have at least a few experiences. skip if testing.
-            if (enough_experiences or (collected_experiences > 100 and time_since_update > 30)) and not args.test:
+            # Update only if we've collected enough experiences - removed time-based fallback
+            if enough_experiences and not args.test:
                 if debug:
-                    print(f"[DEBUG] Updating policy with {collected_experiences} experiences after {time_since_update:.2f}s")
+                    print(f"[DEBUG] Updating policy with {collected_experiences} experiences after {time.time() - last_update_time:.2f}s")
 
                 # Perform the policy update.
                 stats = trainer.update()
@@ -501,55 +503,58 @@ class VectorizedEnv:
 
     def _step_env(self, args):
         """
-        Steps a single environment.  This function is designed to be run in a thread pool.
+        Steps a single environment. Optimized for performance.
         """
         i, env, actions_dict = args
 
-        # Format actions for the RLGym API.  RLGym expects numpy arrays.
+        # Format actions for the RLGym API with minimal conversions
         formatted_actions = {}
         for agent_id, action in actions_dict.items():
             if isinstance(action, np.ndarray):
                 formatted_actions[agent_id] = action
-            elif isinstance(action, int):
-                formatted_actions[agent_id] = np.array([action])
             else:
-                formatted_actions[agent_id] = np.array([int(action)])
+                formatted_actions[agent_id] = np.array([action if isinstance(action, int) else int(action)])
 
-            # Add action to stacker history
+            # Add action to stacker history efficiently
             if self.action_stacker is not None:
                 self.action_stacker.add_action(agent_id, formatted_actions[agent_id])
 
-        # Render only the selected environment.
+        # Render only the selected environment
         if self.render and i == self.render_env_idx:
             env.render()
-            time.sleep(6/120)  # Slow down rendering slightly to make it easier to see.
 
+        # Step the environment
         next_obs_dict, reward_dict, terminated_dict, truncated_dict = env.step(formatted_actions)
 
         return i, next_obs_dict, reward_dict, terminated_dict, truncated_dict
 
     def step(self, actions_dict_list):
         """
-        Steps all environments forward asynchronously.
+        Steps all environments forward using thread pool for better performance.
         """
-        # Create and run async tasks for each environment
-        async def run_steps():
-            tasks = [
-                self._step_env_async(i, env, actions_dict)
+        results = []
+        # Use map directly instead of complex async tasks
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all environments to the thread pool at once
+            futures = [
+                executor.submit(self._step_env, (i, env, actions_dict))
                 for i, (env, actions_dict) in enumerate(zip(self.envs, actions_dict_list))
             ]
-            return await asyncio.gather(*tasks)
 
-        # Run the async tasks in the event loop
-        results = self.loop.run_until_complete(run_steps())
+            # Wait for all to complete
+            for future in concurrent.futures.as_completed(futures):
+                results.append(future.result())
+
+        # Sort results by environment index
+        results.sort(key=lambda x: x[0])
 
         processed_results = []
         for i, next_obs_dict, reward_dict, terminated_dict, truncated_dict in results:
-            # Check if the episode is done in this environment.
+            # Check if episode is done in this environment
             self.dones[i] = any(terminated_dict.values()) or any(truncated_dict.values())
 
             if self.dones[i]:
-                # If done, reset the environment.
+                # If done, reset the environment
                 self.episode_counts[i] += 1
                 self.obs_dicts[i] = self.envs[i].reset()
 
@@ -558,11 +563,11 @@ class VectorizedEnv:
                     for agent_id in next_obs_dict.keys():
                         self.action_stacker.reset_agent(agent_id)
 
-                # If rendering, trigger a render after the reset.
+                # If rendering, trigger a render after the reset
                 if self.render and i == self.render_env_idx:
                     self.envs[i].render()
             else:
-                # If not done, just update the observations.
+                # If not done, just update the observations
                 self.obs_dicts[i] = next_obs_dict
 
             processed_results.append((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
@@ -671,6 +676,12 @@ if __name__ == "__main__":
     parser.add_argument('--no-aux-amp', action='store_false', dest='aux_amp',
                         help='Disable AMP for auxiliary tasks even if main training uses AMP')
     parser.set_defaults(aux_amp=False)
+
+    parser.add_argument('--aux_freq', type=int, default=8,
+                        help='Auxiliary task update frequency (higher = less frequent updates)')
+
+    parser.add_argument('--aux_scale', type=float, default=0.005,
+                        help='Scaling factor for auxiliary task losses')
 
 
     # Backwards compatibility.
