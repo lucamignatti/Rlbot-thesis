@@ -121,7 +121,7 @@ def run_training(
     # Performance optimizations
     os.environ['OMP_NUM_THREADS'] = str(max(1, os.cpu_count() // 4))
     os.environ['KMP_BLOCKTIME'] = '0'
-    os.environ['KMP_SETTINGS'] = '1'
+    os.environ['KMP_SETTINGS'] = '0'
     os.environ['KMP_AFFINITY'] = 'granularity=fine,compact,1,0'
 
     # We need at least one way to know when to stop training.
