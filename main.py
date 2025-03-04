@@ -25,13 +25,27 @@ import multiprocessing as mp
 from multiprocessing import Process, Pipe
 from typing import List, Tuple, Dict
 import numpy as np
+from curriculum_integration import create_basic_curriculum
 
-def get_env(renderer=None, action_stacker=None):
+
+def get_env(renderer=None, action_stacker=None, curriculum_config=None):
     """
-    Sets up the Rocket League environment.  We configure things like the
-    size of the teams, the initial state (kickoff), how we observe the game,
-    what actions the agent can take, what rewards it gets, and when an episode ends.
+    Sets up the Rocket League environment with curriculum support.
     """
+    # Use curriculum configuration if provided
+    if curriculum_config is not None:
+        return RLGym(
+            state_mutator=curriculum_config["state_mutator"],
+            obs_builder=StackedActionsObs(action_stacker, zero_padding=2),
+            action_parser=RepeatAction(LookupTableAction(), repeats=8),
+            reward_fn=curriculum_config["reward_function"],
+            termination_cond=curriculum_config["termination_condition"],
+            truncation_cond=curriculum_config["truncation_condition"],
+            transition_engine=RocketSimEngine(),
+            renderer=renderer
+        )
+
+    # Otherwise use the default configuration
     return RLGym(
         state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=2, orange_size=2),
@@ -43,7 +57,7 @@ def get_env(renderer=None, action_stacker=None):
             # Primary objective rewards - slightly increased to emphasize scoring
             (GoalReward(), 15.0),
 
-            # Offensive Potential KRC group (from paper)
+            # Offensive Potential KRC group
             (KRCReward([
                 (AlignBallToGoalReward(dispersion=1.1, density=1.0), 1.0),
                 (BallProximityReward(dispersion=0.8, density=1.2), 0.8),
@@ -57,7 +71,7 @@ def get_env(renderer=None, action_stacker=None):
                 (BallVelocityToGoalReward(), 0.6)
             ], team_spirit=0.3), 6.0),
 
-            # Distance-weighted Alignment KRC group (from paper)
+            # Distance-weighted Alignment KRC group
             (KRCReward([
                 (AlignBallToGoalReward(dispersion=1.1, density=1.0), 1.0),
                 (BallProximityReward(dispersion=0.8, density=1.2), 0.8)
@@ -95,9 +109,10 @@ def run_training(
     use_wandb: bool = False,
     debug: bool = False,
     use_compile: bool = True,
-    use_amp: bool = False, # Changed default to False
+    use_amp: bool = False,
     save_interval: int = 200,
     output_path: str = None,
+    use_curriculum: bool = False,
     # Hyperparameters
     lr_actor: float = 3e-4,
     lr_critic: float = 1e-3,
@@ -110,7 +125,7 @@ def run_training(
     ppo_epochs: int = 10,
     batch_size: int = 64,
     aux_amp: bool = False,
-    aux_scale: float = 0.005 # Added scaling factor for auxiliary tasks
+    aux_scale: float = 0.005
 ):
     """
     Main training loop.  This sets up the agent, environment, and training process,
@@ -167,8 +182,18 @@ def run_training(
         trainer.actor.train()
         trainer.critic.train()
 
+    # Initialize curriculum if enabled
+    curriculum_manager = None
+    if use_curriculum:
+        curriculum_manager = create_basic_curriculum(debug=args.debug)
+        curriculum_manager.register_trainer(trainer)
+        if debug:
+            print("[DEBUG] Curriculum learning enabled with basic curriculum")
+
     # Use a vectorized environment for parallel data collection.
-    vec_env = VectorizedEnv(num_envs=num_envs, render=render, action_stacker=action_stacker)
+    vec_env = VectorizedEnv(num_envs=num_envs, render=render,
+                           action_stacker=action_stacker,
+                           curriculum_manager=curriculum_manager)
 
     # For time-based training, we'll need to know when we started.
     start_time = time.time()
@@ -202,6 +227,15 @@ def run_training(
         "SR_Loss": "0.0", # State reconstruction loss
         "RP_Loss": "0.0"  # Reward prediction loss
     }
+
+    # Add curriculum info if enabled
+    if curriculum_manager:
+        curriculum_stats = curriculum_manager.get_curriculum_stats()
+        stats_dict.update({
+            "Stage": curriculum_stats["current_stage_name"],
+            "Diff": f"{curriculum_stats['difficulty_level']:.2f}"
+        })
+
     progress_bar.set_postfix(stats_dict)
 
     # Initialize variables to track training progress.
@@ -369,6 +403,22 @@ def run_training(
                     "RP_Loss": f"{stats.get('rp_loss', 0):.4f}"
                 })
 
+                # Update curriculum stats if enabled
+                if curriculum_manager:
+                    curriculum_stats = curriculum_manager.get_curriculum_stats()
+                    stats_dict.update({
+                        "Stage": curriculum_stats["current_stage_name"],
+                        "Diff": f"{curriculum_stats['difficulty_level']:.2f}"
+                    })
+
+                    if use_wandb:
+                        wandb.log({
+                            "curriculum/stage": curriculum_stats["current_stage"],
+                            "curriculum/stage_name": curriculum_stats["current_stage_name"],
+                            "curriculum/difficulty": curriculum_stats["difficulty_level"],
+                            "curriculum/success_rate": curriculum_stats["current_stage_stats"]["success_rate"]
+                        })
+
                 progress_bar.set_postfix(stats_dict)
 
                 collected_experiences = 0
@@ -399,9 +449,6 @@ def run_training(
             except Exception as e:
                 print(f"Error during final update: {str(e)}")
                 import traceback
-                traceback.print_exc()
-
-    return trainer
 
 def parse_time(time_str):
     """
@@ -433,13 +480,15 @@ def parse_time(time_str):
             raise
         raise ValueError(f"Invalid time format: {time_str}. Use format like '5m', '2h', '1d'")
 
-def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacker=None):
+def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacker=None, curriculum_config=None):
     """Worker process that runs a single environment"""
     # Create renderer only if rendering is enabled for this worker
     renderer = RLViserRenderer() if render else None
 
     # Create environment with correct parameters
-    env = env_fn(renderer=renderer, action_stacker=action_stacker)
+    env = env_fn(renderer=renderer, action_stacker=action_stacker, curriculum_config=curriculum_config)
+
+    curr_config = curriculum_config  # Keep track of current curriculum config
 
     while True:
         try:
@@ -467,6 +516,13 @@ def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacke
                 obs = env.reset()
                 remote.send(obs)
 
+            elif cmd == 'set_curriculum':
+                # Update environment with new curriculum configuration
+                curr_config = data
+                env.close()
+                env = env_fn(renderer=renderer, action_stacker=action_stacker, curriculum_config=curr_config)
+                remote.send(True)  # Acknowledge the update
+
             elif cmd == 'close':
                 if renderer:
                     renderer.close()
@@ -488,12 +544,28 @@ class VectorizedEnv:
     Runs multiple RLGym environments in parallel.
     Uses thread-based execution for rendered environments and
     multiprocessing for non-rendered environments.
+    Now supports curriculum learning.
     """
-    def __init__(self, num_envs, render=False, action_stacker=None):
+    def __init__(self, num_envs, render=False, action_stacker=None, curriculum_manager=None):
         self.num_envs = num_envs
         self.render = render
         self.action_stacker = action_stacker
-        self.render_delay = 0.025  # Default render delay in seconds
+        self.curriculum_manager = curriculum_manager
+        self.render_delay = 0.025
+
+        # For tracking episode metrics for curriculum
+        self.episode_rewards = [{} for _ in range(num_envs)]
+        self.episode_successes = [False] * num_envs
+        self.episode_timeouts = [False] * num_envs
+
+        # Get curriculum configurations if available
+        self.curriculum_configs = []
+        for env_idx in range(num_envs):
+            if self.curriculum_manager:
+                # Get potentially different configs for each environment (for rehearsal)
+                self.curriculum_configs.append(self.curriculum_manager.get_environment_config())
+            else:
+                self.curriculum_configs.append(None)
 
         # Decide whether to use threading for rendering
         if render:
@@ -505,7 +577,8 @@ class VectorizedEnv:
             for i in range(num_envs):
                 # Only create renderer for the first environment
                 env_renderer = RLViserRenderer() if (i == 0) else None
-                env = get_env(renderer=env_renderer, action_stacker=action_stacker)
+                env = get_env(renderer=env_renderer, action_stacker=action_stacker,
+                             curriculum_config=self.curriculum_configs[i])
                 self.envs.append(env)
 
             # Reset all environments
@@ -538,7 +611,7 @@ class VectorizedEnv:
             for idx, (work_remote, remote) in enumerate(zip(self.work_remotes, self.remotes)):
                 process = Process(
                     target=worker,
-                    args=(work_remote, get_env, False, action_stacker),
+                    args=(work_remote, get_env, False, action_stacker, self.curriculum_configs[idx]),
                     daemon=True
                 )
                 process.start()
@@ -578,6 +651,13 @@ class VectorizedEnv:
             env.render()  # Explicitly render
             time.sleep(self.render_delay)  # Add delay for better visualization
 
+        # Track rewards for curriculum
+        if self.curriculum_manager is not None:
+            for agent_id, reward in reward_dict.items():
+                if agent_id not in self.episode_rewards[env_idx]:
+                    self.episode_rewards[env_idx][agent_id] = 0
+                self.episode_rewards[env_idx][agent_id] += reward
+
         return env_idx, next_obs_dict, reward_dict, terminated_dict, truncated_dict
 
     def step(self, actions_dict_list):
@@ -602,6 +682,35 @@ class VectorizedEnv:
                 # Check if episode is done
                 self.dones[env_idx] = any(terminated_dict.values()) or any(truncated_dict.values())
 
+                # Track success/timeout for curriculum
+                if self.dones[env_idx]:
+                    self.episode_successes[env_idx] = any(terminated_dict.values())
+                    self.episode_timeouts[env_idx] = any(truncated_dict.values()) and not self.episode_successes[env_idx]
+
+                    # Update curriculum manager with episode results
+                    if self.curriculum_manager:
+                        # Calculate average reward across all agents
+                        avg_reward = sum(self.episode_rewards[env_idx].values()) / max(len(self.episode_rewards[env_idx]), 1)
+
+                        # Submit episode metrics
+                        self.curriculum_manager.update_progression_stats({
+                            "success": self.episode_successes[env_idx],
+                            "timeout": self.episode_timeouts[env_idx],
+                            "episode_reward": avg_reward
+                        })
+
+                        # Get new curriculum configuration for next episode
+                        new_config = self.curriculum_manager.get_environment_config()
+                        self.curriculum_configs[env_idx] = new_config
+
+                        # In threaded mode, need to recreate the environment
+                        if self.dones[env_idx]:
+                            self.envs[env_idx].close()
+                            env_renderer = RLViserRenderer() if (env_idx == 0 and self.render) else None
+                            self.envs[env_idx] = get_env(renderer=env_renderer,
+                                                        action_stacker=self.action_stacker,
+                                                        curriculum_config=new_config)
+
                 if self.dones[env_idx]:
                     # If done, reset the environment
                     self.episode_counts[env_idx] += 1
@@ -613,6 +722,11 @@ class VectorizedEnv:
                     if self.action_stacker is not None:
                         for agent_id in next_obs_dict.keys():
                             self.action_stacker.reset_agent(agent_id)
+
+                    # Reset episode tracking variables
+                    self.episode_rewards[env_idx] = {}
+                    self.episode_successes[env_idx] = False
+                    self.episode_timeouts[env_idx] = False
 
                     # Render again after reset if this is the rendered environment
                     if self.render and env_idx == 0:
@@ -634,10 +748,45 @@ class VectorizedEnv:
             for i, remote in enumerate(self.remotes):
                 next_obs_dict, reward_dict, terminated_dict, truncated_dict = remote.recv()
 
+                # Track rewards for curriculum
+                if self.curriculum_manager is not None:
+                    for agent_id, reward in reward_dict.items():
+                        if agent_id not in self.episode_rewards[i]:
+                            self.episode_rewards[i] = {}
+                        if agent_id not in self.episode_rewards[i]:
+                            self.episode_rewards[i][agent_id] = 0
+                        self.episode_rewards[i][agent_id] += reward
+
                 # Check if episode is done
                 self.dones[i] = any(terminated_dict.values()) or any(truncated_dict.values())
 
+                # Track success/timeout for curriculum
                 if self.dones[i]:
+                    self.episode_successes[i] = any(terminated_dict.values())
+                    self.episode_timeouts[i] = any(truncated_dict.values()) and not self.episode_successes[i]
+
+                    # Update curriculum manager with episode results
+                    if self.curriculum_manager:
+                        # Calculate average reward across all agents
+                        if len(self.episode_rewards[i]) > 0:
+                            avg_reward = sum(self.episode_rewards[i].values()) / len(self.episode_rewards[i])
+                        else:
+                            avg_reward = 0.0
+
+                        # Submit episode metrics
+                        self.curriculum_manager.update_progression_stats({
+                            "success": self.episode_successes[i],
+                            "timeout": self.episode_timeouts[i],
+                            "episode_reward": avg_reward
+                        })
+
+                        # Get new curriculum configuration for next episode
+                        new_config = self.curriculum_manager.get_environment_config()
+
+                        # Send the new curriculum configuration to the worker
+                        remote.send(('set_curriculum', new_config))
+                        remote.recv()  # Wait for acknowledgment
+
                     # If done, reset the environment
                     self.episode_counts[i] += 1
                     remote.send(('reset', None))
@@ -648,6 +797,11 @@ class VectorizedEnv:
                         for agent_id in next_obs_dict.keys():
                             remote.send(('reset_action_stacker', agent_id))
                             remote.recv()  # Wait for confirmation
+
+                    # Reset episode tracking variables
+                    self.episode_rewards[i] = {}
+                    self.episode_successes[i] = False
+                    self.episode_timeouts[i] = False
                 else:
                     # If not done, just update observations
                     self.obs_dicts[i] = next_obs_dict
@@ -727,6 +881,13 @@ if __name__ == "__main__":
 
     parser.add_argument('--render-delay', type=float, default=0.025,
                     help='Delay between rendered frames in seconds (higher values = slower visualization)')
+
+    parser.add_argument('--curriculum', action='store_true',
+                    help='Enable curriculum learning')
+    parser.add_argument('--no-curriculum', action='store_false', dest='curriculum',
+                    help='Disable curriculum learning')
+    parser.set_defaults(curriculum=True)
+
 
     # Hyperparameter arguments (these can be tuned to improve performance)
     parser.add_argument('--lra', type=float, default=1e-4, help='Learning rate for actor network')
@@ -815,6 +976,7 @@ if __name__ == "__main__":
         args.render = True
         args.num_envs = 1
         args.auxiliary = False
+        args.curriculum = False
         print("Test mode enabled: Rendering ON, using 1 environment")
 
     # Handle legacy --processes argument.
@@ -1003,6 +1165,7 @@ if __name__ == "__main__":
         use_amp=args.amp,
         save_interval=args.save_interval,
         output_path=args.out,
+        use_curriculum=args.curriculum,
         # Hyperparameters
         lr_actor=args.lra,
         lr_critic=args.lrc,

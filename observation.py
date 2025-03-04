@@ -81,7 +81,6 @@ class StackedActionsObs(DefaultObs):
             base_size = 542  # Default fallback
 
         total_size = base_size + stacked_actions_size
-        print(f"Total obs space size: {total_size}")
 
         return (total_size,)
 
