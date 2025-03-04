@@ -91,7 +91,7 @@ def run_training(
     use_wandb: bool = False,
     debug: bool = False,
     use_compile: bool = True,
-    use_amp: bool = True,
+    use_amp: bool = False, # Changed default to False
     save_interval: int = 200,
     output_path: str = None,
     # Hyperparameters
@@ -104,7 +104,8 @@ def run_training(
     entropy_coef: float = 0.01,
     max_grad_norm: float = 0.5,
     ppo_epochs: int = 10,
-    batch_size: int = 64
+    batch_size: int = 64,
+    aux_amp: bool = False
 ):
     """
     Main training loop.  This sets up the agent, environment, and training process,
@@ -143,7 +144,8 @@ def run_training(
         use_amp=use_amp,
         use_auxiliary_tasks=args.auxiliary,
         sr_weight=args.sr_weight,
-        rp_weight=args.rp_weight
+        rp_weight=args.rp_weight,
+        aux_amp=aux_amp
     )
 
     #  Use train mode for training and eval for testing
@@ -185,7 +187,9 @@ def run_training(
         "Reward": "0.0",  # Average reward per episode
         "PLoss": "0.0",  # Actor loss
         "VLoss": "0.0",  # Critic loss
-        "Entropy": "0.0"  # Entropy loss
+        "Entropy": "0.0", # Entropy loss
+        "SR_Loss": "0.0", # State reconstruction loss
+        "RP_Loss": "0.0"  # Reward prediction loss
     }
     progress_bar.set_postfix(stats_dict)
 
@@ -237,7 +241,7 @@ def run_training(
                 obs_batch = torch.FloatTensor(np.stack(all_obs)).to(device)
                 with torch.no_grad():
                     # Get actions and values from the networks.
-                    action_batch, log_prob_batch, value_batch = trainer.get_action(obs_batch)
+                    action_batch, log_prob_batch, value_batch, features_batch = trainer.get_action(obs_batch, return_features=True)
 
                 # Organize actions into a list of dictionaries, one for each environment.
                 actions_dict_list = [{} for _ in range(num_envs)]
@@ -627,7 +631,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--amp', action='store_true', help='Use automatic mixed precision for faster training (requires CUDA)')
     parser.add_argument('--no-amp', action='store_false', dest='amp', help='Disable automatic mixed precision')
-    parser.set_defaults(amp=True)
+    parser.set_defaults(amp=False)
 
     parser.add_argument('-m', '--model', type=str, default=None,
                         help='Path to a pre-trained model file to load')
@@ -650,12 +654,23 @@ if __name__ == "__main__":
     parser.add_argument('--stack_size', type=int, default=5, help='Number of previous actions to stack')
 
     # Auxiliary learning parameters
-    parser.add_argument('--auxiliary', action='store_true',
-                        help='Enable auxiliary task learning (SR and RP tasks)')
+    parser.add_argument('--auxiliary', action='store_false', dest='auxiliary',
+                        help='Disable auxiliary task learning (SR and RP tasks)')
+    parser.add_argument('--no-auxiliary', action='store_true', dest='auxiliary',
+                        help='Disable auxiliary task learning (SR and RP tasks) (for backward compatibility)')
+    parser.set_defaults(auxiliary=True)
+
     parser.add_argument('--sr_weight', type=float, default=1.0,
                         help='Weight for the State Representation auxiliary task')
     parser.add_argument('--rp_weight', type=float, default=1.0,
                         help='Weight for the Reward Prediction auxiliary task')
+
+    # Add option to control AMP for auxiliary tasks specifically
+    parser.add_argument('--aux-amp', action='store_true',
+                        help='Enable AMP for auxiliary tasks (can be disabled separately from main training)')
+    parser.add_argument('--no-aux-amp', action='store_false', dest='aux_amp',
+                        help='Disable AMP for auxiliary tasks even if main training uses AMP')
+    parser.set_defaults(aux_amp=False)
 
 
     # Backwards compatibility.
@@ -876,7 +891,8 @@ if __name__ == "__main__":
         entropy_coef=args.entropy_coef,
         max_grad_norm=args.max_grad_norm,
         ppo_epochs=args.ppo_epochs,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        aux_amp=args.aux_amp if args.aux_amp is not None else args.amp
     )
 
 

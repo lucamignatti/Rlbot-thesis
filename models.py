@@ -175,6 +175,7 @@ class SimBa(nn.Module):
         # Store input and output shapes for later use.
         self.obs_shape = obs_shape
         self.action_shape = action_shape
+        self.hidden_dim = hidden_dim  # Explicitly store hidden_dim
 
         # Use Running Statistics Normalization for input.
         self.rsnorm = RSNorm(obs_shape)
@@ -231,6 +232,9 @@ class SimBa(nn.Module):
         if self.training:
             h = self.dropout(h)
 
+        # Store intermediate features for auxiliary tasks
+        features = h.clone()
+
         # Apply the residual blocks.
         for i, block in enumerate(self.blocks):
             # Mark CUDA graph step before each block.
@@ -258,13 +262,16 @@ class SimBa(nn.Module):
 
         # Return features if requested, otherwise just output
         if return_features:
-            return output.clone(), h.clone()
+            return output.clone(), features
         return output.clone()
 
     def to(self, device=None, dtype=None, non_blocking=False):
+        # Fix: Correct method signature to match nn.Module
         super().to(device=device, dtype=dtype, non_blocking=non_blocking)
-        self.device = device
+        if device is not None:
+            self.device = device
         return self
+
 
 class ResidualFFBlock(nn.Module):
     def __init__(self, hidden_dim, dropout_rate=0.1, device=None):

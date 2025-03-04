@@ -283,10 +283,11 @@ class PPOTrainer:
         use_wandb: bool = False,
         debug: bool = False,
         use_compile: bool = True,
-        use_amp: bool = True,
+        use_amp: bool = False,  # Changed default to False
         use_auxiliary_tasks: bool = True,
         sr_weight: float = 1.0,
-        rp_weight: float = 1.0
+        rp_weight: float = 1.0,
+        aux_amp: bool = False
     ):
 
         self.use_wandb = use_wandb
@@ -319,6 +320,7 @@ class PPOTrainer:
 
             # Options for compilation - we don't capture the full graph and allow dynamic shapes.
             compile_options = {
+                "mode": "default",
                 "fullgraph": False,
                 "dynamic": True,
             }
@@ -385,8 +387,8 @@ class PPOTrainer:
         self.use_amp = "cuda" in str(device) and use_amp
         if self.use_amp:
             self.scaler = GradScaler(
-                init_scale=2**10,
-                growth_factor=2.0,
+                init_scale=2**8,  # Reduced from 2**10
+                growth_factor=1.5,  # Reduced from 2.0
                 backoff_factor=0.5,
                 growth_interval=2000,
                 enabled=True
@@ -412,13 +414,14 @@ class PPOTrainer:
                 if self.debug:
                     print(f"[DEBUG] Could not determine observation dimension, using default: {obs_dim}")
 
-            # Initialize auxiliary task manager
+            # Initialize auxiliary task manager with AMP flag
             self.aux_task_manager = AuxiliaryTaskManager(
                 actor=actor,
                 obs_dim=obs_dim,
                 sr_weight=sr_weight,
                 rp_weight=rp_weight,
-                device=self.device
+                device=self.device,
+                use_amp=aux_amp  # Use the passed aux_amp parameter
             )
             self.debug_print("Auxiliary tasks initialized")
 
@@ -452,9 +455,7 @@ class PPOTrainer:
                 self.debug_print(f"Function compilation failed: {str(e)}")
                 self.use_compile = False
 
-
         print_model_info(self.actor, model_name="Actor", print_amp=self.use_amp)
-
         print_model_info(self.critic, model_name="Critic", print_amp=self.use_amp)
 
     def _setup_cuda_graphs(self):
@@ -748,7 +749,7 @@ class PPOTrainer:
             if done is not None:
                 self.memory.dones[idx] = bool(done)
 
-    def get_action(self, state, evaluate=False):
+    def get_action(self, state, evaluate=False, return_features=False):
         """
         Get an action and its log probability from the actor network, given a state.
         Optimized for both single and batched inputs, and handles both discrete and continuous action spaces.
@@ -776,7 +777,7 @@ class PPOTrainer:
         state_device = state_clone.to(self.device)
 
         with torch.no_grad():  # We don't need gradients for inference.
-            with autocast(enabled=self.use_amp, device_type="cuda"):  # Use AMP if available for faster computation.
+            with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):  # Only enable AMP with CUDA
                 # For CUDA graphs, we mark the start of each step.
                 if "cuda" in str(self.device):
                     torch.compiler.cudagraph_mark_step_begin()
@@ -789,9 +790,9 @@ class PPOTrainer:
                 if "cuda" in str(self.device):
                     torch.compiler.cudagraph_mark_step_begin()
 
-                # Now, get the action distribution from the actor.  This is different for discrete vs. continuous spaces.
+                # Now, get the action distribution from the actor with features.
                 if self.action_space_type == "discrete":
-                    logits = self.actor(state_device)
+                    logits, features = self.actor(state_device, return_features=True)
                     logits = logits.clone()
 
                     # Mark step after model execution.
@@ -812,7 +813,14 @@ class PPOTrainer:
                     log_prob = dist.log_prob(action)  # Get the log probability of the chosen action.
                 else:
                     # For continuous action spaces, the actor outputs the mean and (raw) standard deviation of a normal distribution.
-                    mu, sigma_raw = self.actor(state_device)
+                    output, features = self.actor(state_device, return_features=True)
+                    if isinstance(output, tuple):
+                        mu, sigma_raw = output
+                    else:
+                        # Split the output if it's combined
+                        split_size = output.shape[-1] // 2
+                        mu, sigma_raw = output[:, :split_size], output[:, split_size:]
+
                     mu = mu.clone()  # Clone the mean to avoid in-place modifications.
                     sigma_raw = sigma_raw.clone() if isinstance(sigma_raw, torch.Tensor) else sigma_raw # Clone sigma, checking its type first.
 
@@ -843,8 +851,11 @@ class PPOTrainer:
                 action = action.clone()
                 log_prob = log_prob.clone()
                 value = value.clone()
+                features = features.clone()
 
-        # Return actions, log probabilities, and values as numpy arrays (for use with the environment).
+        # Return actions, log probabilities, values and features for auxiliary tasks
+        if return_features:
+            return action.cpu().numpy(), log_prob.cpu().numpy(), value.cpu().numpy(), features.cpu().numpy()
         return action.cpu().numpy(), log_prob.cpu().numpy(), value.cpu().numpy()
 
     def compute_gae(self, rewards, values, dones, next_value):
@@ -1076,6 +1087,14 @@ class PPOTrainer:
 
         return actor_loss, critic_loss, entropy_loss, total_loss, entropy
 
+    def _safe_loss(self, loss_tensor):
+        """Safely handle potentially NaN losses"""
+        if torch.isnan(loss_tensor).any() or torch.isinf(loss_tensor).any():
+            if self.debug:
+                print(f"[DEBUG] NaN or Inf detected in loss - replacing with safe value")
+            return torch.tensor(0.01, device=self.device, requires_grad=True)
+        return loss_tensor
+
     def update(self):
         """Update policy and value networks using the PPO algorithm, with optimizations for AMP."""
         update_start = time.time()
@@ -1085,7 +1104,8 @@ class PPOTrainer:
         if len(states) == 0:
             # If there's nothing to train on, return early with default values.
             return {"actor_loss": 0, "critic_loss": 0, "entropy_loss": 0, "total_loss": 0,
-                    "mean_episode_reward": 0, "value_explained_variance": 0, "kl_divergence": 0}
+                    "mean_episode_reward": 0, "value_explained_variance": 0, "kl_divergence": 0,
+                    "sr_loss":0, "rp_loss":0}  # Return 0 for aux losses too
 
         # Calculate how many episodes are represented in this batch of data.
         episodes_ended = torch.sum(dones.int()).item() if isinstance(dones, torch.Tensor) else np.sum(dones) if len(dones) > 0 else 0
@@ -1140,6 +1160,8 @@ class PPOTrainer:
         total_critic_loss = 0
         total_entropy_loss = 0
         total_aux_loss = 0 # For auxiliary tasks
+        total_sr_loss = 0  # Add this
+        total_rp_loss = 0  # Add this
         total_loss = 0
         old_probs = None
         old_mu = None
@@ -1179,20 +1201,14 @@ class PPOTrainer:
                 eta_min=3e-5
             )
 
+        # Initialize auxiliary task schedulers, if applicable
         if self.use_auxiliary_tasks:
             if not hasattr(self.aux_task_manager, 'sr_scheduler'):
                 self.aux_task_manager.sr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                    self.aux_task_manager.sr_optimizer,
-                    T_max=1000000,
-                    eta_min=1e-5
-                )
+                    self.aux_task_manager.sr_optimizer, T_max=1000000, eta_min=1e-5)
             if not hasattr(self.aux_task_manager, 'rp_scheduler'):
                 self.aux_task_manager.rp_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                    self.aux_task_manager.rp_optimizer,
-                    T_max=1000000,
-                    eta_min=1e-5
-                )
-
+                    self.aux_task_manager.rp_optimizer, T_max=1000000, eta_min=1e-5)
 
         # Initialize reward normalizer.
         if not hasattr(self, 'ret_rms'):
@@ -1251,7 +1267,7 @@ class PPOTrainer:
                     batch_advantages = torch.tensor(advantages[batch_indices], dtype=torch.float32, device=self.device)
                     batch_returns = torch.tensor(returns[batch_indices], dtype=torch.float32, device=self.device)
 
-                # Reset the gradients of the optimizers.  We use set_to_none=True for a slight performance boost.
+                # Reset the gradients of the optimizers.
                 self.actor_optimizer.zero_grad(set_to_none=True)
                 self.critic_optimizer.zero_grad(set_to_none=True)
                 if self.use_auxiliary_tasks:
@@ -1259,152 +1275,108 @@ class PPOTrainer:
                     self.aux_task_manager.rp_optimizer.zero_grad(set_to_none=True)
 
                 try:
-                    # Use a single autocast context for the entire forward pass.  This improves efficiency.
+                    # Use a single autocast context for the entire forward pass when AMP is enabled.
                     with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):
-                        # Forward pass through the critic network.
-                        values = self.critic(batch_states).squeeze()
-
-                        # Forward pass through the actor network. This is different for discrete vs. continuous action spaces.
+                        # Forward pass through actor to get policy outputs and shared features
                         if self.action_space_type == "discrete":
                             logits, features = self.actor(batch_states, return_features=True)
-                            action_probs = F.softmax(logits, dim=1)  # Convert logits to probabilities.
-                            dist = Categorical(action_probs)  # Create a categorical distribution.
-                            new_log_probs = dist.log_prob(batch_actions)  # Get log probabilities of the actions.
-                            entropy = dist.entropy().mean()  # Calculate the entropy of the distribution.
+                            action_probs = F.softmax(logits, dim=1)
+                            dist = Categorical(action_probs)
+                            new_log_probs = dist.log_prob(batch_actions)  # Already correct type
+                            entropy = dist.entropy().mean()
                         else:
                             output, features = self.actor(batch_states, return_features=True)
                             if isinstance(output, tuple):
                                 mu, sigma_raw = output
                             else:
-                                # Split output into mu and sigma if combined
+                                # Split the output if it's combined
                                 split_size = output.shape[-1] // 2
                                 mu, sigma_raw = output[:, :split_size], output[:, split_size:]
 
-                            sigma = F.softplus(sigma_raw) + 1e-5   # Ensure standard deviation is positive.
-                            dist = Normal(mu, sigma)  # Create a normal distribution.
-                            new_log_probs = dist.log_prob(batch_actions)  # Log probability of the actions.
+                            sigma = F.softplus(sigma_raw) + 1e-5
+                            dist = Normal(mu, sigma)
+                            new_log_probs = dist.log_prob(batch_actions)
                             if len(new_log_probs.shape) > 1:
-                                new_log_probs = new_log_probs.sum(dim=1)  # Sum log probs if multi-dimensional action.
+                                new_log_probs = new_log_probs.sum(dim=1)
                             entropy = dist.entropy().mean()
 
-                        # Calculate the ratio between the new and old policies.  This is a key part of the PPO algorithm.
+                        # Forward pass through critic
+                        values = self.critic(batch_states).squeeze()
+
+                        # Calculate PPO losses (in full precision even with AMP)
                         ratio = torch.exp(new_log_probs - batch_old_log_probs)
-
-                        # Apply a more conservative clipping range for numerical stability.
-                        ratio = torch.clamp(ratio, 0.0, 10.0)
-
-                        # Calculate the two surrogate losses for PPO.
+                        ratio = torch.clamp(ratio, 0.0, 10.0) # Prevent extreme values
                         surr1 = ratio * batch_advantages
                         surr2 = torch.clamp(ratio, 1.0 - effective_clip_epsilon, 1.0 + effective_clip_epsilon) * batch_advantages
-
-                        # Calculate the actor loss. We take the minimum of the two surrogate losses.
                         actor_loss = -torch.min(surr1, surr2).mean()
-                        # Critic loss is the mean squared error between predicted values and returns.
+
                         critic_loss = F.mse_loss(values, batch_returns)
-                        # Entropy loss encourages exploration.
                         entropy_loss = -self.entropy_coef * entropy
 
-                        # Auxiliary task losses
-                        if self.use_auxiliary_tasks:
-                            # Get a subsequence for RP
-                            if len(self.aux_task_manager.obs_history) >= self.aux_task_manager.rp_sequence_length:
-                                obs_seq = torch.stack(self.aux_task_manager.obs_history, dim=1)
-                                rewards_seq = torch.stack(self.aux_task_manager.rewards_history, dim=0)
-                                # Now slice to use only current batch indices
-                                obs_seq_batch = obs_seq[batch_indices]
-                                rewards_seq_batch = rewards_seq[batch_indices] if rewards_seq.size(0) > 1 else rewards_seq
-                            else:
-                                obs_seq_batch = None
-                                rewards_seq_batch = None
-
-                            sr_loss, rp_loss = self.aux_task_manager.compute_losses(
-                                features, batch_states, rewards_seq_batch
-                            )
-
-                            # Combine auxiliary losses
-                            aux_loss = sr_loss + rp_loss
-                            total_aux_loss += aux_loss.item()
-
-                            aux_metrics = {
-                                'sr_loss': float(sr_loss.item()) if isinstance(sr_loss, torch.Tensor) else 0.0,
-                                'rp_loss': float(rp_loss.item()) if isinstance(rp_loss, torch.Tensor) else 0.0
-                            }
-
-                            # Store previous loss if not exists
-                            if not hasattr(self, 'previous_aux_loss'):
-                                self.previous_aux_loss = aux_loss.item()
-
-                            # Check for significant increase
-                            if aux_loss.item() > self.previous_aux_loss * 2:  # Threshold of 2x increase
-                                if self.debug:
-                                    self.debug_print("Auxiliary loss increased significantly, skipping auxiliary update")
-                                aux_loss = torch.tensor(0.0, device=self.device)  # Skip auxiliary update
-
-                            self.previous_aux_loss = aux_loss.item()  # Update previous loss
-                            total_aux_loss += aux_loss.item()
-
-
+                    # Calculate auxiliary losses outside autocast (for numerical stability)
+                    if self.use_auxiliary_tasks:
+                        # Use the stored rewards history for RP
+                        if len(self.aux_task_manager.rewards_history) >= self.aux_task_manager.rp_sequence_length:
+                            rewards_seq = torch.stack(self.aux_task_manager.rewards_history)
                         else:
-                            aux_loss = torch.tensor(0.0, device=self.device)
+                            rewards_seq = None
 
-                        # The total loss is a weighted sum of the actor, critic, entropy and auxiliary losses.
-                        loss = actor_loss + self.critic_coef * critic_loss + entropy_loss + aux_loss
+                        # Compute auxiliary losses, ensuring features and observations are float32
+                        sr_loss, rp_loss = self.aux_task_manager.compute_losses(
+                            features=features.float(),
+                            observations=batch_states.float(),
+                            rewards_sequence=rewards_seq
+                        )
 
-                    # If using AMP, scale the loss and perform the backward pass.
-                    if self.use_amp and "cuda" in str(self.device):
+                        # Track auxiliary losses separately for logging and analysis
+                        total_sr_loss += sr_loss.item()
+                        total_rp_loss += rp_loss.item()
+
+                        aux_scale = 0.01  # Scale down auxiliary loss
+                        aux_loss = (sr_loss + rp_loss) * aux_scale
+                        total_aux_loss += aux_loss.item()
+                    else:
+                        aux_loss = torch.tensor(0.0, device=self.device)
+
+
+                    # Combine losses (all in full precision for stability)
+                    loss = actor_loss + self.critic_coef * critic_loss + entropy_loss + aux_loss
+
+                    # Check for nan
+                    if torch.isnan(loss):
+                      print("Warning: NaN loss detected!")
+
+                    # Backward and optimize
+                    if self.use_amp:
                         self.scaler.scale(loss).backward()
-
-                        # Unscale the gradients before clipping.  This is important for AMP.
                         self.scaler.unscale_(self.actor_optimizer)
                         self.scaler.unscale_(self.critic_optimizer)
                         if self.use_auxiliary_tasks:
                             self.scaler.unscale_(self.aux_task_manager.sr_optimizer)
                             self.scaler.unscale_(self.aux_task_manager.rp_optimizer)
 
-                        if self.use_auxiliary_tasks:
-                            torch.nn.utils.clip_grad_norm_(self.aux_task_manager.sr_head.parameters(), self.max_grad_norm)
-                            torch.nn.utils.clip_grad_norm_(self.aux_task_manager.rp_head.parameters(), self.max_grad_norm)
-
-
-                        # Clip gradients by value first for stability.
-                        for param in self.actor.parameters():
-                            if param.grad is not None:
-                                param.grad.data.clamp_(-1.0, 1.0)
-                        for param in self.critic.parameters():
-                            if param.grad is not None:
-                                param.grad.data.clamp_(-1.0, 1.0)
-
-                        # Then, clip gradients by norm.
                         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-
-                        # Step the optimizers (with scaled gradients).
+                        if self.use_auxiliary_tasks:
+                            torch.nn.utils.clip_grad_norm_(self.aux_task_manager.sr_head.parameters(), self.max_grad_norm)
+                            torch.nn.utils.clip_grad_norm_(self.aux_task_manager.rp_lstm.parameters(), self.max_grad_norm)
+                            torch.nn.utils.clip_grad_norm_(self.aux_task_manager.rp_head.parameters(), self.max_grad_norm)
                         self.scaler.step(self.actor_optimizer)
                         self.scaler.step(self.critic_optimizer)
+
                         if self.use_auxiliary_tasks:
                             self.scaler.step(self.aux_task_manager.sr_optimizer)
                             self.scaler.step(self.aux_task_manager.rp_optimizer)
 
-                        # Update the gradient scaler.
                         self.scaler.update()
                     else:
-                        # Standard backward pass (without AMP).
                         loss.backward()
-
-                        # Clip gradients by value first.
-                        for param in self.actor.parameters():
-                            if param.grad is not None:
-                                param.grad.data.clamp_(-1.0, 1.0)
-                        for param in self.critic.parameters():
-                            if param.grad is not None:
-                                param.grad.data.clamp_(-1.0, 1.0)
-
-                        # Then clip by norm.
                         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
 
                         if self.use_auxiliary_tasks:
                             torch.nn.utils.clip_grad_norm_(self.aux_task_manager.sr_head.parameters(), self.max_grad_norm)
+                            torch.nn.utils.clip_grad_norm_(self.aux_task_manager.rp_lstm.parameters(), self.max_grad_norm)
                             torch.nn.utils.clip_grad_norm_(self.aux_task_manager.rp_head.parameters(), self.max_grad_norm)
 
 
@@ -1413,82 +1385,72 @@ class PPOTrainer:
                         if self.use_auxiliary_tasks:
                             self.aux_task_manager.sr_optimizer.step()
                             self.aux_task_manager.rp_optimizer.step()
-
-                    # Keep track of the total losses.
+                    # Track the losses
                     total_actor_loss += actor_loss.item()
                     total_critic_loss += critic_loss.item()
                     total_entropy_loss += entropy_loss.item()
                     total_loss += loss.item()
 
                 except Exception as e:
-                    # If anything goes wrong during training, print an error message and the stack trace.
-                    print(f"Error in batch {batch_idx+1}: {str(e)}")
+                    print(f"Error in batch processing: {e}")
                     import traceback
                     traceback.print_exc()
                     continue
 
-        # Step the learning rate schedulers.
+        # Step learning rate schedulers
         self.actor_scheduler.step()
         self.critic_scheduler.step()
         if self.use_auxiliary_tasks:
             self.aux_task_manager.sr_scheduler.step()
             self.aux_task_manager.rp_scheduler.step()
 
+
         # Calculate the average losses across all epochs and batches.
-        num_updates = max(self.ppo_epochs * len(batches), 1)  # Avoid division by zero.
+        num_updates = max(self.ppo_epochs * len(batches), 1)
         avg_actor_loss = total_actor_loss / num_updates
         avg_critic_loss = total_critic_loss / num_updates
         avg_entropy_loss = total_entropy_loss / num_updates
-        avg_aux_loss = total_aux_loss / num_updates
+        avg_sr_loss = total_sr_loss / num_updates   # average sr loss
+        avg_rp_loss = total_rp_loss / num_updates   # average rp loss
+        avg_aux_loss = total_aux_loss / num_updates # average aux loss
         avg_loss = total_loss / num_updates
 
-        # Calculate the KL divergence between the old and new policies.  This is a measure of how much the policy changed.
+        # Calculate the KL divergence between the old and new policies.
         kl_div = 0
         if len(states) > 0:
             with torch.no_grad():  # No gradients needed for this.
                 if self.action_space_type == "discrete" and old_probs is not None:
-                    # Forward pass through actor in mixed precision.
                     with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):
                         new_logits = self.actor(states)
-
-                    # Calculate KL divergence in full precision for accuracy.
                     new_probs = F.softmax(new_logits.float(), dim=1)
                     kl = old_probs * (torch.log(old_probs + 1e-10) - torch.log(new_probs + 1e-10))
-                    # Handle potential numerical issues.
                     if torch.isnan(kl).any() or torch.isinf(kl).any():
                         kl = torch.nan_to_num(kl, nan=0.0, posinf=1.0, neginf=-1.0)
                     kl_div = kl.sum(1).mean().item()
 
                 elif old_mu is not None and old_sigma is not None:
-                    # Forward pass in mixed precision.
                     with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):
                         new_mu, new_sigma_raw = self.actor(states)
-
-                    # KL calculation in full precision.
                     new_mu = new_mu.float()
                     new_sigma_raw = new_sigma_raw.float() if isinstance(new_sigma_raw, torch.Tensor) else new_sigma_raw
                     new_sigma = F.softplus(new_sigma_raw) + 1e-5
-
                     kl = torch.log(new_sigma/(old_sigma + 1e-10)) + (old_sigma**2 + (old_mu - new_mu)**2)/(2*new_sigma**2 + 1e-10) - 0.5
-                    # Handle potential numerical issues.
                     if torch.isnan(kl).any() or torch.isinf(kl).any():
                         kl = torch.nan_to_num(kl, nan=0.0, posinf=1.0, neginf=-1.0)
                     kl_div = kl.mean().item()
 
-        # Calculate the explained variance.  This tells us how well the value function is predicting the returns.
+
+        # Calculate the explained variance.
         explained_var = 0
         if len(states) > 0:
             with torch.no_grad():
                 try:
-                    # Forward pass of the critic in mixed precision.
                     with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):
                         all_values_half = self.critic(states).squeeze()
 
-                    # Calculate variance in full precision.
                     all_values = all_values_half.float().cpu().numpy().flatten()
                     all_returns = returns.cpu().numpy().flatten() if isinstance(returns, torch.Tensor) else returns.flatten()
 
-                    # Ensure lengths match before calculation.
                     min_length = min(len(all_values), len(all_returns))
                     if min_length > 0:
                         all_values = all_values[:min_length]
@@ -1501,71 +1463,58 @@ class PPOTrainer:
                 except Exception as e:
                     print(f"Error computing explained variance: {e}")
 
-        # Update auxiliary tasks if enabled
-        aux_metrics = {}
 
         # Log the training metrics using wandb, if it's enabled.
         if self.use_wandb:
             try:
-                import sys
-                if 'wandb' in sys.modules:
-                    # Prepare metrics, handling potential NaN values.
+                import wandb
+                if wandb.run is not None:
                     safe_metrics = {
-                        "actor_loss": float(avg_actor_loss) if not np.isnan(avg_actor_loss) else 0.0,
-                        "critic_loss": float(avg_critic_loss) if not np.isnan(avg_critic_loss) else 0.0,
-                        "entropy_loss": float(avg_entropy_loss) if not np.isnan(avg_entropy_loss) else 0.0,
-                        "total_loss": float(avg_loss) if not np.isnan(avg_loss) else 0.0,
+                        "actor_loss": float(avg_actor_loss),
+                        "critic_loss": float(avg_critic_loss),
+                        "entropy_loss": float(avg_entropy_loss),
+                        "total_loss": float(avg_loss),
                         "mean_episode_reward": float(avg_episode_reward),
                         "mean_episode_length": float(avg_episode_length),
-                        "policy_kl_divergence": float(kl_div) if not np.isnan(kl_div) else 0.0,
-                        "value_explained_variance": float(explained_var) if not np.isnan(explained_var) else 0.0,
+                        "policy_kl_divergence": float(kl_div),
+                        "value_explained_variance": float(explained_var),
                         "effective_clip_epsilon": effective_clip_epsilon,
                         "actor_lr": self.actor_scheduler.get_last_lr()[0],
                         "critic_lr": self.critic_scheduler.get_last_lr()[0],
+                        "sr_loss": float(avg_sr_loss),         # Auxiliary task losses
+                        "rp_loss": float(avg_rp_loss),         # Auxiliary task losses
+                        "aux_loss": float(avg_aux_loss),
                     }
+                    if hasattr(self, 'aux_scale'):
+                        safe_metrics["aux_scale"] = self.aux_scale
 
-                    # Add tensor-based metrics, handling NaNs.
                     if isinstance(advantages, torch.Tensor):
                         adv_mean = advantages.mean().item()
-                        if not np.isnan(adv_mean):
-                            safe_metrics["mean_advantage"] = adv_mean
+                        if not np.isnan(adv_mean): safe_metrics["mean_advantage"] = adv_mean
 
                     if isinstance(returns, torch.Tensor):
                         ret_mean = returns.mean().item()
-                        if not np.isnan(ret_mean):
-                            safe_metrics["mean_return"] = ret_mean
+                        if not np.isnan(ret_mean): safe_metrics["mean_return"] = ret_mean
 
-                    # Log AMP scaler value, if applicable.
+                    # Log AMP scaler value
                     if self.use_amp:
                         safe_metrics["amp_scale"] = self.scaler.get_scale()
 
-                    # Log reward normalization statistics.
+                    # Log reward normalization stats
                     if hasattr(self, 'ret_rms'):
                         safe_metrics["reward_mean"] = float(self.ret_rms.mean)
                         safe_metrics["reward_var"] = float(self.ret_rms.var)
 
-                    # Initialize step counters if they don't exist
-                    if not hasattr(self, 'training_steps'):
-                        self.training_steps = 0
-                    if not hasattr(self, 'training_step_offset'):
-                        self.training_step_offset = 0
+                    if not hasattr(self, 'training_steps'): self.training_steps = 0
+                    if not hasattr(self, 'training_step_offset'): self.training_step_offset = 0
 
-                    # Increment step counter
                     self.training_steps += 1
-
-                    # Use combined step count for logging
                     global_step = self.training_steps + self.training_step_offset
 
-                    # Add auxiliary task metrics
-                    # safe_metrics.update(aux_metrics) # <- Removed: aux metrics are now in main return dict
-                    safe_metrics["aux_loss"] = float(avg_aux_loss)
-
-
-                    import wandb
                     wandb.log(safe_metrics, step=global_step)
+
             except Exception as e:
-                if self.debug:
-                    print(f"[DEBUG] Failed to log to wandb: {e}")
+                print(f"[WARNING] Failed to log metrics: {e}")
 
         # Clear the memory buffer after each update.
         self.memory.clear()
@@ -1581,9 +1530,9 @@ class PPOTrainer:
             "kl_divergence": kl_div,
             "effective_clip_epsilon": effective_clip_epsilon,
             "update_time": time.time() - update_start,
-            "sr_loss": aux_metrics.get('sr_loss', 0.0),
-            "rp_loss": aux_metrics.get('rp_loss', 0.0),
-            "aux_loss": avg_aux_loss
+            "sr_loss": avg_sr_loss, # Return auxiliary loss
+            "rp_loss": avg_rp_loss, # Return auxiliary loss
+            "aux_loss": avg_aux_loss # Return auxiliary loss
         }
 
         return return_metrics
