@@ -704,6 +704,7 @@ if __name__ == "__main__":
     if args.test:
         args.render = True
         args.num_envs = 1
+        args.auxiliary = False
         print("Test mode enabled: Rendering ON, using 1 environment")
 
     # Handle legacy --processes argument.
