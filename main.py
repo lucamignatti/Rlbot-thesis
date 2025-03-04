@@ -12,6 +12,7 @@ from rlgym.rocket_league.rlviser import RLViserRenderer
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
 from rewards import BallProximityReward, BallToGoalDistanceReward, BallVelocityToGoalReward, TouchBallReward, TouchBallToGoalAccelerationReward, AlignBallToGoalReward, PlayerVelocityTowardBallReward, KRCReward
 from models import BasicModel, SimBa, fix_compiled_state_dict, extract_model_dimensions, load_partial_state_dict
+from observation import StackedActionsObs, ActionStacker
 from training import PPOTrainer
 import concurrent.futures
 import time
@@ -20,7 +21,7 @@ from tqdm import tqdm
 import signal
 import sys
 
-def get_env(renderer=None):
+def get_env(renderer=None, action_stacker=None):
     """
     Sets up the Rocket League environment.  We configure things like the
     size of the teams, the initial state (kickoff), how we observe the game,
@@ -31,7 +32,7 @@ def get_env(renderer=None):
             FixedTeamSizeMutator(blue_size=2, orange_size=2),
             KickoffMutator()
         ),
-        obs_builder=DefaultObs(zero_padding=2),
+        obs_builder=StackedActionsObs(action_stacker, zero_padding=2),
         action_parser=RepeatAction(LookupTableAction(), repeats=8),
         reward_fn=CombinedReward(
             # Primary objective rewards - slightly increased to emphasize scoring
@@ -116,6 +117,9 @@ def run_training(
     actor.to(device)
     critic.to(device)
 
+    # Initialize action stacker for keeping track of previous actions
+    action_stacker = ActionStacker(stack_size=5, action_size=actor.action_shape)
+
     # Initialize the PPO trainer, which handles the core learning algorithm.
     trainer = PPOTrainer(
         actor,
@@ -147,7 +151,7 @@ def run_training(
         trainer.critic.train()
 
     # Use a vectorized environment for parallel data collection.
-    vec_env = VectorizedEnv(num_envs=num_envs, render=render)
+    vec_env = VectorizedEnv(num_envs=num_envs, render=render, action_stacker=action_stacker)
 
     # For time-based training, we'll need to know when we started.
     start_time = time.time()
@@ -238,6 +242,9 @@ def run_training(
                     agent_id = all_agent_ids[i]
                     actions_dict_list[env_idx][agent_id] = action
 
+                    # Add the action to the action stacker history
+                    action_stacker.add_action(agent_id, action)
+
                     # Store the experience (observations, actions, etc.).
                     # Reward and done are placeholders for now; we'll update them after the environment step.
                     trainer.store_experience(
@@ -261,6 +268,10 @@ def run_training(
                     # Get the actual reward and done flag for this agent in this environment.
                     reward = reward_dict[agent_id]
                     done = terminated_dict[agent_id] or truncated_dict[agent_id]
+
+                    # Reset action history if episode is done
+                    if done:
+                        action_stacker.reset_agent(agent_id)
 
                     # Update the stored experience with the correct reward and done flag.
                     mem_idx = trainer.memory.pos - len(all_obs) + exp_idx
@@ -412,17 +423,19 @@ class VectorizedEnv:
     environments, resetting them when they're done, and rendering one of them
     if desired.
     """
-    def __init__(self, num_envs, render=False):
+    def __init__(self, num_envs, render=False, action_stacker=None):
         self.render = render
         # Create a single renderer. If rendering is enabled, we only render one environment.
         self.renderer = RLViserRenderer() if render else None
+
+        self.action_stacker = action_stacker
 
         # Create the environments.
         self.envs = []
         for i in range(num_envs):
             # Only pass the renderer to the first environment if we're rendering.
             env_renderer = self.renderer if (render and i == 0) else None
-            self.envs.append(get_env(renderer=env_renderer))
+            self.envs.append(get_env(renderer=env_renderer, action_stacker=action_stacker))
 
         self.num_envs = num_envs
         self.render_env_idx = 0  # Index of the environment we'll render.
@@ -458,6 +471,10 @@ class VectorizedEnv:
             else:
                 formatted_actions[agent_id] = np.array([int(action)])
 
+            # Add action to stacker history
+            if self.action_stacker is not None:
+                self.action_stacker.add_action(agent_id, formatted_actions[agent_id])
+
         # Render only the selected environment.
         if self.render and i == self.render_env_idx:
             env.render()
@@ -492,6 +509,12 @@ class VectorizedEnv:
                 # If done, reset the environment.
                 self.episode_counts[i] += 1
                 self.obs_dicts[i] = self.envs[i].reset()
+
+                # Reset action history for all agents in this environment
+                if self.action_stacker is not None:
+                    for agent_id in next_obs_dict.keys():
+                        self.action_stacker.reset_agent(agent_id)
+
                 # If rendering, trigger a render after the reset.
                 if self.render and i == self.render_env_idx:
                     self.envs[i].render()
@@ -579,6 +602,9 @@ if __name__ == "__main__":
     parser.add_argument('--num_blocks', type=int, default=6, help='Number of residual blocks in the network')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate for regularization')
 
+    # Action stacking parameters
+    parser.add_argument('--stack_size', type=int, default=5, help='Number of previous actions to stack')
+
 
     # Backwards compatibility.
     parser.add_argument('-p', '--processes', type=int, default=None,
@@ -608,10 +634,14 @@ if __name__ == "__main__":
         if args.debug:
             print(f"[DEBUG] Using --processes value ({args.processes}) for number of environments")
 
+    # Create action stacker
+    action_stacker = ActionStacker(stack_size=args.stack_size, action_size=8)  # RLGym uses 8 actions
+
     # Get the dimensions of the observation and action spaces.
-    env = get_env()
+    env = get_env(action_stacker=action_stacker)
     env.reset()
-    obs_space_dims = env.observation_space(env.agents[0])[1]
+    obs_space = env.observation_space(env.agents[0])
+    obs_space_dims = obs_space[0]
     action_space_dims = env.action_space(env.agents[0])[1]
     env.close()
 
@@ -684,6 +714,7 @@ if __name__ == "__main__":
                 "num_blocks": args.num_blocks,
                 "dropout": args.dropout,
                 "model_type": args.model_type,
+                "action_stack_size": args.stack_size,
 
                 # Environment details
                 "action_repeat": 8,
@@ -704,6 +735,7 @@ if __name__ == "__main__":
         print(f"[DEBUG] Starting training with {args.num_envs} environments on {device}")
         print(f"[DEBUG] Actor model: {actor}")
         print(f"[DEBUG] Critic model: {critic}")
+        print(f"[DEBUG] Action stacking size: {args.stack_size}")
         if args.time:
             print(f"[DEBUG] Training for {args.time} ({training_time_seconds} seconds)")
         else:
