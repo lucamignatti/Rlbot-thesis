@@ -522,7 +522,7 @@ class VectorizedEnv:
 
         next_obs_dict, reward_dict, terminated_dict, truncated_dict = env.step(formatted_actions)
 
-        return i, (next_obs_dict, reward_dict, terminated_dict, truncated_dict)
+        return i, next_obs_dict, reward_dict, terminated_dict, truncated_dict
 
     def step(self, actions_dict_list):
         """
@@ -539,10 +539,8 @@ class VectorizedEnv:
         # Run the async tasks in the event loop
         results = self.loop.run_until_complete(run_steps())
 
-        # Process results in order
-        for i, result in results:
-            next_obs_dict, reward_dict, terminated_dict, truncated_dict = result
-
+        processed_results = []
+        for i, next_obs_dict, reward_dict, terminated_dict, truncated_dict in results:
             # Check if the episode is done in this environment.
             self.dones[i] = any(terminated_dict.values()) or any(truncated_dict.values())
 
@@ -563,7 +561,9 @@ class VectorizedEnv:
                 # If not done, just update the observations.
                 self.obs_dicts[i] = next_obs_dict
 
-        return results, self.dones.copy(), self.episode_counts.copy()
+            processed_results.append((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
+
+        return processed_results, self.dones.copy(), self.episode_counts.copy()
 
     def close(self):
         """
@@ -765,9 +765,8 @@ if __name__ == "__main__":
                 "hidden_dim": args.hidden_dim,
                 "num_blocks": args.num_blocks,
                 "dropout": args.dropout,
-                "model_type": args.model_type,
                 "action_stack_size": args.stack_size,
-                "auxiliary_tasks": args.auxiliary_tasks,
+                "auxiliary_tasks": args.auxiliary,
                 "sr_weight": args.sr_weight,
                 "rp_weight": args.rp_weight,
 
@@ -930,7 +929,6 @@ if __name__ == "__main__":
                     "update_interval": args.update_interval,
                     "saved_path": saved_path,
                     'model_config': {
-                        'model_type': args.model_type,
                         'hidden_dim': args.hidden_dim,
                         'num_blocks': args.num_blocks,
                         'dropout': args.dropout
