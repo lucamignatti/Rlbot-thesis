@@ -26,7 +26,6 @@ from multiprocessing import Process, Pipe
 from typing import List, Tuple, Dict
 import numpy as np
 
-
 def get_env(renderer=None, action_stacker=None):
     """
     Sets up the Rocket League environment.  We configure things like the
@@ -486,101 +485,212 @@ def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacke
 
 class VectorizedEnv:
     """
-    Runs multiple RLGym environments in parallel using multiprocessing.
+    Runs multiple RLGym environments in parallel.
+    Uses thread-based execution for rendered environments and
+    multiprocessing for non-rendered environments.
     """
-    def __init__(self, num_envs: int, render: bool = False, action_stacker=None):
+    def __init__(self, num_envs, render=False, action_stacker=None):
         self.num_envs = num_envs
         self.render = render
         self.action_stacker = action_stacker
+        self.render_delay = 0.025  # Default render delay in seconds
 
-        # Set start method for multiprocessing
-        try:
-            mp.set_start_method('spawn')
-        except RuntimeError:
-            pass  # Already set
+        # Decide whether to use threading for rendering
+        if render:
+            # Use thread-based approach for all environments when rendering is enabled
+            self.mode = "thread"
 
-        # Create communication pipes
-        self.remotes, self.work_remotes = zip(*[Pipe() for _ in range(num_envs)])
+            # Create environments directly
+            self.envs = []
+            for i in range(num_envs):
+                # Only create renderer for the first environment
+                env_renderer = RLViserRenderer() if (i == 0) else None
+                env = get_env(renderer=env_renderer, action_stacker=action_stacker)
+                self.envs.append(env)
 
-        # Create and start worker processes
-        self.processes = []
-        for idx, (work_remote, remote) in enumerate(zip(self.work_remotes, self.remotes)):
-            # Only render first environment if rendering is enabled
-            worker_render = render and idx == 0
+            # Reset all environments
+            self.obs_dicts = [env.reset() for env in self.envs]
 
-            # Start worker process
-            process = Process(
-                target=worker,
-                args=(work_remote, get_env, worker_render, action_stacker),
-                daemon=True
+            # Explicitly render the first environment
+            if num_envs > 0:
+                self.envs[0].render()
+
+            # Set up thread pool for parallel execution
+            self.executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(32, num_envs),
+                thread_name_prefix='EnvWorker'
             )
-            process.start()
-            self.processes.append(process)
-            work_remote.close()
 
-        # Get initial observations
-        for remote in self.remotes:
-            remote.send(('reset', None))
-        self.obs_dicts = [remote.recv() for remote in self.remotes]
+        else:
+            # Use multiprocessing for maximum performance when not rendering
+            self.mode = "multiprocess"
 
+            try:
+                mp.set_start_method('spawn', force=True)
+            except RuntimeError:
+                pass  # Already set
+
+            # Create communication pipes
+            self.remotes, self.work_remotes = zip(*[Pipe() for _ in range(num_envs)])
+
+            # Create and start worker processes
+            self.processes = []
+            for idx, (work_remote, remote) in enumerate(zip(self.work_remotes, self.remotes)):
+                process = Process(
+                    target=worker,
+                    args=(work_remote, get_env, False, action_stacker),
+                    daemon=True
+                )
+                process.start()
+                self.processes.append(process)
+                work_remote.close()
+
+            # Get initial observations
+            for remote in self.remotes:
+                remote.send(('reset', None))
+            self.obs_dicts = [remote.recv() for remote in self.remotes]
+
+        # Common initialization
         self.dones = [False] * num_envs
         self.episode_counts = [0] * num_envs
-        self.is_discrete = True
 
-    def step(self, actions_dict_list: List[Dict]):
-        """Steps all environments forward using multiprocessing"""
-        # Send step commands to all workers
-        for remote, actions_dict in zip(self.remotes, actions_dict_list):
-            remote.send(('step', actions_dict))
+    def _step_env(self, args):
+        """Thread worker function to step a single environment"""
+        env_idx, env, actions_dict = args
 
-        # Collect results from all workers
-        results = []
-        for i, remote in enumerate(self.remotes):
-            next_obs_dict, reward_dict, terminated_dict, truncated_dict = remote.recv()
-
-            # Check if episode is done
-            self.dones[i] = any(terminated_dict.values()) or any(truncated_dict.values())
-
-            if self.dones[i]:
-                # If done, reset the environment
-                self.episode_counts[i] += 1
-                remote.send(('reset', None))
-                self.obs_dicts[i] = remote.recv()
-
-                # Reset action history for all agents
-                if self.action_stacker is not None:
-                    for agent_id in next_obs_dict.keys():
-                        remote.send(('reset_action_stacker', agent_id))
-                        remote.recv()  # Wait for confirmation
+        # Format actions for RLGym API
+        formatted_actions = {}
+        for agent_id, action in actions_dict.items():
+            if isinstance(action, np.ndarray):
+                formatted_actions[agent_id] = action
             else:
-                # If not done, just update observations
-                self.obs_dicts[i] = next_obs_dict
+                formatted_actions[agent_id] = np.array([action if isinstance(action, int) else int(action)])
 
-            results.append((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
+            # Add action to the stacker history
+            if self.action_stacker is not None:
+                self.action_stacker.add_action(agent_id, formatted_actions[agent_id])
 
-        return results, self.dones.copy(), self.episode_counts.copy()
+        # Step the environment
+        next_obs_dict, reward_dict, terminated_dict, truncated_dict = env.step(formatted_actions)
+
+        # Add rendering and delay if this is the rendered environment
+        if self.render and env_idx == 0:
+            env.render()  # Explicitly render
+            time.sleep(self.render_delay)  # Add delay for better visualization
+
+        return env_idx, next_obs_dict, reward_dict, terminated_dict, truncated_dict
+
+    def step(self, actions_dict_list):
+        """Step all environments forward using appropriate method based on mode"""
+        if self.mode == "thread":
+            # Use thread pool for parallel execution
+            futures = [
+                self.executor.submit(self._step_env, (i, env, actions))
+                for i, (env, actions) in enumerate(zip(self.envs, actions_dict_list))
+            ]
+
+            # Wait for all steps to complete
+            results = []
+            for future in concurrent.futures.as_completed(futures):
+                results.append(future.result())
+
+            # Sort results by environment index
+            results.sort(key=lambda x: x[0])
+
+            processed_results = []
+            for env_idx, next_obs_dict, reward_dict, terminated_dict, truncated_dict in results:
+                # Check if episode is done
+                self.dones[env_idx] = any(terminated_dict.values()) or any(truncated_dict.values())
+
+                if self.dones[env_idx]:
+                    # If done, reset the environment
+                    self.episode_counts[env_idx] += 1
+
+                    # Reset the environment
+                    self.obs_dicts[env_idx] = self.envs[env_idx].reset()
+
+                    # Reset action history for all agents
+                    if self.action_stacker is not None:
+                        for agent_id in next_obs_dict.keys():
+                            self.action_stacker.reset_agent(agent_id)
+
+                    # Render again after reset if this is the rendered environment
+                    if self.render and env_idx == 0:
+                        self.envs[env_idx].render()
+                        time.sleep(self.render_delay)
+                else:
+                    # Otherwise just update the observations
+                    self.obs_dicts[env_idx] = next_obs_dict
+
+                processed_results.append((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
+
+        else:  # multiprocess mode
+            # Send step command to all workers
+            for remote, actions_dict in zip(self.remotes, actions_dict_list):
+                remote.send(('step', actions_dict))
+
+            # Collect results from all workers
+            results = []
+            for i, remote in enumerate(self.remotes):
+                next_obs_dict, reward_dict, terminated_dict, truncated_dict = remote.recv()
+
+                # Check if episode is done
+                self.dones[i] = any(terminated_dict.values()) or any(truncated_dict.values())
+
+                if self.dones[i]:
+                    # If done, reset the environment
+                    self.episode_counts[i] += 1
+                    remote.send(('reset', None))
+                    self.obs_dicts[i] = remote.recv()
+
+                    # Reset action stacker for all agents
+                    if self.action_stacker is not None:
+                        for agent_id in next_obs_dict.keys():
+                            remote.send(('reset_action_stacker', agent_id))
+                            remote.recv()  # Wait for confirmation
+                else:
+                    # If not done, just update observations
+                    self.obs_dicts[i] = next_obs_dict
+
+                results.append((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
+
+            processed_results = results
+
+        return processed_results, self.dones.copy(), self.episode_counts.copy()
 
     def close(self):
-        """Closes all environments and worker processes"""
-        # Send close command to all workers
-        for remote in self.remotes:
-            try:
-                remote.send(('close', None))
-            except (IOError, OSError):
-                pass  # Pipe might already be closed
+        """Clean up resources properly based on the mode"""
+        if self.mode == "thread":
+            # Close the thread pool
+            if hasattr(self, 'executor'):
+                self.executor.shutdown()
 
-        # Wait for all processes to finish
-        for process in self.processes:
-            process.join(timeout=1.0)  # Add timeout to prevent hanging
-            if process.is_alive():
-                process.terminate()  # Force terminate if still alive
+            # Close all environments
+            if hasattr(self, 'envs'):
+                for env in self.envs:
+                    env.close()
 
-        # Close all pipes
-        for remote in self.remotes:
-            try:
-                remote.close()
-            except (IOError, OSError):
-                pass  # Pipe might already be closed
+        else:  # multiprocess mode
+            # Close multiprocessing environments
+            if hasattr(self, 'remotes'):
+                for remote in self.remotes:
+                    try:
+                        remote.send(('close', None))
+                    except (BrokenPipeError, EOFError):
+                        pass  # Already closed
+
+            if hasattr(self, 'processes'):
+                for process in self.processes:
+                    process.join(timeout=1.0)
+                    if process.is_alive():
+                        process.terminate()
+
+            if hasattr(self, 'remotes'):
+                for remote in self.remotes:
+                    try:
+                        remote.close()
+                    except:
+                        pass  # Already closed
 
 def signal_handler(sig, frame):
     """Handles Ctrl+C gracefully, so the program exits cleanly."""
@@ -588,8 +698,6 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 if __name__ == "__main__":
-
-
     # Set start method
     if sys.platform == 'darwin':
         mp.set_start_method('spawn')
@@ -617,6 +725,8 @@ if __name__ == "__main__":
     parser.add_argument('--wandb', action='store_true', help='Enable logging to Weights & Biases')
     parser.add_argument('--debug', action='store_true', help='Enable verbose debug logging')
 
+    parser.add_argument('--render-delay', type=float, default=0.025,
+                    help='Delay between rendered frames in seconds (higher values = slower visualization)')
 
     # Hyperparameter arguments (these can be tuned to improve performance)
     parser.add_argument('--lra', type=float, default=1e-4, help='Learning rate for actor network')
