@@ -26,6 +26,8 @@ from multiprocessing import Process, Pipe
 from typing import List, Tuple, Dict
 import numpy as np
 from curriculum_integration import create_basic_curriculum
+from curriculum import CurriculumManager, CurriculumStage, ProgressionRequirements
+
 
 
 def get_env(renderer=None, action_stacker=None, curriculum_config=None):
@@ -125,7 +127,12 @@ def run_training(
     ppo_epochs: int = 10,
     batch_size: int = 64,
     aux_amp: bool = False,
-    aux_scale: float = 0.005
+    aux_scale: float = 0.005,
+    # Additional args
+    auxiliary: bool = True,
+    sr_weight: float = 1.0,
+    rp_weight: float = 1.0,
+    test: bool = False
 ):
     """
     Main training loop.  This sets up the agent, environment, and training process,
@@ -168,14 +175,14 @@ def run_training(
         debug=debug,
         use_compile=use_compile,
         use_amp=use_amp,
-        use_auxiliary_tasks=args.auxiliary,
-        sr_weight=args.sr_weight * aux_scale,  # Apply scaling to auxiliary task weights
-        rp_weight=args.rp_weight * aux_scale,
+        use_auxiliary_tasks=auxiliary,
+        sr_weight=sr_weight * aux_scale,  # Apply scaling to auxiliary task weights
+        rp_weight=rp_weight * aux_scale,
         aux_amp=aux_amp
     )
 
     #  Use train mode for training and eval for testing
-    if args.test:
+    if test:
         trainer.actor.eval()
         trainer.critic.eval()
     else:
@@ -185,7 +192,7 @@ def run_training(
     # Initialize curriculum if enabled
     curriculum_manager = None
     if use_curriculum:
-        curriculum_manager = create_basic_curriculum(debug=args.debug)
+        curriculum_manager = create_basic_curriculum(debug=debug)
         curriculum_manager.register_trainer(trainer)
         if debug:
             print("[DEBUG] Curriculum learning enabled with basic curriculum")
@@ -382,7 +389,187 @@ def run_training(
             enough_experiences = collected_experiences >= update_interval
 
             # Update only if we've collected enough experiences - removed time-based fallback
-            if enough_experiences and not args.test:
+            if enough_experiences and not test:
+                if debug:
+                    print(f"[DEBUG] Updating policy with {collected_experiences} experiences after {time.time() - last_update_time:.2f}s")
+
+                # Perform the policy update.
+                stats = trainer.update()
+
+                # Update the statistics displayed in the progress bar.
+                stats_dict.update({
+                    "Device": device,
+                    "Envs": num_envs,
+                    "Exp": f"0/{update_interval}",  # Reset experience count
+                    "Episodes": total_episodes_so_far,
+                    "Reward": f"{stats.get('mean_episode_reward', 0):.2f}",
+                    "PLoss": f"{stats.get('actor_loss', 0):.4f}",
+                    "VLoss": f"{stats.get('critic_loss', 0):.4f}",
+                    "Entropy": f"{stats.get('entropy_loss', 0):.4f}",
+                    "SR_Loss": f"{stats.get('sr_loss', 0):.4f}",
+                    "RP_Loss": f"{stats.get('rp_loss', 0):.4f}"
+                })
+
+                # Update curriculum stats if enabled
+                if curriculum_manager:
+                    curriculum_stats = curriculum_manager.get_curriculum_stats()
+                    stats_dict.update({
+                        "Stage": curriculum_stats["current_stage_name"],
+                        "Diff": f"{curriculum_stats['difficulty_level']:.2f}"
+                    })
+
+                    if use_wandb:
+                        wandb.log({
+                            "curriculum/stage": curriculum_stats["current_stage"],
+                            "curriculum/stage_name": curriculum_stats["current_stage_name"],
+                            "curriculum/difficulty": curriculum_stats["difficulty_level"],
+                            "curriculum/success_rate": curriculum_stats["current_stage_stats"]["success_rate"]
+                        })
+
+                progress_bar.set_postfix(stats_dict)
+
+                collected_experiences = 0
+                last_update_time = time.time()
+
+            # Update the experience count in the progress bar.
+            stats_dict["Exp"] = f"{collected_experiences}/{update_interval}"
+            progress_bar.set_postfix(stats_dict)
+        # Main training loop.
+        should_continue = True
+        while should_continue:
+            current_time = time.time()
+            elapsed = current_time - start_time
+
+            # Check if we should stop training.
+            if training_time is not None:
+                # If training based on time, update progress bar once per second.
+                if current_time - last_progress_update >= 1.0:
+                    progress_bar.n = min(int(elapsed), int(training_time))  # Update progress
+                    progress_bar.refresh()  # Force redraw
+                    last_progress_update = current_time
+
+                should_continue = elapsed < training_time  # Stop if elapsed time exceeds training time.
+            else:
+                should_continue = total_episodes_so_far < total_episodes  # Stop if episode count exceeds limit.
+
+            if not should_continue:
+                break
+
+            # Collect observations from all environments for batch processing
+            all_obs = []
+            all_env_indices = []
+            all_agent_ids = []
+
+            # Organize observations into lists for batch processing.
+            for env_idx, obs_dict in enumerate(vec_env.obs_dicts):
+                for agent_id, obs in obs_dict.items():
+                    all_obs.append(obs)
+                    all_env_indices.append(env_idx)
+                    all_agent_ids.append(agent_id)
+
+            # Only proceed if we have observations. (It's possible all environments ended at the same time.)
+            actions_dict_list = [{} for _ in range(num_envs)]  # Initialize outside the block to avoid unbound issues
+            if len(all_obs) > 0:
+                obs_batch = torch.FloatTensor(np.stack(all_obs)).to(device)
+                with torch.no_grad():
+                    # Get actions and values from the networks in a single forward pass
+                    action_batch, log_prob_batch, value_batch, features_batch = trainer.get_action(obs_batch, return_features=True)
+
+                # Organize actions into a list of dictionaries, one for each environment.
+                for i, (action, log_prob, value) in enumerate(zip(action_batch, log_prob_batch, value_batch)):
+                    env_idx = all_env_indices[i]
+                    agent_id = all_agent_ids[i]
+                    actions_dict_list[env_idx][agent_id] = action
+
+                    # Store the experience (observations, actions, etc.).
+                    # Reward and done are placeholders for now; we'll update them after the environment step.
+                    trainer.store_experience(
+                        all_obs[i],
+                        action,
+                        log_prob,
+                        0,
+                        value,
+                        False
+                    )
+
+                    collected_experiences += 1
+
+            # Step all environments forward in parallel - optimized implementation
+            results, dones, episode_counts = vec_env.step(actions_dict_list)
+
+            # Process the results from each environment.
+            exp_idx = 0  # Index into our experience buffer.
+            for env_idx, (next_obs_dict, reward_dict, terminated_dict, truncated_dict) in enumerate(results):
+                for agent_id in reward_dict.keys():  # Use reward_dict to ensure we get the correct agent ID.
+                    # Get the actual reward and done flag for this agent in this environment.
+                    reward = reward_dict[agent_id]
+                    done = terminated_dict[agent_id] or truncated_dict[agent_id]
+
+                    # Reset action history if episode is done
+                    if done:
+                        action_stacker.reset_agent(agent_id)
+                        trainer.reset_auxiliary_tasks()
+
+                    # Update the stored experience with the correct reward and done flag.
+                    mem_idx = trainer.memory.pos - len(all_obs) + exp_idx
+                    if mem_idx < 0:  # Handle wrap-around in the circular buffer.
+                        mem_idx += trainer.memory.buffer_size
+
+                    trainer.store_experience_at_idx(mem_idx, None, None, None, reward, None, done)
+
+                    # Accumulate rewards.
+                    episode_rewards[env_idx][agent_id] += reward
+                    exp_idx += 1
+
+            # Check if any episodes have completed.
+            newly_completed_episodes = sum(dones)
+            if newly_completed_episodes > 0:
+                # Update progress bar for episodes-based training
+                if training_time is None:
+                    progress_bar.update(newly_completed_episodes)
+
+                total_episodes_so_far += newly_completed_episodes
+                stats_dict["Episodes"] = total_episodes_so_far
+
+                # Check if we should save the model.
+                if save_interval > 0 and (total_episodes_so_far - last_save_episode) >= save_interval:
+                    checkpoint_dir = "checkpoints"
+                    if output_path:
+                        if os.path.isdir(output_path):
+                            checkpoint_dir = os.path.join(output_path, "checkpoints")
+                        else:
+                            # If output path is a file, use its directory
+                            output_dir = os.path.dirname(output_path)
+                            checkpoint_dir = os.path.join(output_dir if output_dir else ".", "checkpoints")
+
+                    os.makedirs(checkpoint_dir, exist_ok=True)
+
+                    # save checkpoint
+                    checkpoint_path = os.path.join(checkpoint_dir, f"model_{total_episodes_so_far}.pt")
+                    trainer.save_models(checkpoint_path)
+
+                    # Also save as "latest" for easy loading (keep this for compatibility)
+                    latest_path = os.path.join(checkpoint_dir, "model_latest.pt")
+                    trainer.save_models(latest_path)
+
+                    if debug:
+                        print(f"[DEBUG] Saved checkpoint at episode {total_episodes_so_far} to {checkpoint_path}")
+
+                    last_save_episode = total_episodes_so_far
+
+                # Reset episode rewards for the environments that finished an episode.
+                for env_idx, done in enumerate(dones):
+                    if done:
+                        avg_reward = sum(episode_rewards[env_idx].values()) / len(episode_rewards[env_idx])
+                        if debug:
+                            print(f"Episode {episode_counts[env_idx]} in env {env_idx} completed with avg reward: {avg_reward:.2f}")
+                        episode_rewards[env_idx] = {agent_id: 0 for agent_id in vec_env.obs_dicts[env_idx]}
+
+            # Check if it's time to update the policy.
+            enough_experiences = collected_experiences >= update_interval
+
+            # Update only if we've collected enough experiences - removed time-based fallback
+            if enough_experiences and not test:
                 if debug:
                     print(f"[DEBUG] Updating policy with {collected_experiences} experiences after {time.time() - last_update_time:.2f}s")
 
@@ -693,11 +880,12 @@ class VectorizedEnv:
                         avg_reward = sum(self.episode_rewards[env_idx].values()) / max(len(self.episode_rewards[env_idx]), 1)
 
                         # Submit episode metrics
-                        self.curriculum_manager.update_progression_stats({
+                        metrics = {
                             "success": self.episode_successes[env_idx],
                             "timeout": self.episode_timeouts[env_idx],
                             "episode_reward": avg_reward
-                        })
+                        }
+                        self.curriculum_manager.update_progression_stats(metrics)
 
                         # Get new curriculum configuration for next episode
                         new_config = self.curriculum_manager.get_environment_config()
@@ -733,7 +921,7 @@ class VectorizedEnv:
                         self.envs[env_idx].render()
                         time.sleep(self.render_delay)
                 else:
-                    # Otherwise just update the observations
+                    # Otherwise just update observations
                     self.obs_dicts[env_idx] = next_obs_dict
 
                 processed_results.append((next_obs_dict, reward_dict, terminated_dict, truncated_dict))

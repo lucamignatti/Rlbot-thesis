@@ -13,7 +13,7 @@ from rewards import (
     TouchBallReward, TouchBallToGoalAccelerationReward, AlignBallToGoalReward,
     PlayerVelocityTowardBallReward, KRCReward
 )
-from curriculum import CurriculumManager, CurriculumStage
+from curriculum import CurriculumManager, CurriculumStage, ProgressionRequirements
 import numpy as np
 
 class BallVariationMutator(StateMutator):
@@ -46,7 +46,7 @@ class CarBoostMutator(StateMutator):
             car.boost_amount = self.boost_amount
 
 def create_basic_curriculum(debug=False):
-    """Create curriculum with properly implemented stages"""
+    """Create curriculum with improved stage definitions and progression"""
     stages = []
 
     # Stage 1: Basic Ball Control
@@ -76,7 +76,13 @@ def create_basic_curriculum(debug=False):
             "lr_actor": 3e-4,
             "lr_critic": 1e-3,
             "entropy_coef": 0.02
-        }
+        },
+        progression_requirements=ProgressionRequirements(
+            min_success_rate=0.65,
+            min_avg_reward=0.7,
+            min_episodes=50,
+            max_std_dev=0.3
+        )
     )
     stages.append(stage1)
 
@@ -88,7 +94,7 @@ def create_basic_curriculum(debug=False):
             KickoffMutator(),
             BallVariationMutator(
                 velocity_variance=0.7,
-                position_variance=1000  # Allow some position variation
+                position_variance=1000
             ),
             CarBoostMutator(boost_amount=75)
         ),
@@ -112,7 +118,14 @@ def create_basic_curriculum(debug=False):
             "lr_actor": 2e-4,
             "lr_critic": 8e-4,
             "entropy_coef": 0.015
-        }
+        },
+        progression_requirements=ProgressionRequirements(
+            min_success_rate=0.7,
+            min_avg_reward=0.8,
+            min_episodes=75,
+            max_std_dev=0.25,
+            required_consecutive_successes=5
+        )
     )
     stages.append(stage2)
 
@@ -148,7 +161,14 @@ def create_basic_curriculum(debug=False):
             "lr_actor": 1e-4,
             "lr_critic": 5e-4,
             "entropy_coef": 0.01
-        }
+        },
+        progression_requirements=ProgressionRequirements(
+            min_success_rate=0.75,
+            min_avg_reward=1.0,
+            min_episodes=100,
+            max_std_dev=0.2,
+            required_consecutive_successes=7
+        )
     )
     stages.append(stage3)
 
@@ -183,7 +203,14 @@ def create_basic_curriculum(debug=False):
             "lr_actor": 5e-5,
             "lr_critic": 2e-4,
             "entropy_coef": 0.005
-        }
+        },
+        progression_requirements=ProgressionRequirements(
+            min_success_rate=0.6,  # Lower for 1v1
+            min_avg_reward=0.5,  # Lower for 1v1
+            min_episodes=150,
+            max_std_dev=0.4,  # Higher std dev is expected
+            required_consecutive_successes=3
+        )
     )
     stages.append(stage4)
 
@@ -226,25 +253,25 @@ def create_basic_curriculum(debug=False):
             TimeoutCondition(300.),
             NoTouchTimeoutCondition(30.)
         ),
-        difficulty_params={},  # Difficulty handled by teammate/opponent coordination
+        difficulty_params={},
         hyperparameter_adjustments={
             "lr_actor": 3e-5,
             "lr_critic": 1e-4,
             "entropy_coef": 0.003
-        }
+        },
+        progression_requirements=ProgressionRequirements(
+            min_success_rate=0.5,
+            min_avg_reward=0.4,
+            min_episodes=200,
+            max_std_dev=0.5,
+            required_consecutive_successes=3
+        )
     )
     stages.append(stage5)
 
-    # Create curriculum manager with the stages
-    curriculum_manager = CurriculumManager(
+    return CurriculumManager(
         stages=stages,
-        progress_thresholds={
-            "success_rate": 0.65,
-            "avg_reward": 0.75
-        },
-        max_rehearsal_stages=2,
-        rehearsal_decay_factor=0.6,
-        debug = debug
+        max_rehearsal_stages=3,
+        rehearsal_decay_factor=0.5,
+        debug=debug
     )
-
-    return curriculum_manager
