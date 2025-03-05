@@ -31,8 +31,9 @@ class MockDoneCondition(DoneCondition):
 class TestProgressionRequirements(unittest.TestCase):
     """Test the ProgressionRequirements class"""
 
+    # Test basic initialization with valid parameters
     def test_valid_initialization(self):
-        """Test valid parameter initialization"""
+        """Make sure we can create requirements with valid values"""
         req = ProgressionRequirements(
             min_success_rate=0.7,
             min_avg_reward=0.5,
@@ -43,26 +44,31 @@ class TestProgressionRequirements(unittest.TestCase):
         self.assertEqual(req.min_avg_reward, 0.5)
         self.assertEqual(req.min_episodes, 50)
         self.assertEqual(req.max_std_dev, 0.3)
-        self.assertEqual(req.required_consecutive_successes, 3)  # Default value
+        self.assertEqual(req.required_consecutive_successes, 3)  # Should use default
 
     def test_invalid_parameters(self):
-        """Test validation logic with invalid parameters"""
-        # Test invalid success rate
+        """Make sure we catch all invalid parameter combinations"""
+        # Try a success rate over 100%
         with self.assertRaises(ValueError):
             ProgressionRequirements(min_success_rate=1.5, min_avg_reward=0.5,
                                    min_episodes=50, max_std_dev=0.3)
 
-        # Test invalid min_episodes
+        # Try zero episodes (must be positive)
         with self.assertRaises(ValueError):
             ProgressionRequirements(min_success_rate=0.7, min_avg_reward=0.5,
                                    min_episodes=0, max_std_dev=0.3)
 
-        # Test invalid max_std_dev
+        # Try negative standard deviation (must be positive)
         with self.assertRaises(ValueError):
             ProgressionRequirements(min_success_rate=0.7, min_avg_reward=0.5,
                                    min_episodes=50, max_std_dev=-0.1)
 
-        # Test invalid consecutive_successes
+        # Also test a negative reward threshold
+        with self.assertRaises(ValueError):
+            ProgressionRequirements(min_success_rate=0.7, min_avg_reward=-2.0,
+                                   min_episodes=50, max_std_dev=0.3)
+
+        # Test invalid consecutive successes (must be positive)
         with self.assertRaises(ValueError):
             ProgressionRequirements(min_success_rate=0.7, min_avg_reward=0.5,
                                    min_episodes=50, max_std_dev=0.3,

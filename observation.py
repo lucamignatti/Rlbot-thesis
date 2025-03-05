@@ -5,18 +5,26 @@ import numpy as np
 
 
 class ActionStacker:
-    """Optimized ActionStacker with efficient operations"""
+    """
+    Keeps track of previous actions for each agent to provide action history 
+    in observations. This helps the agent understand momentum and sequences.
+    """
     def __init__(self, stack_size=5, action_size=8):
+        """
+        Args:
+            stack_size: Number of previous actions to remember
+            action_size: Size of each action vector
+        """
         self.stack_size = stack_size
         self.action_size = action_size
         self.agent_action_history = {}
 
     def reset_agent(self, agent_id):
-        """Reset action history for an agent"""
+        """Clear an agent's action history"""
         self.agent_action_history[agent_id] = np.zeros((self.stack_size, self.action_size), dtype=np.float32)
 
     def add_action(self, agent_id, action):
-        """Add new action to agent's history - optimized version"""
+        """Add a new action to an agent's history"""
         if agent_id not in self.agent_action_history:
             self.reset_agent(agent_id)
 
@@ -26,7 +34,7 @@ class ActionStacker:
         history[-1] = action
 
     def get_stacked_actions(self, agent_id):
-        """Get stacked history for an agent"""
+        """Get an agent's action history as a flat array"""
         if agent_id not in self.agent_action_history:
             self.reset_agent(agent_id)
         # Using ravel() is faster than flatten() since it avoids copy when possible
@@ -34,8 +42,16 @@ class ActionStacker:
 
 
 class StackedActionsObs(DefaultObs):
-    """Extends DefaultObs to include stacked previous actions"""
+    """
+    Observation builder that includes action history in the observations.
+    This helps the agent learn from its past actions and understand momentum.
+    """
     def __init__(self, action_stacker, zero_padding=2):
+        """
+        Args:
+            action_stacker: Keeps track of action histories for each agent
+            zero_padding: Extra zeros to add for future compatibility
+        """
         super().__init__(zero_padding=zero_padding)
         self.action_stacker = action_stacker
 
@@ -85,7 +101,18 @@ class StackedActionsObs(DefaultObs):
         return (total_size,)
 
     def build_obs(self, agents: List[AgentID], state: StateType, shared_info: Dict[str, Any]) -> Dict[AgentID, ObsType]:
-        """Build observations for all agents"""
+        """
+        Build observations for all agents. This includes the standard observations
+        from the parent class and adds the action history for each agent.
+
+        Args:
+            agents: List of agent IDs
+            state: Current game state
+            shared_info: Shared information among agents
+
+        Returns:
+            Dictionary mapping agent IDs to their respective observations
+        """
         # Get standard observations from parent class
         observations = super().build_obs(agents, state, shared_info)
 

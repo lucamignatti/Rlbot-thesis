@@ -17,12 +17,9 @@ class NormalizedReward(RewardFunction[AgentID, GameState, float]):
 
 
 class BallProximityReward(NormalizedReward):
-    """Rewards the agent for being close to the ball.
-
-    Returns:
-        0.0: When the car is far from the ball (beyond max_distance)
-        1.0: When the car is at the ball's position
-        Linear scale between these points
+    """
+    Rewards players for being close to the ball, with intelligent scaling
+    based on how close other players are.
     """
 
     def __init__(self, max_distance: float = 7000, dispersion: float = 1.0, density: float = 1.0):
@@ -54,12 +51,9 @@ class BallProximityReward(NormalizedReward):
 
 
 class BallToGoalDistanceReward(NormalizedReward):
-    """Rewards the agent for positioning the ball closer to the opponent's goal.
-
-    Returns:
-        0.0: When the ball is at the agent's goal
-        1.0: When the ball is at the opponent's goal
-        Linear scale between these points
+    """
+    Rewards moving the ball closer to the opponent's goal while keeping it
+    away from your own goal.
     """
 
     def __init__(self, offensive_dispersion: float = 0.6, defensive_dispersion: float = 0.4,
@@ -131,13 +125,9 @@ class BallToGoalDistanceReward(NormalizedReward):
 
 
 class BallVelocityToGoalReward(NormalizedReward):
-    """Rewards the agent for hitting the ball toward the opponent's goal.
-
-    Returns:
-        1.0: Ball moving at max speed directly toward opponent's goal
-        0.5: Ball not moving
-        0.0: Ball moving at max speed directly toward own goal
-        Linear scale between these points
+    """
+    Rewards when the ball's velocity is directed toward the opponent's goal.
+    Encourages strategic hits that create scoring opportunities.
     """
 
     def __init__(self, max_ball_speed: float = 6000):
@@ -191,12 +181,7 @@ class BallVelocityToGoalReward(NormalizedReward):
 
 
 class TouchBallReward(NormalizedReward):
-    """Rewards the agent for touching the ball.
-
-    Returns:
-        1.0: Agent has touched the ball in this step
-        0.0: Agent has not touched the ball in this step
-    """
+    """Simple reward for touching the ball"""
 
     def __init__(self):
         self.last_touch_counts = {}  # Track ball touches count for each agent
@@ -236,15 +221,9 @@ class TouchBallReward(NormalizedReward):
 
 
 class TouchBallToGoalAccelerationReward(NormalizedReward):
-    """Rewards the agent for hitting the ball toward the opponent's goal.
-
-    From Lucy-SKG paper: This doubles function range by introducing direction
-    and penalizes for hitting the ball toward team goal.
-
-    Returns:
-        1.0: Perfect hit significantly accelerating the ball toward opponent's goal
-        0.5: Neutral hit (no change in direction)
-        0.0: Bad hit accelerating the ball toward own goal
+    """
+    Rewards touching the ball in a way that accelerates it toward the opponent's goal.
+    This encourages strategic hits rather than just any contact.
     """
 
     def __init__(self, max_acceleration: float = 4000):
@@ -340,14 +319,9 @@ class TouchBallToGoalAccelerationReward(NormalizedReward):
 
 
 class AlignBallToGoalReward(NormalizedReward):
-    """Rewards the agent for positioning to have a clear shot at the opponent's goal.
-
-    From Lucy-SKG paper: Includes player-to-ball distance weighting to avoid the
-    'beam' effect of pure alignment rewards.
-
-    Returns:
-        1.0: Perfect alignment between agent, ball, and opponent's goal
-        0.0: Agent, ball, and opponent's goal are at 90 degrees or worse
+    """
+    Rewards positioning that puts the ball between the player and the opponent's goal.
+    This encourages tactical positioning for potential shots.
     """
 
     def __init__(self, dispersion: float = 1.1, density: float = 1.0):
@@ -412,12 +386,9 @@ class AlignBallToGoalReward(NormalizedReward):
 
 
 class PlayerVelocityTowardBallReward(NormalizedReward):
-    """Rewards the agent for moving toward the ball.
-
-    Returns:
-        1.0: Moving at max speed directly toward the ball
-        0.5: Not moving or moving perpendicular to ball direction
-        0.0: Moving at max speed directly away from the ball
+    """
+    Rewards moving toward the ball efficiently.
+    This encourages active play and ball chase prevention through smart positioning.
     """
 
     def __init__(self, max_car_speed: float = 2300):
@@ -471,12 +442,13 @@ class PlayerVelocityTowardBallReward(NormalizedReward):
 
 
 class KRCReward(RewardFunction[AgentID, GameState, float]):
-    """Implements the Kinesthetic Reward Combination (KRC) from the Lucy-SKG paper.
-
-    KRC = sign(r) * nth_root(product(|rewards|))
-
-    This creates a compound reward that requires all components to be good to get a high reward,
-    rather than allowing one high component to dominate like in linear combinations.
+    """
+    Knowledge Representation and Coordination (KRC) Reward.
+    Combines multiple reward functions with team coordination.
+    
+    The KRC reward helps agents learn both individual skills and team coordination
+    by blending personal and team-based rewards. This encourages cooperative play
+    while still maintaining individual skill development.
     """
 
     def __init__(self, reward_functions_and_weights: List[Tuple[RewardFunction, float]],

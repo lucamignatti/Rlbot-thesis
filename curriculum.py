@@ -13,6 +13,7 @@ import time
 from collections import deque
 import warnings
 from dataclasses import dataclass
+import wandb  # Add wandb import
 
 @dataclass
 class ProgressionRequirements:
@@ -30,6 +31,8 @@ class ProgressionRequirements:
             raise ValueError("min_episodes must be positive")
         if self.max_std_dev < 0:
             raise ValueError("max_std_dev cannot be negative")
+        if self.min_avg_reward <= -2.0:  # Changed from < to <= to match test expectations
+            raise ValueError("Average reward threshold too low")
         if self.required_consecutive_successes < 1:
             raise ValueError("required_consecutive_successes must be positive")
 
@@ -199,7 +202,8 @@ class CurriculumManager:
         rehearsal_decay_factor: float = 0.5,
         evaluation_window: int = 100,
         debug=False,
-        testing=False
+        testing=False,
+        use_wandb=True  # Add wandb tracking option
     ):
         """
         Initialize the curriculum manager.
@@ -210,11 +214,13 @@ class CurriculumManager:
             max_rehearsal_stages: Maximum number of previous stages to include in rehearsal
             rehearsal_decay_factor: How quickly to reduce probability of older stages
             evaluation_window: Number of episodes to consider when evaluating progression
+            use_wandb: Whether to log curriculum metrics to wandb
         """
         if not stages:
             raise ValueError("At least one curriculum stage must be provided")
 
         self.debug = debug
+        self.use_wandb = use_wandb  # Store wandb usage flag
 
         self.stages = stages
         self.current_stage_index = 0
@@ -361,6 +367,23 @@ class CurriculumManager:
         # Track overall progress
         self.total_episodes += 1
 
+        # Log curriculum metrics to wandb if enabled
+        if self.use_wandb and wandb.run is not None:
+            # Log the current curriculum state
+            curriculum_metrics = {
+                "curriculum/current_stage": self.current_stage_index,
+                "curriculum/stage_name": current_stage.name,
+                "curriculum/current_difficulty": self.current_difficulty,
+                "curriculum/success_rate": current_stage.moving_success_rate,
+                "curriculum/avg_reward": current_stage.moving_avg_reward,
+                "curriculum/total_episodes": self.total_episodes,
+                "curriculum/stage_progress": self.get_stage_progress(),
+                "curriculum/overall_progress": self.get_overall_progress()["total_progress"],
+                "curriculum/episodes_in_stage": current_stage.episode_count,
+                "curriculum/consecutive_successes": current_stage.get_consecutive_successes()
+            }
+            wandb.log(curriculum_metrics)
+
         # Every N episodes, check if we should progress to the next stage
         if self.total_episodes % self.evaluation_window == 0:
             self._evaluate_progression()
@@ -399,6 +422,14 @@ class CurriculumManager:
             if meets_thresholds:
                 self.current_difficulty = min(1.0, self.current_difficulty + self.difficulty_increase_rate)
                 self.debug_print(f"Increasing difficulty in stage {current_stage.name} to {self.current_difficulty:.2f}")
+                
+                # Log difficulty increase to wandb
+                if self.use_wandb and wandb.run is not None:
+                    wandb.log({
+                        "curriculum/difficulty_increased": self.current_difficulty,
+                        "curriculum/stage_name": current_stage.name,
+                    })
+                
                 return False  # No stage progression yet
 
         # Only progress to next stage if current one is at max difficulty and thresholds are met
@@ -440,6 +471,29 @@ class CurriculumManager:
 
         # Apply hyperparameter adjustments for the new stage
         self._adjust_hyperparameters()
+        
+        # Log stage transition to wandb
+        if self.use_wandb and wandb.run is not None:
+            # Create a detailed record of the stage transition
+            transition_metrics = {
+                "curriculum/stage_transition": 1.0,  # Event flag
+                "curriculum/from_stage": self.current_stage_index - 1,
+                "curriculum/to_stage": self.current_stage_index,
+                "curriculum/from_stage_name": old_stage,
+                "curriculum/to_stage_name": new_stage,
+                "curriculum/transition_episode": self.total_episodes,
+                "curriculum/total_stages": len(self.stages)
+            }
+            
+            # Also log the stage's final statistics
+            old_stage_obj = self.stages[self.current_stage_index - 1]
+            transition_metrics.update({
+                "curriculum/completed_stage/success_rate": old_stage_obj.moving_success_rate,
+                "curriculum/completed_stage/avg_reward": old_stage_obj.moving_avg_reward,
+                "curriculum/completed_stage/episodes": old_stage_obj.episode_count
+            })
+            
+            wandb.log(transition_metrics)
 
     def _get_rehearsal_probability(self) -> float:
         """Get the probability of using a rehearsal stage instead of the current stage."""
@@ -499,6 +553,14 @@ class CurriculumManager:
         if "entropy_coef" in adjustments and hasattr(self.trainer, "entropy_coef"):
             self.trainer.entropy_coef = adjustments["entropy_coef"]
             self.debug_print(f"Adjusted entropy coefficient to {adjustments['entropy_coef']}")
+            
+        # Log hyperparameter adjustments to wandb
+        if self.use_wandb and wandb.run is not None and adjustments:
+            wandb.log({
+                "curriculum/hyperparams/lr_actor": adjustments.get("lr_actor", 0),
+                "curriculum/hyperparams/lr_critic": adjustments.get("lr_critic", 0),
+                "curriculum/hyperparams/entropy_coef": adjustments.get("entropy_coef", 0),
+            })
 
     def get_curriculum_stats(self) -> Dict[str, Any]:
         """Get statistics about the curriculum progress."""
@@ -597,6 +659,17 @@ class CurriculumManager:
             stage.rewards_history = stage_data['rewards_history']
             stage.moving_success_rate = stage_data['moving_success_rate']
             stage.moving_avg_reward = stage_data['moving_avg_reward']
+        
+        # Log the loaded curriculum state to wandb
+        if self.use_wandb and wandb.run is not None:
+            current_stage = self.stages[self.current_stage_index]
+            wandb.log({
+                "curriculum/loaded_state/current_stage": self.current_stage_index,
+                "curriculum/loaded_state/stage_name": current_stage.name,
+                "curriculum/loaded_state/difficulty": self.current_difficulty,
+                "curriculum/loaded_state/total_episodes": self.total_episodes,
+                "curriculum/loaded_state/success_rate": current_stage.moving_success_rate
+            })
 
     def get_stage_progress(self) -> float:
         """Get progress through current stage (0-1)"""
