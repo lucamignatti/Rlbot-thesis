@@ -1,0 +1,3 @@
+[submodule "RLBotPack"]
+	path = RLBotPack
+	url = https://github.com/RLBot/RLBotPack.git

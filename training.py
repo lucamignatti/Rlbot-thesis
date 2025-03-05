@@ -458,8 +458,8 @@ class PPOTrainer:
                 self.debug_print(f"Function compilation failed: {str(e)}")
                 self.use_compile = False
 
-        print_model_info(self.actor, model_name="Actor", print_amp=self.use_amp)
-        print_model_info(self.critic, model_name="Critic", print_amp=self.use_amp)
+        print_model_info(self.actor, model_name="Actor", print_amp=self.use_amp, debug=self.debug)
+        print_model_info(self.critic, model_name="Critic", print_amp=self.use_amp, debug=self.debug)
 
     def _setup_cuda_graphs(self):
         # Create static input for policy evaluation graph
@@ -1042,9 +1042,11 @@ class PPOTrainer:
 
         # Final checks for NaN values before returning.  If we find any, use fallback values.
         if self._detect_abnormal(actor_loss, "actor_loss"):
+            self.debug_print("Using fallback value for actor_loss")
             actor_loss = torch.tensor(1.0, device=self.device, requires_grad=True)  # Fallback value.
 
         if self._detect_abnormal(entropy_loss, "entropy_loss"):
+            self.debug_print("Using fallback value for entropy_loss")
             entropy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)  # Fallback value.
 
         return actor_loss, entropy_loss, entropy
@@ -1620,7 +1622,7 @@ class PPOTrainer:
                 if wandb.run is not None:
                     wandb_run_id = wandb.run.id
             except ImportError:
-                pass
+                self.debug_print("WandB not available")
 
         # Save all models to a single file.
         torch.save({
@@ -1634,6 +1636,7 @@ class PPOTrainer:
             'wandb_run_id': wandb_run_id
         }, model_path)
 
+        self.debug_print(f"Saved models to: {model_path}")
         return model_path
 
     def load_models(self, model_path):

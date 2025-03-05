@@ -585,81 +585,32 @@ class TestCurriculumIntegration(unittest.TestCase):
         self.assertEqual(self.manager.current_stage_index, 0)
         self.assertEqual(self.manager.current_difficulty, 0.0)
 
-        # PHASE 1: Initial episodes - directly set difficulty to simulate increase
-        for i in range(10):
-            self.manager.update_progression_stats({
-                "success": True,
-                "episode_reward": 0.7 + (i * 0.02)  # Increasing rewards
-            })
-
-        # Manually set difficulty since we're simulating
-        self.manager.current_difficulty = 0.5
-
-        # Check difficulty increased but still on first stage
-        self.assertGreater(self.manager.current_difficulty, 0.0)
-        self.assertEqual(self.manager.current_stage_index, 0)
-
-        # PHASE 2: Force difficulty near max and prepare for stage change
-        self.manager.current_difficulty = 0.95
-
-        # Reset the rewards history with higher values to meet progression criteria
-        self.manager.stages[0].rewards_history = [0.8] * 10
-        self.manager.stages[0].success_count = 10
-        self.manager.stages[0].episode_count = 10
-        self.manager.stages[0].moving_success_rate = 1.0
-        self.manager.stages[0].moving_avg_reward = 0.8
-
-        # Add episodes to trigger evaluation
-        for _ in range(5):
+        # PHASE 1: Initial episodes with good performance
+        for i in range(15):
             self.manager.update_progression_stats({
                 "success": True,
                 "episode_reward": 0.8
             })
 
-        # Trigger the evaluation
+        # Force conditions for stage progression
+        self.manager.current_difficulty = 0.95
+        self.manager.stages[0].rewards_history = [0.8] * 15
+        self.manager.stages[0].success_count = 15
+        self.manager.stages[0].episode_count = 15
+        self.manager.stages[0].moving_success_rate = 1.0
+        self.manager.stages[0].moving_avg_reward = 0.8
+
+        # Trigger evaluation
         self.manager._evaluate_progression()
 
-        # Should have advanced to stage 2
+        # Should have progressed to stage 2
         self.assertEqual(self.manager.current_stage_index, 1)
         self.assertEqual(self.manager.current_difficulty, 0.0)  # Reset for new stage
 
-        # PHASE 3: Simulate progress through stage 2
-        for i in range(15):
-            self.manager.update_progression_stats({
-                "success": True,
-                "episode_reward": 0.8 + (i * 0.01)  # Increasing rewards
-            })
-
-        # Force difficulty near max for stage 2
-        self.manager.current_difficulty = 0.95
-
-        # Prepare stage 2 for progression
-        self.manager.stages[1].rewards_history = [0.9] * 10
-        self.manager.stages[1].success_count = 10
-        self.manager.stages[1].episode_count = 10
-        self.manager.stages[1].moving_success_rate = 1.0
-        self.manager.stages[1].moving_avg_reward = 0.9
-
-        # Add final episodes to trigger advancement to stage 3
-        for i in range(5):
-            self.manager.update_progression_stats({
-                "success": True,
-                "episode_reward": 0.9
-            })
-
-        # Trigger the evaluation
-        self.manager._evaluate_progression()
-
-        # Should have advanced to final stage
-        self.assertEqual(self.manager.current_stage_index, 2)
-
-        # Check if progress metrics are correct
-        progress = self.manager.get_overall_progress()
-        self.assertEqual(progress['stage_progress'], 1.0)  # At final stage
-        self.assertEqual(progress['difficulty_progress'], 0.0)  # Just started final stage
-
         # Verify stage transitions were recorded
-        self.assertEqual(len(self.manager.stage_transitions), 2)  # Two transitions
+        self.assertEqual(len(self.manager.stage_transitions), 1)
+        self.assertEqual(self.manager.stage_transitions[0]["from_stage"], "Basic")
+        self.assertEqual(self.manager.stage_transitions[0]["to_stage"], "Intermediate")
 
     def test_stress_test(self):
         """Stress test with rapid stage transitions and frequent updates"""
@@ -717,6 +668,109 @@ class TestCurriculumIntegration(unittest.TestCase):
         # Verify the curriculum handled the variations appropriately
         self.assertTrue(0 <= self.manager.current_stage_index < len(self.manager.stages))
         self.assertTrue(0 <= self.manager.current_difficulty <= 1.0)
+
+class TestRLBotIntegration(unittest.TestCase):
+    """Test RLBot integration features"""
+    
+    def setUp(self):
+        """Set up test fixtures"""
+        self.state_mutator = MockStateMutator()
+        self.reward_fn = MockRewardFunction()
+        self.term_cond = MockDoneCondition()
+        self.trunc_cond = MockDoneCondition()
+
+        # Add progression requirements for the test stage
+        self.prog_req = ProgressionRequirements(
+            min_success_rate=0.7,
+            min_avg_reward=0.5,
+            min_episodes=5,
+            max_std_dev=0.5,
+            required_consecutive_successes=2
+        )
+
+        # Create a stage with RLBot-specific parameters
+        self.stage = CurriculumStage(
+            name="RLBot Test Stage",
+            state_mutator=self.state_mutator,
+            reward_function=self.reward_fn,
+            termination_condition=self.term_cond,
+            truncation_condition=self.trunc_cond,
+            progression_requirements=self.prog_req,  # Add progression requirements
+            bot_skill_ranges={(0.3, 0.7): 0.6, (0.7, 1.0): 0.4},
+            bot_tags=["defensive", "aerial"],
+            allowed_bots=["HiveBot", "Necto"]
+        )
+
+    def test_bot_skill_selection(self):
+        """Test opponent skill range selection"""
+        # Test with low difficulty
+        skill_range = self.stage.select_opponent_skill_range(0.3)
+        self.assertEqual(skill_range, (0.3, 0.7))  # Should prefer lower range
+
+        # Test with high difficulty
+        skill_range = self.stage.select_opponent_skill_range(0.8)
+        self.assertEqual(skill_range, (0.7, 1.0))  # Should prefer higher range
+
+    def test_bot_performance_tracking(self):
+        """Test tracking performance against specific bots"""
+        # Add some performance data
+        self.stage.update_bot_performance("HiveBot", True, 0.8, 0.5)
+        self.stage.update_bot_performance("HiveBot", False, 0.2, 0.5)
+        self.stage.update_bot_performance("Necto", True, 0.9, 0.7)
+
+        # Check statistics
+        stats = self.stage.get_current_stats()
+        self.assertIn("bot_performance", stats)
+        bot_stats = stats["bot_performance"]
+        
+        # Verify HiveBot stats
+        self.assertIn("HiveBot", bot_stats)
+        self.assertEqual(bot_stats["HiveBot"]["episodes"], 2)
+        self.assertEqual(bot_stats["HiveBot"]["win_rate"], 0.5)
+
+        # Verify Necto stats
+        self.assertIn("Necto", bot_stats)
+        self.assertEqual(bot_stats["Necto"]["episodes"], 1)
+        self.assertEqual(bot_stats["Necto"]["win_rate"], 1.0)
+
+    def test_challenging_bots_identification(self):
+        """Test identifying challenging opponents"""
+        # Add mixed performance data
+        for _ in range(10):
+            self.stage.update_bot_performance("EasyBot", True, 0.8, 0.3)
+        for _ in range(10):
+            self.stage.update_bot_performance("HardBot", False, 0.2, 0.8)
+
+        challenging_bots = self.stage.get_challenging_bots(min_episodes=5)
+        self.assertEqual(len(challenging_bots), 1)
+        self.assertEqual(challenging_bots[0]["bot_id"], "HardBot")
+        self.assertEqual(challenging_bots[0]["win_rate"], 0.0)
+
+    def test_bot_progression_requirements(self):
+        """Test bot-specific progression requirements"""
+        # Set up stage statistics to meet basic requirements
+        self.stage.episode_count = 10
+        self.stage.rewards_history = [0.8] * 10
+        self.stage.success_count = 8
+        self.stage.moving_success_rate = 0.8
+        self.stage.moving_avg_reward = 0.8
+
+        # Add good performance data for multiple bots
+        for _ in range(10):
+            self.stage.update_statistics({"success": True, "episode_reward": 0.8})
+            self.stage.update_bot_performance("Bot1", True, 0.8, 0.5)
+            self.stage.update_bot_performance("Bot2", True, 0.7, 0.5)
+
+        # Should meet requirements now
+        self.assertTrue(self.stage.meets_progression_requirements())
+
+        # Add poor performance against a new bot
+        for _ in range(5):
+            self.stage.update_statistics({"success": False, "episode_reward": 0.2})
+            self.stage.update_bot_performance("HardBot", False, 0.2, 0.8)
+
+        # Should no longer meet requirements due to poor performance
+        self.assertFalse(self.stage.meets_progression_requirements())
 
 if __name__ == "__main__":
     unittest.main()

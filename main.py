@@ -27,6 +27,8 @@ from typing import List, Tuple, Dict
 import numpy as np
 from curriculum_integration import create_basic_curriculum
 from curriculum import CurriculumManager, CurriculumStage, ProgressionRequirements
+from rlbot_integration import RLBotVectorizedEnv
+from curriculum_rlbot import create_rlbot_curriculum
 
 
 
@@ -132,7 +134,11 @@ def run_training(
     auxiliary: bool = True,
     sr_weight: float = 1.0,
     rp_weight: float = 1.0,
-    test: bool = False
+    test: bool = False,
+    rlbotpack_path: str = None,
+    specific_bot: str = None,
+    bot_difficulty: float = None,
+    no_bot_curriculum: bool = False
 ):
     """
     Main training loop.  This sets up the agent, environment, and training process,
@@ -190,17 +196,41 @@ def run_training(
         trainer.critic.train()
 
     # Initialize curriculum if enabled
-    curriculum_manager = None
-    if use_curriculum:
-        curriculum_manager = create_basic_curriculum(debug=debug)
-        curriculum_manager.register_trainer(trainer)
-        if debug:
-            print("[DEBUG] Curriculum learning enabled with basic curriculum")
+    if rlbotpack_path:
+        env_class = RLBotVectorizedEnv
+        if use_curriculum and not no_bot_curriculum:
+            curriculum_manager = create_rlbot_curriculum(debug=debug)
+            curriculum_manager.register_trainer(trainer)
+            if debug:
+                print("[DEBUG] Using RLBot curriculum")
+        else:
+            curriculum_manager = None
+    else:
+        env_class = VectorizedEnv
+        if use_curriculum:
+            curriculum_manager = create_basic_curriculum(debug=debug)
+            curriculum_manager.register_trainer(trainer)
 
-    # Use a vectorized environment for parallel data collection.
-    vec_env = VectorizedEnv(num_envs=num_envs, render=render,
-                           action_stacker=action_stacker,
-                           curriculum_manager=curriculum_manager)
+    # Create vectorized environment with potential RLBot support
+    vec_env = env_class(
+        num_envs=num_envs,
+        render=render,
+        action_stacker=action_stacker,
+        curriculum_manager=curriculum_manager,
+        rlbotpack_path=rlbotpack_path
+    )
+
+    # If using a specific bot or difficulty, configure it
+    if rlbotpack_path and (specific_bot or bot_difficulty is not None):
+        for env_idx in range(num_envs):
+            # Determine opponents based on environment configuration
+            num_opponents = vec_env.envs[env_idx].num_orange
+            for agent_id in range(1, num_opponents + 1):  # Skip 0 (our agent)
+                if specific_bot:
+                    vec_env.register_opponent_bot(env_idx, agent_id, bot_id=specific_bot)
+                elif bot_difficulty is not None:
+                    skill_range = (bot_difficulty, min(1.0, bot_difficulty + 0.2))
+                    vec_env.register_opponent_bot(env_idx, agent_id, skill_range=skill_range)
 
     # For time-based training, we'll need to know when we started.
     start_time = time.time()
@@ -575,7 +605,7 @@ class VectorizedEnv:
     multiprocessing for non-rendered environments.
     Now supports curriculum learning.
     """
-    def __init__(self, num_envs, render=False, action_stacker=None, curriculum_manager=None):
+    def __init__(self, num_envs, render=False, action_stacker=None, curriculum_manager=None, rlbotpack_path=None):
         self.num_envs = num_envs
         self.render = render
         self.action_stacker = action_stacker
@@ -883,6 +913,51 @@ def signal_handler(sig, frame):
     print("\nInterrupted by user. Cleaning up...")
     sys.exit(0)
 
+def setup_rlbot_opponents(rlbotpack_path=None):
+    """Set up RLBotPack integration"""
+    if not rlbotpack_path:
+        # Default to submodule path
+        rlbotpack_path = "./RLBotPack"
+    
+    if not os.path.exists(rlbotpack_path) or not os.path.isdir(rlbotpack_path):
+        # Try to initialize submodule if it's missing
+        try:
+            import subprocess
+            subprocess.check_call(["git", "submodule", "update", "--init", "--recursive"])
+        except Exception as e:
+            print(f"Error initializing RLBotPack submodule: {e}")
+            print("Custom opponent bots will be disabled.")
+            return None
+    
+    print(f"Using RLBotPack from: {rlbotpack_path}")
+    return rlbotpack_path
+
+# Add this to parse_args function, right after creating the ArgumentParser
+def parse_args():
+    parser = argparse.ArgumentParser(description='RLBot Training Script')
+    # ... (existing arguments) ...
+
+    # Add these to existing argument groups
+    rlbot_group = parser.add_argument_group('RLBot Integration')
+    rlbot_group.add_argument('--rlbotpack', type=str, default=None,
+                            help='Path to RLBotPack repository')
+    rlbot_group.add_argument('--bot-difficulty', type=float, default=None,
+                            help='Override opponent bot difficulty (0.0-1.0)')
+    rlbot_group.add_argument('--specific-bot', type=str, default=None,
+                            help='Use a specific bot from RLBotPack (e.g. "HiveBot")')
+    rlbot_group.add_argument('--no-bot-curriculum', action='store_true',
+                            help='Disable progressive bot difficulty in curriculum')
+    
+    args = parser.parse_args()
+
+    # Validate and setup RLBotPack if specified
+    if args.rlbotpack:
+        args.rlbotpack = setup_rlbot_opponents(args.rlbotpack)
+        if not args.rlbotpack and (args.specific_bot or args.bot_difficulty is not None):
+            parser.error("RLBotPack path not found but bot options were specified")
+    
+    return args
+
 if __name__ == "__main__":
     # Set start method
     if sys.platform == 'darwin':
@@ -920,6 +995,14 @@ if __name__ == "__main__":
                     help='Disable curriculum learning')
     parser.set_defaults(curriculum=True)
 
+    parser.add_argument('--rlbotpack', type=str, default=None,
+                    help='Path to RLBotPack repository')
+    parser.add_argument('--bot-difficulty', type=float, default=None,
+                    help='Override opponent bot difficulty (0.0-1.0)')
+    parser.add_argument('--specific-bot', type=str, default=None,
+                    help='Use a specific bot from RLBotPack (e.g. "HiveBot")')
+    parser.add_argument('--no-bot-curriculum', action='store_true',
+                    help='Disable progressive bot difficulty in curriculum')
 
     # Hyperparameter arguments (these can be tuned to improve performance)
     parser.add_argument('--lra', type=float, default=1e-4, help='Learning rate for actor network')
@@ -1209,7 +1292,11 @@ if __name__ == "__main__":
         max_grad_norm=args.max_grad_norm,
         ppo_epochs=args.ppo_epochs,
         batch_size=args.batch_size,
-        aux_amp=args.aux_amp if args.aux_amp is not None else args.amp
+        aux_amp=args.aux_amp if args.aux_amp is not None else args.amp,
+        rlbotpack_path=args.rlbotpack,
+        specific_bot=args.specific_bot,
+        bot_difficulty=args.bot_difficulty,
+        no_bot_curriculum=args.no_bot_curriculum
     )
 
 

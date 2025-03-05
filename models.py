@@ -38,133 +38,116 @@ def load_partial_state_dict(model, state_dict):
     model.load_state_dict(filtered_dict, strict=False)
     return len(mismatched)
 
-def print_model_info(model, model_name, print_amp=False):
-    """
-    Prints model information in a clean, multi-line format
-    """
-    # Count parameters
+def print_model_info(model, model_name, print_amp=False, debug=False):
+    """Print information about a model including parameter count and device"""
     total_params = sum(p.numel() for p in model.parameters())
-
-    # Get device
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     device = next(model.parameters()).device
-
-    # Print in a consistent multi-line format
-    print(f"\n{model_name}:")
-    print(f"Parameters: {total_params:,}")
-
-    if hasattr(model, 'obs_shape'):
-        print(f"Obs Shape: {model.obs_shape}")
-
-    if hasattr(model, 'action_shape'):
-        print(f"Act Shape: {model.action_shape}")
-
-    print(f"Device: {device}")
-
-    if hasattr(model, '_orig_mod'):
-        print("Status: Compiled")
+    
+    if debug:
+        print(f"\n{model_name} Info:")
+        print(f"- Device: {device}")
+        print(f"- Total parameters: {total_params:,}")
+        print(f"- Trainable parameters: {trainable_params:,}")
+        if print_amp:
+            print(f"- AMP enabled: {True}")
+        print(f"- Using torch.compile: {hasattr(model, '_orig_mod')}")
     else:
-        print("Status: Not compiled")
-
-    print("AMP: Enabled" if print_amp else "AMP: Disabled")
+        # More concise output when not in debug mode
+        print(f"{model_name}: {trainable_params:,} params on {device}")
 
 def extract_model_dimensions(state_dict):
-    """
-    Extracts model dimensions from a saved state dictionary.
-
-    Returns:
-        tuple: (observation_shape, hidden_dim, action_shape, num_blocks)
-    """
-    # Remove _orig_mod prefix if present for easier access to keys
-    fixed_dict = fix_compiled_state_dict(state_dict)
-
-    # First, find embedding layer to get input shape and hidden dimension
-    hidden_dim = None
-    obs_shape = None
-    action_shape = None
-    num_blocks = 0
-
-    # Find key patterns to extract dimensions
-    for key in fixed_dict.keys():
-        if 'embedding.weight' in key:
-            if hidden_dim is None:
-                hidden_dim = fixed_dict[key].shape[0]  # First dimension is hidden_dim
-            if obs_shape is None:
-                obs_shape = fixed_dict[key].shape[1]   # Second dimension is input shape
-
-        if 'output_layer.weight' in key:
-            if action_shape is None:
-                action_shape = fixed_dict[key].shape[0]  # First dimension is output shape
-
-        # Count blocks by looking for block-specific parameters
-        if 'blocks.' in key:
-            parts = key.split('.')
-            if len(parts) > 2 and parts[0] == 'blocks' and parts[1].isdigit():
-                block_num = int(parts[1])
-                num_blocks = max(num_blocks, block_num + 1)  # +1 because 0-indexed
-
-    return (obs_shape, hidden_dim, action_shape, num_blocks)
+    """Extract model dimensions from a state dict"""
+    # Find input dimension from first layer
+    first_layer = next(key for key in state_dict.keys() if 'embedding.weight' in key)
+    obs_shape = state_dict[first_layer].shape[1]
+    
+    # Find hidden dimension
+    hidden_dim = state_dict[first_layer].shape[0]
+    
+    # Find output dimension from last layer
+    output_layers = [key for key in state_dict.keys() if 'output' in key and 'weight' in key]
+    if output_layers:
+        action_shape = state_dict[output_layers[0]].shape[0]
+    else:
+        action_shape = None
+    
+    # Find number of blocks from number of residual layers
+    num_blocks = len([key for key in state_dict.keys() if 'blocks.' in key]) // 4
+    
+    return obs_shape, hidden_dim, action_shape, num_blocks
 
 def fix_compiled_state_dict(state_dict):
-    """
-    Fixes state dictionaries saved from compiled models.
-
-    This handles both simple cases (prefix '_orig_mod.') and
-    cases where there are multiple levels of compilation wrappers.
-    """
-    # If no prefixes to fix, return as is
-    if not any(k.startswith('_orig_mod.') for k in state_dict.keys()):
-        # Check if the keys match what a compiled model would expect
-        if any('.' in k for k in state_dict.keys()):
-            # This is likely a non-compiled state dict being loaded into a compiled model
-            # We need to add the '_orig_mod.' prefix
-            fixed_dict = {'_orig_mod.' + k: v for k, v in state_dict.items()}
-            return fixed_dict
-        return state_dict  # No fix needed
-
-    # Remove one level of '_orig_mod.' prefix
-    fixed_dict = {}
+    """Fix state dict keys for compiled models by removing _orig_mod prefix"""
+    fixed_state_dict = {}
     for key, value in state_dict.items():
         if key.startswith('_orig_mod.'):
-            new_key = key[len('_orig_mod.'):]
-            fixed_dict[new_key] = value
+            new_key = key.replace('_orig_mod.', '')
+            fixed_state_dict[new_key] = value
         else:
-            fixed_dict[key] = value
-
-    # Recursively fix in case of multiple levels
-    if any(k.startswith('_orig_mod.') for k in fixed_dict.keys()):
-        return fix_compiled_state_dict(fixed_dict)
-
-    return fixed_dict
+            fixed_state_dict[key] = value
+    return fixed_state_dict
 
 class BasicModel(nn.Module):
-    def __init__(self, input_size = 784, output_size = 10, hidden_size = 64, dropout_rate = 0.5):
-        super(BasicModel, self).__init__()
-        self.network = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size//2),
-            nn.ReLU(),
-            nn.Linear(hidden_size//2, output_size),
-        )
+    """Base model that all policy/value models should inherit from"""
+    def __init__(self, obs_shape, action_shape, hidden_dim=512, num_blocks=4,
+                 dropout_rate=0.1, device="cpu"):
+        super().__init__()
+        self.obs_shape = obs_shape
+        self.action_shape = action_shape
+        self.hidden_dim = hidden_dim
+        self.device = device
 
-    def forward(self, x):
-        return self.network(x)
+        # Input norm and embedding
+        self.input_norm = RSNorm(obs_shape)
+        self.embedding = nn.Linear(obs_shape, hidden_dim)
+        
+        # Dropout (MPS-friendly if needed)
+        if torch.backends.mps.is_available():
+            self.dropout = MPSFriendlyDropout(dropout_rate)
+        else:
+            self.dropout = nn.Dropout(dropout_rate)
+
+        # Stack residual blocks
+        self.blocks = nn.ModuleList([
+            ResidualFFBlock(hidden_dim, dropout_rate)
+            for _ in range(num_blocks)
+        ])
+
+        # Output head
+        self.output = nn.Linear(hidden_dim, action_shape)
+
+    def forward(self, x, return_features=False):
+        # Input normalization and embedding
+        x = self.input_norm(x)
+        features = self.embedding(x)
+        features = self.dropout(features)
+
+        # Process through residual blocks
+        for block in self.blocks:
+            features = block(features)
+
+        # Get output
+        output = self.output(features)
+
+        if return_features:
+            return output, features
+        return output
 
 class MPSFriendlyDropout(nn.Module):
     """Dropout layer that's compatible with MPS backend by avoiding native_dropout"""
-    def __init__(self, p=0.5):
-        super(MPSFriendlyDropout, self).__init__()
+    def __init__(self, p: float = 0.5):
+        super().__init__()
         self.p = p
 
     def forward(self, x):
         if not self.training or self.p == 0:
             return x
 
-        # Create a mask with the same shape as input x, filled with (1-p).
-        # Then, randomly set some elements of the mask to 0 based on Bernoulli distribution.
-        # Finally, scale the mask by 1/(1-p) to preserve the expected value of input elements.
-        mask = torch.bernoulli(torch.full_like(x, 1 - self.p)) / (1 - self.p)
-        return x * mask
+        # Generate binary mask using bernoulli distribution
+        mask = torch.bernoulli(torch.full_like(x, 1 - self.p))
+        # Scale output during training
+        return x * mask / (1 - self.p)
 
 class SimBa(nn.Module):
     def __init__(self, obs_shape, action_shape, hidden_dim=1536, num_blocks=6,
@@ -191,163 +174,70 @@ class SimBa(nn.Module):
         # Stack residual feedforward blocks for the main part of the network.
         self.blocks = nn.ModuleList()
         for _ in range(num_blocks):
-            self.blocks.append(ResidualFFBlock(hidden_dim, dropout_rate, device=self.device))
+            self.blocks.append(ResidualFFBlock(hidden_dim, dropout_rate))
 
-        # Layer normalization after the residual blocks.
-        self.post_ln = nn.LayerNorm(hidden_dim)
-
-        # Output layer to project back to the action space.
-        self.output_layer = nn.Linear(hidden_dim, action_shape)
-
-        self.to(self.device)
+        # Final output layer to map to action space.
+        # For continuous action spaces, output both mean and log std.
+        if isinstance(action_shape, tuple):
+            self.output = nn.Linear(hidden_dim, np.prod(action_shape) * 2)
+        else:
+            self.output = nn.Linear(hidden_dim, action_shape)
 
     def forward(self, x, return_features=False):
-        """Forward pass through the network, with option to return intermediate features"""
-        # For CUDA graphs, explicitly mark step before we begin.
-        if "cuda" in str(self.device):
-            torch.compiler.cudagraph_mark_step_begin()
-
-        # Ensure input is a tensor on the correct device, preserving gradient history.
-        if not isinstance(x, torch.Tensor):
-            x = torch.tensor(x, dtype=torch.float32, device=self.device)
-        elif x.device != self.device:
-            x = x.to(self.device)
-
-        # Clone to avoid in-place modification of the original input.
-        x = x.clone()
-
-        # Mark another step after input preparation.
-        if "cuda" in str(self.device):
-            torch.compiler.cudagraph_mark_step_begin()
-
-        # Normalize the input using running statistics.
-        x_normalized = self.rsnorm(x)
-
-        # Mark CUDA graph step after normalization.
-        if "cuda" in str(self.device):
-            torch.compiler.cudagraph_mark_step_begin()
+        # Normalize input using running statistics.
+        x = self.rsnorm(x)
 
         # Initial embedding and dropout.
-        h = self.embedding(x_normalized)
-        if self.training:
-            h = self.dropout(h)
+        features = self.embedding(x)
+        features = self.dropout(features)
 
-        # Store intermediate features for auxiliary tasks
-        features = h.clone()
+        # Process through residual blocks.
+        for block in self.blocks:
+            features = block(features)
 
-        # Apply the residual blocks.
-        for i, block in enumerate(self.blocks):
-            # Mark CUDA graph step before each block.
-            if "cuda" in str(self.device):
-                torch.compiler.cudagraph_mark_step_begin()
-            h = block(h)
+        # Get raw output.
+        output = self.output(features)
 
-        # Mark CUDA graph step before normalization.
-        if "cuda" in str(self.device):
-            torch.compiler.cudagraph_mark_step_begin()
-
-        # Apply layer normalization after the residual blocks.
-        h = self.post_ln(h)
-
-        # Mark CUDA graph step before the final layer.
-        if "cuda" in str(self.device):
-            torch.compiler.cudagraph_mark_step_begin()
-
-        # Get the final output.
-        output = self.output_layer(h)
-
-        # Mark CUDA graph step after the model completes.
-        if "cuda" in str(self.device):
-            torch.compiler.cudagraph_mark_step_begin()
-
-        # Return features if requested, otherwise just output
+        # Return features if requested (for auxiliary tasks).
         if return_features:
-            return output.clone(), features
-        return output.clone()
-
-    def to(self, device=None, dtype=None, non_blocking=False):
-        # Fix: Correct method signature to match nn.Module
-        super().to(device=device, dtype=dtype, non_blocking=non_blocking)
-        if device is not None:
-            self.device = device
-        return self
-
+            return output, features
+        return output
 
 class ResidualFFBlock(nn.Module):
-    def __init__(self, hidden_dim, dropout_rate=0.1, device=None):
-        super(ResidualFFBlock, self).__init__()
-        self.hidden_dim = hidden_dim
-        self.dropout_rate = dropout_rate
-        self.device = device
-
-        # Layer normalization before the MLP.
-        self.ln = nn.LayerNorm(hidden_dim)
-
-        # MLP with an inverted bottleneck structure (4x expansion).
-        self.linear1 = nn.Linear(hidden_dim, hidden_dim * 4)
-
-        # Choose dropout based on device to handle MPS.
+    """Residual feed-forward block with pre-layer normalization"""
+    def __init__(self, hidden_dim, dropout_rate=0.1):
+        super().__init__()
+        self.norm1 = RSNorm(hidden_dim)
+        self.ff1 = nn.Linear(hidden_dim, hidden_dim * 4)
+        self.ff2 = nn.Linear(hidden_dim * 4, hidden_dim)
         if torch.backends.mps.is_available():
-            self.dropout1 = MPSFriendlyDropout(dropout_rate)
-            self.dropout2 = MPSFriendlyDropout(dropout_rate)
+            self.dropout = MPSFriendlyDropout(dropout_rate)
         else:
-            self.dropout1 = nn.Dropout(dropout_rate)
-            self.dropout2 = nn.Dropout(dropout_rate)
-
-        self.linear2 = nn.Linear(hidden_dim * 4, hidden_dim)
+            self.dropout = nn.Dropout(dropout_rate)
+        self.activation = nn.GELU()
 
     def forward(self, x):
-        # Clone the input to avoid in-place modifications, but preserve gradients.
-        x = x.clone()
-
-        # Mark step for CUDA graph, if applicable.
-        if self.device and "cuda" in str(self.device):
-            torch.compiler.cudagraph_mark_step_begin()
-
-        # Apply layer normalization.
-        norm_x = self.ln(x)
-
-        # Mark step after normalization.
-        if self.device and "cuda" in str(self.device):
-            torch.compiler.cudagraph_mark_step_begin()
-
-        # First linear layer, ReLU activation, and dropout.
-        h = self.linear1(norm_x)
-        h = F.relu(h)
-        if self.training:
-            h = self.dropout1(h)
-
-        # Mark step between linear layers.
-        if self.device and "cuda" in str(self.device):
-            torch.compiler.cudagraph_mark_step_begin()
-
-        # Second linear layer and dropout.
-        h = self.linear2(h)
-        if self.training:
-            h = self.dropout2(h)
-
-        # Mark step before residual connection.
-        if self.device and "cuda" in str(self.device):
-            torch.compiler.cudagraph_mark_step_begin()
-
-        # Add the residual connection.
-        output = x + h
-
-        # Mark step after computation completes
-        if self.device and "cuda" in str(self.device):
-            torch.compiler.cudagraph_mark_step_begin()
-
-        # Clone the output to ensure no in-place modification, while keeping gradient flow.
-        return output.clone()
+        # Pre-layer normalization
+        norm_x = self.norm1(x)
+        
+        # Feed-forward network
+        h = self.ff1(norm_x)
+        h = self.activation(h)
+        h = self.dropout(h)
+        h = self.ff2(h)
+        h = self.dropout(h)
+        
+        # Residual connection
+        return x + h
 
 class RSNorm(nn.Module):
-    def __init__(self, num_features, eps=1e-5, momentum=0.1):
-        super(RSNorm, self).__init__()
+    """Running Statistics Normalization - more stable than BatchNorm for RL"""
+    def __init__(self, num_features, momentum=0.1, eps=1e-5):
+        super().__init__()
         self.num_features = num_features
-        self.eps = eps  # Small constant to avoid division by zero.
-        self.momentum = momentum  # Momentum for updating running statistics.
+        self.momentum = momentum
+        self.eps = eps
 
-        # Initialize running statistics (mean and variance) as buffers.
         self.register_buffer('running_mean', torch.zeros(num_features))
         self.register_buffer('running_var', torch.ones(num_features))
         self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
@@ -403,14 +293,14 @@ class RSNorm(nn.Module):
 
             # Update running statistics with safe operations
             with torch.no_grad():
-                self.running_mean = (1 - update_factor) * self.running_mean + update_factor * batch_mean.detach()
-                self.running_var = (1 - update_factor) * self.running_var + update_factor * batch_var.detach()
-
-            # Normalize using batch statistics
-            normalized = (x - batch_mean.unsqueeze(0)) / torch.sqrt(batch_var.unsqueeze(0) + self.eps)
+                self.running_mean = (1 - update_factor) * self.running_mean + update_factor * batch_mean
+                self.running_var = (1 - update_factor) * self.running_var + update_factor * batch_var
         else:
-            # Normalize using running statistics
-            normalized = (x - self.running_mean.unsqueeze(0)) / torch.sqrt(self.running_var.unsqueeze(0) + self.eps)
+            # Use running statistics for evaluation
+            batch_mean = self.running_mean
+            batch_var = self.running_var
 
-        # Return a clone to prevent in-place operations but still maintain gradient information.
-        return normalized
+        # Normalize using current statistics
+        x_norm = (x - batch_mean[None, :]) / torch.sqrt(batch_var[None, :] + self.eps)
+        
+        return x_norm
