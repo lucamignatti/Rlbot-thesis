@@ -423,6 +423,9 @@ def run_training(
                         # Get current stage stats
                         current_stage_stats = curriculum_stats["current_stage_stats"]
                         
+                        # Get the global step counter that the trainer is using
+                        global_step = trainer.training_steps + trainer.training_step_offset
+                        
                         wandb.log({
                             # Stage progression metrics
                             "curriculum/stage": curriculum_stats["current_stage"],
@@ -443,7 +446,7 @@ def run_training(
                             
                             # Combined progress metric (considers both stage and difficulty)
                             "curriculum/total_progress": (float(curriculum_stats["current_stage"]) / max(1, curriculum_stats["total_stages"] - 1) + curriculum_stats["difficulty_level"]) / 2
-                        })
+                        }, step=global_step)
 
                 progress_bar.set_postfix(stats_dict)
 

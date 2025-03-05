@@ -257,6 +257,9 @@ class CurriculumManager:
         # Validate all stages during initialization
         if not testing:
             self.validate_all_stages()
+            
+        # Add training step tracking to sync with PPO trainer
+        self.last_wandb_step = 0
 
     def debug_print(self, message: str):
         if self.debug:
@@ -374,7 +377,12 @@ class CurriculumManager:
         self.total_episodes += 1
 
         # Log curriculum metrics to wandb if enabled
-        if self.use_wandb and wandb.run is not None:
+        if self.use_wandb and wandb.run is not None and hasattr(self, 'trainer') and self.trainer is not None:
+            # Get the trainer's global step if available
+            if hasattr(self.trainer, 'training_steps') and hasattr(self.trainer, 'training_step_offset'):
+                # Use the same global step counter as the trainer
+                self.last_wandb_step = self.trainer.training_steps + self.trainer.training_step_offset
+            
             # Log the current curriculum state
             curriculum_metrics = {
                 "curriculum/current_stage": self.current_stage_index,
@@ -388,7 +396,9 @@ class CurriculumManager:
                 "curriculum/episodes_in_stage": current_stage.episode_count,
                 "curriculum/consecutive_successes": current_stage.get_consecutive_successes()
             }
-            wandb.log(curriculum_metrics)
+            
+            # Include step parameter in wandb.log to ensure consistent logging
+            wandb.log(curriculum_metrics, step=self.last_wandb_step)
 
         # Every N episodes, check if we should progress to the next stage
         if self.total_episodes % self.evaluation_window == 0:
@@ -434,7 +444,7 @@ class CurriculumManager:
                     wandb.log({
                         "curriculum/difficulty_increased": self.current_difficulty,
                         "curriculum/stage_name": current_stage.name,
-                    })
+                    }, step=self.last_wandb_step)
                 
                 return False  # No stage progression yet
 
@@ -499,7 +509,7 @@ class CurriculumManager:
                 "curriculum/completed_stage/episodes": old_stage_obj.episode_count
             })
             
-            wandb.log(transition_metrics)
+            wandb.log(transition_metrics, step=self.last_wandb_step)
 
     def _get_rehearsal_probability(self) -> float:
         """Get the probability of using a rehearsal stage instead of the current stage."""
@@ -675,7 +685,7 @@ class CurriculumManager:
                 "curriculum/loaded_state/difficulty": self.current_difficulty,
                 "curriculum/loaded_state/total_episodes": self.total_episodes,
                 "curriculum/loaded_state/success_rate": current_stage.moving_success_rate
-            })
+            }, step=self.last_wandb_step)
 
     def get_stage_progress(self) -> float:
         """Get progress through current stage (0-1)"""
