@@ -1500,6 +1500,28 @@ class PPOTrainer:
                         "rp_loss": float(avg_rp_loss),         # Auxiliary task losses
                         "aux_loss": float(avg_aux_loss),
                     }
+
+                    # Add curriculum metrics if curriculum is enabled
+                    if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None:
+                        curr_stats = self.curriculum_manager.get_curriculum_stats()
+                        current_stage = curr_stats["current_stage"]
+                        current_diff = curr_stats["difficulty_level"]
+                        stage_stats = curr_stats["current_stage_stats"]
+                        
+                        # Add curriculum metrics to safe_metrics
+                        safe_metrics.update({
+                            "curriculum/difficulty": float(current_diff),
+                            "curriculum/stage": int(current_stage),
+                            "curriculum/stage_name": str(curr_stats["current_stage_name"]),
+                            "curriculum/total_stages": int(curr_stats["total_stages"]),
+                            "curriculum/total_progress": float((current_stage + current_diff) / curr_stats["total_stages"]),
+                            "curriculum/success_rate": float(stage_stats["success_rate"]),
+                            "curriculum/avg_reward": float(stage_stats["avg_reward"]),
+                            "curriculum/episodes_in_stage": int(stage_stats["episodes"]),
+                            "curriculum/stage_successes": int(stage_stats["successes"]),
+                            "curriculum/stage_failures": int(stage_stats["failures"])
+                        })
+
                     if hasattr(self, 'aux_scale'):
                         safe_metrics["aux_scale"] = self.aux_scale
 

@@ -654,7 +654,6 @@ class VectorizedEnv:
         self.episode_counts = [0] * num_envs
 
     def _step_env(self, args):
-        """Thread worker function to step a single environment"""
         env_idx, env, actions_dict = args
 
         # Format actions for RLGym API
@@ -674,8 +673,8 @@ class VectorizedEnv:
 
         # Add rendering and delay if this is the rendered environment
         if self.render and env_idx == 0:
-            env.render()  # Explicitly render
-            time.sleep(self.render_delay)  # Add delay for better visualization
+            env.render()
+            time.sleep(self.render_delay)
 
         # Track rewards for curriculum
         if self.curriculum_manager is not None:
@@ -688,6 +687,8 @@ class VectorizedEnv:
 
     def step(self, actions_dict_list):
         """Step all environments forward using appropriate method based on mode"""
+        stats_dict = {}
+        
         if self.mode == "thread":
             # Use thread pool for parallel execution
             futures = [
@@ -724,8 +725,9 @@ class VectorizedEnv:
                             "timeout": self.episode_timeouts[env_idx],
                             "episode_reward": avg_reward
                         }
+                        
                         self.curriculum_manager.update_progression_stats(metrics)
-
+                        
                         # Get new curriculum configuration for next episode
                         new_config = self.curriculum_manager.get_environment_config()
                         self.curriculum_configs[env_idx] = new_config
@@ -735,35 +737,35 @@ class VectorizedEnv:
                             self.envs[env_idx].close()
                             env_renderer = RLViserRenderer() if (env_idx == 0 and self.render) else None
                             self.envs[env_idx] = get_env(renderer=env_renderer,
-                                                        action_stacker=self.action_stacker,
-                                                        curriculum_config=new_config)
+                                                       action_stacker=self.action_stacker,
+                                                       curriculum_config=new_config)
 
-                if self.dones[env_idx]:
-                    # If done, reset the environment
-                    self.episode_counts[env_idx] += 1
+                    if self.dones[env_idx]:
+                        # If done, reset the environment
+                        self.episode_counts[env_idx] += 1
 
-                    # Reset the environment
-                    self.obs_dicts[env_idx] = self.envs[env_idx].reset()
+                        # Reset the environment
+                        self.obs_dicts[env_idx] = self.envs[env_idx].reset()
 
-                    # Reset action history for all agents
-                    if self.action_stacker is not None:
-                        for agent_id in next_obs_dict.keys():
-                            self.action_stacker.reset_agent(agent_id)
+                        # Reset action history for all agents
+                        if self.action_stacker is not None:
+                            for agent_id in next_obs_dict.keys():
+                                self.action_stacker.reset_agent(agent_id)
 
-                    # Reset episode tracking variables
-                    self.episode_rewards[env_idx] = {}
-                    self.episode_successes[env_idx] = False
-                    self.episode_timeouts[env_idx] = False
+                        # Reset episode tracking variables
+                        self.episode_rewards[env_idx] = {}
+                        self.episode_successes[env_idx] = False
+                        self.episode_timeouts[env_idx] = False
 
-                    # Render again after reset if this is the rendered environment
-                    if self.render and env_idx == 0:
-                        self.envs[env_idx].render()
-                        time.sleep(self.render_delay)
-                else:
-                    # Otherwise just update observations
-                    self.obs_dicts[env_idx] = next_obs_dict
+                        # Render again after reset if this is the rendered environment
+                        if self.render and env_idx == 0:
+                            self.envs[env_idx].render()
+                            time.sleep(self.render_delay)
+                    else:
+                        # Otherwise just update observations
+                        self.obs_dicts[env_idx] = next_obs_dict
 
-                processed_results.append((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
+                    processed_results.append((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
 
         else:  # multiprocess mode
             # Send step command to all workers
