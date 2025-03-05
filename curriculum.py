@@ -219,6 +219,12 @@ class CurriculumManager:
         if not stages:
             raise ValueError("At least one curriculum stage must be provided")
 
+        if max_rehearsal_stages < 0:
+            raise ValueError("max_rehearsal_stages must be non-negative")
+
+        if rehearsal_decay_factor <= 0 or rehearsal_decay_factor > 1:
+            raise ValueError("rehearsal_decay_factor must be in range (0, 1]")
+
         self.debug = debug
         self.use_wandb = use_wandb  # Store wandb usage flag
 

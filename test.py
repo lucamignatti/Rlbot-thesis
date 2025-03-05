@@ -74,6 +74,28 @@ class TestProgressionRequirements(unittest.TestCase):
                                    min_episodes=50, max_std_dev=0.3,
                                    required_consecutive_successes=0)
 
+    def test_edge_cases(self):
+        """Test edge cases for progression requirements"""
+        # Test minimum valid values
+        min_req = ProgressionRequirements(
+            min_success_rate=0.0,
+            min_avg_reward=0.0,
+            min_episodes=1,
+            max_std_dev=0.0,
+            required_consecutive_successes=1
+        )
+        self.assertEqual(min_req.min_success_rate, 0.0)
+        
+        # Test maximum valid values
+        max_req = ProgressionRequirements(
+            min_success_rate=1.0,
+            min_avg_reward=1.0,
+            min_episodes=1000000,
+            max_std_dev=10.0,
+            required_consecutive_successes=1000
+        )
+        self.assertEqual(max_req.min_success_rate, 1.0)
+
 class TestCurriculumStage(unittest.TestCase):
     """Test the CurriculumStage class"""
 
@@ -199,6 +221,41 @@ class TestCurriculumStage(unittest.TestCase):
 
         # This should pass all validation criteria
         self.assertTrue(self.stage.validate_progression())
+
+    def test_reset_statistics(self):
+        """Test complete reset of stage statistics"""
+        # Add some data
+        self.stage.update_statistics({"success": True, "episode_reward": 0.8})
+        self.stage.update_statistics({"success": False, "episode_reward": 0.2})
+        
+        # Verify data exists
+        self.assertTrue(len(self.stage.rewards_history) > 0)
+        self.assertTrue(self.stage.episode_count > 0)
+        
+        # Reset
+        self.stage.reset_statistics()
+        
+        # Verify complete reset
+        self.assertEqual(len(self.stage.rewards_history), 0)
+        self.assertEqual(self.stage.episode_count, 0)
+        self.assertEqual(self.stage.success_count, 0)
+        self.assertEqual(self.stage.failure_count, 0)
+        self.assertEqual(self.stage.moving_success_rate, 0.0)
+        self.assertEqual(self.stage.moving_avg_reward, 0.0)
+
+    def test_empty_difficulty_params(self):
+        """Test stage behavior with no difficulty parameters"""
+        stage = CurriculumStage(
+            name="No Difficulty Stage",
+            state_mutator=self.state_mutator,
+            reward_function=self.reward_fn,
+            termination_condition=self.termination_cond,
+            truncation_condition=self.truncation_cond
+        )
+        
+        # Should return empty dict for any difficulty level
+        self.assertEqual(stage.get_config_with_difficulty(0.5), {})
+        self.assertEqual(stage.get_config_with_difficulty(1.0), {})
 
 class TestCurriculumManager(unittest.TestCase):
     """Test the CurriculumManager class"""
@@ -390,6 +447,64 @@ class TestCurriculumManager(unittest.TestCase):
         # Clean up
         os.unlink(temp_path)
 
+    def test_invalid_rehearsal_config(self):
+        """Test rehearsal behavior with invalid configuration"""
+        # Try negative max_rehearsal_stages
+        with self.assertRaises(ValueError):
+            CurriculumManager(
+                stages=[self.stage1, self.stage2],
+                max_rehearsal_stages=-1
+            )
+        
+        # Try invalid rehearsal_decay_factor
+        with self.assertRaises(ValueError):
+            CurriculumManager(
+                stages=[self.stage1, self.stage2],
+                rehearsal_decay_factor=-0.5
+            )
+
+    def test_empty_stages(self):
+        """Test handling of empty stages list"""
+        with self.assertRaises(ValueError):
+            CurriculumManager(stages=[])
+
+    def test_hyperparameter_adjustments(self):
+        """Test detailed hyperparameter adjustment behavior"""
+        mock_trainer = MagicMock()
+        mock_trainer.actor_optimizer.param_groups = [{"lr": 1e-3}]
+        mock_trainer.critic_optimizer.param_groups = [{"lr": 1e-2}]
+        mock_trainer.entropy_coef = 0.1
+        
+        self.manager.register_trainer(mock_trainer)
+        
+        # Add custom hyperparameter adjustments to stage2
+        self.stage2.hyperparameter_adjustments = {
+            "lr_actor": 5e-4,
+            "lr_critic": 5e-3,
+            "entropy_coef": 0.05
+        }
+        
+        # Force progression to stage 2
+        self.manager.current_stage_index = 0
+        self.manager.current_difficulty = 0.95
+        self.stage1.rewards_history = [0.8] * 10
+        self.stage1.success_count = 10
+        self.stage1.episode_count = 10
+        self.stage1.moving_success_rate = 1.0
+        self.stage1.moving_avg_reward = 0.8
+        
+        # Trigger progression
+        for _ in range(5):
+            self.manager.update_progression_stats({
+                "success": True,
+                "episode_reward": 0.8
+            })
+        
+        # Verify all hyperparameters were adjusted
+        self.assertEqual(mock_trainer.actor_optimizer.param_groups[0]["lr"], 5e-4)
+        self.assertEqual(mock_trainer.critic_optimizer.param_groups[0]["lr"], 5e-3)
+        self.assertEqual(mock_trainer.entropy_coef, 0.05)
+
 class TestCurriculumIntegration(unittest.TestCase):
     """Integration tests for curriculum learning"""
 
@@ -545,6 +660,63 @@ class TestCurriculumIntegration(unittest.TestCase):
 
         # Verify stage transitions were recorded
         self.assertEqual(len(self.manager.stage_transitions), 2)  # Two transitions
+
+    def test_stress_test(self):
+        """Stress test with rapid stage transitions and frequent updates"""
+        # Simulate rapid updates
+        for _ in range(1000):
+            self.manager.update_progression_stats({
+                "success": True,
+                "episode_reward": 0.9
+            })
+            
+            # Randomly force stage transitions
+            if np.random.random() < 0.1:  # 10% chance
+                self.manager.current_difficulty = 0.95
+                current_stage = self.manager.stages[self.manager.current_stage_index]
+                current_stage.rewards_history = [0.9] * 20
+                current_stage.success_count = 20
+                current_stage.episode_count = 20
+                current_stage.moving_success_rate = 1.0
+                current_stage.moving_avg_reward = 0.9
+                
+                # Should handle rapid transitions gracefully
+                self.manager._evaluate_progression()
+        
+        # Verify manager state is still valid
+        self.assertGreaterEqual(self.manager.current_stage_index, 0)
+        self.assertLess(self.manager.current_stage_index, len(self.manager.stages))
+        self.assertGreaterEqual(self.manager.current_difficulty, 0.0)
+        self.assertLessEqual(self.manager.current_difficulty, 1.0)
+
+    def test_varied_performance(self):
+        """Test curriculum behavior with varying performance patterns"""
+        # Pattern 1: Gradually improving performance
+        for i in range(20):
+            success = np.random.random() < (0.5 + i * 0.025)  # Increasing success probability
+            reward = 0.5 + (i * 0.02)  # Gradually increasing rewards
+            self.manager.update_progression_stats({
+                "success": success,
+                "episode_reward": reward
+            })
+        
+        # Pattern 2: Sudden performance drop
+        for _ in range(10):
+            self.manager.update_progression_stats({
+                "success": False,
+                "episode_reward": 0.2
+            })
+        
+        # Pattern 3: Recovery
+        for _ in range(15):
+            self.manager.update_progression_stats({
+                "success": True,
+                "episode_reward": 0.8
+            })
+        
+        # Verify the curriculum handled the variations appropriately
+        self.assertTrue(0 <= self.manager.current_stage_index < len(self.manager.stages))
+        self.assertTrue(0 <= self.manager.current_difficulty <= 1.0)
 
 if __name__ == "__main__":
     unittest.main()
