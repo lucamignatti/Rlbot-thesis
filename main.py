@@ -103,7 +103,8 @@ def run_training(
     actor,
     critic,
     device,
-    num_envs: int,
+    num_envs: int,  # Required parameter first
+    training_step_offset: int = 0,  # Optional parameter with default value after
     total_episodes: int = None,
     training_time: float = None,
     render: bool = False,
@@ -423,9 +424,12 @@ def run_training(
                         # Get current stage stats
                         current_stage_stats = curriculum_stats["current_stage_stats"]
                         
-                        # Get the global step counter that the trainer is using
-                        global_step = trainer.training_steps + trainer.training_step_offset
-                        
+                        # Use trainer's _true_training_steps as source of truth for step counting
+                        if hasattr(trainer, '_true_training_steps'):
+                            current_step = trainer._true_training_steps
+                        else:
+                            current_step = trainer.training_steps + trainer.training_step_offset
+                            
                         wandb.log({
                             # Stage progression metrics
                             "curriculum/stage": curriculum_stats["current_stage"],
@@ -447,7 +451,7 @@ def run_training(
                             
                             # Combined progress metric (considers both stage and difficulty)
                             "curriculum/total_progress": (float(curriculum_stats["current_stage"]) / max(1, curriculum_stats["total_stages"] - 1) + curriculum_stats["difficulty_level"]) / 2
-                        }, step=global_step)
+                        }, step=current_step)
 
                 progress_bar.set_postfix(stats_dict)
 
@@ -1087,8 +1091,10 @@ if __name__ == "__main__":
     # Set up Weights & Biases for experiment tracking, if enabled.
     if args.wandb:
         import wandb
-        wandb.init(
+        # Initialize wandb with proper step counting setup
+        run = wandb.init(
             project="rlbot-training",
+            resume="allow",  # Allow resuming previous runs
             config={
                 # Hyperparameters
                 "learning_rate_actor": args.lra,
@@ -1140,10 +1146,24 @@ if __name__ == "__main__":
     if args.model:
         try:
             # Load a pre-trained model.
+            # Load checkpoint and handle wandb run ID if present
             checkpoint = torch.load(args.model, map_location=device)
+            wandb_run_id = checkpoint.get('wandb_run_id')
 
             if args.debug:
                 print(f"[DEBUG] Loaded checkpoint from {args.model}")
+                if wandb_run_id:
+                    print(f"[DEBUG] Found wandb run ID: {wandb_run_id}")
+
+            # If using wandb and checkpoint has a run ID, try to resume that run
+            if args.wandb and wandb_run_id:
+                try:
+                    wandb.init(id=wandb_run_id, resume="must")
+                    print(f"Resuming wandb run {wandb_run_id}")
+                except Exception as e:
+                    print(f"Could not resume wandb run {wandb_run_id}: {e}")
+                    # Fall back to new run
+                    wandb.init()
 
             # If the checkpoint contains both actor and critic, extract their parameters.
             if isinstance(checkpoint, dict) and 'actor' in checkpoint and 'critic' in checkpoint:
@@ -1180,7 +1200,16 @@ if __name__ == "__main__":
                 # Load the model weights, skipping mismatched layers
                 load_partial_state_dict(actor, checkpoint['actor'])
                 load_partial_state_dict(critic, checkpoint['critic'])
+                # Get training step count from checkpoint if available
+                if 'training_step' in checkpoint:
+                    trainer_offset = checkpoint.get('training_step', 0)
+                    if args.debug:
+                        print(f"[DEBUG] Loaded training step offset: {trainer_offset}")
+                else:
+                    trainer_offset = 0
+                
                 print(f"Successfully loaded model from {args.model} with adjusted dimensions")
+                print(f"Continuing from training step {trainer_offset}")
 
             else:
                 print(f"Error: Unsupported model format in {args.model}")
@@ -1190,11 +1219,14 @@ if __name__ == "__main__":
                 import traceback
                 traceback.print_exc()
 
-    # Start the main training process.  Pass in parameters based on whether we're
-    # training for a set number of episodes or a fixed amount of time.
+    # Get the training step offset if we loaded a checkpoint
+    trainer_offset = trainer_offset if 'trainer_offset' in locals() else 0
+    
+    # Start the main training process with proper step counting
     trainer = run_training(
         actor=actor,
         critic=critic,
+        training_step_offset=trainer_offset,  # Pass the offset to maintain step counting
         device=device,
         num_envs=args.num_envs,
         total_episodes=args.episodes if args.time is None else None,
@@ -1229,8 +1261,13 @@ if __name__ == "__main__":
     if trainer is not None:  # Only check if trainer exists, not test mode
         # Always save when trainer exists and small number of episodes were run - these are likely evaluation runs
         output_path = args.out if args.out else None
-        saved_path = trainer.save_models(output_path)
-        print(f"Training complete - Model saved to {saved_path}")
+        # Save model with step count and wandb info
+        metadata = {
+            'training_step': trainer._true_training_steps if hasattr(trainer, '_true_training_steps') else trainer.training_steps,
+            'wandb_run_id': wandb.run.id if args.wandb and wandb.run else None
+        }
+        saved_path = trainer.save_models(output_path, metadata)
+        print(f"Training complete - Model saved to {saved_path} at step {metadata['training_step']}")
     else:
         print("Training failed - no model saved.")
 

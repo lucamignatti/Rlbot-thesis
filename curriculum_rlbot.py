@@ -1,8 +1,9 @@
 """RLBot curriculum implementation."""
-from typing import Dict, List, Any, Tuple, Optional
+from typing import Dict, List, Any, Tuple, Optional, Set
 from rlgym.rocket_league.done_conditions import GoalCondition, TimeoutCondition, NoTouchTimeoutCondition
 from rlgym.rocket_league.reward_functions import CombinedReward, GoalReward, TouchReward
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
+from rlgym.api import StateMutator, RewardFunction, DoneCondition
 from curriculum import CurriculumManager, CurriculumStage, ProgressionRequirements
 from rewards import (
     BallProximityReward, BallToGoalDistanceReward, BallVelocityToGoalReward,
@@ -11,6 +12,8 @@ from rewards import (
 )
 from collections import defaultdict, deque
 import os
+import random
+import numpy as np
 
 # Helper functions to manage bot compatibility
 def load_bot_skills() -> Dict[str, float]:
@@ -74,141 +77,267 @@ def get_compatible_bots(min_skill: float = 0.0, max_skill: float = 1.0) -> Dict[
 
 
 class RLBotStage(CurriculumStage):
-    """Curriculum stage with RLBot opponent selection."""
-    
-    def __init__(self, name, state_mutator, reward_function, termination_condition, truncation_condition,
-                 bot_skill_ranges=None, bot_tags=None, allowed_bots=None, progression_requirements=None,
-                 difficulty_params=None, hyperparameter_adjustments=None):
-        super().__init__(name, state_mutator, reward_function, termination_condition, truncation_condition,
-                        bot_skill_ranges=bot_skill_ranges, bot_tags=bot_tags, allowed_bots=allowed_bots,
-                        progression_requirements=progression_requirements, difficulty_params=difficulty_params,
-                        hyperparameter_adjustments=hyperparameter_adjustments)
-        
-        # Additional tracking specific to bot opponents
-        self.bot_stats = {}  # Use dict instead of defaultdict for easier serialization
-    
-    def update_bot_stats(self, bot_id: str, outcome: str):
-        """Update performance tracking for a specific bot"""
-        if bot_id not in self.bot_stats:
-            self.bot_stats[bot_id] = {
-                'wins': 0, 
-                'losses': 0, 
-                'draws': 0,
-                'total_reward': 0.0,
-                'episodes': 0,
-                'recent_outcomes': []  # Last 20 outcomes
-            }
-        
-        stats = self.bot_stats[bot_id]
-        if outcome == 'win':
-            stats['wins'] += 1
-            stats['recent_outcomes'].append(1)
-        elif outcome == 'loss':
-            stats['losses'] += 1
-            stats['recent_outcomes'].append(-1)
-        else:  # draw
-            stats['draws'] += 1
-            stats['recent_outcomes'].append(0)
+    """Extended curriculum stage with RLBot integration"""
+    def __init__(
+        self,
+        name: str,
+        state_mutator: StateMutator,
+        reward_function: RewardFunction,
+        termination_condition: DoneCondition,
+        truncation_condition: DoneCondition,
+        bot_skill_ranges: Optional[Dict[Tuple[float, float], float]] = None,
+        bot_tags: Optional[List[str]] = None,
+        progression_requirements: Optional[ProgressionRequirements] = None,
+        difficulty_params: Optional[Dict[str, Tuple[float, float]]] = None,
+        hyperparameter_adjustments: Optional[Dict[str, float]] = None
+    ):
+        # Type check inputs for better error messages
+        if not isinstance(reward_function, RewardFunction):
+            raise TypeError(f"reward_function must be a RewardFunction instance, got {type(reward_function)}")
             
-        # Keep only last 20 outcomes
-        if len(stats['recent_outcomes']) > 20:
-            stats['recent_outcomes'] = stats['recent_outcomes'][-20:]
-    
-    def get_bot_performance(self, bot_id: str) -> Optional[Dict[str, Any]]:
-        """Get performance metrics for a specific bot"""
-        if bot_id not in self.bot_stats:
-            return None
+        super().__init__(
+            name=name,
+            state_mutator=state_mutator,
+            reward_function=reward_function,
+            termination_condition=termination_condition,
+            truncation_condition=truncation_condition,
+            progression_requirements=progression_requirements,
+            difficulty_params=difficulty_params,
+            hyperparameter_adjustments=hyperparameter_adjustments
+        )
         
-        stats = self.bot_stats[bot_id]
-        total_games = stats['wins'] + stats['losses'] + stats['draws']
+        # RLBot-specific configuration
+        self.bot_skill_ranges = bot_skill_ranges or {(0.3, 0.7): 1.0}
+        self.bot_tags = set(bot_tags or [])
+        self.bot_performance = {}
+        self.recent_bot_win_rate = {}
+        
+    def select_opponent(self, difficulty_level: float) -> Optional[str]:
+        """Select an opponent based on the current difficulty level"""
+        skill_min, skill_max = self.select_opponent_skill_range(difficulty_level)
+        
+        # Find compatible bots within this skill range
+        compatible_bots = get_compatible_bots(skill_min, skill_max, self.bot_tags)
+        
+        if not compatible_bots:
+            return None
+            
+        # Select randomly from compatible bots
+        return random.choice(compatible_bots)
+        
+    def select_opponent_skill_range(self, difficulty_level: float) -> Tuple[float, float]:
+        """Select a skill range based on the current difficulty level"""
+        # Find the range closest to the current difficulty
+        best_range = None
+        best_match = -1
+        
+        for skill_range, probability in self.bot_skill_ranges.items():
+            min_skill, max_skill = skill_range
+            mid_point = (min_skill + max_skill) / 2
+            
+            # Calculate how well this range matches the difficulty
+            match_quality = 1 - abs(difficulty_level - mid_point)
+            
+            if match_quality > best_match:
+                best_match = match_quality
+                best_range = skill_range
+                
+        # Return the best matching range, or a default range if none found
+        return best_range if best_range else (0.3, 0.7)
+        
+    def update_bot_performance(self, bot_id: str, win: bool, reward: float, difficulty: float) -> None:
+        """Update performance statistics for a specific bot"""
+        if bot_id not in self.bot_performance:
+            self.bot_performance[bot_id] = {
+                'wins': 0,
+                'losses': 0,
+                'rewards': [],
+                'difficulties': []
+            }
+            self.recent_bot_win_rate[bot_id] = deque(maxlen=10)  # Track recent 10 matches
+            
+        stats = self.bot_performance[bot_id]
+        
+        if win:
+            stats['wins'] += 1
+            self.recent_bot_win_rate[bot_id].append(1)
+        else:
+            stats['losses'] += 1
+            self.recent_bot_win_rate[bot_id].append(0)
+            
+        stats['rewards'].append(reward)
+        stats['difficulties'].append(difficulty)
+        
+    def get_bot_performance(self, bot_id: str) -> Optional[Dict[str, Any]]:
+        """Get performance statistics for a bot"""
+        if bot_id not in self.bot_performance:
+            return None
+            
+        stats = self.bot_performance[bot_id]
+        total_games = stats['wins'] + stats['losses']
         
         if total_games == 0:
             return None
-        
-        # Calculate recent win rate from last 20 games
-        recent = stats['recent_outcomes']
-        recent_wins = sum(1 for x in recent if x == 1)
-        recent_win_rate = recent_wins / len(recent) if recent else 0
+            
+        recent_results = self.recent_bot_win_rate[bot_id]
         
         return {
-            'win_rate': stats['wins'] / total_games,
-            'recent_win_rate': recent_win_rate,
-            'total_games': total_games,
             'wins': stats['wins'],
             'losses': stats['losses'],
-            'draws': stats['draws'],
-            'avg_reward': stats['total_reward'] / total_games if total_games > 0 else 0.0
+            'total_games': total_games,
+            'win_rate': stats['wins'] / total_games,
+            'recent_win_rate': sum(recent_results) / len(recent_results) if recent_results else 0,
+            'avg_reward': sum(stats['rewards']) / len(stats['rewards']) if stats['rewards'] else 0,
+            'avg_difficulty': sum(stats['difficulties']) / len(stats['difficulties']) if stats['difficulties'] else 0
         }
-    
-    def update_bot_performance(self, bot_id: str, win: bool, reward: float):
-        """Track performance against specific bots."""
-        # Update base class stats
-        super().update_bot_performance(
-            bot_id=bot_id,
-            win=win,
-            reward=reward,
-            difficulty=get_bot_skill(bot_id) or 0.5
-        )
         
-        # Update our detailed stats
-        if bot_id not in self.bot_stats:
-            self.bot_stats[bot_id] = {
-                'wins': 0,
-                'losses': 0,
-                'draws': 0,
-                'total_reward': 0.0,
-                'episodes': 0,
-                'recent_outcomes': []
-            }
+    def get_challenging_bots(self, threshold: float = 0.4) -> List[str]:
+        """Find bots where win rate is below threshold"""
+        challenging_bots = []
         
-        stats = self.bot_stats[bot_id]
-        stats['episodes'] += 1
-        stats['total_reward'] += reward
-        
-        if win:
-            self.update_bot_stats(bot_id, 'win')
-        else:
-            self.update_bot_stats(bot_id, 'loss')
-    
-    def get_challenging_opponents(self, count: int = 3) -> List[str]:
-        """Get list of challenging opponents to focus on."""
-        challenging = []
-        
-        for bot_id in self.bot_stats:
-            stats = self.get_bot_performance(bot_id)
-            if stats and stats['total_games'] >= 10:
-                # Consider a bot challenging if recent performance is poor
-                if stats['recent_win_rate'] < 0.5 or stats['win_rate'] < 0.4:
-                    challenging.append((bot_id, stats['recent_win_rate']))
-        
-        # Sort by recent win rate ascending (hardest bots first)
-        challenging.sort(key=lambda x: x[1])
-        return [bot_id for bot_id, _ in challenging[:count]]
-    
-    def select_opponent(self, difficulty: float) -> Optional[str]:
-        """Select an appropriate opponent based on current difficulty."""
-        min_skill, max_skill = self.select_opponent_skill_range(difficulty)
-        
-        # Get compatible bots in skill range
-        available_bots = get_compatible_bots(min_skill, max_skill)
-        if not available_bots:
-            if hasattr(self, 'debug') and self.debug:
-                print(f"Warning: No compatible bots found in skill range {min_skill}-{max_skill}")
-            return None
-            
-        # Sort by skill to prefer bots closer to target difficulty
-        target_skill = (min_skill + max_skill) / 2
-        sorted_bots = sorted(
-            available_bots.items(),
-            key=lambda x: abs(x[1] - target_skill)
-        )
-        
-        return sorted_bots[0][0] if sorted_bots else None  # Return name of best matching bot
-    
-    def validate_opponent(self, bot_id: str) -> bool:
-        """Verify that a bot is valid and compatible."""
-        return is_bot_compatible(bot_id)
+        for bot_id, stats in self.bot_performance.items():
+            perf = self.get_bot_performance(bot_id)
+            if perf and perf['win_rate'] <= threshold:
+                challenging_bots.append(bot_id)
+                
+        return challenging_bots
 
+# Global bot skill cache
+_bot_skills = {}
+_bot_tags = {}
+_compatible_bots = None
+
+def _load_bot_skills() -> None:
+    """Load bot skills from file"""
+    global _bot_skills
+    if _bot_skills:  # Already loaded
+        return
+        
+    try:
+        with open("bot_skills.txt", "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    parts = line.split("=")
+                    if len(parts) == 2:
+                        bot_name, skill = parts
+                        try:
+                            _bot_skills[bot_name.strip()] = float(skill)
+                        except ValueError:
+                            pass
+    except FileNotFoundError:
+        print("Warning: Could not find bot_skills.txt")
+        
+def _load_bot_tags() -> None:
+    """Load bot tags from file"""
+    global _bot_tags
+    if _bot_tags:  # Already loaded
+        return
+        
+    try:
+        with open("bot_metadata.txt", "r") as f:
+            bot_id = None
+            tags = []
+            
+            for line in f:
+                line = line.strip()
+                if line.startswith("[") and line.endswith("]"):
+                    # Save previous bot if any
+                    if bot_id:
+                        _bot_tags[bot_id] = set(tags)
+                        
+                    # Start new bot
+                    bot_id = line[1:-1]
+                    tags = []
+                elif ":" in line:
+                    key, value = line.split(":", 1)
+                    if key.strip() == "tags":
+                        tags = [t.strip() for t in value.split(",")]
+                        
+            # Save final bot
+            if bot_id:
+                _bot_tags[bot_id] = set(tags)
+    except FileNotFoundError:
+        print("Warning: Could not find bot_metadata.txt")
+
+def _load_compatible_bots() -> None:
+    """Load list of compatible bots"""
+    global _compatible_bots
+    if _compatible_bots is not None:  # Already loaded
+        return
+        
+    _compatible_bots = set()
+    try:
+        if os.path.exists("validated_bots.txt"):
+            with open("validated_bots.txt", "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        _compatible_bots.add(line)
+        elif os.path.exists("runnable_bots.txt"):
+            with open("runnable_bots.txt", "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        _compatible_bots.add(line)
+        else:
+            # Use all bots with skills as fallback
+            _load_bot_skills()
+            _compatible_bots = set(_bot_skills.keys())
+            
+        # Filter out disabled bots
+        if os.path.exists("disabled_bots.txt"):
+            disabled = set()
+            with open("disabled_bots.txt", "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        disabled.add(line)
+            _compatible_bots -= disabled
+    except Exception as e:
+        print(f"Warning: Error loading compatible bots: {e}")
+        _compatible_bots = set()
+
+def get_bot_skill(bot_id: str) -> Optional[float]:
+    """Get skill rating for bot"""
+    _load_bot_skills()
+    return _bot_skills.get(bot_id)
+    
+def get_bot_tags(bot_id: str) -> Set[str]:
+    """Get tags for bot"""
+    _load_bot_tags()
+    return _bot_tags.get(bot_id, set())
+    
+def is_bot_compatible(bot_id: str) -> bool:
+    """Check if bot is compatible with the system"""
+    _load_compatible_bots()
+    return bot_id in _compatible_bots
+    
+def get_compatible_bots(min_skill: float = 0.0, max_skill: float = 1.0, 
+                       required_tags: Optional[List[str]] = None) -> List[str]:
+    """Get bots within skill range with required tags"""
+    _load_bot_skills()
+    _load_compatible_bots()
+    _load_bot_tags()
+    
+    required_tag_set = set(required_tags or [])
+    result = []
+    
+    for bot_id in _compatible_bots:
+        # Check skill range
+        skill = _bot_skills.get(bot_id)
+        if skill is None or not (min_skill <= skill <= max_skill):
+            continue
+            
+        # Check tags if specified
+        if required_tag_set:
+            bot_tag_set = _bot_tags.get(bot_id, set())
+            if not required_tag_set.issubset(bot_tag_set):
+                continue
+                
+        result.append(bot_id)
+        
+    return result
 
 def create_rlbot_curriculum(debug=False):
     """Create a curriculum for training against RLBotPack bots."""

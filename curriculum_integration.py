@@ -8,7 +8,6 @@ from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMut
 from rlgym.rocket_league.reward_functions import CombinedReward, GoalReward
 from rlgym.api import StateMutator
 from rlgym.rocket_league.api import GameState
-# Removing problematic import: from rlgym.envs import Match
 from env_base import EnvBase
 from curriculum_config import DEFAULT_CURRICULUM_CONFIG, BOT_SKILL_RANGES, STAGE_REQUIREMENTS
 from curriculum import CurriculumManager, CurriculumStage, ProgressionRequirements

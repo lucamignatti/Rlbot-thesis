@@ -36,6 +36,7 @@ class SkillModule:
         self.episode_count += 1
         if metrics.get('success', False):
             self.success_count += 1
+            
         self.rewards_history.append(metrics.get('episode_reward', 0.0))
         self.success_rate = self.success_count / max(1, self.episode_count)
         
@@ -46,14 +47,27 @@ class SkillModule:
         
         for param_name, (min_val, max_val) in self.difficulty_params.items():
             config[param_name] = min_val + difficulty * (max_val - min_val)
-            
-        return config
         
+        return config
+
     def meets_mastery_criteria(self) -> bool:
         """Check if the skill meets mastery criteria"""
         min_episodes = 20  # Minimum episodes needed for reliable assessment
-        return (self.episode_count >= min_episodes and 
-                self.success_rate >= self.success_threshold)
+        if self.episode_count < min_episodes:
+            return False
+            
+        # Check success rate meets threshold
+        if self.success_rate < self.success_threshold:
+            return False
+            
+        # Check for stability in recent performance
+        recent_rewards = self.rewards_history[-10:]  # Last 10 episodes
+        if len(recent_rewards) >= 10:
+            std_dev = np.std(recent_rewards)
+            if std_dev > 0.3:  # High variance indicates unstable performance
+                return False
+                
+        return True
 
 
 class SkillBasedCurriculumStage:

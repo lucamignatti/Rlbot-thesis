@@ -1548,11 +1548,13 @@ class PPOTrainer:
                         safe_metrics["reward_mean"] = float(self.ret_rms.mean)
                         safe_metrics["reward_var"] = float(self.ret_rms.var)
 
-                    if not hasattr(self, 'training_steps'): self.training_steps = 0
-                    if not hasattr(self, 'training_step_offset'): self.training_step_offset = 0
-
-                    self.training_steps += 1
-                    global_step = self.training_steps + self.training_step_offset
+                    # Track steps at the batch level to ensure monotonic increase
+                    if not hasattr(self, '_true_training_steps'):
+                        self._true_training_steps = 0
+                    
+                    # Increment before logging to maintain correct ordering
+                    self._true_training_steps += 1
+                    global_step = self._true_training_steps
 
                     wandb.log(safe_metrics, step=global_step)
 

@@ -55,6 +55,18 @@ class CurriculumStage:
         difficulty_params: Optional[Dict[str, Tuple[float, float]]] = None,
         hyperparameter_adjustments: Optional[Dict[str, float]] = None
     ):
+        # Validate inputs
+        if not isinstance(name, str):
+            raise TypeError("name must be a string")
+        if not isinstance(state_mutator, StateMutator):
+            raise TypeError("state_mutator must be a StateMutator")
+        if not isinstance(reward_function, RewardFunction):
+            raise TypeError("reward_function must be a RewardFunction")
+        if not isinstance(termination_condition, DoneCondition):
+            raise TypeError("termination_condition must be a DoneCondition")
+        if not isinstance(truncation_condition, DoneCondition):
+            raise TypeError("truncation_condition must be a DoneCondition")
+            
         # Existing initialization
         self.name = name
         self.state_mutator = state_mutator
@@ -291,6 +303,22 @@ class CurriculumStage:
 
     def update_statistics(self, metrics: Dict[str, Any]):
         """Update stage statistics with new episode results"""
+        # Type checking
+        if not isinstance(metrics, dict):
+            raise TypeError("metrics must be a dictionary")
+            
+        # Verify required keys
+        if 'episode_reward' not in metrics:
+            raise KeyError("metrics must contain 'episode_reward'")
+
+        # Initialize histories if None (recovery from corrupt state)
+        if self.rewards_history is None:
+            self.rewards_history = []
+        if not hasattr(self, 'moving_success_rate'):
+            self.moving_success_rate = 0.0
+        if not hasattr(self, 'moving_avg_reward'):
+            self.moving_avg_reward = 0.0
+
         self.episode_count += 1
 
         # Track success/failure
@@ -307,16 +335,6 @@ class CurriculumStage:
         window = min(100, self.episode_count)  # Use last 100 episodes max
         self.moving_success_rate = self.success_count / max(1, self.episode_count)
         self.moving_avg_reward = np.mean(self.rewards_history[-window:])
-
-        # Update bot-specific stats if available
-        if 'opponent_bot_ids' in metrics:
-            for agent_id, bot_id in metrics['opponent_bot_ids'].items():
-                self.update_bot_performance(
-                    bot_id=bot_id,
-                    win=metrics.get('success', False),
-                    reward=metrics.get('episode_reward', 0.0),
-                    difficulty=metrics.get('difficulty_level', 0.5)
-                )
 
     def get_consecutive_successes(self) -> int:
         """Get number of consecutive successful episodes"""
@@ -410,8 +428,8 @@ class CurriculumManager:
         if not testing:
             self.validate_all_stages()
 
-        # Add training step tracking to sync with PPO trainer - initialize to 1 to avoid conflicts
-        self.last_wandb_step = 1
+        # Step counter used only when trainer reference is not available
+        self.last_wandb_step = 0
 
     def debug_print(self, message: str):
         if self.debug:
@@ -528,29 +546,35 @@ class CurriculumManager:
         self.total_episodes += 1
 
         # Log curriculum metrics to wandb if enabled
-        if self.use_wandb and wandb.run is not None and hasattr(self, 'trainer') and self.trainer is not None:
-            # Get the trainer's global step if available
-            if hasattr(self.trainer, 'training_steps') and hasattr(self.trainer, 'training_step_offset'):
-                # Use the same global step counter as the trainer
-                current_step = self.trainer.training_steps + self.trainer.training_step_offset
-                self.last_wandb_step = max(self.last_wandb_step + 1, current_step)
-
-            # Log the current curriculum state
-            curriculum_metrics = {
-                "curriculum/current_stage": self.current_stage_index,
-                "curriculum/stage_name": current_stage.name,
-                "curriculum/current_difficulty": self.current_difficulty,
-                "curriculum/success_rate": current_stage.moving_success_rate,
-                "curriculum/avg_reward": current_stage.moving_avg_reward,
-                "curriculum/total_episodes": self.total_episodes,
-                "curriculum/stage_progress": self.get_stage_progress(),
-                "curriculum/overall_progress": self.get_overall_progress()["total_progress"],
-                "curriculum/episodes_in_stage": current_stage.episode_count,
-                "curriculum/consecutive_successes": current_stage.get_consecutive_successes()
-            }
-
-            # Include step parameter in wandb.log to ensure consistent logging
-            wandb.log(curriculum_metrics, step=self.last_wandb_step)
+        if self.use_wandb:
+            try:
+                import wandb
+                if wandb.run is not None:
+                    # Use trainer's step count directly if available, otherwise increment our counter
+                        if hasattr(self, 'trainer') and self.trainer is not None and hasattr(self.trainer, '_true_training_steps'):
+                            current_step = self.trainer._true_training_steps
+                        else:
+                            self.last_wandb_step += 1
+                            current_step = self.last_wandb_step
+    
+                        # Log metrics at current step
+                        wandb.log({
+                        "curriculum/current_stage": self.current_stage_index,
+                        "curriculum/stage_name": current_stage.name,
+                        "curriculum/current_difficulty": self.current_difficulty,
+                        "curriculum/success_rate": current_stage.moving_success_rate,
+                        "curriculum/avg_reward": current_stage.moving_avg_reward,
+                        "curriculum/total_episodes": self.total_episodes,
+                        "curriculum/stage_episodes": current_stage.episode_count,
+                        "curriculum/consecutive_successes": current_stage.get_consecutive_successes()
+                    }, step=current_step)
+                    
+                    # Update our last logged step
+                        self.last_wandb_step = current_step
+            except ImportError:
+                if self.debug:
+                    print("Warning: wandb not available, logging disabled")
+                self.use_wandb = False
 
         # Every N episodes, check if we should progress to the next stage
         if self.total_episodes % self.evaluation_window == 0:
@@ -570,26 +594,19 @@ class CurriculumManager:
         # First, try to increase difficulty within the current stage
         if self.current_difficulty < 1.0:
             # Check if we're meeting the thresholds at the current difficulty
-            meets_thresholds = True
-            for metric_name, threshold in self.progress_thresholds.items():
-                if metric_name == "success_rate" and stats["success_rate"] < threshold:
-                    meets_thresholds = False
-                    break
-                elif metric_name == "avg_reward" and stats["avg_reward"] < threshold:
-                    meets_thresholds = False
-                    break
+            meets_thresholds = (
+                stats["success_rate"] >= self.progress_thresholds["success_rate"] and
+                stats["avg_reward"] >= self.progress_thresholds["avg_reward"] and
+                current_stage.episode_count >= current_stage.progression_requirements.min_episodes
+            )
 
-            # If meeting thresholds, increase difficulty
-            if meets_thresholds and current_stage.episode_count >= current_stage.progression_requirements.min_episodes:
+            # Always try to increase difficulty when thresholds are met
+            if meets_thresholds:
+                old_difficulty = self.current_difficulty
                 self.current_difficulty = min(1.0, self.current_difficulty + self.difficulty_increase_rate)
-                self.debug_print(f"Increasing difficulty in stage {current_stage.name} to {self.current_difficulty:.2f}")
-
-                # Log difficulty increase to wandb
-                if self.use_wandb and wandb.run is not None:
-                    wandb.log({
-                        "curriculum/difficulty_increased": self.current_difficulty,
-                        "curriculum/stage_name": current_stage.name,
-                    }, step=self.last_wandb_step)
+                
+                if self.debug:
+                    print(f"Increased difficulty from {old_difficulty:.2f} to {self.current_difficulty:.2f}")
 
         # Check if we should progress to next stage
         if self.current_difficulty >= 0.95 and current_stage.validate_progression():
@@ -618,42 +635,55 @@ class CurriculumManager:
             "timestamp": np.datetime64('now')
         })
 
-        self.debug_print(f"Curriculum progressed from '{old_stage}' to '{new_stage}' at episode {self.total_episodes}")
-
         # Apply hyperparameter adjustments for the new stage
         if self.trainer is not None:
             self._adjust_hyperparameters()
 
         # Log stage transition to wandb
-        if self.use_wandb and wandb.run is not None:
-            transition_metrics = {
-                "curriculum/stage_transition": 1.0,
-                "curriculum/from_stage": self.current_stage_index - 1,
-                "curriculum/to_stage": self.current_stage_index,
-                "curriculum/from_stage_name": old_stage,
-                "curriculum/to_stage_name": new_stage,
-                "curriculum/transition_episode": self.total_episodes,
-                "curriculum/total_stages": len(self.stages)
-            }
+        if self.use_wandb:
+            try:
+                import wandb
+                if wandb.run is not None:
+                    # Use trainer's step count directly if available, otherwise use our local counter
+                    if hasattr(self, 'trainer') and self.trainer is not None and hasattr(self.trainer, '_true_training_steps'):
+                        current_step = self.trainer._true_training_steps
+                    else:
+                        self.last_wandb_step += 1
+                        current_step = self.last_wandb_step
 
-            # Also log the stage's final statistics
-            old_stage_obj = self.stages[self.current_stage_index - 1]
-            transition_metrics.update({
-                "curriculum/completed_stage/success_rate": old_stage_obj.moving_success_rate,
-                "curriculum/completed_stage/avg_reward": old_stage_obj.moving_avg_reward,
-                "curriculum/completed_stage/episodes": old_stage_obj.episode_count
-            })
-
-            wandb.log(transition_metrics, step=self.last_wandb_step)
+                    transition_metrics = {
+                        "curriculum/stage_transition": 1.0,
+                        "curriculum/from_stage": old_stage,
+                        "curriculum/to_stage": new_stage,
+                        "curriculum/transition_episode": self.total_episodes
+                    }
+                    wandb.log(transition_metrics, step=current_step)
+                    
+                    # Update our last logged step
+                    self.last_wandb_step = current_step
+            except ImportError:
+                if self.debug:
+                    print("Warning: wandb not available, logging disabled")
+                self.use_wandb = False
 
     def _get_rehearsal_probability(self) -> float:
         """Get the probability of using a rehearsal stage instead of the current stage."""
         # Base probability depends on how many stages we've progressed through
         base_prob = 0.3  # 30% chance of rehearsal when possible
 
-        # Scale down if we're still early in the curriculum
+        # Increase probability based on poor recent performance
+        current_stage = self.stages[self.current_stage_index]
+        if current_stage.moving_success_rate < 0.3:  # If success rate is very low
+            base_prob = 0.5  # Increase rehearsal chance to 50%
+        elif current_stage.moving_avg_reward < 0.2:  # If rewards are very low
+            base_prob = 0.4  # Increase rehearsal chance to 40%
+
+        # Scale probability based on stage progress
         progress_factor = min(1.0, self.current_stage_index / max(len(self.stages) - 1, 1))
-        return base_prob * progress_factor
+        prob = base_prob * progress_factor
+
+        # Return increased probability during regression
+        return prob if current_stage.moving_success_rate >= 0.4 else 0.5
 
     def _select_rehearsal_stage(self) -> int:
         """
