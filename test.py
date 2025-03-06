@@ -5,6 +5,7 @@ from curriculum import ProgressionRequirements, CurriculumStage, CurriculumManag
 from rlgym.api import StateMutator, RewardFunction, DoneCondition
 import tempfile
 import os
+from curriculum_skills import SkillModule, SkillBasedCurriculumStage
 
 # filepath: /home/luca/Projects/Rlbot-thesis/test_curriculum.py
 
@@ -771,6 +772,252 @@ class TestRLBotIntegration(unittest.TestCase):
 
         # Should no longer meet requirements due to poor performance
         self.assertFalse(self.stage.meets_progression_requirements())
+
+class TestSkillModule(unittest.TestCase):
+    """Test the SkillModule class"""
+    
+    def setUp(self):
+        """Set up test fixtures"""
+        self.state_mutator = MockStateMutator()
+        self.reward_fn = MockRewardFunction()
+        self.term_cond = MockDoneCondition()
+        self.trunc_cond = MockDoneCondition()
+        
+        self.skill = SkillModule(
+            name="Test Skill",
+            state_mutator=self.state_mutator,
+            reward_function=self.reward_fn,
+            termination_condition=self.term_cond,
+            truncation_condition=self.trunc_cond,
+            difficulty_params={"height": (100, 500), "speed": (500, 2000)},
+            success_threshold=0.7
+        )
+    
+    def test_initialization(self):
+        """Test skill module initialization"""
+        self.assertEqual(self.skill.name, "Test Skill")
+        self.assertEqual(self.skill.success_threshold, 0.7)
+        self.assertEqual(self.skill.episode_count, 0)
+        self.assertEqual(self.skill.success_count, 0)
+        self.assertEqual(len(self.skill.rewards_history), 0)
+        self.assertEqual(self.skill.success_rate, 0.0)
+    
+    def test_update_statistics(self):
+        """Test updating skill statistics"""
+        # Test successful episode
+        self.skill.update_statistics({"success": True, "episode_reward": 0.8})
+        self.assertEqual(self.skill.episode_count, 1)
+        self.assertEqual(self.skill.success_count, 1)
+        self.assertEqual(self.skill.rewards_history, [0.8])
+        self.assertEqual(self.skill.success_rate, 1.0)
+        
+        # Test failed episode
+        self.skill.update_statistics({"success": False, "episode_reward": -0.2})
+        self.assertEqual(self.skill.episode_count, 2)
+        self.assertEqual(self.skill.success_count, 1)
+        self.assertEqual(self.skill.rewards_history, [0.8, -0.2])
+        self.assertEqual(self.skill.success_rate, 0.5)
+    
+    def test_get_config(self):
+        """Test getting difficulty-adjusted configuration"""
+        # Test min difficulty
+        config = self.skill.get_config(0.0)
+        self.assertEqual(config["height"], 100)
+        self.assertEqual(config["speed"], 500)
+        
+        # Test max difficulty
+        config = self.skill.get_config(1.0)
+        self.assertEqual(config["height"], 500)
+        self.assertEqual(config["speed"], 2000)
+        
+        # Test intermediate difficulty
+        config = self.skill.get_config(0.5)
+        self.assertEqual(config["height"], 300)  # 100 + 0.5 * (500 - 100)
+        self.assertEqual(config["speed"], 1250)  # 500 + 0.5 * (2000 - 500)
+    
+    def test_meets_mastery_criteria(self):
+        """Test skill mastery evaluation"""
+        # Not enough episodes
+        self.assertFalse(self.skill.meets_mastery_criteria())
+        
+        # Add episodes but low success rate
+        for _ in range(10):
+            self.skill.update_statistics({"success": False, "episode_reward": 0.1})
+        self.assertFalse(self.skill.meets_mastery_criteria())
+        
+        # Reset and add successful episodes
+        self.skill.episode_count = 0
+        self.skill.success_count = 0
+        self.skill.rewards_history = []
+        self.skill.success_rate = 0.0
+        
+        for _ in range(25):
+            self.skill.update_statistics({"success": True, "episode_reward": 0.8})
+        self.assertTrue(self.skill.meets_mastery_criteria())
+
+class TestSkillBasedCurriculumStage(unittest.TestCase):
+    """Test the SkillBasedCurriculumStage class"""
+    
+    def setUp(self):
+        """Set up test fixtures"""
+        self.state_mutator = MockStateMutator()
+        self.reward_fn = MockRewardFunction()
+        self.term_cond = MockDoneCondition()
+        self.trunc_cond = MockDoneCondition()
+        
+        # Create two test skill modules
+        self.skill1 = SkillModule(
+            name="Basic Skill",
+            state_mutator=self.state_mutator,
+            reward_function=self.reward_fn,
+            termination_condition=self.term_cond,
+            truncation_condition=self.trunc_cond,
+            difficulty_params={"param1": (0.1, 1.0)}
+        )
+        
+        self.skill2 = SkillModule(
+            name="Advanced Skill",
+            state_mutator=self.state_mutator,
+            reward_function=self.reward_fn,
+            termination_condition=self.term_cond,
+            truncation_condition=self.trunc_cond,
+            difficulty_params={"param2": (1.0, 2.0)}
+        )
+        
+        # Create the skill-based stage
+        self.stage = SkillBasedCurriculumStage(
+            name="Skill Stage",
+            base_task_state_mutator=self.state_mutator,
+            base_task_reward_function=self.reward_fn,
+            base_task_termination_condition=self.term_cond,
+            base_task_truncation_condition=self.trunc_cond,
+            skill_modules=[self.skill1, self.skill2],
+            progression_requirements=ProgressionRequirements(
+                min_success_rate=0.7,
+                min_avg_reward=0.5,
+                min_episodes=10,
+                max_std_dev=0.3,
+                required_consecutive_successes=3
+            ),
+            base_task_prob=0.6
+        )
+    
+    def test_task_selection(self):
+        """Test task selection probabilities"""
+        # Run many selections to verify probabilities
+        base_count = 0
+        skill_counts = {skill.name: 0 for skill in [self.skill1, self.skill2]}
+        
+        n_trials = 1000
+        for _ in range(n_trials):
+            is_base, selected_skill = self.stage.select_task()
+            if is_base:
+                base_count += 1
+            else:
+                skill_counts[selected_skill.name] += 1
+        
+        # Check base task probability (should be close to 60%)
+        self.assertAlmostEqual(base_count / n_trials, 0.6, delta=0.05)
+        
+        # Initially, both skills should have roughly equal probability in the remaining 40%
+        expected_skill_prob = 0.2  # 40% split between 2 skills
+        for count in skill_counts.values():
+            self.assertAlmostEqual(count / n_trials, expected_skill_prob, delta=0.05)
+    
+    def test_skill_selection_weighting(self):
+        """Test skill selection based on success rates"""
+        # Update success rates to create imbalance
+        self.skill1.update_statistics({"success": True, "episode_reward": 0.8})  # High success
+        for _ in range(10):
+            self.skill2.update_statistics({"success": False, "episode_reward": 0.2})  # Low success
+        
+        # Run selections focusing on skill choice
+        skill_counts = {skill.name: 0 for skill in [self.skill1, self.skill2]}
+        n_trials = 100
+        
+        for _ in range(n_trials):
+            is_base, selected_skill = self.stage.select_task()
+            if not is_base and selected_skill:
+                skill_counts[selected_skill.name] += 1
+        
+        # Skill2 (lower success rate) should be selected more often
+        self.assertGreater(skill_counts["Advanced Skill"], skill_counts["Basic Skill"])
+    
+    def test_environment_config(self):
+        """Test environment configuration generation"""
+        # Test base task config
+        with patch('random.random', return_value=0.0):  # Force base task selection
+            config = self.stage.get_environment_config(0.5)
+            self.assertEqual(config["task_type"], "base")
+            self.assertEqual(config["stage_name"], "Skill Stage")
+            self.assertEqual(config["difficulty_level"], 0.5)
+        
+        # Test skill config
+        with patch('random.random', return_value=0.7):  # Force skill selection
+            with patch('numpy.random.choice', return_value=self.skill1):
+                config = self.stage.get_environment_config(0.5)
+                self.assertEqual(config["task_type"], "skill")
+                self.assertEqual(config["skill_name"], "Basic Skill")
+                self.assertEqual(config["difficulty_level"], 0.5)
+    
+    def test_meets_progression_requirements(self):
+        """Test progression requirements for skill-based stage"""
+        # Should not meet requirements initially
+        self.assertFalse(self.stage.meets_progression_requirements())
+        
+        # Add successful base task episodes
+        for _ in range(15):
+            self.stage.update_statistics({
+                "success": True, 
+                "episode_reward": 0.8,
+                "is_base_task": True
+            })
+        
+        # Add successful skill episodes
+        for skill in [self.skill1, self.skill2]:
+            for _ in range(15):
+                self.stage.update_statistics({
+                    "success": True,
+                    "episode_reward": 0.8,
+                    "is_base_task": False,
+                    "skill_name": skill.name
+                })
+        
+        # Should now meet requirements
+        self.assertTrue(self.stage.meets_progression_requirements())
+        
+        # Verify requirement tracking
+        self.assertGreater(self.stage.base_task_episodes, 0)
+        self.assertGreater(self.stage.base_task_successes, 0)
+        for skill in [self.skill1, self.skill2]:
+            self.assertGreater(skill.episode_count, 0)
+            self.assertGreater(skill.success_count, 0)
+    
+    def test_statistics_tracking(self):
+        """Test detailed statistics tracking"""
+        # Add mixed performance data
+        episodes = [
+            {"success": True, "episode_reward": 0.8, "is_base_task": True},
+            {"success": False, "episode_reward": 0.2, "is_base_task": True},
+            {"success": True, "episode_reward": 0.9, "is_base_task": False, "skill_name": "Basic Skill"},
+            {"success": True, "episode_reward": 0.7, "is_base_task": False, "skill_name": "Advanced Skill"}
+        ]
+        
+        for episode in episodes:
+            self.stage.update_statistics(episode)
+        
+        # Get statistics
+        stats = self.stage.get_statistics()
+        
+        # Check base task stats
+        self.assertEqual(stats["base_task"]["episodes"], 2)
+        self.assertEqual(stats["base_task"]["success_rate"], 0.5)
+        
+        # Check skill stats
+        self.assertIn("Basic Skill", stats["skills"])
+        self.assertIn("Advanced Skill", stats["skills"])
+        self.assertEqual(stats["skills"]["Basic Skill"]["episodes"], 1)
+        self.assertEqual(stats["skills"]["Advanced Skill"]["episodes"], 1)
 
 if __name__ == "__main__":
     unittest.main()

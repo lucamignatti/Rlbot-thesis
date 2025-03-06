@@ -1,4 +1,3 @@
-
 # Python
 __pycache__/
 
@@ -14,3 +13,11 @@ wandb/
 /checkpoints
 models/
 checkpoints/
+
+# Bot management files
+bot_skills.txt
+bot_metadata.txt
+disabled_bots.txt
+invalid_bots.txt
+validated_bots.txt
+runnable_bots.txt
