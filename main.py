@@ -910,9 +910,9 @@ if __name__ == "__main__":
     training_duration.add_argument('-t', '--time', type=str, default=None,
                                   help='Training duration in format: 5m (minutes), 5h (hours), 5d (days)')
 
-    parser.add_argument('-n', '--num_envs', type=int, default=os.cpu_count() or 4,
+    parser.add_argument('-n', '--num_envs', type=int, default=int(5 * os.cpu_count()) or 4,
                         help='Number of parallel environments to run for faster data collection')
-    parser.add_argument('--update_interval', type=int, default=10 * (os.cpu_count() or 4),
+    parser.add_argument('--update_interval', type=int, default=4096,
                         help='Number of experiences to collect before updating the policy')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use for training (cuda/mps/cpu).  Autodetects if not specified.')
@@ -929,17 +929,23 @@ if __name__ == "__main__":
     parser.set_defaults(curriculum=True)
 
 
-    # Hyperparameter arguments (these can be tuned to improve performance)
-    parser.add_argument('--lra', type=float, default=1e-4, help='Learning rate for actor network')
-    parser.add_argument('--lrc', type=float, default=3e-3, help='Learning rate for critic network')
-    parser.add_argument('--gamma', type=float, default=0.999, help='Discount factor for future rewards')
-    parser.add_argument('--gae_lambda', type=float, default=0.98, help='Lambda parameter for Generalized Advantage Estimation')
-    parser.add_argument('--clip_epsilon', type=float, default=0.2, help='PPO clipping parameter')
-    parser.add_argument('--critic_coef', type=float, default=0.85, help='Weight of the critic loss')
-    parser.add_argument('--entropy_coef', type=float, default=0.01, help='Weight of the entropy bonus (encourages exploration)')
-    parser.add_argument('--max_grad_norm', type=float, default=0.5, help='Maximum gradient norm for clipping')
+    # Learning rates
+    parser.add_argument('--lra', type=float, default=5e-5, help='Learning rate for actor network')
+    parser.add_argument('--lrc', type=float, default=1e-4, help='Learning rate for critic network')
+
+    # Discount factors
+    parser.add_argument('--gamma', type=float, default=0.997, help='Discount factor for future rewards')
+    parser.add_argument('--gae_lambda', type=float, default=0.95, help='Lambda parameter for Generalized Advantage Estimation')
+
+    # PPO parameters
+    parser.add_argument('--clip_epsilon', type=float, default=0.15, help='PPO clipping parameter')
+    parser.add_argument('--critic_coef', type=float, default=1.0, help='Weight of the critic loss')
+    parser.add_argument('--entropy_coef', type=float, default=0.005, help='Weight of the entropy bonus (encourages exploration)')
+    parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Maximum gradient norm for clipping')
+
+    # Training loop parameters
     parser.add_argument('--ppo_epochs', type=int, default=10, help='Number of PPO epochs per update')
-    parser.add_argument('--batch_size', type=int, default=1024, help='Batch size for PPO updates')
+    parser.add_argument('--batch_size', type=int, default=2048, help='Batch size for PPO updates')
 
     parser.add_argument('--compile', action='store_true', help='Use torch.compile for model optimization (if available)')
     parser.add_argument('--no-compile', action='store_false', dest='compile', help='Disable torch.compile')
@@ -962,9 +968,9 @@ if __name__ == "__main__":
     parser.add_argument('--save_interval', type=int, default=200,
                        help='Save the model every N episodes')
 
-    parser.add_argument('--hidden_dim', type=int, default=1536, help='Hidden dimension for the network')
-    parser.add_argument('--num_blocks', type=int, default=8, help='Number of residual blocks in the network')
-    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate for regularization')
+    parser.add_argument('--hidden_dim', type=int, default=512, help='Hidden dimension for the network')
+    parser.add_argument('--num_blocks', type=int, default=3, help='Number of residual blocks in the network')
+    parser.add_argument('--dropout', type=float, default=0.05, help='Dropout rate for regularization')
 
     # Action stacking parameters
     parser.add_argument('--stack_size', type=int, default=5, help='Number of previous actions to stack')

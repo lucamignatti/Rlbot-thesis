@@ -1587,13 +1587,14 @@ class PPOTrainer:
         if self.use_auxiliary_tasks:
             self.aux_task_manager.reset()
 
-    def save_models(self, model_path=None):
+    def save_models(self, model_path=None, metadata=None):
         """
         Save both actor and critic models to a single file.
 
         Args:
             model_path: Optional custom path. If None, creates a timestamped file.
                     If a directory is provided, a timestamped file will be created inside it.
+            metadata: Optional dictionary containing additional metadata to save with the model
 
         Returns:
             The complete path where the model was saved
@@ -1640,7 +1641,7 @@ class PPOTrainer:
 
         # Save all models to a single file.
         try:
-            torch.save({
+            save_data = {
                 'actor': actor_state,
                 'critic': critic_state,
                 'auxiliary': aux_state,
@@ -1649,7 +1650,13 @@ class PPOTrainer:
                 'timestamp': time.time(),
                 'version': '1.0',
                 'wandb_run_id': wandb_run_id
-            }, model_path)
+            }
+            
+            # Add any additional metadata if provided
+            if metadata:
+                save_data.update(metadata)
+
+            torch.save(save_data, model_path)
 
             self.debug_print(f"Saved models to: {model_path}")
             return model_path
