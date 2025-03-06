@@ -311,9 +311,9 @@ class PPOTrainer:
         self.critic = critic.to(self.device)
 
         # We'll decay the entropy coefficient over time to encourage exploration শুরুতে, and exploitation later.
-        self.entropy_coef = entropy_coef
-        self.entropy_coef_decay = entropy_coef_decay
-        self.min_entropy_coef = 0.001  # Don't let entropy go to zero.
+        self.entropy_coef = entropy_coef if entropy_coef else 0.01
+        self.entropy_coef_decay = entropy_coef_decay if entropy_coef_decay else 0.999  # Slower decay
+        self.min_entropy_coef = 0.005  # Higher minimum
 
         try:
             self.debug_print(f"Compiling models for {self.device}...")
@@ -1421,6 +1421,10 @@ class PPOTrainer:
             self.aux_task_manager.sr_scheduler.step()
             self.aux_task_manager.rp_scheduler.step()
 
+        # Apply entropy decay more slowly
+        if self.entropy_coef > self.min_entropy_coef:
+            self.entropy_coef = max(self.min_entropy_coef, 
+                               self.entropy_coef * self.entropy_coef_decay)
 
         # Calculate the average losses across all epochs and batches.
         num_updates = max(self.ppo_epochs * len(batches), 1)

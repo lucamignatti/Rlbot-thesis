@@ -234,35 +234,33 @@ class CurriculumStage:
             return False
 
         reqs = self.progression_requirements
+        
+        # Ensure minimum number of episodes
         if self.episode_count < reqs.min_episodes:
             return False
 
-        # Calculate recent metrics over evaluation window
+        # Check consecutive successes first
+        consecutive = self.get_consecutive_successes()
+        if consecutive < reqs.required_consecutive_successes:
+            return False
+            
+        # Calculate metrics over evaluation window
         window_size = min(len(self.rewards_history), reqs.min_episodes)
-        if window_size == 0:
+        recent_rewards = self.rewards_history[-window_size:]
+        
+        # Check success rate
+        if self.moving_success_rate < reqs.min_success_rate:
+            return False
+            
+        # Check average reward
+        if np.mean(recent_rewards) < reqs.min_avg_reward:
+            return False
+            
+        # Check reward stability
+        if len(recent_rewards) > 5 and np.std(recent_rewards) > reqs.max_std_dev:
             return False
 
-        recent_rewards = self.rewards_history[-window_size:]
-
-        # Check all requirements
-        meets_success_rate = self.moving_success_rate >= reqs.min_success_rate
-        meets_reward = np.mean(recent_rewards) >= reqs.min_avg_reward
-        meets_std = np.std(recent_rewards) <= reqs.max_std_dev if len(recent_rewards) > 1 else True
-
-        # Check consecutive successes more simply - just count recent positive rewards
-        consecutive_successes = 0
-        for reward in reversed(self.rewards_history):
-            if reward > 0:
-                consecutive_successes += 1
-                if consecutive_successes >= reqs.required_consecutive_successes:
-                    break
-            else:
-                consecutive_successes = 0
-                break
-
-        meets_consecutive = consecutive_successes >= reqs.required_consecutive_successes
-
-        return meets_success_rate and meets_reward and meets_std and meets_consecutive
+        return True
 
     def get_config_with_difficulty(self, difficulty: float) -> Dict[str, Any]:
         """Get stage configuration adjusted for current difficulty level"""
@@ -412,8 +410,8 @@ class CurriculumManager:
         if not testing:
             self.validate_all_stages()
 
-        # Add training step tracking to sync with PPO trainer
-        self.last_wandb_step = 0
+        # Add training step tracking to sync with PPO trainer - initialize to 1 to avoid conflicts
+        self.last_wandb_step = 1
 
     def debug_print(self, message: str):
         if self.debug:
@@ -534,7 +532,8 @@ class CurriculumManager:
             # Get the trainer's global step if available
             if hasattr(self.trainer, 'training_steps') and hasattr(self.trainer, 'training_step_offset'):
                 # Use the same global step counter as the trainer
-                self.last_wandb_step = self.trainer.training_steps + self.trainer.training_step_offset
+                current_step = self.trainer.training_steps + self.trainer.training_step_offset
+                self.last_wandb_step = max(self.last_wandb_step + 1, current_step)
 
             # Log the current curriculum state
             curriculum_metrics = {
