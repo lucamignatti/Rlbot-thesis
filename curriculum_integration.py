@@ -1,40 +1,83 @@
 import os
-from typing import Dict, Set, Optional, List, Any, Tuple
+from typing import Dict, Set, Optional, List, Any, Tuple, Union
 import numpy as np
 import torch
 import wandb
 from rlgym.rocket_league.done_conditions import GoalCondition, AnyCondition, TimeoutCondition, NoTouchTimeoutCondition
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
 from rlgym.rocket_league.reward_functions import CombinedReward, GoalReward
-from rewards import BallProximityReward, BallToGoalDistanceReward, BallVelocityToGoalReward, TouchBallReward, TouchBallToGoalAccelerationReward, AlignBallToGoalReward, PlayerVelocityTowardBallReward, KRCReward
-
-# Keep all existing imports except for the circular one
+from rlgym.api import StateMutator
+from rlgym.rocket_league.api import GameState
+# Removing problematic import: from rlgym.envs import Match
+from env_base import EnvBase
+from curriculum_config import DEFAULT_CURRICULUM_CONFIG, BOT_SKILL_RANGES, STAGE_REQUIREMENTS
 from curriculum import CurriculumManager, CurriculumStage, ProgressionRequirements
+from rewards import (
+    BallProximityReward, BallToGoalDistanceReward, BallVelocityToGoalReward,
+    TouchBallReward, TouchBallToGoalAccelerationReward, AlignBallToGoalReward,
+    PlayerVelocityTowardBallReward, KRCReward
+)
+from curriculum_mutators import (
+    BallTowardGoalSpawnMutator, BallPositionMutator, BallVelocityMutator,
+    CarPositionMutator, CarBoostMutator, BallTouchedCondition,
+    KickoffPerformanceReward, DefensivePositioningReward, OffensiveClearReward
+)
 
-# Note: We've moved the compatibility functions to curriculum_rlbot.py
-# and will import them only when needed in specific functions
+class BallVariationMutator(StateMutator):
+    """Mutator that adds variation to ball position and velocity"""
+    def __init__(self,
+                 position_range: Tuple[float, float] = (-100, 100),
+                 height_range: Tuple[float, float] = (100, 300),
+                 velocity_range: Tuple[float, float] = (-300, 300),
+                 angular_velocity_range: Tuple[float, float] = (-1, 1)):
+        self.position_range = position_range
+        self.height_range = height_range
+        self.velocity_range = velocity_range
+        self.angular_velocity_range = angular_velocity_range
 
-class BallVariationMutator:
-    # ...existing code...
-    pass
+    def apply(self, state: GameState, shared_info: Dict[str, Any]) -> None:
+        # Add slight randomization to ball position
+        if hasattr(state, 'ball') and state.ball is not None:
+            # Get current position and add variation
+            curr_pos = np.array(state.ball.position)
+            variation = np.array([
+                np.random.uniform(*self.position_range),
+                np.random.uniform(*self.position_range),
+                np.random.uniform(*self.height_range)
+            ])
+            state.ball.position = curr_pos + variation
 
-class CarBoostMutator:
-    # ...existing code...
-    pass
+            # Add velocity variation
+            curr_vel = np.array(state.ball.linear_velocity)
+            velocity_variation = np.array([
+                np.random.uniform(*self.velocity_range),
+                np.random.uniform(*self.velocity_range),
+                np.random.uniform(*self.velocity_range)
+            ])
+            state.ball.linear_velocity = curr_vel + velocity_variation
+
+            # Add angular velocity variation
+            curr_ang = np.array(state.ball.angular_velocity)
+            angular_variation = np.array([
+                np.random.uniform(*self.angular_velocity_range),
+                np.random.uniform(*self.angular_velocity_range),
+                np.random.uniform(*self.angular_velocity_range)
+            ])
+            state.ball.angular_velocity = curr_ang + angular_variation
 
 def create_basic_curriculum(debug=False):
     """
     Creates a basic curriculum focused on fundamental game mechanics.
-    
+
     Args:
         debug: Whether to print debug information
-        
+
     Returns:
         CurriculumManager configured with basic stages
     """
     # Create the stages list
     stages = []
-    
+
     # Common termination/truncation conditions
     termination = GoalCondition()
     truncation = AnyCondition(
@@ -170,41 +213,41 @@ def create_basic_curriculum(debug=False):
             max_std_dev=2.5
         )
     ))
-    
+
     # Create and return the curriculum manager with the stages
     curriculum = CurriculumManager(stages=stages, debug=debug)
-    
+
     if debug:
         print("[DEBUG] Created basic curriculum with 5 stages")
         for stage in curriculum.stages:
             print(f"[DEBUG] Stage: {stage.name}")
-    
+
     return curriculum
 
 def load_curriculum(curriculum_type="skill_based", debug=False, use_wandb=True):
     """
     Load the specified curriculum.
-    
+
     Args:
         curriculum_type: Type of curriculum to load ('skill_based', 'rlbot', or 'none')
         debug: Whether to print debug information
         use_wandb: Whether to log curriculum data to wandb
-        
+
     Returns:
         CurriculumManager or None
     """
     if curriculum_type == "none":
         return None
-    
+
     if curriculum_type == "skill_based":
         print("Loading skill-based 60/40 curriculum...")
         from curriculum_implementation import create_skill_based_curriculum
         return create_skill_based_curriculum(debug=debug, use_wandb=use_wandb)
-    
+
     if curriculum_type == "rlbot":
         print("Loading standard RLBot curriculum...")
         from curriculum_rlbot import create_rlbot_curriculum
         return create_rlbot_curriculum(debug=debug, use_wandb=use_wandb)
-        
+
     print(f"Unknown curriculum type: {curriculum_type}")
     return None

@@ -13,6 +13,7 @@ from rlgym.rocket_league.state_mutators import (
     MutatorSequence, FixedTeamSizeMutator, KickoffMutator
 )
 from curriculum import CurriculumManager, CurriculumStage, ProgressionRequirements
+from typing import Union
 
 # Custom reward class to replace EventReward
 class SimpleEventReward(RewardFunction):
@@ -315,6 +316,147 @@ class OffensiveClearReward(RewardFunction):
             # Pass an empty array as previous_action since we don't use it
             rewards[agent] = self.get_reward(agent, state, np.array([]))
         return rewards
+
+class BallTowardGoalSpawnMutator(StateMutator):
+    """Spawns the ball in a position that lines up with the goal"""
+    def __init__(self, offensive_team=0, distance_from_goal=0.7, random_offset=0.2):
+        self.offensive_team = offensive_team
+        self.distance_from_goal = distance_from_goal
+        self.random_offset = random_offset
+
+    def apply(self, state: GameState, shared_info: Dict[str, Any]) -> None:
+        # Set goal direction based on offensive team
+        goal_direction = 1 if self.offensive_team == 0 else -1
+
+        # Calculate ball position
+        x_pos = goal_direction * (1 - self.distance_from_goal) * 4096  # Field is roughly -4096 to 4096 in x
+        y_pos = (np.random.random() * 2 - 1) * self.random_offset * 5120  # Field is roughly -5120 to 5120 in y
+
+        # Set ball position (slightly elevated to prevent ground friction initially)
+        state.ball.position = np.array([x_pos, y_pos, 100])
+
+        # Give ball slight velocity toward goal
+        velocity_magnitude = np.random.random() * 500  # Random initial speed
+        state.ball.linear_velocity = np.array([goal_direction * velocity_magnitude, 0, 0])
+
+class AnyCondition(DoneCondition):
+    """Terminates when any of the provided conditions are met"""
+    def __init__(self, *conditions):
+        self.conditions = conditions
+
+    def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
+        for condition in self.conditions:
+            condition.reset(agents, initial_state, shared_info)
+
+    def is_done(self, agents: List[AgentID], state: GameState, shared_info: Dict[str, Any]) -> Dict[AgentID, bool]:
+        result = {agent: False for agent in agents}
+        for condition in self.conditions:
+            condition_result = condition.is_done(agents, state, shared_info)
+            for agent, done in condition_result.items():
+                result[agent] = result[agent] or done
+        return result
+
+
+class BallPositionMutator(StateMutator):
+    """Sets the ball's position using a callback function"""
+    def __init__(self, position_function: Optional[Callable[[], np.ndarray]] = None):
+        """
+        Args:
+            position_function: Function that returns a 3D position array
+        """
+        self.position_function = position_function or (lambda: np.array([0, 0, 100]))
+
+    def apply(self, state: GameState, shared_info: Dict[str, Any]) -> None:
+        position = self.position_function()
+        state.ball.position = position
+        state.ball.linear_velocity = np.zeros(3)
+        state.ball.angular_velocity = np.zeros(3)
+
+class BallVelocityMutator(StateMutator):
+    """Sets the ball's velocity using a callback function"""
+    def __init__(self, velocity_function: Optional[Callable[[], np.ndarray]] = None):
+        """
+        Args:
+            velocity_function: Function that returns a 3D velocity array
+        """
+        self.velocity_function = velocity_function or (lambda: np.zeros(3))
+
+    def apply(self, state: GameState, shared_info: Dict[str, Any]) -> None:
+        velocity = self.velocity_function()
+        state.ball.linear_velocity = velocity
+        state.ball.angular_velocity = np.zeros(3)
+
+class CarPositionMutator(StateMutator):
+    """Sets a car's position using a callback function"""
+    def __init__(self, car_id: int, position_function: Optional[Callable[[], np.ndarray]] = None):
+        """
+        Args:
+            car_id: ID of the car to reposition
+            position_function: Function that returns a 3D position array
+        """
+        self.car_id = car_id
+        self.position_function = position_function or (lambda: np.array([0, 0, 17]))
+
+    def apply(self, state: GameState, shared_info: Dict[str, Any]) -> None:
+        if str(self.car_id) not in state.cars:
+            return  # Car not found
+
+        position = self.position_function()
+        try:
+            # Try to set the position directly
+            state.cars[str(self.car_id)].position = position
+        except (AttributeError, TypeError):
+            # If direct setting fails, we might need to access physics object
+            if hasattr(state.cars[str(self.car_id)], 'physics'):
+                state.cars[str(self.car_id)].physics.position = position
+
+        # Reset rotation - handle both direct and physics attributes
+        try:
+            state.cars[str(self.car_id)].euler_angles = np.array([0, 0, 0])
+        except (AttributeError, TypeError):
+            if hasattr(state.cars[str(self.car_id)], 'physics'):
+                state.cars[str(self.car_id)].physics.euler_angles = np.array([0, 0, 0])
+
+class CarBoostMutator(StateMutator):
+    """Sets boost amount for all cars or for specific cars"""
+    def __init__(self, boost_amount: Union[float, Callable[[], float]] = 100, car_ids: Optional[List[int]] = None):
+        """
+        Args:
+            boost_amount: Amount of boost (0-100) or a function that returns boost amount
+            car_ids: List of car IDs to modify boost for. If None, affects all cars.
+        """
+        self.boost_amount = boost_amount
+        self.car_ids = car_ids
+
+    def apply(self, state: GameState, shared_info: Dict[str, Any]) -> None:
+        # Determine boost amount (fixed value or from callback)
+        if callable(self.boost_amount):
+            amount = self.boost_amount()
+        else:
+            amount = self.boost_amount
+
+        # Clamp to valid range
+        amount = max(0, min(100, amount))
+
+        # Apply to either specified cars or all cars
+        if self.car_ids is not None:
+            for car_id in self.car_ids:
+                if str(car_id) in state.cars:
+                    try:
+                        state.cars[str(car_id)].boost_amount = amount
+                    except (AttributeError, TypeError):
+                        # Try alternative attribute names
+                        if hasattr(state.cars[str(car_id)], 'boost'):
+                            state.cars[str(car_id)].boost = amount
+        else:
+            for car_id, car in state.cars.items():
+                try:
+                    car.boost_amount = amount
+                except (AttributeError, TypeError):
+                    # Try alternative attribute names
+                    if hasattr(car, 'boost'):
+                        car.boost = amount
+
 
 def create_basic_curriculum(debug=False):
     """

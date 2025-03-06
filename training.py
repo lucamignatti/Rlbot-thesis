@@ -1603,6 +1603,11 @@ class PPOTrainer:
             # If model_path is a directory, append timestamped filename.
             os.makedirs(model_path, exist_ok=True)
             model_path = os.path.join(model_path, f"rlbot_model_{timestamp}.pt")
+        
+        # Make sure parent directory exists
+        parent_dir = os.path.dirname(model_path)
+        if parent_dir:
+            os.makedirs(parent_dir, exist_ok=True)
 
         # Get the original models if using compiled versions.
         actor_state = self.actor._orig_mod.state_dict() if hasattr(self.actor, '_orig_mod') else self.actor.state_dict()
@@ -1611,8 +1616,11 @@ class PPOTrainer:
         # Get auxiliary task models if enabled
         aux_state = {}
         if self.use_auxiliary_tasks:
-            aux_state['sr_head'] = self.aux_task_manager.sr_head.state_dict()
-            aux_state['rp_head'] = self.aux_task_manager.rp_head.state_dict()
+            try:
+                aux_state['sr_head'] = self.aux_task_manager.sr_head.state_dict()
+                aux_state['rp_head'] = self.aux_task_manager.rp_head.state_dict()
+            except Exception as e:
+                self.debug_print(f"Failed to save auxiliary task models: {e}")
 
         # Get the WandB run ID if available
         wandb_run_id = None
@@ -1625,19 +1633,36 @@ class PPOTrainer:
                 self.debug_print("WandB not available")
 
         # Save all models to a single file.
-        torch.save({
-            'actor': actor_state,
-            'critic': critic_state,
-            'auxiliary': aux_state,
-            'training_step': getattr(self, 'training_steps', 0) + getattr(self, 'training_step_offset', 0),
-            'total_episodes': getattr(self, 'total_episodes', 0) + getattr(self, 'total_episodes_offset', 0),
-            'timestamp': time.time(),
-            'version': '1.0',
-            'wandb_run_id': wandb_run_id
-        }, model_path)
+        try:
+            torch.save({
+                'actor': actor_state,
+                'critic': critic_state,
+                'auxiliary': aux_state,
+                'training_step': getattr(self, 'training_steps', 0) + getattr(self, 'training_step_offset', 0),
+                'total_episodes': getattr(self, 'total_episodes', 0) + getattr(self, 'total_episodes_offset', 0),
+                'timestamp': time.time(),
+                'version': '1.0',
+                'wandb_run_id': wandb_run_id
+            }, model_path)
 
-        self.debug_print(f"Saved models to: {model_path}")
-        return model_path
+            self.debug_print(f"Saved models to: {model_path}")
+            return model_path
+        except Exception as e:
+            print(f"Error saving model to {model_path}: {e}")
+            # Try to save to default location if custom path fails
+            try:
+                fallback_path = f"models/rlbot_model_{timestamp}_fallback.pt"
+                os.makedirs("models", exist_ok=True)
+                torch.save({
+                    'actor': actor_state,
+                    'critic': critic_state,
+                    'auxiliary': aux_state,
+                }, fallback_path)
+                print(f"Model saved to fallback location: {fallback_path}")
+                return fallback_path
+            except Exception as e2:
+                print(f"Failed to save model to fallback location: {e2}")
+                return None
 
     def load_models(self, model_path):
         """

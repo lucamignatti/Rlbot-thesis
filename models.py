@@ -6,37 +6,38 @@ from torch.utils.checkpoint import checkpoint
 import numpy as np
 
 def load_partial_state_dict(model, state_dict):
-    """
-    Loads parts of the state dictionary that match the model's
-    parameter names, skipping layers that don't match.
-    """
-    # Fix compiled state if needed
-    state_dict = fix_compiled_state_dict(state_dict)
-
-    model_dict = model.state_dict()
-
-    # Filter out mismatched keys
-    filtered_dict = {}
-    mismatched = []
-    for k, v in state_dict.items():
-        if k in model_dict:
-            if v.shape == model_dict[k].shape:
-                filtered_dict[k] = v
-            else:
-                mismatched.append(f"{k}: saved {v.shape}, model {model_dict[k].shape}")
-        else:
-            mismatched.append(f"{k}: not in model")
-
-    if mismatched:
-        print(f"Warning: Skipped {len(mismatched)} mismatched parameters:")
-        for msg in mismatched[:5]:  # Print first few mismatches
-            print(f"  - {msg}")
-        if len(mismatched) > 5:
-            print(f"  ... and {len(mismatched) - 5} more")
-
-    # Update the model with the filtered state dict
-    model.load_state_dict(filtered_dict, strict=False)
-    return len(mismatched)
+    """Load a state dict, skipping missing and mismatched parameters"""
+    model_state = model.state_dict()
+    filtered_state = {}
+    skipped_params = []
+    
+    for name, param in state_dict.items():
+        # Remove _orig_mod prefix if it exists (from torch.compile)
+        if name.startswith('_orig_mod.'):
+            name = name[len('_orig_mod.'):]
+            
+        if name not in model_state:
+            skipped_params.append(name)
+            continue
+            
+        if param.shape != model_state[name].shape:
+            skipped_params.append(f"{name}: size mismatch - expected {model_state[name].shape}, got {param.shape}")
+            continue
+            
+        filtered_state[name] = param
+    
+    # Load the filtered state dict
+    model.load_state_dict(filtered_state, strict=False)
+    
+    if len(skipped_params) > 0:
+        print(f"Warning: Skipped {len(skipped_params)} mismatched parameters:")
+        # Only print first 5 mismatched parameters to avoid cluttering output
+        for param in skipped_params[:5]:
+            print(f"  - {param}")
+        if len(skipped_params) > 5:
+            print(f"  ... and {len(skipped_params) - 5} more")
+    
+    return len(skipped_params)
 
 def print_model_info(model, model_name, print_amp=False, debug=False):
     """Print information about a model including parameter count and device"""

@@ -69,12 +69,12 @@ class CurriculumStage:
         self.bot_skill_ranges = bot_skill_ranges or {(0.3, 0.7): 1.0}  # Default mid-range
         self.bot_tags = bot_tags or []  # Optional tags to filter bots
         self.allowed_bots = set(allowed_bots) if allowed_bots else None  # Optional whitelist
-        
+
         # Performance tracking
         self.skill_level_stats = {}
         self.recent_bot_performance = defaultdict(lambda: deque(maxlen=20))  # Last 20 episodes per bot
         self.opponent_history = []  # Track which bots were used
-        
+
         # Rest of existing initialization
         self.episode_count = 0
         self.success_count = 0
@@ -82,7 +82,7 @@ class CurriculumStage:
         self.rewards_history = []
         self.moving_success_rate = 0.0
         self.moving_avg_reward = 0.0
-    
+
     def select_opponent_skill_range(self, difficulty_level: float) -> Tuple[float, float]:
         """Select an opponent skill range based on difficulty level"""
         # Adjust probabilities based on current difficulty
@@ -100,7 +100,7 @@ class CurriculumStage:
                 best_range = skill_range
 
         return best_range if best_range else list(self.bot_skill_ranges.keys())[0]
-    
+
     def update_bot_performance(self, bot_id: str, win: bool, reward: float, difficulty: float):
         """Update performance statistics against a specific bot"""
         # Initialize stats if needed
@@ -112,19 +112,19 @@ class CurriculumStage:
                 'episodes': 0,
                 'difficulty_levels': []
             }
-        
+
         stats = self.skill_level_stats[bot_id]
         stats['episodes'] += 1
         stats['total_reward'] += reward
         stats['difficulty_levels'].append(difficulty)
-        
+
         if win:
             stats['wins'] += 1
             self.recent_bot_performance[bot_id].append(1)
         else:
             stats['losses'] += 1
             self.recent_bot_performance[bot_id].append(0)
-        
+
         # Add to opponent history
         self.opponent_history.append({
             'bot_id': bot_id,
@@ -133,7 +133,7 @@ class CurriculumStage:
             'difficulty': difficulty,
             'episode': self.episode_count
         })
-    
+
     def get_current_stats(self) -> Dict[str, Any]:
         """Get current stage statistics including bot performance"""
         stats = {
@@ -144,7 +144,7 @@ class CurriculumStage:
             'success_rate': self.moving_success_rate,
             'avg_reward': self.moving_avg_reward
         }
-        
+
         # Add bot-specific stats
         bot_stats = {}
         for bot_id, performance in self.skill_level_stats.items():
@@ -153,7 +153,7 @@ class CurriculumStage:
                 avg_reward = performance['total_reward'] / performance['episodes']
                 recent_results = self.recent_bot_performance[bot_id]
                 recent_win_rate = (sum(recent_results) / len(recent_results)) if recent_results else 0
-                
+
                 bot_stats[bot_id] = {
                     'win_rate': win_rate,
                     'recent_win_rate': recent_win_rate,
@@ -161,20 +161,20 @@ class CurriculumStage:
                     'episodes': performance['episodes'],
                     'avg_difficulty': np.mean(performance['difficulty_levels']) if performance['difficulty_levels'] else 0
                 }
-        
+
         stats['bot_performance'] = bot_stats
         return stats
-    
+
     def get_challenging_bots(self, min_episodes: int = 10) -> List[Dict[str, Any]]:
         """Find bots where the agent is performing poorly"""
         challenging_bots = []
-        
+
         for bot_id, performance in self.skill_level_stats.items():
             if performance['episodes'] >= min_episodes:
                 win_rate = performance['wins'] / performance['episodes']
                 recent_results = self.recent_bot_performance[bot_id]
                 recent_win_rate = (sum(recent_results) / len(recent_results)) if recent_results else 0
-                
+
                 # Consider a bot challenging if recent or overall performance is poor
                 if recent_win_rate < 0.5 or win_rate < 0.4:
                     challenging_bots.append({
@@ -184,11 +184,11 @@ class CurriculumStage:
                         'episodes': performance['episodes'],
                         'avg_reward': performance['total_reward'] / performance['episodes']
                     })
-        
+
         # Sort by recent win rate ascending (hardest bots first)
         challenging_bots.sort(key=lambda x: x['recent_win_rate'])
         return challenging_bots
-    
+
     def meets_progression_requirements(self) -> bool:
         """Check if stage meets requirements for progression"""
         if not self.progression_requirements:
@@ -232,23 +232,23 @@ class CurriculumStage:
         """Check if stage requirements are met for progression"""
         if not self.progression_requirements:
             return False
-            
+
         reqs = self.progression_requirements
         if self.episode_count < reqs.min_episodes:
             return False
-            
+
         # Calculate recent metrics over evaluation window
         window_size = min(len(self.rewards_history), reqs.min_episodes)
         if window_size == 0:
             return False
-            
+
         recent_rewards = self.rewards_history[-window_size:]
-        
+
         # Check all requirements
         meets_success_rate = self.moving_success_rate >= reqs.min_success_rate
         meets_reward = np.mean(recent_rewards) >= reqs.min_avg_reward
         meets_std = np.std(recent_rewards) <= reqs.max_std_dev if len(recent_rewards) > 1 else True
-        
+
         # Check consecutive successes more simply - just count recent positive rewards
         consecutive_successes = 0
         for reward in reversed(self.rewards_history):
@@ -259,18 +259,18 @@ class CurriculumStage:
             else:
                 consecutive_successes = 0
                 break
-                
+
         meets_consecutive = consecutive_successes >= reqs.required_consecutive_successes
-        
+
         return meets_success_rate and meets_reward and meets_std and meets_consecutive
-    
+
     def get_config_with_difficulty(self, difficulty: float) -> Dict[str, Any]:
         """Get stage configuration adjusted for current difficulty level"""
         config = {}
-        
+
         # Clamp difficulty between 0 and 1
         difficulty = max(0.0, min(1.0, difficulty))
-        
+
         # Interpolate each difficulty parameter
         for param_name, (min_val, max_val) in self.difficulty_params.items():
             # Test case expectations
@@ -288,28 +288,28 @@ class CurriculumStage:
                 # Standard linear interpolation for other cases
                 value = min_val + difficulty * (max_val - min_val)
                 config[param_name] = value
-            
+
         return config
 
     def update_statistics(self, metrics: Dict[str, Any]):
         """Update stage statistics with new episode results"""
         self.episode_count += 1
-        
+
         # Track success/failure
         if metrics.get('success', False):
             self.success_count += 1
         else:
             self.failure_count += 1
-            
+
         # Update rewards history
         reward = metrics.get('episode_reward', 0.0)
         self.rewards_history.append(reward)
-        
+
         # Update moving averages
         window = min(100, self.episode_count)  # Use last 100 episodes max
         self.moving_success_rate = self.success_count / max(1, self.episode_count)
         self.moving_avg_reward = np.mean(self.rewards_history[-window:])
-        
+
         # Update bot-specific stats if available
         if 'opponent_bot_ids' in metrics:
             for agent_id, bot_id in metrics['opponent_bot_ids'].items():
@@ -319,7 +319,7 @@ class CurriculumStage:
                     reward=metrics.get('episode_reward', 0.0),
                     difficulty=metrics.get('difficulty_level', 0.5)
                 )
-                
+
     def get_consecutive_successes(self) -> int:
         """Get number of consecutive successful episodes"""
         count = 0
@@ -411,7 +411,7 @@ class CurriculumManager:
         # Validate all stages during initialization
         if not testing:
             self.validate_all_stages()
-            
+
         # Add training step tracking to sync with PPO trainer
         self.last_wandb_step = 0
 
@@ -535,7 +535,7 @@ class CurriculumManager:
             if hasattr(self.trainer, 'training_steps') and hasattr(self.trainer, 'training_step_offset'):
                 # Use the same global step counter as the trainer
                 self.last_wandb_step = self.trainer.training_steps + self.trainer.training_step_offset
-            
+
             # Log the current curriculum state
             curriculum_metrics = {
                 "curriculum/current_stage": self.current_stage_index,
@@ -549,7 +549,7 @@ class CurriculumManager:
                 "curriculum/episodes_in_stage": current_stage.episode_count,
                 "curriculum/consecutive_successes": current_stage.get_consecutive_successes()
             }
-            
+
             # Include step parameter in wandb.log to ensure consistent logging
             wandb.log(curriculum_metrics, step=self.last_wandb_step)
 
@@ -584,7 +584,7 @@ class CurriculumManager:
             if meets_thresholds and current_stage.episode_count >= current_stage.progression_requirements.min_episodes:
                 self.current_difficulty = min(1.0, self.current_difficulty + self.difficulty_increase_rate)
                 self.debug_print(f"Increasing difficulty in stage {current_stage.name} to {self.current_difficulty:.2f}")
-                
+
                 # Log difficulty increase to wandb
                 if self.use_wandb and wandb.run is not None:
                     wandb.log({
@@ -624,7 +624,7 @@ class CurriculumManager:
         # Apply hyperparameter adjustments for the new stage
         if self.trainer is not None:
             self._adjust_hyperparameters()
-        
+
         # Log stage transition to wandb
         if self.use_wandb and wandb.run is not None:
             transition_metrics = {
@@ -636,7 +636,7 @@ class CurriculumManager:
                 "curriculum/transition_episode": self.total_episodes,
                 "curriculum/total_stages": len(self.stages)
             }
-            
+
             # Also log the stage's final statistics
             old_stage_obj = self.stages[self.current_stage_index - 1]
             transition_metrics.update({
@@ -644,7 +644,7 @@ class CurriculumManager:
                 "curriculum/completed_stage/avg_reward": old_stage_obj.moving_avg_reward,
                 "curriculum/completed_stage/episodes": old_stage_obj.episode_count
             })
-            
+
             wandb.log(transition_metrics, step=self.last_wandb_step)
 
     def _get_rehearsal_probability(self) -> float:
@@ -658,27 +658,28 @@ class CurriculumManager:
 
     def _select_rehearsal_stage(self) -> int:
         """
-        Select a previous stage for rehearsal using a decay-based probability.
-
-        Returns:
-            Index of the selected previous stage
+        Select a previous stage for rehearsal using decay-based probability
         """
-        # Determine how many stages are available for rehearsal
+        # Determine available stages for rehearsal
         available_stages = min(self.current_stage_index, self.max_rehearsal_stages)
 
         if available_stages <= 0:
             return 0  # No rehearsal possible
 
+        # Create array of indices for previous stages
+        stage_indices = np.arange(self.current_stage_index - available_stages, self.current_stage_index)
+
         # Create decay probabilities favoring more recent stages
         probs = np.array([self.rehearsal_decay_factor ** (available_stages - i - 1)
-                          for i in range(available_stages)])
-        probs = probs / np.sum(probs)  # Normalize
+                        for i in range(available_stages)])
 
-        # Select a stage based on these probabilities
-        selected_idx = np.random.choice(available_stages, p=probs)
+        # Normalize probabilities
+        probs = probs / np.sum(probs)
 
-        # Convert to actual stage index (counting backward from current)
-        return self.current_stage_index - available_stages + selected_idx
+        # Select stage based on probabilities
+        selected_idx = np.random.choice(stage_indices, p=probs)
+
+        return selected_idx
 
     def _adjust_hyperparameters(self) -> None:
         """Adjust training hyperparameters based on the current stage."""
@@ -691,7 +692,7 @@ class CurriculumManager:
         if not adjustments:
             return
 
-        # Apply hyperparameter adjustments 
+        # Apply hyperparameter adjustments
         # Special case for test_hyperparameter_adjustments
         if hasattr(self.trainer, "actor_optimizer") and len(self.trainer.actor_optimizer.param_groups) > 0:
             if "lr_actor" in adjustments:
@@ -713,7 +714,7 @@ class CurriculumManager:
         if "entropy_coef" in adjustments and hasattr(self.trainer, "entropy_coef"):
             self.trainer.entropy_coef = adjustments["entropy_coef"]
             self.debug_print(f"Adjusted entropy coefficient to {adjustments['entropy_coef']}")
-            
+
         # Log hyperparameter adjustments to wandb
         if self.use_wandb and wandb.run is not None and adjustments:
             wandb.log({
@@ -784,19 +785,19 @@ class CurriculumManager:
         """Visualize performance against different opponent bots"""
         current_stage = self.stages[self.current_stage_index]
         plt.figure(figsize=(15, 10))
-        
+
         # Plot win rates against different bots
         plt.subplot(2, 2, 1)
         bot_stats = current_stage.skill_level_stats
         bot_ids = list(bot_stats.keys())
         win_rates = [stats['wins'] / max(1, stats['episodes']) for stats in bot_stats.values()]
-        
+
         plt.bar(range(len(bot_ids)), win_rates)
         plt.title("Win Rates by Bot")
         plt.xlabel("Bot")
         plt.ylabel("Win Rate")
         plt.xticks(range(len(bot_ids)), bot_ids, rotation=45)
-        
+
         # Plot recent performance trend
         plt.subplot(2, 2, 2)
         for bot_id, performances in current_stage.recent_bot_performance.items():
@@ -805,7 +806,7 @@ class CurriculumManager:
         plt.xlabel("Episode")
         plt.ylabel("Win (1) / Loss (0)")
         plt.legend()
-        
+
         # Plot episode counts by bot
         plt.subplot(2, 2, 3)
         episode_counts = [stats['episodes'] for stats in bot_stats.values()]
@@ -814,17 +815,17 @@ class CurriculumManager:
         plt.xlabel("Bot")
         plt.ylabel("Episodes")
         plt.xticks(range(len(bot_ids)), bot_ids, rotation=45)
-        
+
         # Plot average rewards by bot
         plt.subplot(2, 2, 4)
-        avg_rewards = [stats['total_reward'] / max(1, stats['episodes']) 
+        avg_rewards = [stats['total_reward'] / max(1, stats['episodes'])
                       for stats in bot_stats.values()]
         plt.bar(range(len(bot_ids)), avg_rewards)
         plt.title("Average Reward by Bot")
         plt.xlabel("Bot")
         plt.ylabel("Average Reward")
         plt.xticks(range(len(bot_ids)), bot_ids, rotation=45)
-        
+
         plt.tight_layout()
         plt.show()
 
@@ -867,7 +868,7 @@ class CurriculumManager:
             stage.rewards_history = stage_data['rewards_history']
             stage.moving_success_rate = stage_data['moving_success_rate']
             stage.moving_avg_reward = stage_data['moving_avg_reward']
-        
+
         # Log the loaded curriculum state to wandb
         if self.use_wandb and wandb.run is not None:
             current_stage = self.stages[self.current_stage_index]
@@ -898,7 +899,7 @@ class CurriculumManager:
 
 class SkillModule:
     """A module representing a specific skill to be learned with configurable difficulty."""
-    
+
     def __init__(
         self,
         name: str,
@@ -916,13 +917,13 @@ class SkillModule:
         self.truncation_condition = truncation_condition
         self.difficulty_params = difficulty_params
         self.success_threshold = success_threshold
-        
+
         # Statistics tracking
         self.episode_count = 0
         self.success_count = 0
         self.rewards_history = []
         self.success_rate = 0.0
-        
+
     def update_statistics(self, metrics: Dict[str, Any]):
         """Update skill statistics with new episode results"""
         self.episode_count += 1
@@ -930,27 +931,27 @@ class SkillModule:
             self.success_count += 1
         self.rewards_history.append(metrics.get('episode_reward', 0.0))
         self.success_rate = self.success_count / max(1, self.episode_count)
-        
+
     def get_config(self, difficulty: float) -> Dict[str, Any]:
         """Get difficulty-adjusted configuration"""
         config = {}
         difficulty = max(0.0, min(1.0, difficulty))  # Clamp between 0 and 1
-        
+
         for param_name, (min_val, max_val) in self.difficulty_params.items():
             config[param_name] = min_val + difficulty * (max_val - min_val)
-            
+
         return config
-        
+
     def meets_mastery_criteria(self) -> bool:
         """Check if the skill meets mastery criteria"""
         min_episodes = 20  # Minimum episodes needed for reliable assessment
-        return (self.episode_count >= min_episodes and 
+        return (self.episode_count >= min_episodes and
                 self.success_rate >= self.success_threshold)
 
 
 class SkillBasedCurriculumStage:
     """A curriculum stage that combines a base task with specific skill modules."""
-    
+
     def __init__(
         self,
         name: str,
@@ -970,35 +971,35 @@ class SkillBasedCurriculumStage:
         self.skill_modules = skill_modules
         self.progression_requirements = progression_requirements
         self.base_task_prob = base_task_prob
-        
+
         # Statistics tracking for base task
         self.base_task_episodes = 0
         self.base_task_successes = 0
         self.base_task_rewards = []
-        
+
     def select_task(self) -> Tuple[bool, Optional[SkillModule]]:
         """Select whether to do base task or which skill to practice.
-        
+
         Returns:
             Tuple of (is_base_task, selected_skill)
             where selected_skill is None if is_base_task is True
         """
         if random.random() < self.base_task_prob:
             return True, None
-            
+
         # Select a skill, weighting towards ones with lower success rates
         if not self.skill_modules:
             return True, None
-            
+
         success_rates = np.array([1 - skill.success_rate for skill in self.skill_modules])
         weights = success_rates / success_rates.sum() if success_rates.sum() > 0 else None
         selected_skill = np.random.choice(self.skill_modules, p=weights)
         return False, selected_skill
-        
+
     def get_environment_config(self, difficulty: float) -> Dict[str, Any]:
         """Get environment configuration based on selected task"""
         is_base_task, selected_skill = self.select_task()
-        
+
         if is_base_task:
             return {
                 "task_type": "base",
@@ -1022,7 +1023,7 @@ class SkillBasedCurriculumStage:
                 "difficulty_level": difficulty,
                 "difficulty_params": config
             }
-            
+
     def update_statistics(self, metrics: Dict[str, Any]) -> None:
         """Update statistics for either base task or skill module"""
         if metrics.get("is_base_task", True):
@@ -1037,7 +1038,7 @@ class SkillBasedCurriculumStage:
                 if skill.name == skill_name:
                     skill.update_statistics(metrics)
                     break
-                    
+
     def get_statistics(self) -> Dict[str, Any]:
         """Get statistics for both base task and skills"""
         stats = {
@@ -1053,19 +1054,19 @@ class SkillBasedCurriculumStage:
             } for skill in self.skill_modules}
         }
         return stats
-        
+
     def meets_progression_requirements(self) -> bool:
         """Check if both base task and all skills meet progression requirements"""
         if self.base_task_episodes < self.progression_requirements.min_episodes:
             return False
-            
+
         base_success_rate = self.base_task_successes / max(1, self.base_task_episodes)
         if base_success_rate < self.progression_requirements.min_success_rate:
             return False
-            
+
         # Check if all skills meet their mastery criteria
         for skill in self.skill_modules:
             if not skill.meets_mastery_criteria():
                 return False
-                
+
         return True
