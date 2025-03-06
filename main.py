@@ -433,12 +433,13 @@ def run_training(
                             "curriculum/total_stages": curriculum_stats["total_stages"],
                             "curriculum/difficulty": curriculum_stats["difficulty_level"],
                             
-                            # Current stage performance metrics
+                            # Current stage performance metrics - use the keys that exist in the curriculum_stats
                             "curriculum/success_rate": current_stage_stats["success_rate"],
                             "curriculum/avg_reward": current_stage_stats["avg_reward"],
                             "curriculum/episodes": current_stage_stats["episodes"],
-                            "curriculum/successes": current_stage_stats["successes"],
-                            "curriculum/failures": current_stage_stats["failures"],
+                            # Fix the successes and failures keys to match what's in the curriculum_stats dictionary
+                            "curriculum/successes": current_stage_stats.get("success_count", 0),
+                            "curriculum/failures": current_stage_stats.get("failure_count", 0),
                             
                             # Overall progress
                             "curriculum/total_episodes": curriculum_stats["total_episodes"],
