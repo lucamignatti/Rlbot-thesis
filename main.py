@@ -269,7 +269,7 @@ def run_training(
                     progress_bar.refresh()
                     last_progress_update = current_time
 
-                should_continue = elapsed < training_time  
+                should_continue = elapsed < training_time
             else:
                 # Using an episode-based schedule
                 should_continue = total_episodes_so_far < total_episodes
@@ -423,20 +423,20 @@ def run_training(
                     if use_wandb:
                         # Get current stage stats
                         current_stage_stats = curriculum_stats["current_stage_stats"]
-                        
+
                         # Use trainer's _true_training_steps as source of truth for step counting
                         if hasattr(trainer, '_true_training_steps'):
                             current_step = trainer._true_training_steps
                         else:
                             current_step = trainer.training_steps + trainer.training_step_offset
-                            
+
                         wandb.log({
                             # Stage progression metrics
                             "curriculum/stage": curriculum_stats["current_stage"],
                             "curriculum/stage_name": curriculum_stats["current_stage_name"],
                             "curriculum/total_stages": curriculum_stats["total_stages"],
                             "curriculum/difficulty": curriculum_stats["difficulty_level"],
-                            
+
                             # Current stage performance metrics - use the keys that exist in the curriculum_stats
                             "curriculum/success_rate": current_stage_stats["success_rate"],
                             "curriculum/avg_reward": current_stage_stats["avg_reward"],
@@ -444,11 +444,11 @@ def run_training(
                             # Fix the successes and failures keys to match what's in the curriculum_stats dictionary
                             "curriculum/successes": current_stage_stats.get("success_count", 0),
                             "curriculum/failures": current_stage_stats.get("failure_count", 0),
-                            
+
                             # Overall progress
                             "curriculum/total_episodes": curriculum_stats["total_episodes"],
                             "curriculum/stage_progress": float(curriculum_stats["current_stage"]) / max(1, curriculum_stats["total_stages"] - 1),
-                            
+
                             # Combined progress metric (considers both stage and difficulty)
                             "curriculum/total_progress": (float(curriculum_stats["current_stage"]) / max(1, curriculum_stats["total_stages"] - 1) + curriculum_stats["difficulty_level"]) / 2
                         }, step=current_step)
@@ -483,7 +483,7 @@ def run_training(
                 print(f"Error during final update: {str(e)}")
                 import traceback
                 traceback.print_exc()
-                
+
         # Return the trainer regardless of potential errors
         return trainer
 
@@ -699,7 +699,7 @@ class VectorizedEnv:
     def step(self, actions_dict_list):
         """Step all environments forward using appropriate method based on mode"""
         stats_dict = {}
-        
+
         if self.mode == "thread":
             # Use thread pool for parallel execution
             futures = [
@@ -736,9 +736,9 @@ class VectorizedEnv:
                             "timeout": self.episode_timeouts[env_idx],
                             "episode_reward": avg_reward
                         }
-                        
+
                         self.curriculum_manager.update_progression_stats(metrics)
-                        
+
                         # Get new curriculum configuration for next episode
                         new_config = self.curriculum_manager.get_environment_config()
                         self.curriculum_configs[env_idx] = new_config
@@ -910,9 +910,9 @@ if __name__ == "__main__":
     training_duration.add_argument('-t', '--time', type=str, default=None,
                                   help='Training duration in format: 5m (minutes), 5h (hours), 5d (days)')
 
-    parser.add_argument('-n', '--num_envs', type=int, default=os.cpu_count()*10,
+    parser.add_argument('-n', '--num_envs', type=int, default=os.cpu_count() or 4,
                         help='Number of parallel environments to run for faster data collection')
-    parser.add_argument('--update_interval', type=int, default=500 * (os.cpu_count() or 4),
+    parser.add_argument('--update_interval', type=int, default=10 * (os.cpu_count() or 4),
                         help='Number of experiences to collect before updating the policy')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use for training (cuda/mps/cpu).  Autodetects if not specified.')
@@ -1061,10 +1061,10 @@ if __name__ == "__main__":
         torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 on Ampere and newer
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True  # Enable cudnn autotuner
-        
+
         # Configure BLAS operations
         torch.backends.cuda.preferred_linalg_library('cusolver')  # Prefer cuSOLVER for stability
-        
+
         # Try to set bailout depth for CUDA graphs
         try:
             torch._C._jit_set_bailout_depth(20)
@@ -1073,7 +1073,7 @@ if __name__ == "__main__":
                 print("[DEBUG] _jit_set_bailout_depth not available in this PyTorch version")
 
         torch.cuda.set_device(torch.cuda.current_device())
-        
+
         # Improve CUDA graph memory allocation
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -1207,7 +1207,7 @@ if __name__ == "__main__":
                         print(f"[DEBUG] Loaded training step offset: {trainer_offset}")
                 else:
                     trainer_offset = 0
-                
+
                 print(f"Successfully loaded model from {args.model} with adjusted dimensions")
                 print(f"Continuing from training step {trainer_offset}")
 
@@ -1221,7 +1221,7 @@ if __name__ == "__main__":
 
     # Get the training step offset if we loaded a checkpoint
     trainer_offset = trainer_offset if 'trainer_offset' in locals() else 0
-    
+
     # Start the main training process with proper step counting
     trainer = run_training(
         actor=actor,
