@@ -1,5 +1,4 @@
 import os
-
 import numpy as np
 import torch
 from rlgym.api import RLGym
@@ -8,6 +7,7 @@ from rlgym.rocket_league.done_conditions import GoalCondition, AnyCondition, Tim
 from rlgym.rocket_league.obs_builders import DefaultObs
 from rlgym.rocket_league.reward_functions import CombinedReward, GoalReward, TouchReward
 from rlgym.rocket_league.sim import RocketSimEngine
+import RocketSim as rocketsim
 from rlgym.rocket_league.rlviser import RLViserRenderer
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
 from rewards import BallProximityReward, BallToGoalDistanceReward, BallVelocityToGoalReward, TouchBallReward, TouchBallToGoalAccelerationReward, AlignBallToGoalReward, PlayerVelocityTowardBallReward, KRCReward
@@ -25,79 +25,17 @@ import multiprocessing as mp
 from multiprocessing import Process, Pipe
 from typing import List, Tuple, Dict
 import numpy as np
-from curriculum_integration import create_basic_curriculum
+from curriculum import create_skill_based_curriculum
 from curriculum import CurriculumManager, CurriculumStage, ProgressionRequirements
-
-
-
-def get_env(renderer=None, action_stacker=None, curriculum_config=None):
-    """
-    Sets up the Rocket League environment with curriculum support.
-    """
-    # Use curriculum configuration if provided
-    if curriculum_config is not None:
-        return RLGym(
-            state_mutator=curriculum_config["state_mutator"],
-            obs_builder=StackedActionsObs(action_stacker, zero_padding=2),
-            action_parser=RepeatAction(LookupTableAction(), repeats=8),
-            reward_fn=curriculum_config["reward_function"],
-            termination_cond=curriculum_config["termination_condition"],
-            truncation_cond=curriculum_config["truncation_condition"],
-            transition_engine=RocketSimEngine(),
-            renderer=renderer
-        )
-
-    # Otherwise use the default configuration
-    return RLGym(
-        state_mutator=MutatorSequence(
-            FixedTeamSizeMutator(blue_size=2, orange_size=2),
-            KickoffMutator()
-        ),
-        obs_builder=StackedActionsObs(action_stacker, zero_padding=2),
-        action_parser=RepeatAction(LookupTableAction(), repeats=8),
-        reward_fn=CombinedReward(
-            # Primary objective rewards - slightly increased to emphasize scoring
-            (GoalReward(), 15.0),
-
-            # Offensive Potential KRC group
-            (KRCReward([
-                (AlignBallToGoalReward(dispersion=1.1, density=1.0), 1.0),
-                (BallProximityReward(dispersion=0.8, density=1.2), 0.8),
-                (PlayerVelocityTowardBallReward(), 0.6)
-            ], team_spirit=0.3), 8.0),
-
-            # Ball Control KRC group
-            (KRCReward([
-                (TouchBallToGoalAccelerationReward(), 1.0),
-                (TouchBallReward(), 0.8),
-                (BallVelocityToGoalReward(), 0.6)
-            ], team_spirit=0.3), 6.0),
-
-            # Distance-weighted Alignment KRC group
-            (KRCReward([
-                (AlignBallToGoalReward(dispersion=1.1, density=1.0), 1.0),
-                (BallProximityReward(dispersion=0.8, density=1.2), 0.8)
-            ], team_spirit=0.3), 4.0),
-
-            # Strategic Ball Positioning
-            (KRCReward([
-                (BallToGoalDistanceReward(
-                    offensive_dispersion=0.6,
-                    defensive_dispersion=0.4,
-                    offensive_density=1.0,
-                    defensive_density=1.0
-                ), 1.0),
-                (BallProximityReward(dispersion=0.7, density=1.0), 0.4)
-            ], team_spirit=0.3), 2.0),
-        ),
-        termination_cond=GoalCondition(),
-        truncation_cond=AnyCondition(
-            TimeoutCondition(300.),
-            NoTouchTimeoutCondition(30.)
-        ),
-        transition_engine=RocketSimEngine(),
-        renderer=renderer
-    )
+from envs.factory import get_env
+from envs.vectorized import VectorizedEnv
+from envs.rlbot_vectorized import RLBotVectorizedEnv
+from curriculum import (
+    create_skill_based_curriculum,
+    CurriculumManager,
+    CurriculumStage,
+    ProgressionRequirements
+)
 
 def run_training(
     actor,
@@ -193,15 +131,33 @@ def run_training(
     # Initialize curriculum if enabled
     curriculum_manager = None
     if use_curriculum:
-        curriculum_manager = create_basic_curriculum(debug=debug)
+        curriculum_manager = create_skill_based_curriculum(debug=debug)
         curriculum_manager.register_trainer(trainer)
         if debug:
             print("[DEBUG] Curriculum learning enabled with basic curriculum")
 
-    # Use a vectorized environment for parallel data collection.
-    vec_env = VectorizedEnv(num_envs=num_envs, render=render,
-                           action_stacker=action_stacker,
-                           curriculum_manager=curriculum_manager)
+        # Use a vectorized environment for parallel data collection.
+        env_class = VectorizedEnv  # Default
+        if curriculum_manager and curriculum_manager.requires_bots():
+            env_class = RLBotVectorizedEnv
+
+        vec_env = env_class(
+            num_envs=num_envs,
+            render=render,
+            action_stacker=action_stacker,
+            curriculum_manager=curriculum_manager,
+            rlbotpack_path=os.path.join(os.path.dirname(__file__), "RLBotPack"),
+            debug=debug
+        )
+    else:
+        # Use a default vectorized environment without curriculum
+        env_class = VectorizedEnv
+        vec_env = env_class(
+            num_envs=num_envs,
+            render=render,
+            action_stacker=action_stacker,
+            debug=debug
+        )
 
     # For time-based training, we'll need to know when we started.
     start_time = time.time()
@@ -247,11 +203,26 @@ def run_training(
     progress_bar.set_postfix(stats_dict)
 
     # Initialize variables to track training progress.
-    collected_experiences = 0  # Experiences since last policy update
-    total_episodes_so_far = 0  # Total episodes completed
-    last_update_time = time.time()  # When did we last update the policy?
-    last_save_episode = 0  # When did we last save the model?
-    episode_rewards = {i: {agent_id: 0 for agent_id in vec_env.obs_dicts[i]} for i in range(num_envs)}  # Track rewards per episode, per agent
+    collected_experiences = 0
+    total_episodes_so_far = 0
+    last_update_time = time.time()
+    last_save_episode = 0
+    
+    # Add defensive initialization for episode_rewards
+    episode_rewards = {}
+    for i in range(num_envs):
+        episode_rewards[i] = {}
+        try:
+            if vec_env.obs_dicts[i]:
+                for agent_id in vec_env.obs_dicts[i]:
+                    episode_rewards[i][agent_id] = 0
+            else:
+                if debug:
+                    print(f"[DEBUG] Warning: Empty observations for env {i}")
+        except Exception as e:
+            if debug:
+                print(f"[DEBUG] Error initializing rewards for env {i}: {e}")
+
     last_progress_update = start_time  # For updating time-based progress bar
     should_continue = True  # Initialize the control variable
 
@@ -281,7 +252,6 @@ def run_training(
             all_obs = []
             all_env_indices = []
             all_agent_ids = []
-
             # Organize observations into lists for batch processing.
             for env_idx, obs_dict in enumerate(vec_env.obs_dicts):
                 for agent_id, obs in obs_dict.items():
@@ -517,374 +487,6 @@ def parse_time(time_str):
             raise
         raise ValueError(f"Invalid time format: {time_str}. Use format like '5m', '2h', '1d'")
 
-def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacker=None, curriculum_config=None):
-    """Worker process that runs a single environment"""
-    # Create renderer only if rendering is enabled for this worker
-    renderer = RLViserRenderer() if render else None
-
-    # Create environment with correct parameters
-    env = env_fn(renderer=renderer, action_stacker=action_stacker, curriculum_config=curriculum_config)
-
-    curr_config = curriculum_config  # Keep track of current curriculum config
-
-    while True:
-        try:
-            cmd, data = remote.recv()
-
-            if cmd == 'step':
-                actions_dict = data
-                # Format actions for RLGym API
-                formatted_actions = {}
-                for agent_id, action in actions_dict.items():
-                    if isinstance(action, np.ndarray):
-                        formatted_actions[agent_id] = action
-                    else:
-                        formatted_actions[agent_id] = np.array([action if isinstance(action, int) else int(action)])
-
-                    # Add action to stacker history
-                    if action_stacker is not None:
-                        action_stacker.add_action(agent_id, formatted_actions[agent_id])
-
-                # Step the environment
-                next_obs_dict, reward_dict, terminated_dict, truncated_dict = env.step(formatted_actions)
-                remote.send((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
-
-            elif cmd == 'reset':
-                obs = env.reset()
-                remote.send(obs)
-
-            elif cmd == 'set_curriculum':
-                # Update environment with new curriculum configuration
-                curr_config = data
-                env.close()
-                env = env_fn(renderer=renderer, action_stacker=action_stacker, curriculum_config=curr_config)
-                remote.send(True)  # Acknowledge the update
-
-            elif cmd == 'close':
-                if renderer:
-                    renderer.close()
-                env.close()
-                remote.close()
-                break
-
-            elif cmd == 'reset_action_stacker':
-                agent_id = data
-                if action_stacker is not None:
-                    action_stacker.reset_agent(agent_id)
-                remote.send(True)
-
-        except EOFError:
-            break
-
-class VectorizedEnv:
-    """
-    Runs multiple RLGym environments in parallel.
-    Uses thread-based execution for rendered environments and
-    multiprocessing for non-rendered environments.
-    Now supports curriculum learning.
-    """
-    def __init__(self, num_envs, render=False, action_stacker=None, curriculum_manager=None):
-        self.num_envs = num_envs
-        self.render = render
-        self.action_stacker = action_stacker
-        self.curriculum_manager = curriculum_manager
-        self.render_delay = 0.025
-
-        # For tracking episode metrics for curriculum
-        self.episode_rewards = [{} for _ in range(num_envs)]
-        self.episode_successes = [False] * num_envs
-        self.episode_timeouts = [False] * num_envs
-
-        # Get curriculum configurations if available
-        self.curriculum_configs = []
-        for env_idx in range(num_envs):
-            if self.curriculum_manager:
-                # Get potentially different configs for each environment (for rehearsal)
-                self.curriculum_configs.append(self.curriculum_manager.get_environment_config())
-            else:
-                self.curriculum_configs.append(None)
-
-        # Decide whether to use threading for rendering
-        if render:
-            # Use thread-based approach for all environments when rendering is enabled
-            self.mode = "thread"
-
-            # Create environments directly
-            self.envs = []
-            for i in range(num_envs):
-                # Only create renderer for the first environment
-                env_renderer = RLViserRenderer() if (i == 0) else None
-                env = get_env(renderer=env_renderer, action_stacker=action_stacker,
-                             curriculum_config=self.curriculum_configs[i])
-                self.envs.append(env)
-
-            # Reset all environments
-            self.obs_dicts = [env.reset() for env in self.envs]
-
-            # Explicitly render the first environment
-            if num_envs > 0:
-                self.envs[0].render()
-
-            # Set up thread pool for parallel execution
-            self.executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=min(32, num_envs),
-                thread_name_prefix='EnvWorker'
-            )
-
-        else:
-            # Use multiprocessing for maximum performance when not rendering
-            self.mode = "multiprocess"
-
-            try:
-                mp.set_start_method('spawn', force=True)
-            except RuntimeError:
-                pass  # Already set
-
-            # Create communication pipes
-            self.remotes, self.work_remotes = zip(*[Pipe() for _ in range(num_envs)])
-
-            # Create and start worker processes
-            self.processes = []
-            for idx, (work_remote, remote) in enumerate(zip(self.work_remotes, self.remotes)):
-                process = Process(
-                    target=worker,
-                    args=(work_remote, get_env, False, action_stacker, self.curriculum_configs[idx]),
-                    daemon=True
-                )
-                process.start()
-                self.processes.append(process)
-                work_remote.close()
-
-            # Get initial observations
-            for remote in self.remotes:
-                remote.send(('reset', None))
-            self.obs_dicts = [remote.recv() for remote in self.remotes]
-
-        # Common initialization
-        self.dones = [False] * num_envs
-        self.episode_counts = [0] * num_envs
-
-    def _step_env(self, args):
-        env_idx, env, actions_dict = args
-
-        # Format actions for RLGym API
-        formatted_actions = {}
-        for agent_id, action in actions_dict.items():
-            if isinstance(action, np.ndarray):
-                formatted_actions[agent_id] = action
-            else:
-                formatted_actions[agent_id] = np.array([action if isinstance(action, int) else int(action)])
-
-            # Add action to the stacker history
-            if self.action_stacker is not None:
-                self.action_stacker.add_action(agent_id, formatted_actions[agent_id])
-
-        # Step the environment
-        next_obs_dict, reward_dict, terminated_dict, truncated_dict = env.step(formatted_actions)
-
-        # Add rendering and delay if this is the rendered environment
-        if self.render and env_idx == 0:
-            env.render()
-            time.sleep(self.render_delay)
-
-        # Track rewards for curriculum
-        if self.curriculum_manager is not None:
-            for agent_id, reward in reward_dict.items():
-                if agent_id not in self.episode_rewards[env_idx]:
-                    self.episode_rewards[env_idx][agent_id] = 0
-                self.episode_rewards[env_idx][agent_id] += reward
-
-        return env_idx, next_obs_dict, reward_dict, terminated_dict, truncated_dict
-
-    def step(self, actions_dict_list):
-        """Step all environments forward using appropriate method based on mode"""
-        stats_dict = {}
-
-        if self.mode == "thread":
-            # Use thread pool for parallel execution
-            futures = [
-                self.executor.submit(self._step_env, (i, env, actions))
-                for i, (env, actions) in enumerate(zip(self.envs, actions_dict_list))
-            ]
-
-            # Wait for all steps to complete
-            results = []
-            for future in concurrent.futures.as_completed(futures):
-                results.append(future.result())
-
-            # Sort results by environment index
-            results.sort(key=lambda x: x[0])
-
-            processed_results = []
-            for env_idx, next_obs_dict, reward_dict, terminated_dict, truncated_dict in results:
-                # Check if episode is done
-                self.dones[env_idx] = any(terminated_dict.values()) or any(truncated_dict.values())
-
-                # Track success/timeout for curriculum
-                if self.dones[env_idx]:
-                    self.episode_successes[env_idx] = any(terminated_dict.values())
-                    self.episode_timeouts[env_idx] = any(truncated_dict.values()) and not self.episode_successes[env_idx]
-
-                    # Update curriculum manager with episode results
-                    if self.curriculum_manager:
-                        # Calculate average reward across all agents
-                        avg_reward = sum(self.episode_rewards[env_idx].values()) / max(len(self.episode_rewards[env_idx]), 1)
-
-                        # Submit episode metrics
-                        metrics = {
-                            "success": self.episode_successes[env_idx],
-                            "timeout": self.episode_timeouts[env_idx],
-                            "episode_reward": avg_reward
-                        }
-
-                        self.curriculum_manager.update_progression_stats(metrics)
-
-                        # Get new curriculum configuration for next episode
-                        new_config = self.curriculum_manager.get_environment_config()
-                        self.curriculum_configs[env_idx] = new_config
-
-                        # In threaded mode, need to recreate the environment
-                        if self.dones[env_idx]:
-                            self.envs[env_idx].close()
-                            env_renderer = RLViserRenderer() if (env_idx == 0 and self.render) else None
-                            self.envs[env_idx] = get_env(renderer=env_renderer,
-                                                       action_stacker=self.action_stacker,
-                                                       curriculum_config=new_config)
-
-                    if self.dones[env_idx]:
-                        # If done, reset the environment
-                        self.episode_counts[env_idx] += 1
-
-                        # Reset the environment
-                        self.obs_dicts[env_idx] = self.envs[env_idx].reset()
-
-                        # Reset action history for all agents
-                        if self.action_stacker is not None:
-                            for agent_id in next_obs_dict.keys():
-                                self.action_stacker.reset_agent(agent_id)
-
-                        # Reset episode tracking variables
-                        self.episode_rewards[env_idx] = {}
-                        self.episode_successes[env_idx] = False
-                        self.episode_timeouts[env_idx] = False
-
-                        # Render again after reset if this is the rendered environment
-                        if self.render and env_idx == 0:
-                            self.envs[env_idx].render()
-                            time.sleep(self.render_delay)
-                    else:
-                        # Otherwise just update observations
-                        self.obs_dicts[env_idx] = next_obs_dict
-
-                    processed_results.append((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
-
-        else:  # multiprocess mode
-            # Send step command to all workers
-            for remote, actions_dict in zip(self.remotes, actions_dict_list):
-                remote.send(('step', actions_dict))
-
-            # Collect results from all workers
-            results = []
-            for i, remote in enumerate(self.remotes):
-                next_obs_dict, reward_dict, terminated_dict, truncated_dict = remote.recv()
-
-                # Track rewards for curriculum
-                if self.curriculum_manager is not None:
-                    for agent_id, reward in reward_dict.items():
-                        if agent_id not in self.episode_rewards[i]:
-                            self.episode_rewards[i] = {}
-                        if agent_id not in self.episode_rewards[i]:
-                            self.episode_rewards[i][agent_id] = 0
-                        self.episode_rewards[i][agent_id] += reward
-
-                # Check if episode is done
-                self.dones[i] = any(terminated_dict.values()) or any(truncated_dict.values())
-
-                # Track success/timeout for curriculum
-                if self.dones[i]:
-                    self.episode_successes[i] = any(terminated_dict.values())
-                    self.episode_timeouts[i] = any(truncated_dict.values()) and not self.episode_successes[i]
-
-                    # Update curriculum manager with episode results
-                    if self.curriculum_manager:
-                        # Calculate average reward across all agents
-                        if len(self.episode_rewards[i]) > 0:
-                            avg_reward = sum(self.episode_rewards[i].values()) / len(self.episode_rewards[i])
-                        else:
-                            avg_reward = 0.0
-
-                        # Submit episode metrics
-                        self.curriculum_manager.update_progression_stats({
-                            "success": self.episode_successes[i],
-                            "timeout": self.episode_timeouts[i],
-                            "episode_reward": avg_reward
-                        })
-
-                        # Get new curriculum configuration for next episode
-                        new_config = self.curriculum_manager.get_environment_config()
-
-                        # Send the new curriculum configuration to the worker
-                        remote.send(('set_curriculum', new_config))
-                        remote.recv()  # Wait for acknowledgment
-
-                    # If done, reset the environment
-                    self.episode_counts[i] += 1
-                    remote.send(('reset', None))
-                    self.obs_dicts[i] = remote.recv()
-
-                    # Reset action stacker for all agents
-                    if self.action_stacker is not None:
-                        for agent_id in next_obs_dict.keys():
-                            remote.send(('reset_action_stacker', agent_id))
-                            remote.recv()  # Wait for confirmation
-
-                    # Reset episode tracking variables
-                    self.episode_rewards[i] = {}
-                    self.episode_successes[i] = False
-                    self.episode_timeouts[i] = False
-                else:
-                    # If not done, just update observations
-                    self.obs_dicts[i] = next_obs_dict
-
-                results.append((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
-
-            processed_results = results
-
-        return processed_results, self.dones.copy(), self.episode_counts.copy()
-
-    def close(self):
-        """Clean up resources properly based on the mode"""
-        if self.mode == "thread":
-            # Close the thread pool
-            if hasattr(self, 'executor'):
-                self.executor.shutdown()
-
-            # Close all environments
-            if hasattr(self, 'envs'):
-                for env in self.envs:
-                    env.close()
-
-        else:  # multiprocess mode
-            # Close multiprocessing environments
-            if hasattr(self, 'remotes'):
-                for remote in self.remotes:
-                    try:
-                        remote.send(('close', None))
-                    except (BrokenPipeError, EOFError):
-                        pass  # Already closed
-
-            if hasattr(self, 'processes'):
-                for process in self.processes:
-                    process.join(timeout=1.0)
-                    if process.is_alive():
-                        process.terminate()
-
-            if hasattr(self, 'remotes'):
-                for remote in self.remotes:
-                    try:
-                        remote.close()
-                    except:
-                        pass  # Already closed
 
 def signal_handler(sig, frame):
     """Handles Ctrl+C gracefully, so the program exits cleanly."""
@@ -894,9 +496,9 @@ def signal_handler(sig, frame):
 if __name__ == "__main__":
     # Set start method
     if sys.platform == 'darwin':
-        mp.set_start_method('spawn')
+        mp.set_start_method('spawn', force=True)
     elif sys.platform == 'linux':
-        mp.set_start_method('fork')
+        mp.set_start_method('fork', force=True)
 
     # Set up Ctrl+C handler to exit gracefully.
     signal.signal(signal.SIGINT, signal_handler)
@@ -935,7 +537,7 @@ if __name__ == "__main__":
 
     # Discount factors
     parser.add_argument('--gamma', type=float, default=0.997, help='Discount factor for future rewards')
-    parser.add_argument('--gae_lambda', type=float, default=0.95, help='Lambda parameter for Generalized Advantage Estimation')
+    parser.add_argument('--gae_lambda', type=float, default=0.95, help='Lambda para,meter for Generalized Advantage Estimation')
 
     # PPO parameters
     parser.add_argument('--clip_epsilon', type=float, default=0.15, help='PPO clipping parameter')
@@ -1269,10 +871,10 @@ if __name__ == "__main__":
         output_path = args.out if args.out else None
         # Save model with step count and wandb info
         metadata = {
-            'training_step': trainer._true_training_steps if hasattr(trainer, '_true_training_steps') else trainer.training_steps,
+            'training_step': getattr(trainer, '_true_training_steps', 0),
             'wandb_run_id': wandb.run.id if args.wandb and wandb.run else None
         }
-        saved_path = trainer.save_models(output_path, metadata)
+        trainer.save_models(output_path, metadata)
         print(f"Training complete - Model saved to {saved_path} at step {metadata['training_step']}")
     else:
         print("Training failed - no model saved.")

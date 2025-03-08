@@ -21,3 +21,8 @@ disabled_bots.txt
 invalid_bots.txt
 validated_bots.txt
 runnable_bots.txt
+
+.idea/
+.pytest_cache/
+.venv/
+.vscode/

@@ -89,6 +89,24 @@ def fix_compiled_state_dict(state_dict):
             fixed_state_dict[key] = value
     return fixed_state_dict
 
+def fix_rsnorm_cuda_graphs(model):
+    """Fix CUDA graphs compilation issues for RSNorm modules
+    
+    This function should be called before using torch.compile() on models
+    that contain RSNorm modules.
+    
+    Args:
+        model: PyTorch model that may contain RSNorm layers
+        
+    Returns:
+        The patched model with more stable compilation behavior
+    """
+    for module in model.modules():
+        if isinstance(module, RSNorm):
+            # Mark the module as fixed
+            module._cuda_graphs_fixed = True
+    return model
+
 class BasicModel(nn.Module):
     """Base model that all policy/value models should inherit from"""
     def __init__(self, obs_shape, action_shape, hidden_dim=512, num_blocks=4,
@@ -238,15 +256,45 @@ class RSNorm(nn.Module):
         self.num_features = num_features
         self.momentum = momentum
         self.eps = eps
+        self._cuda_graphs_fixed = False
 
         self.register_buffer('running_mean', torch.zeros(num_features))
         self.register_buffer('running_var', torch.ones(num_features))
         self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
 
     def forward(self, x):
+        # Special path for torch.compile() to avoid control flow
+        is_compiling = hasattr(torch, '_dynamo') and torch._dynamo.is_compiling()
+        
+        # For CUDA graphs compatibility, use simplified path during compilation
+        if is_compiling or getattr(self, '_cuda_graphs_fixed', False):
+            # Simple path for compilation
+            device = x.device
+            
+            if x.dim() == 1:
+                x = x.view(1, -1)  # Add batch dimension for consistency
+
+            if self.training:
+                # Calculate batch statistics
+                batch_mean = x.mean(dim=0)
+                batch_var = x.var(dim=0, unbiased=False)
+                
+                # Normalize using batch statistics
+                x_norm = (x - batch_mean[None, :]) / torch.sqrt(batch_var[None, :] + self.eps)
+                
+                # No device transfers or control flow during compilation
+                return x_norm
+            else:
+                # Use stored statistics
+                running_mean = self.running_mean.to(device)
+                running_var = self.running_var.to(device)
+                return (x - running_mean[None, :]) / torch.sqrt(running_var[None, :] + self.eps)
+        
+        # Original implementation for non-compiled execution
         # Disable compilation on MPS device - it's causing issues
         if "mps" in str(x.device):
-            torch._dynamo.config.suppress_errors = True
+            if hasattr(torch, '_dynamo') and hasattr(torch._dynamo, 'config'):
+                torch._dynamo.config.suppress_errors = True
 
         # Clone to avoid in-place modifications.
         x = x.clone()
