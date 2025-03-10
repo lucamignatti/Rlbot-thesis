@@ -117,17 +117,46 @@ class BallProximityReward(ParameterizedReward):
         super().__init__(dispersion, density)
         self.negative_slope = negative_slope  # If true, reward decreases with distance
 
-    def calculate(self, agent_id, state: GameState, previous_state: Optional[GameState] = None) -> float:
-        if not state or not hasattr(state, 'ball') or not state.ball:
+    def calculate(self, agent_id, state: GameState, previous_state: Optional[GameState] = None) -> float:        
+        if not state:
+            return 0.0
+            
+        if not hasattr(state, 'ball'):
+            return 0.0
+            
+        if not state.ball:
             return 0.0
         
         # Get car data for this agent
         car_data = self._get_car_data_from_state(agent_id, state)
-        if not car_data or not hasattr(car_data, 'position'):
+        
+        if not car_data:
             return 0.0
         
+        
+        # Try different common position attributes
+        car_pos = None
+        if hasattr(car_data, 'position'):
+            car_pos = np.array(car_data.position)
+        elif hasattr(car_data, 'physics'):
+            physics = car_data.physics
+            if hasattr(physics, 'location'):
+                car_pos = np.array(physics.location)
+            elif hasattr(physics, 'position'):
+                car_pos = np.array(physics.position)
+            elif hasattr(physics, 'pos'):
+                car_pos = np.array(physics.pos)
+            elif hasattr(physics, 'x') and hasattr(physics, 'y') and hasattr(physics, 'z'):
+                car_pos = np.array([physics.x, physics.y, physics.z])
+        elif hasattr(car_data, 'location'):
+            car_pos = np.array(car_data.location)
+        elif hasattr(car_data, 'pos'):
+            car_pos = np.array(car_data.pos)
+        
+        if car_pos is None:
+            return 0.0
+                
         ball_pos = np.array(state.ball.position)
-        car_pos = np.array(car_data.position)
         
         # Calculate distance
         distance = np.linalg.norm(ball_pos - car_pos)
@@ -144,7 +173,6 @@ class BallProximityReward(ParameterizedReward):
         reward = self.apply_parameterization(normalized_distance, 1.0)
         
         return clamp_reward(reward)
-
 
 class BallToGoalDistanceReward(ParameterizedReward):
     """
@@ -360,11 +388,32 @@ class AlignBallToGoalReward(ParameterizedReward):
         
         # Get car data for this agent
         car_data = self._get_car_data_from_state(agent_id, state)
-        if not car_data or not hasattr(car_data, 'position'):
+        if not car_data:
+            return 0.0
+            
+        # Try different common position attributes
+        car_pos = None
+        if hasattr(car_data, 'position'):
+            car_pos = np.array(car_data.position)
+        elif hasattr(car_data, 'physics'):
+            physics = car_data.physics
+            if hasattr(physics, 'location'):
+                car_pos = np.array(physics.location)
+            elif hasattr(physics, 'position'):
+                car_pos = np.array(physics.position)
+            elif hasattr(physics, 'pos'):
+                car_pos = np.array(physics.pos)
+            elif hasattr(physics, 'x') and hasattr(physics, 'y') and hasattr(physics, 'z'):
+                car_pos = np.array([physics.x, physics.y, physics.z])
+        elif hasattr(car_data, 'location'):
+            car_pos = np.array(car_data.location)
+        elif hasattr(car_data, 'pos'):
+            car_pos = np.array(car_data.pos)
+            
+        if car_pos is None:
             return 0.0
         
         ball_pos = np.array(state.ball.position)
-        car_pos = np.array(car_data.position)
         goal_pos = np.array([0, self.team_goal_y, 100])
         
         # Vector from ball to goal
@@ -410,12 +459,49 @@ class PlayerVelocityTowardBallReward(BaseRewardFunction):
         
         # Get car data for this agent
         car_data = self._get_car_data_from_state(agent_id, state)
-        if not car_data or not hasattr(car_data, 'position') or not hasattr(car_data, 'linear_velocity'):
+        if not car_data:
+            return 0.0
+            
+        # Try different common position attributes
+        car_pos = None
+        if hasattr(car_data, 'position'):
+            car_pos = np.array(car_data.position)
+        elif hasattr(car_data, 'physics'):
+            physics = car_data.physics
+            if hasattr(physics, 'location'):
+                car_pos = np.array(physics.location)
+            elif hasattr(physics, 'position'):
+                car_pos = np.array(physics.position)
+            elif hasattr(physics, 'pos'):
+                car_pos = np.array(physics.pos)
+            elif hasattr(physics, 'x') and hasattr(physics, 'y') and hasattr(physics, 'z'):
+                car_pos = np.array([physics.x, physics.y, physics.z])
+        elif hasattr(car_data, 'location'):
+            car_pos = np.array(car_data.location)
+        elif hasattr(car_data, 'pos'):
+            car_pos = np.array(car_data.pos)
+            
+        # Try different common velocity attributes
+        car_vel = None
+        if hasattr(car_data, 'linear_velocity'):
+            car_vel = np.array(car_data.linear_velocity)
+        elif hasattr(car_data, 'physics'):
+            physics = car_data.physics
+            if hasattr(physics, 'velocity'):
+                car_vel = np.array(physics.velocity)
+            elif hasattr(physics, 'linear_velocity'):
+                car_vel = np.array(physics.linear_velocity)
+            elif hasattr(physics, 'vel'):
+                car_vel = np.array(physics.vel)
+        elif hasattr(car_data, 'velocity'):
+            car_vel = np.array(car_data.velocity)
+        elif hasattr(car_data, 'vel'):
+            car_vel = np.array(car_data.vel)
+            
+        if car_pos is None or car_vel is None:
             return 0.0
         
         ball_pos = np.array(state.ball.position)
-        car_pos = np.array(car_data.position)
-        car_vel = np.array(car_data.linear_velocity)
         
         # Get direction to ball
         to_ball = ball_pos - car_pos

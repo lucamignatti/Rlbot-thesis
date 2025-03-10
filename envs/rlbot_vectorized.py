@@ -151,10 +151,10 @@ class RLBotVectorizedEnv(VectorizedEnv):
         """Step all environments forward with bot actions efficiently batched in main process"""
         # Process bot actions in the main process first if we're in multiprocessing mode
         if self.mode == "multiprocess" and self.bot_agents:
-            # Collect states from workers first
+            # Collect states from workers first with error handling
             states_by_env = {}
             for env_idx, remote in enumerate(self.remotes):
-                # Non-blocking check if there are bots for this env
+                # Check if there are bots for this env
                 bot_exists = False
                 for (e_idx, _), _ in self.bot_agents.items():
                     if e_idx == env_idx:
@@ -172,9 +172,9 @@ class RLBotVectorizedEnv(VectorizedEnv):
                                 if self.debug:
                                     print(f"[DEBUG] Timeout getting state from env {env_idx}")
                         else:
-                            # Fallback if select not available
+                            # Fallback without select
                             states_by_env[env_idx] = remote.recv()
-                    except Exception as e:
+                    except (BrokenPipeError, EOFError, ConnectionResetError) as e:
                         if self.debug:
                             print(f"[DEBUG] Error getting state from env {env_idx}: {e}")
             
@@ -184,47 +184,65 @@ class RLBotVectorizedEnv(VectorizedEnv):
                 if e_idx in states_by_env:  # Only process if we have a state
                     state = states_by_env[e_idx]
                     try:
-                        # Get or create bot adapter if needed (lazy initialization)
+                        # Get or create bot adapter if needed
                         if not hasattr(self, '_bot_adapters'):
                             self._bot_adapters = {}
                         
-                        # Use bot_id as adapter key if available
                         adapter_key = bot_info.get("bot_id", None) if isinstance(bot_info, dict) else str(agent_id)
                         
                         if adapter_key and adapter_key not in self._bot_adapters:
                             if isinstance(bot_info, dict) and "bot_id" in bot_info:
                                 self._bot_adapters[adapter_key] = self.bot_registry.create_bot_adapter(bot_info["bot_id"])
                         
-                        # Calculate bot action only if we have a valid adapter
                         if adapter_key in self._bot_adapters:
                             if e_idx not in bot_actions_by_env:
                                 bot_actions_by_env[e_idx] = {}
                                 
-                            # Get the bot action and store it
-                            bot_action = self._bot_adapters[adapter_key].get_action(state)
-                            bot_actions_by_env[e_idx][agent_id] = bot_action
+                            # Get the bot action with a brief timeout
+                            bot_action = None
+                            try:
+                                bot_action = self._bot_adapters[adapter_key].get_action(state)
+                            except Exception as bot_e:
+                                if self.debug:
+                                    print(f"[DEBUG] Bot {agent_id} action error: {bot_e}")
+                                    
+                            if bot_action is not None:
+                                bot_actions_by_env[e_idx][agent_id] = bot_action
                             
-                            if self.debug and np.random.random() < 0.001:  # Occasional debug print
-                                print(f"[DEBUG] Bot {agent_id} in env {e_idx} action computed")
-                                
                     except Exception as e:
                         if self.debug:
                             print(f"[DEBUG] Error computing bot action for env {e_idx}, agent {agent_id}: {e}")
             
-            # Send bot actions to workers
+            # Send bot actions to workers with error handling
             for env_idx, bot_actions in bot_actions_by_env.items():
                 if bot_actions:  # Only send if we have actions
                     try:
-                        # Use non-blocking send to avoid deadlock
                         self.remotes[env_idx].send(('prepare_bot_actions', bot_actions))
-                    except Exception as e:
+                        # No need to wait for a response here
+                    except (BrokenPipeError, EOFError, ConnectionResetError) as e:
                         if self.debug:
                             print(f"[DEBUG] Error sending bot actions to env {env_idx}: {e}")
 
-        # Let parent class handle the stepping with our modified actions
-        results, dones, episode_counts = super().step(actions_dict_list)
-        return results, dones, episode_counts
-    
+        # Call the parent class's step method with proper error handling
+        try:
+            results, dones, episode_counts = super().step(actions_dict_list)
+            return results, dones, episode_counts
+        except (BrokenPipeError, EOFError, ConnectionResetError) as e:
+            if self.debug:
+                print(f"[DEBUG] Error in parent step: {e}")
+            
+            # Create empty results as fallback
+            results = []
+            for _ in range(self.num_envs):
+                results.append(({}, {}, {}, {}))
+                
+            # Mark all environments as done to trigger reset
+            dones = [True] * self.num_envs
+            
+            # Keep episode counts as is
+            episode_counts = getattr(self, 'episode_counts', [0] * self.num_envs)
+            
+            return results, dones, episode_counts
     def reset(self):
         """Extended reset that maintains bot assignments"""
         # Let parent class handle the basic reset

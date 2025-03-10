@@ -497,7 +497,7 @@ if __name__ == "__main__":
     training_duration.add_argument('-t', '--time', type=str, default=None,
                                   help='Training duration in format: 5m (minutes), 5h (hours), 5d (days)')
 
-    parser.add_argument('-n', '--num_envs', type=int, default=30,
+    parser.add_argument('-n', '--num_envs', type=int, default=30 if sys.platform != "darwin" else 12,
                         help='Number of parallel environments to run for faster data collection')
     parser.add_argument('--update_interval', type=int, default=3072,
                         help='Number of experiences to collect before updating the policy')

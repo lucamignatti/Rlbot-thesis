@@ -494,17 +494,89 @@ class VectorizedEnv:
                     processed_results.append((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
 
         else:  # multiprocess mode
-            # Send step command to all workers
-            for remote, actions_dict in zip(self.remotes, actions_dict_list):
-                remote.send(('step', actions_dict))
+            # Send step command to all workers with error handling
+            active_remotes = []
+            for i, (remote, actions_dict) in enumerate(zip(self.remotes, actions_dict_list)):
+                try:
+                    remote.send(('step', actions_dict))
+                    active_remotes.append((i, remote))
+                except BrokenPipeError:
+                    if self.debug:
+                        print(f"[DEBUG] Worker {i} has a broken pipe. Attempting recovery...")
+                    self.dones[i] = True  # Mark as done to trigger reset
+                    
+                    # Try to recreate this worker in the background
+                    try:
+                        # Close the broken connection if possible
+                        try:
+                            remote.close()
+                        except:
+                            pass
+                            
+                        # Create a new connection
+                        new_remote, new_work_remote = Pipe()
+                        
+                        # Create and start a new worker process
+                        process = Process(
+                            target=worker,
+                            args=(new_work_remote, get_env, False, self.action_stacker, 
+                                self.curriculum_configs[i], self.debug),
+                            daemon=True
+                        )
+                        process.start()
+                        new_work_remote.close()
+                        
+                        # Replace the old remote with the new one
+                        self.remotes[i] = new_remote
+                        self.processes[i].terminate()  # Terminate old process
+                        self.processes[i] = process
+                        
+                        # Reset this environment
+                        new_remote.send(('reset', None))
+                        if hasattr(select, 'select') and select.select([new_remote], [], [], 5.0)[0]:
+                            self.obs_dicts[i] = new_remote.recv()
+                        else:
+                            self.obs_dicts[i] = {}  # Empty dict as fallback
+                            
+                        if self.debug:
+                            print(f"[DEBUG] Worker {i} successfully recreated")
+                    except Exception as e:
+                        if self.debug:
+                            print(f"[DEBUG] Failed to recreate worker {i}: {e}")
 
             # Collect results from all workers
             results = []
             for i, remote in enumerate(self.remotes):
-                next_obs_dict, reward_dict, terminated_dict, truncated_dict = remote.recv()
+                if (i, remote) in active_remotes:
+                    try:
+                        if hasattr(select, 'select'):
+                            if select.select([remote], [], [], 10.0)[0]:  # 10-second timeout
+                                next_obs_dict, reward_dict, terminated_dict, truncated_dict = remote.recv()
+                            else:
+                                if self.debug:
+                                    print(f"[DEBUG] Worker {i} timed out during step")
+                                # Use empty results as fallback
+                                next_obs_dict, reward_dict, terminated_dict, truncated_dict = {}, {}, {True: True}, {True: True}
+                                # Mark this environment as done to trigger reset
+                                self.dones[i] = True
+                        else:
+                            # Fallback without select
+                            next_obs_dict, reward_dict, terminated_dict, truncated_dict = remote.recv()
+                    except (BrokenPipeError, EOFError, ConnectionResetError) as e:
+                        if self.debug:
+                            print(f"[DEBUG] Error receiving data from worker {i}: {e}")
+                        # Use empty results
+                        next_obs_dict, reward_dict, terminated_dict, truncated_dict = {}, {}, {True: True}, {True: True}
+                        # Mark this environment as done to trigger reset
+                        self.dones[i] = True
+                else:
+                    # For inactive workers, use empty results
+                    next_obs_dict, reward_dict, terminated_dict, truncated_dict = {}, {}, {True: True}, {True: True}
+                    self.dones[i] = True
+                
                 # Track rewards for curriculum
                 if self.curriculum_manager is not None:
-                    # FIX: Don't replace the dict, just ensure it's initialized
+                    # Ensure episode rewards dict is initialized
                     if not isinstance(self.episode_rewards[i], dict):
                         self.episode_rewards[i] = {}
                     
@@ -519,9 +591,9 @@ class VectorizedEnv:
                 # Validate agents match expected
                 config = self.curriculum_configs[i]
                 if config is None:
-                    required = len(next_obs_dict)
+                    required = len(next_obs_dict) if next_obs_dict else 0
                 else:
-                    required = config.get("required_agents", len(next_obs_dict))
+                    required = config.get("required_agents", len(next_obs_dict) if next_obs_dict else 0)
 
                 # Track success/timeout for curriculum
                 if self.dones[i]:
@@ -549,28 +621,83 @@ class VectorizedEnv:
                         new_config = self._make_config_picklable(new_config)
                         self.curriculum_configs[i] = new_config
 
-                        # Send the new curriculum configuration to the worker
-                        remote.send(('set_curriculum', new_config))
-                        remote.recv()  # Wait for acknowledgment
+                        # Send the new curriculum configuration to the worker if it's still active
+                        try:
+                            remote.send(('set_curriculum', new_config))
+                            if select.select([remote], [], [], 5.0)[0]:
+                                remote.recv()  # Wait for acknowledgment
+                        except (BrokenPipeError, EOFError):
+                            if self.debug:
+                                print(f"[DEBUG] Worker {i} failed to update curriculum - will recreate on reset")
 
                     # If done, reset the environment with retry logic
                     self.episode_counts[i] += 1
                     max_reset_attempts = 3
+                    reset_success = False
+                    
                     for attempt in range(max_reset_attempts):
-                        remote.send(('reset', None))
-                        obs = remote.recv()
-                        if len(obs) == required:
-                            self.obs_dicts[i] = obs
-                            break
-                        print(f"Reset attempt {attempt + 1} failed")
-                        if attempt == max_reset_attempts - 1:
-                            print("Max reset attempts reached")
-
-                    # Reset action stacker for all agents
-                    if self.action_stacker is not None:
+                        try:
+                            remote.send(('reset', None))
+                            if hasattr(select, 'select') and select.select([remote], [], [], 5.0)[0]:
+                                obs = remote.recv()
+                                if len(obs) == required:
+                                    self.obs_dicts[i] = obs
+                                    reset_success = True
+                                    break
+                            if self.debug:
+                                print(f"[DEBUG] Reset attempt {attempt + 1} failed or timed out")
+                        except (BrokenPipeError, EOFError) as e:
+                            if self.debug:
+                                print(f"[DEBUG] Reset attempt {attempt + 1} failed: {e}")
+                            if attempt == max_reset_attempts - 1:
+                                # Try to recreate the worker
+                                try:
+                                    # Close connections
+                                    try:
+                                        remote.close()
+                                    except:
+                                        pass
+                                        
+                                    # Create new connection
+                                    new_remote, new_work_remote = Pipe()
+                                    
+                                    # Create and start new worker
+                                    process = Process(
+                                        target=worker,
+                                        args=(new_work_remote, get_env, False, self.action_stacker, 
+                                            self.curriculum_configs[i], self.debug),
+                                        daemon=True
+                                    )
+                                    process.start()
+                                    new_work_remote.close()
+                                    
+                                    # Replace old remote with new one
+                                    self.remotes[i] = new_remote
+                                    self.processes[i].terminate()
+                                    self.processes[i] = process
+                                    
+                                    # Reset new environment
+                                    new_remote.send(('reset', None))
+                                    if hasattr(select, 'select') and select.select([new_remote], [], [], 5.0)[0]:
+                                        self.obs_dicts[i] = new_remote.recv()
+                                        reset_success = True
+                                    
+                                    if self.debug:
+                                        print(f"[DEBUG] Worker {i} successfully recreated")
+                                except Exception as e:
+                                    if self.debug:
+                                        print(f"[DEBUG] Failed to recreate worker {i}: {e}")
+                    
+                    # Reset action stacker for all agents if there's valid observation data
+                    if self.action_stacker is not None and next_obs_dict and reset_success:
                         for agent_id in next_obs_dict.keys():
-                            remote.send(('reset_action_stacker', agent_id))
-                            remote.recv()  # Wait for confirmation
+                            try:
+                                remote.send(('reset_action_stacker', agent_id))
+                                if select.select([remote], [], [], 5.0)[0]:
+                                    remote.recv()  # Wait for confirmation
+                            except (BrokenPipeError, EOFError):
+                                if self.debug:
+                                    print(f"[DEBUG] Failed to reset action stacker for agent {agent_id}")
 
                     # Reset episode tracking variables
                     self.episode_rewards[i] = {}
@@ -582,10 +709,8 @@ class VectorizedEnv:
 
                 results.append((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
 
-            processed_results = results
-
-        return processed_results, self.dones.copy(), self.episode_counts.copy()
-
+        return results, self.dones.copy(), self.episode_counts.copy()
+        
     def force_env_reset(self, env_idx):
         """Force reset a problematic environment (thread mode)"""
         if self.mode == "thread":
