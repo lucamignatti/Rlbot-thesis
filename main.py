@@ -25,17 +25,10 @@ import multiprocessing as mp
 from multiprocessing import Process, Pipe
 from typing import List, Tuple, Dict
 import numpy as np
-from curriculum import create_skill_based_curriculum
-from curriculum import CurriculumManager, CurriculumStage, ProgressionRequirements
 from envs.factory import get_env
 from envs.vectorized import VectorizedEnv
 from envs.rlbot_vectorized import RLBotVectorizedEnv
-from curriculum import (
-    create_skill_based_curriculum,
-    CurriculumManager,
-    CurriculumStage,
-    ProgressionRequirements
-)
+from curriculum import create_lucy_skg_curriculum
 
 def run_training(
     actor,
@@ -131,7 +124,7 @@ def run_training(
     # Initialize curriculum if enabled
     curriculum_manager = None
     if use_curriculum:
-        curriculum_manager = create_skill_based_curriculum(debug=debug)
+        curriculum_manager = create_lucy_skg_curriculum(debug=debug)
         curriculum_manager.register_trainer(trainer)
         if debug:
             print("[DEBUG] Curriculum learning enabled with basic curriculum")
@@ -512,9 +505,9 @@ if __name__ == "__main__":
     training_duration.add_argument('-t', '--time', type=str, default=None,
                                   help='Training duration in format: 5m (minutes), 5h (hours), 5d (days)')
 
-    parser.add_argument('-n', '--num_envs', type=int, default=int(5 * os.cpu_count()) or 4,
+    parser.add_argument('-n', '--num_envs', type=int, default=30,
                         help='Number of parallel environments to run for faster data collection')
-    parser.add_argument('--update_interval', type=int, default=4096,
+    parser.add_argument('--update_interval', type=int, default=3072,
                         help='Number of experiences to collect before updating the policy')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use for training (cuda/mps/cpu).  Autodetects if not specified.')
