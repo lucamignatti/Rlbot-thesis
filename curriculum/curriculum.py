@@ -83,7 +83,7 @@ def create_skill_based_curriculum(debug=False, use_wandb=True):
     goal_condition = GoalCondition()
     timeout_condition = TimeoutCondition(BASE_TIMEOUT)
     skill_timeout = TimeoutCondition(SKILL_TIMEOUT)
-    no_touch_timeout = NoTouchTimeoutCondition(timeout_seconds=30)
+    no_touch_timeout = NoTouchTimeoutCondition(30)  # Changed from timeout_seconds=30 to just pass the value
 
     # Stage 1: Basic Shooting
     basic_shooting = RLBotSkillStage(

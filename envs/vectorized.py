@@ -63,13 +63,7 @@ def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacke
 
         while True:
             try:
-                # Use select with timeout for safer IPC
-                if hasattr(remote, 'poll') and hasattr(select, 'select'):
-                    if not select.select([remote], [], [], 30.0)[0]:  # 30 second timeout
-                        if debug:
-                            print("[DEBUG] Worker timeout waiting for command")
-                        continue
-                
+                # Don't use select here - it can cause issues with some platforms
                 cmd, data = remote.recv()
                 
                 if cmd == 'step':
@@ -98,6 +92,7 @@ def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacke
                         try:
                             obs = env.reset()
                             reset_success = True
+                            remote.send(obs)  # Send response immediately after successful reset
                             break
                         except Exception as e:
                             if debug:
@@ -106,19 +101,9 @@ def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacke
                                 raise
                             time.sleep(0.1)  # Small delay between attempts
                     
-                    if reset_success:
-                        # Update timeout initial tick
-                        if hasattr(env, 'truncation_cond'):
-                            def set_initial_tick(cond):
-                                if isinstance(cond, TimeoutCondition):
-                                    cond.initial_tick = env.transition_engine._tick_count
-                                elif hasattr(cond, 'conditions'):
-                                    for sub_cond in cond.conditions:
-                                        set_initial_tick(sub_cond)
-                            set_initial_tick(env.truncation_cond)
-                        remote.send(obs)
-                        if debug:
-                            print(f"[DEBUG] Reset successful for {curr_config.get('stage_name', 'Unknown') if curr_config else 'Default'}")
+                    if not reset_success:
+                        # If all reset attempts failed, send empty dict
+                        remote.send({})
                 
                 elif cmd == 'set_curriculum':
                     # Update environment with new curriculum configuration
@@ -258,29 +243,76 @@ class VectorizedEnv:
                 process.start()
                 self.processes.append(process)
                 work_remote.close()
-            # Get initial observations
-            for remote in self.remotes:
-                remote.send(('reset', None))
-        
-                    
+            
+            # Initialize all environments with proper timeout handling
             self.obs_dicts = []
-            for remote in self.remotes:
-                if hasattr(remote, 'poll') and hasattr(select, 'select'):
-                    # Use select with timeout
-                    if select.select([remote], [], [], 30):  # 30 second timeout
-                        self.obs_dicts.append(remote.recv())
+            failed_workers = []
+            
+            for env_idx, remote in enumerate(self.remotes):
+                try:
+                    remote.send(('reset', None))
+                    if hasattr(remote, 'poll') and hasattr(select, 'select'):
+                        if select.select([remote], [], [], 10.0)[0]:  # 10 second timeout per worker
+                            obs = remote.recv()
+                            self.obs_dicts.append(obs)
+                            if self.debug:
+                                print(f"[DEBUG] Worker {env_idx} initialized successfully")
+                            continue
                     else:
-                        print(f"WARNING: Worker process timeout during initialization")
-                        # Create empty dict as fallback
-                        self.obs_dicts.append({})
-                        # Send termination command to worker to prevent zombie processes
-                        try:
-                            remote.send(('close', None))
-                        except:
-                            pass
-                else:
-                    # Fallback if select not available
-                    self.obs_dicts.append(remote.recv())
+                        # Fallback without select
+                        obs = remote.recv()
+                        self.obs_dicts.append(obs)
+                        continue
+                        
+                except Exception as e:
+                    if self.debug:
+                        print(f"[DEBUG] Worker {env_idx} failed to initialize: {e}")
+                
+                # If we reach here, the worker failed to initialize properly
+                failed_workers.append(env_idx)
+                self.obs_dicts.append({})  # Add empty dict as placeholder
+                
+                # Try to terminate the failed worker
+                try:
+                    if env_idx < len(self.processes):
+                        self.processes[env_idx].terminate()
+                        self.processes[env_idx].join(timeout=1.0)
+                except:
+                    pass
+            
+            # Recreate failed workers if any
+            if failed_workers and self.debug:
+                print(f"[DEBUG] Recreating {len(failed_workers)} failed workers")
+                
+            for env_idx in failed_workers:
+                try:
+                    # Create new pipe
+                    new_remote, new_work_remote = Pipe()
+                    self.remotes[env_idx] = new_remote
+                    
+                    # Create new process
+                    process = Process(
+                        target=worker,
+                        args=(new_work_remote, get_env, False, action_stacker, 
+                              self.curriculum_configs[env_idx], self.debug),
+                        daemon=True
+                    )
+                    process.start()
+                    self.processes[env_idx] = process
+                    new_work_remote.close()
+                    
+                    # Initialize the new worker
+                    new_remote.send(('reset', None))
+                    if select.select([new_remote], [], [], 10.0)[0]:
+                        self.obs_dicts[env_idx] = new_remote.recv()
+                        if self.debug:
+                            print(f"[DEBUG] Worker {env_idx} reinitialized successfully")
+                    else:
+                        if self.debug:
+                            print(f"[DEBUG] Worker {env_idx} failed to respond to reset command")
+                except Exception as e:
+                    if self.debug:
+                        print(f"[DEBUG] Failed to recreate worker {env_idx}: {e}")
 
         # Common initialization
         self.dones = [False] * num_envs

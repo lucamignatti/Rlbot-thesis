@@ -15,8 +15,9 @@ import numpy as np
 class PatchedRocketSimEngine(RocketSimEngine):
     """A patched version of RocketSimEngine that ensures car positions are never None"""
     
-    def __init__(self, rlbot_delay=True):
-        super().__init__(rlbot_delay=rlbot_delay)
+    def __init__(self):
+        # The parent class no longer accepts rlbot_delay parameter
+        super().__init__()
     
     def _set_car_state(self, car: rsim.Car, desired_car: any):
         """

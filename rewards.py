@@ -383,7 +383,7 @@ class PlayerVelocityTowardBallReward(BaseRewardFunction):
 
 
 class KRCReward(BaseRewardFunction):
-    """Key Rocket Concepts reward - combines multiple reward components"""
+    """Kinesthetic Reward Combiner - combines multiple reward components"""
     def __init__(self, reward_functions=None, team_spirit=0.0, team_goal_y=5120):
         """
         Initialize the KRC reward with customizable reward components
