@@ -125,7 +125,10 @@ def run_training(
     curriculum_manager = None
     if use_curriculum:
         curriculum_manager = create_lucy_skg_curriculum(debug=debug)
+        # Bidirectional registration for proper wandb step synchronization
         curriculum_manager.register_trainer(trainer)
+        trainer.register_curriculum_manager(curriculum_manager)
+        
         if debug:
             print("[DEBUG] Curriculum learning enabled with basic curriculum")
 
@@ -382,40 +385,29 @@ def run_training(
                         "Stage": curriculum_stats["current_stage_name"],
                         "Diff": f"{curriculum_stats['difficulty_level']:.2f}"
                     })
-
+                    
                     if use_wandb:
                         # Get current stage stats
                         current_stage_stats = curriculum_stats["current_stage_stats"]
-
+                        
                         # Use trainer's _true_training_steps as source of truth for step counting
-                        if hasattr(trainer, '_true_training_steps'):
-                            current_step = trainer._true_training_steps
-                        else:
-                            current_step = trainer.training_steps + trainer.training_step_offset
-
-                        wandb.log({
-                            # Stage progression metrics
-                            "curriculum/stage": curriculum_stats["current_stage"],
-                            "curriculum/stage_name": curriculum_stats["current_stage_name"],
-                            "curriculum/total_stages": curriculum_stats["total_stages"],
-                            "curriculum/difficulty": curriculum_stats["difficulty_level"],
-
-                            # Current stage performance metrics - use the keys that exist in the curriculum_stats
-                            "curriculum/success_rate": current_stage_stats["success_rate"],
-                            "curriculum/avg_reward": current_stage_stats["avg_reward"],
-                            "curriculum/episodes": current_stage_stats["episodes"],
-                            # Fix the successes and failures keys to match what's in the curriculum_stats dictionary
-                            "curriculum/successes": current_stage_stats.get("success_count", 0),
-                            "curriculum/failures": current_stage_stats.get("failure_count", 0),
-
-                            # Overall progress
-                            "curriculum/total_episodes": curriculum_stats["total_episodes"],
-                            "curriculum/stage_progress": float(curriculum_stats["current_stage"]) / max(1, curriculum_stats["total_stages"] - 1),
-
-                            # Combined progress metric (considers both stage and difficulty)
-                            "curriculum/total_progress": (float(curriculum_stats["current_stage"]) / max(1, curriculum_stats["total_stages"] - 1) + curriculum_stats["difficulty_level"]) / 2
-                        }, step=current_step)
-
+                        # This ensures we're using EXACTLY the same step as the trainer just used
+                        current_step = trainer._true_training_steps
+                        
+                        # Synchronize curriculum manager step counter to match trainer exactly
+                        curriculum_manager._last_wandb_step = current_step
+                        
+                        # Don't log curriculum metrics separately - the PPOTrainer.update() method 
+                        # already logs these through the synchronized step counter
+                        # This prevents duplicate/competing logging attempts
+                        
+                        # Instead, we'll update the trainer's curriculum manager reference
+                        # to ensure that it has the most up-to-date curriculum statistics
+                        # for its own logging in the next update
+                        if hasattr(trainer, 'curriculum_manager'):
+                            # Just make sure the trainer's reference is up to date
+                            trainer.curriculum_manager = curriculum_manager
+                
                 progress_bar.set_postfix(stats_dict)
 
                 collected_experiences = 0

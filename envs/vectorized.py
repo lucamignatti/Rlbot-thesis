@@ -393,7 +393,7 @@ class VectorizedEnv:
                 self.dones[env_idx] = any(terminated_dict.values()) or any(truncated_dict.values())
 
                 # Validate agents match expected
-                config = self.curriculum_configs[i]
+                config = self.curriculum_configs[env_idx]
                 if config is None:
                     required = len(next_obs_dict)
                 else:

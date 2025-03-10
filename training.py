@@ -1555,7 +1555,13 @@ class PPOTrainer:
                     # Increment before logging to maintain correct ordering
                     self._true_training_steps += 1
                     global_step = self._true_training_steps
-
+                    
+                    # Synchronize with curriculum manager if present
+                    if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None:
+                        # Update curriculum manager's step counter
+                        self.curriculum_manager._last_wandb_step = global_step
+                        
+                    # Log with synchronized step
                     wandb.log(safe_metrics, step=global_step)
 
             except Exception as e:
@@ -1737,3 +1743,17 @@ class PPOTrainer:
                 return False
             except Exception as e:
                 raise RuntimeError(f"Failed to load model: {str(e)}")
+
+    def register_curriculum_manager(self, curriculum_manager):
+        """Register a curriculum manager to synchronize wandb logging"""
+        self.curriculum_manager = curriculum_manager
+        if curriculum_manager is not None:
+            # Register this trainer with the curriculum manager
+            curriculum_manager.register_trainer(self)
+            # Initialize step counter if not present
+            if not hasattr(self, '_true_training_steps'):
+                self._true_training_steps = max(0, curriculum_manager._last_wandb_step)
+            else:
+                # Synchronize step counters
+                self._true_training_steps = max(self._true_training_steps, curriculum_manager._last_wandb_step)
+                curriculum_manager._last_wandb_step = self._true_training_steps

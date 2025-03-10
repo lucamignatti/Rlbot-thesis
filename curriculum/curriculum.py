@@ -13,7 +13,8 @@ from rlgym.rocket_league.state_mutators import KickoffMutator
 from rewards import (
     TouchBallReward, PlayerVelocityTowardBallReward, create_offensive_potential_reward,
     BallVelocityToGoalReward, TouchBallToGoalAccelerationReward, SaveBoostReward,
-    create_distance_weighted_alignment_reward, BallToGoalDistanceReward, create_lucy_skg_reward
+    create_distance_weighted_alignment_reward, BallToGoalDistanceReward, create_lucy_skg_reward, 
+    BallProximityReward
 )
 from functools import partial
 
@@ -54,11 +55,10 @@ def get_fast_aerial_ball_position():
     return np.array([x, y, z])
 
 def get_ground_dribbling_ball_position():
-    """Get ground dribbling ball position"""
-    x = np.random.uniform(-2000, 2000)
-    y = np.random.uniform(-3000, 0)  # Start in blue half for dribbling toward orange
+    x_offset = np.random.uniform(-100, 100)  # Small x variation
+    y_offset = 300  # Place ball ~300 units in front of car
     z = 93  # Ball radius + small offset
-    return np.array([x, y, z])
+    return np.array([x_offset, y_offset, z])  # Relative to car position
 
 def get_ground_dribbling_ball_velocity():
     """Get slight forward momentum for dribbling"""
@@ -165,7 +165,8 @@ def create_lucy_skg_curriculum(team_goal_y=5120, debug=False, use_wandb=True):
         base_task_reward_function=CombinedReward(
             (TouchBallReward(weight=0.05), 1.0),
             (PlayerVelocityTowardBallReward(), 0.8),
-            (create_offensive_potential_reward(team_goal_y), 1.0)
+            (create_offensive_potential_reward(team_goal_y), 1.0),
+            (BallProximityReward(), 0.25)
         ),
         base_task_termination_condition=goal_condition,
         base_task_truncation_condition=skill_timeout,

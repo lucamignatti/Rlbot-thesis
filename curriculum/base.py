@@ -271,22 +271,48 @@ class CurriculumManager:
     def _get_current_step(self) -> Optional[int]:
         """Get current training step for wandb logging"""
         if self.trainer is None:
+            # If no trainer is registered, use internal counter
+            self._last_wandb_step += 1
             return self._last_wandb_step
-        if hasattr(self.trainer, 'training_steps') and hasattr(self.trainer, 'training_step_offset'):
-            current_step = self.trainer.training_steps + self.trainer.training_step_offset
-            self._last_wandb_step = max(self._last_wandb_step, current_step)
+            
+        # Use trainer's step counter as source of truth when available
+        if hasattr(self.trainer, '_true_training_steps'):
+            # Use the true training steps counter from the trainer (most accurate)
+            return self.trainer._true_training_steps
+        elif hasattr(self.trainer, 'training_steps') and hasattr(self.trainer, 'training_step_offset'):
+            # Fall back to calculated training steps if true counter isn't available
+            return self.trainer.training_steps + self.trainer.training_step_offset
+        else:
+            # Last resort: increment internal counter if no trainer counters are available
+            self._last_wandb_step += 1
             return self._last_wandb_step
-        return self._last_wandb_step
 
     def _log_to_wandb(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
         """Centralized wandb logging with step validation"""
         if not self.use_wandb or wandb.run is None:
             return
             
+        # If step is explicitly provided, use it
+        # Otherwise get synchronized step from trainer
         current_step = step if step is not None else self._get_current_step()
-        if current_step is not None:
-            wandb.log(metrics, step=current_step)
-            self._last_wandb_step = current_step
+        
+        if current_step is None:
+            # Skip logging if we can't get a valid step
+            if self.debug:
+                print("Skipping wandb logging - couldn't get valid step")
+            return
+            
+        # Never log to a step that's less than our last step
+        if current_step <= self._last_wandb_step:
+            if self.debug:
+                print(f"Skipping wandb log for step {current_step} (≤ {self._last_wandb_step})")
+            return
+            
+        # Log with the valid step
+        wandb.log(metrics, step=current_step)
+        
+        # Remember this step for next time
+        self._last_wandb_step = current_step
 
     def get_environment_config(self) -> Dict[str, Any]:
         """
