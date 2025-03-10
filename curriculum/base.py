@@ -251,7 +251,8 @@ class CurriculumManager:
         self.total_episodes = 0
         self.current_difficulty = 0.0
         self.difficulty_increase_rate = 0.01
-        self.last_wandb_step = 0
+        # Initialize step counter
+        self._last_wandb_step = 0
 
         if max_rehearsal_stages < 0:
             raise ValueError("max_rehearsal_stages must be non-negative")
@@ -266,6 +267,26 @@ class CurriculumManager:
     def register_trainer(self, trainer) -> None:
         """Register the PPO trainer for hyperparameter adjustment."""
         self.trainer = trainer
+
+    def _get_current_step(self) -> Optional[int]:
+        """Get current training step for wandb logging"""
+        if self.trainer is None:
+            return self._last_wandb_step
+        if hasattr(self.trainer, 'training_steps') and hasattr(self.trainer, 'training_step_offset'):
+            current_step = self.trainer.training_steps + self.trainer.training_step_offset
+            self._last_wandb_step = max(self._last_wandb_step, current_step)
+            return self._last_wandb_step
+        return self._last_wandb_step
+
+    def _log_to_wandb(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
+        """Centralized wandb logging with step validation"""
+        if not self.use_wandb or wandb.run is None:
+            return
+            
+        current_step = step if step is not None else self._get_current_step()
+        if current_step is not None:
+            wandb.log(metrics, step=current_step)
+            self._last_wandb_step = current_step
 
     def get_environment_config(self) -> Dict[str, Any]:
         """
@@ -312,11 +333,8 @@ class CurriculumManager:
         current_stage.update_statistics(episode_metrics)
         self.total_episodes += 1
 
-        if self.use_wandb and wandb.run is not None and hasattr(self, 'trainer') and self.trainer is not None:
-            if hasattr(self.trainer, 'training_steps') and hasattr(self.trainer, 'training_step_offset'):
-                self.last_wandb_step = self.trainer.training_steps + self.trainer.training_step_offset
-
-            wandb.log({
+        if self.use_wandb:
+            self._log_to_wandb({
                 "curriculum/current_stage": self.current_stage_index,
                 "curriculum/stage_name": current_stage.name,
                 "curriculum/current_difficulty": self.current_difficulty,
@@ -327,7 +345,7 @@ class CurriculumManager:
                 "curriculum/overall_progress": self.get_overall_progress()["total_progress"],
                 "curriculum/episodes_in_stage": current_stage.episode_count,
                 "curriculum/consecutive_successes": current_stage.get_consecutive_successes()
-            }, step=self.last_wandb_step)
+            })
 
         if self.total_episodes % self.evaluation_window == 0:
             self._evaluate_progression()
@@ -353,11 +371,11 @@ class CurriculumManager:
                 self.current_difficulty = min(1.0, self.current_difficulty + self.difficulty_increase_rate)
 
                 if self.use_wandb and wandb.run is not None:
-                    wandb.log({
+                    self._log_to_wandb({
                         "curriculum/difficulty_increase": self.current_difficulty - old_difficulty,
                         "curriculum/current_difficulty": self.current_difficulty,
                         "curriculum/stage_name": current_stage.name
-                    }, step=self.last_wandb_step)
+                    })
 
         # Check for stage progression
         if (self.current_difficulty >= 0.95 and
@@ -429,8 +447,6 @@ class CurriculumManager:
 
         old_stage = self.stages[self.current_stage_index]
         old_stage_name = old_stage.name
-
-        # Record old stage stats
         old_stats = old_stage.get_statistics()
 
         # Progress to next stage
@@ -452,9 +468,9 @@ class CurriculumManager:
         # Apply hyperparameter adjustments
         self._adjust_hyperparameters()
 
-        # Log transition if wandb enabled
-        if self.use_wandb and wandb.run is not None:
-            wandb.log({
+        # Log transition with validated step
+        if self.use_wandb:
+            self._log_to_wandb({
                 "curriculum/stage_transition": 1.0,
                 "curriculum/from_stage": old_stage_name,
                 "curriculum/to_stage": new_stage.name,
@@ -463,22 +479,7 @@ class CurriculumManager:
                 "curriculum/completed_stage/success_rate": old_stats["success_rate"],
                 "curriculum/completed_stage/avg_reward": old_stats["avg_reward"],
                 "curriculum/completed_stage/episodes": old_stats["episodes"]
-            }, step=self.last_wandb_step)
-
-        if self.use_wandb and wandb.run is not None:
-            old_stage_obj = self.stages[self.current_stage_index - 1]
-            wandb.log({
-                "curriculum/stage_transition": 1.0,
-                "curriculum/from_stage": self.current_stage_index - 1,
-                "curriculum/to_stage": self.current_stage_index,
-                "curriculum/from_stage_name": old_stage,
-                "curriculum/to_stage_name": new_stage,
-                "curriculum/transition_episode": self.total_episodes,
-                "curriculum/total_stages": len(self.stages),
-                "curriculum/completed_stage/success_rate": old_stage_obj.moving_success_rate,
-                "curriculum/completed_stage/avg_reward": old_stage_obj.moving_avg_reward,
-                "curriculum/completed_stage/episodes": old_stage_obj.episode_count
-            }, step=self.last_wandb_step)
+            })
 
     def _adjust_hyperparameters(self) -> None:
         """Adjust training hyperparameters based on the current stage."""
@@ -501,27 +502,11 @@ class CurriculumManager:
             elif param == "entropy_coef" and hasattr(self.trainer, "entropy_coef"):
                 self.trainer.entropy_coef = value
 
-        if self.use_wandb and wandb.run is not None:
-            wandb.log({
+        if self.use_wandb:
+            self._log_to_wandb({
                 f"curriculum/hyperparams/{param}": value
                 for param, value in adjustments.items()
-            }, step=self.last_wandb_step)
-
-    def get_stage_progress(self) -> float:
-        """Get progress through current stage (0-1)"""
-        if not self.stages:
-            return 0.0
-        current = self.current_stage_index
-        return current / (len(self.stages) - 1) if len(self.stages) > 1 else 1.0
-
-    def get_overall_progress(self) -> Dict[str, float]:
-        """Get detailed progress metrics"""
-        return {
-            'stage_progress': self.get_stage_progress(),
-            'difficulty_progress': self.current_difficulty,
-            'total_progress': (self.get_stage_progress() + self.current_difficulty) / 2,
-            'episodes_completed': self.total_episodes
-        }
+            })
 
     def requires_bots(self) -> bool:
         """Check if any stage requires RLBot opponents."""
@@ -567,16 +552,16 @@ class CurriculumManager:
             stage.moving_success_rate = stage_data['moving_success_rate']
             stage.moving_avg_reward = stage_data['moving_avg_reward']
 
-        # Log the loaded curriculum state to wandb
-        if self.use_wandb and wandb.run is not None:
+        # Log the loaded curriculum state
+        if self.use_wandb:
             current_stage = self.stages[self.current_stage_index]
-            wandb.log({
+            self._log_to_wandb({
                 "curriculum/loaded_state/current_stage": self.current_stage_index,
                 "curriculum/loaded_state/stage_name": current_stage.name,
                 "curriculum/loaded_state/difficulty": self.current_difficulty,
                 "curriculum/loaded_state/total_episodes": self.total_episodes,
                 "curriculum/loaded_state/success_rate": current_stage.moving_success_rate
-            }, step=self.last_wandb_step)
+            })
 
     def get_curriculum_stats(self) -> Dict[str, Any]:
         """
@@ -595,4 +580,20 @@ class CurriculumManager:
             "current_stage_stats": current_stage_stats,
             "stage_progress": self.get_stage_progress(),
             "overall_progress": self.get_overall_progress()
+        }
+
+    def get_stage_progress(self) -> float:
+        """Get progress through current stage (0-1)"""
+        if not self.stages:
+            return 0.0
+        current = self.current_stage_index
+        return current / (len(self.stages) - 1) if len(self.stages) > 1 else 1.0
+
+    def get_overall_progress(self) -> Dict[str, float]:
+        """Get detailed progress metrics"""
+        return {
+            'stage_progress': self.get_stage_progress(),
+            'difficulty_progress': self.current_difficulty,
+            'total_progress': (self.get_stage_progress() + self.current_difficulty) / 2,
+            'episodes_completed': self.total_episodes
         }
