@@ -28,7 +28,7 @@ import numpy as np
 from envs.factory import get_env
 from envs.vectorized import VectorizedEnv
 from envs.rlbot_vectorized import RLBotVectorizedEnv
-from curriculum import create_lucy_skg_curriculum
+from curriculum import create_curriculum
 
 def run_training(
     actor,
@@ -124,7 +124,7 @@ def run_training(
     # Initialize curriculum if enabled
     curriculum_manager = None
     if use_curriculum:
-        curriculum_manager = create_lucy_skg_curriculum(debug=debug)
+        curriculum_manager = create_curriculum(debug=debug)
         # Bidirectional registration for proper wandb step synchronization
         curriculum_manager.register_trainer(trainer)
         trainer.register_curriculum_manager(curriculum_manager)

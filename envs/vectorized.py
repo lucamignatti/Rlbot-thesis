@@ -231,10 +231,13 @@ class VectorizedEnv:
             # Use multiprocessing for maximum performance when not rendering
             self.mode = "multiprocess"
             # Create communication pipes
-            self.remotes, self.work_remotes = zip(*[Pipe() for _ in range(num_envs)])
+            pipes = [Pipe() for _ in range(num_envs)]
+            self.remotes = [remote for remote, _ in pipes]  # Store as list instead of tuple
+            self.work_remotes = [work_remote for _, work_remote in pipes]  # Store as list
+            
             # Create and start worker processes
             self.processes = []
-            for idx, (work_remote, remote) in enumerate(zip(self.work_remotes, self.remotes)):
+            for idx, work_remote in enumerate(self.work_remotes):
                 process = Process(
                     target=worker,
                     args=(work_remote, get_env, False, action_stacker, self.curriculum_configs[idx], self.debug),
@@ -243,7 +246,7 @@ class VectorizedEnv:
                 process.start()
                 self.processes.append(process)
                 work_remote.close()
-            
+
             # Initialize all environments with proper timeout handling
             self.obs_dicts = []
             failed_workers = []
@@ -321,11 +324,28 @@ class VectorizedEnv:
     def _make_config_picklable(self, config):
         """Ensure valid team size configuration"""
         processed = dict(config)
-
+        
+        # Make sure state_mutator is properly constructed if it's a MutatorSequence
+        if "state_mutator" in processed and hasattr(processed["state_mutator"], "mutators"):
+            # Ensure that the MutatorSequence is properly constructed with individual mutator arguments
+            # rather than a list of mutators
+            old_mutator_sequence = processed["state_mutator"]
+            if hasattr(old_mutator_sequence, "mutators"):
+                # Create a new MutatorSequence with the individual mutators unpacked
+                from rlgym.rocket_league.state_mutators import MutatorSequence
+                mutators = old_mutator_sequence.mutators
+                processed["state_mutator"] = MutatorSequence(*mutators)
+        
         # Force required_agents field
         if "required_agents" not in processed:
-            team_mutators = [m for m in processed["state_mutator"].mutators
-                           if isinstance(m, FixedTeamSizeMutator)]
+            from rlgym.rocket_league.state_mutators import FixedTeamSizeMutator
+            team_mutators = []
+            
+            # Check if state_mutator is a MutatorSequence with mutators attribute
+            if hasattr(processed["state_mutator"], "mutators"):
+                team_mutators = [m for m in processed["state_mutator"].mutators
+                               if isinstance(m, FixedTeamSizeMutator)]
+            
             if team_mutators:
                 processed["required_agents"] = (
                     team_mutators[0].blue_size
@@ -333,7 +353,7 @@ class VectorizedEnv:
                 )
             else:
                 processed["required_agents"] = 1
-
+                
         return processed
 
     def _step_env(self, args):

@@ -14,9 +14,10 @@ from rewards import (
     TouchBallReward, PlayerVelocityTowardBallReward, create_offensive_potential_reward,
     BallVelocityToGoalReward, TouchBallToGoalAccelerationReward, SaveBoostReward,
     create_distance_weighted_alignment_reward, BallToGoalDistanceReward, create_lucy_skg_reward, 
-    BallProximityReward
+    BallProximityReward, KRCRewardFunction
 )
 from functools import partial
+from typing import Tuple, List, Dict, Any, Optional
 
 # Define position functions as regular functions instead of lambdas
 def aerial_ball_position():
@@ -139,222 +140,655 @@ def get_advanced_aerial_car_position():
 def get_ground_ball_position():
     return np.array([600 + np.random.uniform(-50, 50), np.random.uniform(-100, 100), 93])
 
-def create_lucy_skg_curriculum(team_goal_y=5120, debug=False, use_wandb=True):
-    """Create a progressive curriculum inspired by the Lucy-SKG approach"""
+def get_car_position_near_goal(team: int = 0) -> np.ndarray:
+    """Get initial car position near the goal
+    Args:
+        team: 0 for blue team (negative y), 1 for orange team (positive y)
+    Returns:
+        np.ndarray: [x, y, z] position
+    """
+    y_pos = -3000 if team == 0 else 3000
+    return np.array([0, y_pos, 17])
 
+def get_car_defensive_position(team: int = 0) -> np.ndarray:
+    """Get defensive car position
+    Args:
+        team: 0 for blue team (negative y), 1 for orange team (positive y)
+    Returns:
+        np.ndarray: [x, y, z] position
+    """
+    y_sign = -1 if team == 0 else 1
+    return np.array([
+        np.random.uniform(-200, 200),
+        np.random.uniform(4000, 4500) * y_sign,
+        17
+    ])
+
+def get_car_offensive_position(team: int = 0) -> np.ndarray:
+    """Get offensive car position
+    Args:
+        team: 0 for blue team (negative y), 1 for orange team (positive y)
+    Returns:
+        np.ndarray: [x, y, z] position
+    """
+    y_sign = -1 if team == 0 else 1
+    return np.array([
+        np.random.uniform(-1000, 1000),
+        np.random.uniform(2000, 3000) * y_sign,
+        17
+    ])
+
+def get_car_wall_position(side: str = 'left') -> np.ndarray:
+    """Get car position on wall
+    Args:
+        side: 'left' or 'right' wall
+    Returns:
+        np.ndarray: [x, y, z] position
+    """
+    x_pos = -4096 + 17 if side == 'left' else 4096 - 17
+    return np.array([x_pos, np.random.uniform(-3000, 3000), 250])
+
+def get_ball_ground_position(neutral: bool = False) -> np.ndarray:
+    """Get ball position on ground
+    Args:
+        neutral: If True, position will be in neutral field position
+    Returns:
+        np.ndarray: [x, y, z] position
+    """
+    if neutral:
+        x = np.random.uniform(-2000, 2000)
+        y = np.random.uniform(-2000, 2000)
+    else:
+        x = np.random.uniform(-3000, 3000)
+        y = np.random.uniform(-4000, 4000)
+    return np.array([x, y, 93])
+
+def get_ball_aerial_position(difficulty: str = 'basic') -> np.ndarray:
+    """Get aerial ball position
+    Args:
+        difficulty: 'basic', 'intermediate', or 'advanced'
+    Returns:
+        np.ndarray: [x, y, z] position
+    """
+    height_ranges = {
+        'basic': (300, 800),
+        'intermediate': (800, 1200),
+        'advanced': (1200, 1800)
+    }
+    min_height, max_height = height_ranges.get(difficulty, (300, 800))
+    
+    return np.array([
+        np.random.uniform(-2000, 2000),
+        np.random.uniform(-2000, 2000),
+        np.random.uniform(min_height, max_height)
+    ])
+
+def get_ball_wall_position(side: str = 'left') -> np.ndarray:
+    """Get ball position near wall
+    Args:
+        side: 'left' or 'right' wall
+    Returns:
+        np.ndarray: [x, y, z] position
+    """
+    x_pos = -4096 + 100 if side == 'left' else 4096 - 100
+    return np.array([
+        x_pos,
+        np.random.uniform(-3000, 3000),
+        np.random.uniform(500, 1000)
+    ])
+
+def get_ball_dribble_position(car_pos: np.ndarray) -> np.ndarray:
+    """Get ball position for dribbling, relative to car position
+    Args:
+        car_pos: Current car position
+    Returns:
+        np.ndarray: [x, y, z] position
+    """
+    return np.array([
+        car_pos[0] + np.random.uniform(-50, 50),
+        car_pos[1] + 300,  # Ball slightly in front of car
+        93  # Ball radius
+    ])
+
+def get_ball_shot_position(team: int = 0) -> np.ndarray:
+    """Get ball position for shooting training
+    Args:
+        team: 0 for blue team (shooting positive y), 1 for orange (shooting negative y)
+    Returns:
+        np.ndarray: [x, y, z] position
+    """
+    y_sign = 1 if team == 0 else -1
+    return np.array([
+        np.random.uniform(-1000, 1000),
+        np.random.uniform(2000, 3000) * y_sign,
+        93
+    ])
+
+def get_ball_passing_position(team: int = 0) -> np.ndarray:
+    """Get ball position for passing plays
+    Args:
+        team: 0 for blue team, 1 for orange team
+    Returns:
+        np.ndarray: [x, y, z] position
+    """
+    y_sign = 1 if team == 0 else -1
+    return np.array([
+        np.random.uniform(-2000, 2000),
+        np.random.uniform(1000, 2000) * y_sign,
+        93
+    ])
+
+def get_strategic_position(role: str = 'defense', team: int = 0) -> np.ndarray:
+    """Get strategic position based on role
+    Args:
+        role: 'defense', 'midfield', or 'offense'
+        team: 0 for blue team, 1 for orange team
+    Returns:
+        np.ndarray: [x, y, z] position
+    """
+    y_ranges = {
+        'defense': (-4500, -3500) if team == 0 else (3500, 4500),
+        'midfield': (-2000, -1000) if team == 0 else (1000, 2000),
+        'offense': (-1000, 0) if team == 0 else (0, 1000)
+    }
+    y_min, y_max = y_ranges.get(role, (-4500, -3500) if team == 0 else (3500, 4500))
+    
+    return np.array([
+        np.random.uniform(-1000, 1000),
+        np.random.uniform(y_min, y_max),
+        17
+    ])
+
+# Ball velocity functions
+def get_ball_rolling_velocity(speed_range: Tuple[float, float] = (500, 1000)) -> np.ndarray:
+    """Get velocity for rolling ball
+    Args:
+        speed_range: (min_speed, max_speed) in uu/s
+    Returns:
+        np.ndarray: [vx, vy, vz] velocity
+    """
+    speed = np.random.uniform(*speed_range)
+    angle = np.random.uniform(-np.pi, np.pi)
+    return np.array([
+        speed * np.cos(angle),
+        speed * np.sin(angle),
+        0
+    ])
+
+def get_ball_aerial_velocity(speed_range: Tuple[float, float] = (100, 500)) -> np.ndarray:
+    """Get velocity for aerial ball
+    Args:
+        speed_range: (min_speed, max_speed) in uu/s
+    Returns:
+        np.ndarray: [vx, vy, vz] velocity
+    """
+    speed = np.random.uniform(*speed_range)
+    horizontal_angle = np.random.uniform(-np.pi, np.pi)
+    vertical_angle = np.random.uniform(0, np.pi/3)  # Up to 60 degrees up
+    
+    return np.array([
+        speed * np.cos(vertical_angle) * np.cos(horizontal_angle),
+        speed * np.cos(vertical_angle) * np.sin(horizontal_angle),
+        speed * np.sin(vertical_angle)
+    ])
+
+def get_defensive_ball_position(team: int = 0) -> np.ndarray:
+    """Get ball position for defensive training
+    Args:
+        team: 0 for blue team (negative y), 1 for orange team (positive y)
+    Returns:
+        np.ndarray: [x, y, z] position
+    """
+    y_coord = -3000 if team == 0 else 3000  # Ball in defensive third
+    return np.array([
+        np.random.uniform(-2000, 2000),
+        y_coord,
+        np.random.uniform(100, 200)
+    ])
+
+def get_defensive_save_ball_position() -> np.ndarray:
+    """Get ball position for practicing goal-line saves
+    Returns:
+        np.ndarray: [x, y, z] position - positioned toward blue goal
+    """
+    return np.array([
+        np.random.uniform(-800, 800),
+        -3500,  # Ball positioned toward blue goal
+        np.random.uniform(100, 300)
+    ])
+
+def get_defensive_save_ball_velocity() -> np.ndarray:
+    """Get ball velocity for practicing goal-line saves
+    Returns:
+        np.ndarray: [vx, vy, vz] velocity - moving toward blue goal
+    """
+    return np.array([
+        np.random.uniform(-300, 300),
+        -2000,  # Ball moving toward blue goal
+        np.random.uniform(-100, 100)
+    ])
+
+def get_defensive_save_car_position() -> np.ndarray:
+    """Get car position for practicing goal-line saves
+    Returns:
+        np.ndarray: [x, y, z] position - car near blue goal
+    """
+    return np.array([
+        np.random.uniform(-500, 500),
+        -4500,  # Blue car positioned near goal
+        17
+    ])
+
+def get_offensive_ball_position() -> np.ndarray:
+    """Get ball position for offensive coordination training
+    Returns:
+        np.ndarray: [x, y, z] position - ball in orange defensive third
+    """
+    return np.array([
+        np.random.uniform(-2000, 2000),
+        3000,  # Ball in orange defensive third
+        np.random.uniform(100, 200)
+    ])
+
+# NEW: Safe ball position function moved outside create_curriculum
+def safe_ball_position():
+    """Get a safe default ball position - always valid"""
+    return np.array([0.0, 0.0, 93.0])
+
+# Replace the safe_function_wrapper with a class that can be pickled
+class SafePositionWrapper:
+    """Wrapper class for position functions to ensure they always return valid coordinates"""
+    def __init__(self, func):
+        self.func = func
+        self.default_car_position = np.array([0.0, -2000.0, 17.0], dtype=np.float32)  # Safe default car position
+        self.default_ball_position = np.array([0.0, 0.0, 93.0], dtype=np.float32)  # Safe default ball position
+    
+    def __call__(self, *args, **kwargs):
+        try:
+            # Call the wrapped function
+            result = self.func(*args, **kwargs) if callable(self.func) else self.func
+            
+            # Basic validation
+            if result is None or not isinstance(result, (np.ndarray, list, tuple)) or len(result) != 3:
+                return self.default_car_position
+                
+            # Convert to numpy array if it isn't one
+            if not isinstance(result, np.ndarray):
+                result = np.array(result, dtype=np.float32)
+            
+            # Ensure all values are finite numbers
+            if not np.all(np.isfinite(result)):
+                return self.default_car_position
+                
+            # Ensure proper type
+            result = result.astype(np.float32)
+            
+            # Basic position validation
+            if result[2] < 17.0:  # Car can't be below ground
+                result[2] = 17.0
+                
+            # Clamp positions to field bounds
+            result[0] = np.clip(result[0], -4096, 4096)  # X bounds
+            result[1] = np.clip(result[1], -5120, 5120)  # Y bounds
+            result[2] = np.clip(result[2], 17, 2044)     # Z bounds
+            
+            return result
+        except:
+            return self.default_car_position
+
+def create_curriculum(debug=False):
     # Basic constants
-    SKILL_TIMEOUT = 20  # seconds for skill training
-    BASE_TIMEOUT = 300  # full match time
+    SHORT_TIMEOUT = 8  # seconds for short skill training
+    MED_TIMEOUT = 15   # medium timeout for more complex skills
+    LONG_TIMEOUT = 20  # longer timeout for team coordination
+    MATCH_TIMEOUT = 300  # full match time
     
     # Common conditions
     goal_condition = GoalCondition()
-    timeout_condition = TimeoutCondition(BASE_TIMEOUT)
-    skill_timeout = TimeoutCondition(SKILL_TIMEOUT)
-    no_touch_timeout = NoTouchTimeoutCondition(10)
+    short_timeout = TimeoutCondition(SHORT_TIMEOUT)
+    med_timeout = TimeoutCondition(MED_TIMEOUT)
+    long_timeout = TimeoutCondition(LONG_TIMEOUT)
+    match_timeout = TimeoutCondition(MATCH_TIMEOUT)
+    no_touch_timeout = NoTouchTimeoutCondition(4)  # Time without touching ball
     
+    # Create the base task mutators list
+    base_task_mutators = MutatorSequence(
+        FixedTeamSizeMutator(1),
+        BallPositionMutator(position_function=safe_ball_position),
+        BallVelocityMutator(lambda: np.zeros(3))
+    )
     
-    # ======== STAGE 1: BALL CONTROL FUNDAMENTALS ========
-    # Focus on basic touch and control with KRC rewards
-    ball_control = RLBotSkillStage(
-        name="Ball Control Fundamentals",
+    base_task_reward_function = KRCRewardFunction([
+        BallProximityReward(),
+        BallToGoalDistanceReward(team_goal_y=5120),
+        TouchBallReward(),
+        BallVelocityToGoalReward(team_goal_y=5120),
+        create_distance_weighted_alignment_reward(5120)
+    ])
+    
+    # ======== STAGE 1: MOVEMENT FOUNDATIONS ========
+    movement_foundations = RLBotSkillStage(
+        name="Movement Foundations",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
-            BallPositionMutator(get_ground_ball_position),  # Ball on ground
-            CarPositionMutator(car_id=0, position_function=partial(create_position, 100, -2000, 17))
+            CarPositionMutator(car_id=0, position_function=SafePositionWrapper(get_strategic_car_position)),
+            BallPositionMutator(position_function=SafePositionWrapper(safe_ball_position))
         ),
         base_task_reward_function=CombinedReward(
-            (TouchBallReward(weight=0.05), 1.0),
+            (BallProximityReward(dispersion=1.0), 1.0),
             (PlayerVelocityTowardBallReward(), 0.8),
-            (create_offensive_potential_reward(team_goal_y), 1.0),
-            (BallProximityReward(), 0.25)
+            (SaveBoostReward(weight=0.5), 0.3)
         ),
         base_task_termination_condition=goal_condition,
-        base_task_truncation_condition=skill_timeout,
+        base_task_truncation_condition=short_timeout,
         progression_requirements=ProgressionRequirements(
-            min_success_rate=0.7,
-            min_avg_reward=0.4,
-            min_episodes=100,
+            min_success_rate=0.85,
+            min_avg_reward=0.5,
+            min_episodes=50,
+            max_std_dev=1.0,
+            required_consecutive_successes=3
+        )
+    )
+    
+    # ======== STAGE 2: BALL ENGAGEMENT ========
+    ball_engagement = RLBotSkillStage(
+        name="Ball Engagement",
+        base_task_state_mutator=MutatorSequence(
+            FixedTeamSizeMutator(blue_size=1, orange_size=0),
+            BallPositionMutator(position_function=get_ground_ball_position),
+            CarPositionMutator(car_id=0, position_function=partial(create_position, 0, -2000, 17))
+        ),
+        base_task_reward_function=KRCRewardFunction([
+            (BallProximityReward(dispersion=0.8), 0.8),
+            (TouchBallReward(weight=0.3), 0.3),
+            (TouchBallToGoalAccelerationReward(team_goal_y=5120, weight=0.5), 0.5)
+        ], team_spirit=0.0),
+        base_task_termination_condition=goal_condition,
+        base_task_truncation_condition=short_timeout,
+        progression_requirements=ProgressionRequirements(
+            min_success_rate=0.8,
+            min_avg_reward=0.6,
+            min_episodes=75,
             max_std_dev=1.5,
             required_consecutive_successes=3
         )
     )
-
-    # ======== STAGE 2: DIRECTIONAL SHOOTING ========
-    # Learn to hit the ball toward the goal using Distance-weighted Alignment KRC
-    directional_shooting = RLBotSkillStage(
-        name="Directional Shooting",
+    
+    # ======== STAGE 3: BALL CONTROL & DIRECTION ========
+    ball_control = RLBotSkillStage(
+        name="Ball Control & Direction",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
-            BallTowardGoalSpawnMutator(offensive_team=0, distance_from_goal=0.6),
-            CarPositionMutator(car_id=0, position_function=get_directional_shooting_car_position)
+            BallPositionMutator(position_function=get_ground_ball_position),
+            CarPositionMutator(car_id=0, position_function=partial(create_position, 0, -2500, 17))
         ),
-        base_task_reward_function=CombinedReward(
-            (TouchBallReward(weight=0.05), 0.5),
-            (BallVelocityToGoalReward(team_goal_y=team_goal_y, weight=0.8), 1.0),
-            (TouchBallToGoalAccelerationReward(team_goal_y=team_goal_y, weight=0.25), 1.5),
-            (create_distance_weighted_alignment_reward(team_goal_y), 2.0)
-        ),
+        base_task_reward_function=KRCRewardFunction([
+            (TouchBallReward(weight=0.2), 0.2),
+            (BallVelocityToGoalReward(team_goal_y=5120, weight=0.6), 0.6),
+            (TouchBallToGoalAccelerationReward(team_goal_y=5120, weight=0.3), 0.3)
+        ], team_spirit=0.0),
         base_task_termination_condition=goal_condition,
-        base_task_truncation_condition=skill_timeout,
+        base_task_truncation_condition=TimeoutCondition(10),
+        progression_requirements=ProgressionRequirements(
+            min_success_rate=0.65,
+            min_avg_reward=0.4,
+            min_episodes=100,
+            max_std_dev=1.8,
+            required_consecutive_successes=2
+        )
+    )
+    
+    # ======== STAGE 4: SHOOTING FUNDAMENTALS ========
+    shooting_mutators = MutatorSequence(
+        FixedTeamSizeMutator(blue_size=1, orange_size=0),
+        BallTowardGoalSpawnMutator(offensive_team=0, distance_from_goal=0.75),
+        CarPositionMutator(car_id=0, position_function=get_directional_shooting_car_position)
+    )
+    
+    shooting_fundamentals = RLBotSkillStage(
+        name="Shooting Fundamentals",
+        base_task_state_mutator=shooting_mutators,
+        base_task_reward_function=KRCRewardFunction([
+            (BallVelocityToGoalReward(team_goal_y=5120, weight=0.7), 0.7),
+            (TouchBallToGoalAccelerationReward(team_goal_y=5120, weight=0.3), 0.3),
+            (create_distance_weighted_alignment_reward(5120), 1.0)
+        ], team_spirit=0.0),
+        base_task_termination_condition=goal_condition,
+        base_task_truncation_condition=short_timeout,
         progression_requirements=ProgressionRequirements(
             min_success_rate=0.6,
             min_avg_reward=0.5,
-            min_episodes=150,
+            min_episodes=125,
             max_std_dev=1.8,
-            required_consecutive_successes=3
+            required_consecutive_successes=2
         )
     )
-
-    # ======== STAGE 3: AERIAL FUNDAMENTALS ========
-    # Basic aerial control using both offensive potential and alignment
-    aerial_fundamentals = RLBotSkillStage(
-        name="Aerial Fundamentals",
+    
+    # ======== STAGE 5: WALL & AIR MECHANICS ========
+    wall_air_mechanics = RLBotSkillStage(
+        name="Wall & Air Mechanics",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
-            BallPositionMutator(get_aerial_ball_position),
-            CarBoostMutator(boost_amount=100),
+            BallPositionMutator(position_function=get_aerial_ball_position),
+            CarBoostMutator(boost_amount=50),
             CarPositionMutator(car_id=0, position_function=get_aerial_car_position)
         ),
-        base_task_reward_function=CombinedReward(
-            (TouchBallReward(weight=0.05), 1.0),
-            (BallVelocityToGoalReward(team_goal_y=team_goal_y, weight=0.8), 1.0),
-            (SaveBoostReward(weight=0.5), 0.5),
-            (create_offensive_potential_reward(team_goal_y), 1.5)
-        ),
+        base_task_reward_function=KRCRewardFunction([
+            (TouchBallReward(weight=0.2), 0.2),
+            (SaveBoostReward(weight=0.3), 0.3),
+            (BallVelocityToGoalReward(team_goal_y=5120, weight=0.5), 0.5)
+        ], team_spirit=0.0),
         base_task_termination_condition=goal_condition,
-        base_task_truncation_condition=TimeoutCondition(15),
+        base_task_truncation_condition=short_timeout,
         progression_requirements=ProgressionRequirements(
-            min_success_rate=0.5,
+            min_success_rate=0.55,
             min_avg_reward=0.4,
-            min_episodes=200,
+            min_episodes=150,
             max_std_dev=2.0,
             required_consecutive_successes=2
         )
     )
-
-    # ======== STAGE 4: STRATEGIC POSITIONING ========
-    # Focus on ball-to-goal distance and positioning with KRCs
-    strategic_positioning = RLBotSkillStage(
-        name="Strategic Positioning",
+    
+    # ======== STAGE 6: BEGINNING TEAM PLAY (2v0) ========
+    beginning_team_play = RLBotSkillStage(
+        name="Beginning Team Play",
         base_task_state_mutator=MutatorSequence(
-            FixedTeamSizeMutator(blue_size=1, orange_size=1),  # Add opponent
-            BallPositionMutator(get_strategic_ball_position),
-            CarPositionMutator(car_id=0, position_function=get_strategic_car_position)
+            FixedTeamSizeMutator(blue_size=2, orange_size=0),
+            BallPositionMutator(position_function=get_strategic_ball_position)
         ),
-        base_task_reward_function=CombinedReward(
-            (BallToGoalDistanceReward(
-                team_goal_y=team_goal_y,
-                offensive_dispersion=0.6, 
-                defensive_dispersion=0.4,
-                offensive_density=1.0,
-                defensive_density=1.0
-            ), 2.0),
-            (SaveBoostReward(weight=0.5), 0.5),
-            (create_distance_weighted_alignment_reward(team_goal_y), 1.0),
-            (create_offensive_potential_reward(team_goal_y), 1.0)
-        ),
+        base_task_reward_function=KRCRewardFunction([
+            (create_offensive_potential_reward(5120), 0.7),
+            (TouchBallReward(weight=0.5), 0.5),
+            (BallVelocityToGoalReward(team_goal_y=5120, weight=0.5), 0.5)
+        ], team_spirit=0.7),  # Higher team spirit for team play
         base_task_termination_condition=goal_condition,
-        base_task_truncation_condition=timeout_condition,
-        bot_skill_ranges={(0.0, 0.3): 0.7, (0.3, 0.6): 0.3},  # Easy opponents
+        base_task_truncation_condition=med_timeout,
         progression_requirements=ProgressionRequirements(
-            min_success_rate=0.6,
-            min_avg_reward=0.5,
-            min_episodes=200,
+            min_success_rate=0.55,
+            min_avg_reward=0.4,
+            min_episodes=125,
             max_std_dev=2.0,
-            required_consecutive_successes=3
-        )
-    )
-
-    # ======== STAGE 5: ADVANCED AERIALS ========
-    # Complex aerial control with full reward system
-    advanced_aerials = RLBotSkillStage(
-        name="Advanced Aerials",
-        base_task_state_mutator=MutatorSequence(
-            FixedTeamSizeMutator(blue_size=1, orange_size=0),
-            BallPositionMutator(get_advanced_aerial_ball_position),
-            BallVelocityMutator(get_advanced_aerial_ball_velocity),
-            CarBoostMutator(boost_amount=100),
-            CarPositionMutator(car_id=0, position_function=get_advanced_aerial_car_position)
-        ),
-        base_task_reward_function=CombinedReward(
-            (TouchBallReward(weight=0.05), 0.5),
-            (BallVelocityToGoalReward(team_goal_y=team_goal_y, weight=0.8), 1.5),
-            (TouchBallToGoalAccelerationReward(team_goal_y=team_goal_y, weight=0.25), 2.0),
-            (SaveBoostReward(weight=0.5), 0.3),
-            (create_offensive_potential_reward(team_goal_y), 1.0)
-        ),
-        base_task_termination_condition=goal_condition,
-        base_task_truncation_condition=TimeoutCondition(18),
-        progression_requirements=ProgressionRequirements(
-            min_success_rate=0.4,
-            min_avg_reward=0.3,
-            min_episodes=250, 
-            max_std_dev=2.5,
             required_consecutive_successes=2
         )
     )
-
-    # ======== STAGE 6: COMPETITIVE PLAY ========
-    # Full game with opponents using the complete Lucy-SKG reward structure
-    competitive_play = RLBotSkillStage(
-        name="Competitive Play",
+    
+    # ======== STAGE 7: DEFENSE & GOAL-LINE SAVES ========
+    defense = RLBotSkillStage(
+        name="Defense & Goal-line Saves",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=1),
-            KickoffMutator()  # Use standard kickoffs for proper matches
+            BallPositionMutator(position_function=get_defensive_save_ball_position),
+            BallVelocityMutator(velocity_function=get_defensive_save_ball_velocity),
+            CarPositionMutator(car_id=0, position_function=get_defensive_save_car_position)
         ),
-        base_task_reward_function=create_lucy_skg_reward(team_goal_y),
+        base_task_reward_function=KRCRewardFunction([
+            (SaveBoostReward(weight=0.5), 0.5),
+            (TouchBallReward(weight=0.7), 0.7),
+            (BallVelocityToGoalReward(team_goal_y=-5120, weight=0.4), 0.4)
+        ], team_spirit=0.0),
         base_task_termination_condition=goal_condition,
-        base_task_truncation_condition=timeout_condition,
-        bot_skill_ranges={(0.3, 0.7): 0.6, (0.7, 1.0): 0.4},  # Moderate to challenging opponents
+        base_task_truncation_condition=TimeoutCondition(10),
+        bot_skill_ranges={(0.2, 0.4): 1.0},
         progression_requirements=ProgressionRequirements(
             min_success_rate=0.6,
             min_avg_reward=0.4,
-            min_episodes=300,
+            min_episodes=150,
             max_std_dev=2.0,
-            required_consecutive_successes=3
+            required_consecutive_successes=2
         )
     )
-
-    # ======== STAGE 7: TEAM PLAY ========
-    # 2v2 play with team spirit and full Lucy-SKG rewards
-    team_play = RLBotSkillStage(
-        name="Team Play",
+    
+    # ======== STAGE 8: INTERMEDIATE BALL CONTROL ========
+    # Focus on close ball control and dribbling setup
+    intermediate_ball_control = RLBotSkillStage(
+        name="Intermediate Ball Control",
         base_task_state_mutator=MutatorSequence(
-            FixedTeamSizeMutator(blue_size=2, orange_size=2),  # 2v2 format
-            KickoffMutator()
+            FixedTeamSizeMutator(blue_size=1, orange_size=0),
+            BallPositionMutator(position_function=get_ground_dribbling_ball_position),
+            BallVelocityMutator(velocity_function=get_ground_dribbling_ball_velocity),
+            CarPositionMutator(car_id=0, position_function=partial(create_position, 0, -2800, 17)),
+            CarBoostMutator(boost_amount=50)
         ),
-        base_task_reward_function=create_lucy_skg_reward(team_goal_y),  # Full Lucy-SKG reward
+        base_task_reward_function=KRCRewardFunction([
+            (BallProximityReward(dispersion=0.5), 0.6),  # Keep ball close
+            (PlayerVelocityTowardBallReward(), 0.4),
+            (BallVelocityToGoalReward(team_goal_y=5120, weight=0.4), 0.4)
+        ], team_spirit=0.0),
         base_task_termination_condition=goal_condition,
-        base_task_truncation_condition=timeout_condition,
-        bot_skill_ranges={(0.5, 1.0): 1.0},  # Challenging opponents only
+        base_task_truncation_condition=TimeoutCondition(12),
         progression_requirements=ProgressionRequirements(
             min_success_rate=0.5,
+            min_avg_reward=0.4,
+            min_episodes=175,
+            max_std_dev=2.0,
+            required_consecutive_successes=2
+        )
+    )
+    
+    # ======== STAGE 9: 2v2 DEFENSIVE ROTATION ========
+    # Focus on team defense and rotation
+    defensive_rotation = RLBotSkillStage(
+        name="2v2 Defensive Rotation",
+        base_task_state_mutator=MutatorSequence(
+            FixedTeamSizeMutator(blue_size=2, orange_size=2),
+            BallPositionMutator(position_function=get_defensive_ball_position)
+        ),
+        base_task_reward_function=KRCRewardFunction([
+            (BallVelocityToGoalReward(team_goal_y=-5120, weight=0.6), 0.6),
+            (TouchBallReward(weight=0.5), 0.5),
+            (create_offensive_potential_reward(5120), 0.6)
+        ], team_spirit=0.7),
+        base_task_termination_condition=goal_condition,
+        base_task_truncation_condition=long_timeout,
+        bot_skill_ranges={(0.3, 0.5): 1.0},
+        progression_requirements=ProgressionRequirements(
+            min_success_rate=0.55,
+            min_avg_reward=0.4,
+            min_episodes=175,
+            max_std_dev=2.0,
+            required_consecutive_successes=2
+        )
+    )
+    
+    # ======== STAGE 10: 2v2 OFFENSIVE COORDINATION ========
+    # Focus on team offense and passing
+    offensive_coordination = RLBotSkillStage(
+        name="2v2 Offensive Coordination", 
+        base_task_state_mutator=MutatorSequence(
+            FixedTeamSizeMutator(blue_size=2, orange_size=2),
+            BallPositionMutator(position_function=get_offensive_ball_position)
+        ),
+        base_task_reward_function=KRCRewardFunction([
+            (BallVelocityToGoalReward(team_goal_y=5120, weight=0.7), 0.7),
+            (TouchBallReward(weight=0.5), 0.5),
+            (create_offensive_potential_reward(5120), 0.6),
+            (TouchBallToGoalAccelerationReward(team_goal_y=5120, weight=0.6), 0.6)
+        ], team_spirit=0.7),
+        base_task_termination_condition=goal_condition,
+        base_task_truncation_condition=long_timeout,
+        bot_skill_ranges={(0.3, 0.5): 1.0},
+        progression_requirements=ProgressionRequirements(
+            min_success_rate=0.5,
+            min_avg_reward=0.4,
+            min_episodes=200,
+            max_std_dev=2.0,
+            required_consecutive_successes=2
+        )
+    )
+    
+    # ======== STAGE 11: INTERMEDIATE AERIALS & WALL PLAY ========
+    # Focus on more complex aerial mechanics and wall plays
+    intermediate_aerials = RLBotSkillStage(
+        name="Intermediate Aerials & Wall Play",
+        base_task_state_mutator=MutatorSequence(
+            FixedTeamSizeMutator(blue_size=1, orange_size=0),
+            BallPositionMutator(position_function=get_advanced_aerial_ball_position),
+            BallVelocityMutator(velocity_function=get_advanced_aerial_ball_velocity),
+            CarPositionMutator(car_id=0, position_function=get_advanced_aerial_car_position),
+            CarBoostMutator(boost_amount=75)
+        ),
+        base_task_reward_function=KRCRewardFunction([
+            (TouchBallReward(weight=0.2), 0.2),
+            (BallVelocityToGoalReward(team_goal_y=5120, weight=0.4), 0.4),
+            (SaveBoostReward(weight=0.4), 0.4),
+            (TouchBallToGoalAccelerationReward(team_goal_y=5120, weight=0.6), 0.6)
+        ], team_spirit=0.0),
+        base_task_termination_condition=goal_condition,
+        base_task_truncation_condition=TimeoutCondition(10),
+        progression_requirements=ProgressionRequirements(
+            min_success_rate=0.45,
             min_avg_reward=0.3,
-            min_episodes=300,
+            min_episodes=200,
             max_std_dev=2.5,
             required_consecutive_successes=2
         )
     )
-
+    
+    # ======== STAGE 12: FULL 2v2 INTEGRATION ========
+    # Focus on complete 2v2 match play
+    full_2v2_integration = RLBotSkillStage(
+        name="Full 2v2 Integration",
+        base_task_state_mutator=MutatorSequence(
+            FixedTeamSizeMutator(blue_size=2, orange_size=2),
+            KickoffMutator()
+        ),
+        base_task_reward_function=create_lucy_skg_reward(5120),
+        base_task_termination_condition=goal_condition,
+        base_task_truncation_condition=match_timeout,
+        bot_skill_ranges={(0.4, 0.6): 0.7, (0.6, 0.7): 0.3},
+        progression_requirements=ProgressionRequirements(
+            min_success_rate=0.55,
+            min_avg_reward=0.3,
+            min_episodes=250,
+            max_std_dev=2.5,
+            required_consecutive_successes=2
+        )
+    )
+    
     # Create the full curriculum
     stages = [
+        movement_foundations,
+        ball_engagement,
         ball_control,
-        directional_shooting,
-        aerial_fundamentals,
-        strategic_positioning,
-        advanced_aerials,
-        competitive_play,
-        team_play
+        shooting_fundamentals,
+        wall_air_mechanics,
+        beginning_team_play,
+        defense,
+        intermediate_ball_control,
+        defensive_rotation,
+        offensive_coordination,
+        intermediate_aerials,
+        full_2v2_integration
     ]
-
+    
     curriculum_manager = CurriculumManager(
         stages=stages,
-        progress_thresholds={"success_rate": 0.6, "avg_reward": 0.5},
-        max_rehearsal_stages=2,  # Revisit up to 2 previous stages
-        rehearsal_decay_factor=0.6,  # Higher weight for more recent stages
+        progress_thresholds={"success_rate": 0.6, "avg_reward": 0.4},
+        max_rehearsal_stages=3,  # Revisit up to 3 previous stages to prevent skill degradation
+        rehearsal_decay_factor=0.7,  # Higher weight for more recent stages
         evaluation_window=50,
         debug=debug,
-        use_wandb=use_wandb
+        use_wandb=True
     )
-
+    
     return curriculum_manager
