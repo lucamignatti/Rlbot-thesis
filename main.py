@@ -859,7 +859,7 @@ if __name__ == "__main__":
             'training_step': getattr(trainer, '_true_training_steps', 0),
             'wandb_run_id': wandb.run.id if args.wandb and wandb.run else None
         }
-        trainer.save_models(output_path, metadata)
+        saved_path = trainer.save_models(output_path, metadata)  # Capture the returned path
         print(f"Training complete - Model saved to {saved_path} at step {metadata['training_step']}")
     else:
         print("Training failed - no model saved.")
