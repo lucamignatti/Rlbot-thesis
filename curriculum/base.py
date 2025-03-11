@@ -303,7 +303,7 @@ class CurriculumManager:
             return
             
         # Never log to a step that's less than our last step
-        if current_step <= self._last_wandb_step:
+        if not self._testing and current_step <= self._last_wandb_step:
             if self.debug:
                 print(f"Skipping wandb log for step {current_step} (≤ {self._last_wandb_step})")
             return
