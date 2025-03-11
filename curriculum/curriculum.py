@@ -137,7 +137,7 @@ def get_advanced_aerial_car_position():
     ])
 
 def get_ground_ball_position():
-    return np.array([0, 0, 93])
+    return np.array([600 + np.random.uniform(-50, 50), np.random.uniform(-100, 100), 93])
 
 def create_lucy_skg_curriculum(team_goal_y=5120, debug=False, use_wandb=True):
     """Create a progressive curriculum inspired by the Lucy-SKG approach"""

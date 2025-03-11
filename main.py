@@ -287,7 +287,18 @@ def run_training(
 
             # Process the results from each environment.
             exp_idx = 0  # Index into our experience buffer.
-            for env_idx, (next_obs_dict, reward_dict, terminated_dict, truncated_dict) in enumerate(results):
+            for env_idx, result in enumerate(results):
+                # Handle both threading and multiprocessing return formats
+                if isinstance(result, tuple):
+                    if len(result) == 5:  # Thread mode: (env_idx, obs, rewards, terminated, truncated)
+                        _, next_obs_dict, reward_dict, terminated_dict, truncated_dict = result
+                    else:  # Multiprocessing mode: (obs, rewards, terminated, truncated)
+                        next_obs_dict, reward_dict, terminated_dict, truncated_dict = result
+                else:
+                    if debug:
+                        print(f"[DEBUG] Unexpected result type: {type(result)}")
+                    continue
+                    
                 for agent_id in reward_dict.keys():  # Use reward_dict to ensure we get the correct agent ID.
                     # Get the actual reward and done flag for this agent in this environment.
                     reward = reward_dict[agent_id]
