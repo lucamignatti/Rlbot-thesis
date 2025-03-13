@@ -404,37 +404,37 @@ class SafePositionWrapper:
         self.default_ball_position = np.array([0.0, 0.0, 93.0], dtype=np.float32)  # Safe default ball position
     
     def __call__(self, *args, **kwargs):
+        """Call the wrapped function and ensure it returns valid coordinates"""
         try:
-            # Call the wrapped function
-            result = self.func(*args, **kwargs) if callable(self.func) else self.func
+            # Call the wrapped function to get position
+            position = self.func(*args, **kwargs)
             
-            # Basic validation
-            if result is None or not isinstance(result, (np.ndarray, list, tuple)) or len(result) != 3:
+            # Ensure position is a numpy array
+            if not isinstance(position, np.ndarray):
+                position = np.array(position, dtype=np.float32)
+                
+            # Check if position contains NaN or infinite values
+            if np.isnan(position).any() or np.isinf(position).any():
+                # Determine appropriate default based on context clues in function name
+                if 'car' in self.func.__name__.lower():
+                    return self.default_car_position
+                else:
+                    return self.default_ball_position
+                    
+            # If position seems valid, return it
+            return position
+            
+        except Exception as e:
+            # If any exception occurs, fall back to default position
+            if 'car' in self.func.__name__.lower():
                 return self.default_car_position
-                
-            # Convert to numpy array if it isn't one
-            if not isinstance(result, np.ndarray):
-                result = np.array(result, dtype=np.float32)
-            
-            # Ensure all values are finite numbers
-            if not np.all(np.isfinite(result)):
-                return self.default_car_position
-                
-            # Ensure proper type
-            result = result.astype(np.float32)
-            
-            # Basic position validation
-            if result[2] < 17.0:  # Car can't be below ground
-                result[2] = 17.0
-                
-            # Clamp positions to field bounds
-            result[0] = np.clip(result[0], -4096, 4096)  # X bounds
-            result[1] = np.clip(result[1], -5120, 5120)  # Y bounds
-            result[2] = np.clip(result[2], 17, 2044)     # Z bounds
-            
-            return result
-        except:
-            return self.default_car_position
+            else:
+                return self.default_ball_position
+    
+    def __str__(self):
+        """Return a string representation of the position"""
+        result = self()
+        return f"Position: {result}"
 
 def create_curriculum(debug=False):
     # Basic constants
@@ -471,7 +471,7 @@ def create_curriculum(debug=False):
         name="Movement Foundations",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
-            CarPositionMutator(car_id=0, position_function=SafePositionWrapper(get_strategic_car_position)),
+            CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(get_strategic_car_position)),
             BallPositionMutator(position_function=SafePositionWrapper(safe_ball_position))
         ),
         base_task_reward_function=CombinedReward(
@@ -496,7 +496,7 @@ def create_curriculum(debug=False):
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
             BallPositionMutator(position_function=get_ground_ball_position),
-            CarPositionMutator(car_id=0, position_function=partial(create_position, 0, -2000, 17))
+            CarPositionMutator(car_id="blue-0", position_function=partial(create_position, 0, -2000, 17))
         ),
         base_task_reward_function=KRCRewardFunction([
             (BallProximityReward(dispersion=0.8), 0.8),
@@ -520,7 +520,7 @@ def create_curriculum(debug=False):
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
             BallPositionMutator(position_function=get_ground_ball_position),
-            CarPositionMutator(car_id=0, position_function=partial(create_position, 0, -2500, 17))
+            CarPositionMutator(car_id="blue-0", position_function=partial(create_position, 0, -2500, 17))
         ),
         base_task_reward_function=KRCRewardFunction([
             (TouchBallReward(weight=0.2), 0.2),
@@ -542,7 +542,7 @@ def create_curriculum(debug=False):
     shooting_mutators = MutatorSequence(
         FixedTeamSizeMutator(blue_size=1, orange_size=0),
         BallTowardGoalSpawnMutator(offensive_team=0, distance_from_goal=0.75),
-        CarPositionMutator(car_id=0, position_function=get_directional_shooting_car_position)
+        CarPositionMutator(car_id="blue-0", position_function=get_directional_shooting_car_position)
     )
     
     shooting_fundamentals = RLBotSkillStage(
@@ -571,7 +571,7 @@ def create_curriculum(debug=False):
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
             BallPositionMutator(position_function=get_aerial_ball_position),
             CarBoostMutator(boost_amount=50),
-            CarPositionMutator(car_id=0, position_function=get_aerial_car_position)
+            CarPositionMutator(car_id="blue-0", position_function=get_aerial_car_position)
         ),
         base_task_reward_function=KRCRewardFunction([
             (TouchBallReward(weight=0.2), 0.2),
@@ -619,7 +619,7 @@ def create_curriculum(debug=False):
             FixedTeamSizeMutator(blue_size=1, orange_size=1),
             BallPositionMutator(position_function=get_defensive_save_ball_position),
             BallVelocityMutator(velocity_function=get_defensive_save_ball_velocity),
-            CarPositionMutator(car_id=0, position_function=get_defensive_save_car_position)
+            CarPositionMutator(car_id="blue-0", position_function=get_defensive_save_car_position)
         ),
         base_task_reward_function=KRCRewardFunction([
             (SaveBoostReward(weight=0.5), 0.5),
@@ -646,7 +646,7 @@ def create_curriculum(debug=False):
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
             BallPositionMutator(position_function=get_ground_dribbling_ball_position),
             BallVelocityMutator(velocity_function=get_ground_dribbling_ball_velocity),
-            CarPositionMutator(car_id=0, position_function=partial(create_position, 0, -2800, 17)),
+            CarPositionMutator(car_id="blue-0", position_function=partial(create_position, 0, -2800, 17)),
             CarBoostMutator(boost_amount=50)
         ),
         base_task_reward_function=KRCRewardFunction([
@@ -724,7 +724,7 @@ def create_curriculum(debug=False):
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
             BallPositionMutator(position_function=get_advanced_aerial_ball_position),
             BallVelocityMutator(velocity_function=get_advanced_aerial_ball_velocity),
-            CarPositionMutator(car_id=0, position_function=get_advanced_aerial_car_position),
+            CarPositionMutator(car_id="blue-0", position_function=get_advanced_aerial_car_position),
             CarBoostMutator(boost_amount=75)
         ),
         base_task_reward_function=KRCRewardFunction([

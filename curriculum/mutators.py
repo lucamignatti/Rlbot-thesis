@@ -44,15 +44,13 @@ class BallVelocityMutator(StateMutator):
 
 class CarPositionMutator(StateMutator):
     """Sets a car's position using a callback function"""
-    def __init__(self, car_id: int, position_function: Optional[Callable[[], np.ndarray]] = None):
+    def __init__(self, car_id: str, position_function: Optional[Callable[[], np.ndarray]] = None):
         self.car_id = car_id
-        self.position_function = position_function or (lambda: np.array([0, 0, 17]))
-        # Store a default position to use as fallback
-        self.default_position = np.array([0, 0, 17])
+        self.position_function = position_function
 
     def apply(self, state: GameState, shared_info: Dict[str, Any]) -> None:
         car_id_str = str(self.car_id)
-        
+
         # Check if the car exists in the state
         if car_id_str not in state.cars:
             # Car doesn't exist yet, there might be nothing we can do at this point
@@ -66,11 +64,10 @@ class CarPositionMutator(StateMutator):
         try:
             position = self.position_function()
             if position is None or not isinstance(position, (np.ndarray, list, tuple)):
-                # Fallback to default if position is None or not iterable
-                position = self.default_position.copy()
+                # raise an error if position is None or not iterable
+                raise
         except Exception as e:
             # If the position function throws an error, use the default position
-            position = self.default_position.copy()
             print(f"Error in position_function: {e}, using default position")
         
         # Ensure position is always a numpy array

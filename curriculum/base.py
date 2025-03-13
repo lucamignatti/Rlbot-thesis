@@ -623,3 +623,42 @@ class CurriculumManager:
             'total_progress': (self.get_stage_progress() + self.current_difficulty) / 2,
             'episodes_completed': self.total_episodes
         }
+
+    def validate_all_stages(self) -> bool:
+        """Validate all stages in the curriculum."""
+        if not self.stages:
+            print("ERROR: No stages in curriculum")
+            return False
+            
+        print("Validating stages:")
+        for i, stage in enumerate(self.stages):
+            print(f"\nStage {i}: {stage.name}")
+            
+            # Check required components
+            if not stage.state_mutator:
+                print(f"ERROR: Stage {stage.name} missing state_mutator")
+                return False
+            if not stage.reward_function:
+                print(f"ERROR: Stage {stage.name} missing reward_function")
+                return False
+            if not stage.termination_condition:
+                print(f"ERROR: Stage {stage.name} missing termination_condition")
+                return False
+            if not stage.truncation_condition:
+                print(f"ERROR: Stage {stage.name} missing truncation_condition")
+                return False
+                
+            # Check progression requirements if not final stage
+            if i < len(self.stages) - 1 and not stage.progression_requirements:
+                print(f"WARNING: Non-final stage {stage.name} has no progression requirements")
+                
+            if self.debug:
+                print(f"- State mutator: {stage.state_mutator.__class__.__name__}")
+                print(f"- Reward function: {stage.reward_function.__class__.__name__}")
+                print(f"- Termination condition: {stage.termination_condition.__class__.__name__}")
+                print(f"- Truncation condition: {stage.truncation_condition.__class__.__name__}")
+                if stage.progression_requirements:
+                    print("- Has progression requirements")
+                    
+        print("\nAll stages validated successfully!")
+        return True
