@@ -120,3 +120,89 @@ class CarBoostMutator(StateMutator):
         else:
             for car in state.cars.values():
                 car.boost_amount = self.boost_amount
+
+class CarBallRelativePositionMutator(StateMutator):
+    """Sets a car's position relative to the ball's position"""
+    def __init__(self, car_id: str, position_function: Optional[Callable[[np.ndarray], np.ndarray]] = None):
+        """
+        Args:
+            car_id: Identifier for the car to position
+            position_function: Function that takes ball position and returns car position
+                               If None, positions the car 1000 units behind the ball on y-axis
+        """
+        self.car_id = car_id
+        self.position_function = position_function or (lambda ball_pos: np.array([ball_pos[0], ball_pos[1]-1000, 17]))
+        
+    def apply(self, state: GameState, shared_info: Dict[str, Any]) -> None:
+        car_id_str = str(self.car_id)
+
+        # Check if the car exists in the state
+        if car_id_str not in state.cars:
+            return
+            
+        # Get the car from the state
+        car = state.cars[car_id_str]
+        
+        # Get the ball's current position
+        ball_position = state.ball.position
+        
+        # Generate the car position relative to the ball
+        try:
+            position = self.position_function(ball_position)
+            if position is None or not isinstance(position, (np.ndarray, list, tuple)):
+                raise ValueError("Position function returned invalid position")
+        except Exception as e:
+            # If there's an error, use a safe default position (1000 units behind ball)
+            print(f"Error in position_function: {e}, using default relative position")
+            position = np.array([ball_position[0], ball_position[1]-1000, 17])
+        
+        # Ensure position is always a numpy array
+        if not isinstance(position, np.ndarray):
+            position = np.array(position)
+        
+        # Set the car position
+        if hasattr(car, 'physics'):
+            if car.physics is None:
+                car.physics = type('Physics', (), {})()
+            car.physics.position = position
+            
+            # Initialize velocity as zeros if it doesn't exist
+            if not hasattr(car.physics, 'linear_velocity') or car.physics.linear_velocity is None:
+                car.physics.linear_velocity = np.zeros(3)
+                
+            # Initialize angular velocity as zeros if it doesn't exist
+            if not hasattr(car.physics, 'angular_velocity') or car.physics.angular_velocity is None:
+                car.physics.angular_velocity = np.zeros(3)
+        else:
+            car.position = position
+        
+        # Reset rotation to point car toward ball
+        try:
+            # Calculate direction vector from car to ball
+            direction = ball_position - position
+            
+            # Only set rotation if we're not too close to the ball (avoid division by zero)
+            if np.linalg.norm(direction) > 1.0:
+                # Normalize direction
+                direction = direction / np.linalg.norm(direction)
+                
+                # Simple rotation to face the ball (only yaw)
+                yaw = np.arctan2(direction[1], direction[0])
+                
+                if hasattr(car, 'physics') and car.physics is not None:
+                    car.physics.rotation = np.array([0, 0, yaw])
+                else:
+                    car.rotation = np.array([0, 0, yaw])
+            else:
+                # Default rotation if too close to ball
+                if hasattr(car, 'physics') and car.physics is not None:
+                    car.physics.rotation = np.zeros(3)
+                else:
+                    car.rotation = np.zeros(3)
+        except (AttributeError, TypeError):
+            # Fallback for rotation
+            try:
+                if hasattr(car, 'rotation_mtx'):
+                    car.rotation_mtx = np.eye(3)
+            except:
+                pass

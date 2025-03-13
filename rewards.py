@@ -575,7 +575,13 @@ class KRCRewardFunction(BaseRewardFunction):
         # Get rewards from all components
         rewards = []
         for component in self.components:
-            reward = component.calculate(agent_id, state, previous_state)
+            # Check if component is a tuple (reward_fn, params...) or direct reward function
+            if isinstance(component, tuple):
+                reward_fn = component[0]  # First element should be the reward function
+                reward = reward_fn.calculate(agent_id, state, previous_state)
+            else:
+                # Direct reward function
+                reward = component.calculate(agent_id, state, previous_state)
             rewards.append(reward)
         
         # Apply KRC formula: sgn(r) * n√(∏|Ri|)

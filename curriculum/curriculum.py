@@ -1,7 +1,7 @@
 from .base import CurriculumManager, ProgressionRequirements
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator
 from .mutators import (
-    BallTowardGoalSpawnMutator, BallPositionMutator,
+    BallTowardGoalSpawnMutator, BallPositionMutator, CarBallRelativePositionMutator,
     CarBoostMutator, BallVelocityMutator, CarPositionMutator
 )
 from rlgym.rocket_league.done_conditions import GoalCondition, TimeoutCondition, NoTouchTimeoutCondition
@@ -111,8 +111,8 @@ def get_strategic_ball_position():
 
 def get_strategic_car_position():
     return np.array([
-        np.random.uniform(-1000, 1000),
-        np.random.uniform(-4000, -3000),
+        np.random.uniform(-4000, 4000),
+        np.random.uniform(-4700, 4700),
         17
     ])
 
@@ -390,7 +390,106 @@ def get_offensive_ball_position() -> np.ndarray:
         np.random.uniform(100, 200)
     ])
 
-# NEW: Safe ball position function moved outside create_curriculum
+def get_varied_ground_ball_position():
+    """Get varied ball positions across the field"""
+    x = np.random.uniform(-2000, 2000)  # Wide x-range across field
+    y = np.random.uniform(-2000, 2000)  # Full field y-range
+    return np.array([x, y, 93])  # Ball radius height
+
+def get_varied_approach_car_position(ball_pos=None):
+    """Get car position with varied approach angles to ball"""
+    if ball_pos is None:
+        # Default positioning if no ball reference
+        return np.array([
+            np.random.uniform(-3000, 3000),
+            np.random.uniform(-4000, 0),  # Blue half of field
+            17
+        ])
+    
+    # Position car at varied distances and angles from ball
+    distance = np.random.uniform(1000, 2500)
+    angle = np.random.uniform(-np.pi, np.pi)  # Full 360° approach angles
+    
+    return np.array([
+        ball_pos[0] - distance * np.cos(angle),
+        ball_pos[1] - distance * np.sin(angle),
+        17
+    ])
+
+def get_blue_defender_position():
+    """Get position for blue team defensive player"""
+    return get_strategic_position(role='defense', team=0)
+
+def get_blue_attacker_position():
+    """Get position for blue team offensive player"""
+    return get_strategic_position(role='offense', team=0)
+
+
+def get_blue_primary_defender_position():
+    """Get position for blue team's primary defender (closest to goal)"""
+    return np.array([
+        np.random.uniform(-700, 700),
+        np.random.uniform(-5000, -4300),
+        17
+    ])
+
+def get_blue_secondary_defender_position():
+    """Get position for blue team's secondary defender (slightly upfield)"""
+    return np.array([
+        np.random.uniform(-1200, 1200),  # Wider position range
+        np.random.uniform(-4200, -3500),  # Further upfield than primary defender
+        17
+    ])
+
+def get_orange_attacker_position():
+    """Get position for orange team attacker"""
+    return np.array([
+        np.random.uniform(-1000, 1000),
+        np.random.uniform(-3000, -2000),  # In blue's defensive third
+        17
+    ])
+
+def get_orange_support_position():
+    """Get position for orange team support player"""
+    return np.array([
+        np.random.uniform(-2000, 2000),  # Wider positioning
+        np.random.uniform(-2500, -1500),  # Behind the main attacker
+        17
+    ])
+
+
+def get_blue_attacker_offensive_position():
+    """Get position for blue team primary attacker deep in orange territory"""
+    return np.array([
+        np.random.uniform(-700, 700),
+        np.random.uniform(2000, 3500),  # Orange half of field
+        17
+    ])
+
+def get_blue_support_offensive_position():
+    """Get position for blue team support player in orange territory"""
+    return np.array([
+        np.random.uniform(-1500, 1500),  # Wider positioning
+        np.random.uniform(1000, 2000),   # Behind the main attacker
+        17
+    ])
+
+def get_orange_primary_defender_position():
+    """Get position for orange team's primary defender (closest to goal)"""
+    return np.array([
+        np.random.uniform(-700, 700),
+        np.random.uniform(4300, 5000),  # Near orange goal
+        17
+    ])
+
+def get_orange_secondary_defender_position():
+    """Get position for orange team's secondary defender (slightly downfield)"""
+    return np.array([
+        np.random.uniform(-1200, 1200),  # Wider position range
+        np.random.uniform(3500, 4200),   # Further downfield than primary defender
+        17
+    ])
+
 def safe_ball_position():
     """Get a safe default ball position - always valid"""
     return np.array([0.0, 0.0, 93.0])
@@ -495,8 +594,10 @@ def create_curriculum(debug=False):
         name="Ball Engagement",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
-            BallPositionMutator(position_function=get_ground_ball_position),
-            CarPositionMutator(car_id="blue-0", position_function=partial(create_position, 0, -2000, 17))
+            # First set ball position
+            BallPositionMutator(position_function=SafePositionWrapper(get_varied_ground_ball_position)),
+            # Then position the car relative to the ball with varied angles and distances
+            CarBallRelativePositionMutator(car_id="blue-0", position_function=SafePositionWrapper(get_varied_approach_car_position))
         ),
         base_task_reward_function=KRCRewardFunction([
             (BallProximityReward(dispersion=0.8), 0.8),
@@ -513,7 +614,7 @@ def create_curriculum(debug=False):
             required_consecutive_successes=3
         )
     )
-    
+
     # ======== STAGE 3: BALL CONTROL & DIRECTION ========
     ball_control = RLBotSkillStage(
         name="Ball Control & Direction",
@@ -594,7 +695,12 @@ def create_curriculum(debug=False):
         name="Beginning Team Play",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=2, orange_size=0),
-            BallPositionMutator(position_function=get_strategic_ball_position)
+            BallPositionMutator(position_function=get_strategic_ball_position),
+            # Position first car in defensive role
+            CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(get_blue_defender_position)),
+            # Position second car in offensive role
+            CarPositionMutator(car_id="blue-1", position_function=SafePositionWrapper(get_blue_attacker_position))
+
         ),
         base_task_reward_function=KRCRewardFunction([
             (create_offensive_potential_reward(5120), 0.7),
@@ -671,7 +777,14 @@ def create_curriculum(debug=False):
         name="2v2 Defensive Rotation",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=2, orange_size=2),
-            BallPositionMutator(position_function=get_defensive_ball_position)
+            BallPositionMutator(position_function=get_defensive_ball_position),
+            # Blue team defensive positions
+            CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(get_blue_primary_defender_position)),
+            CarPositionMutator(car_id="blue-1", position_function=SafePositionWrapper(get_blue_secondary_defender_position)),
+            # Orange team attacking positions
+            CarPositionMutator(car_id="orange-0", position_function=SafePositionWrapper(get_orange_attacker_position)),
+            CarPositionMutator(car_id="orange-1", position_function=SafePositionWrapper(get_orange_support_position))
+
         ),
         base_task_reward_function=KRCRewardFunction([
             (BallVelocityToGoalReward(team_goal_y=-5120, weight=0.6), 0.6),
@@ -696,7 +809,14 @@ def create_curriculum(debug=False):
         name="2v2 Offensive Coordination", 
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=2, orange_size=2),
-            BallPositionMutator(position_function=get_offensive_ball_position)
+            BallPositionMutator(position_function=get_offensive_ball_position),
+            # Blue team attacking positions
+            CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(get_blue_attacker_offensive_position)),
+            CarPositionMutator(car_id="blue-1", position_function=SafePositionWrapper(get_blue_support_offensive_position)),
+            # Orange team defensive positions
+            CarPositionMutator(car_id="orange-0", position_function=SafePositionWrapper(get_orange_primary_defender_position)),
+            CarPositionMutator(car_id="orange-1", position_function=SafePositionWrapper(get_orange_secondary_defender_position))
+
         ),
         base_task_reward_function=KRCRewardFunction([
             (BallVelocityToGoalReward(team_goal_y=5120, weight=0.7), 0.7),
