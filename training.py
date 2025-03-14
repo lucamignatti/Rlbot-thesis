@@ -462,22 +462,41 @@ class PPOTrainer:
         print_model_info(self.critic, model_name="Critic", print_amp=self.use_amp, debug=self.debug)
 
     def _setup_cuda_graphs(self):
-        # Create static input for policy evaluation graph
-        self.static_batch = torch.zeros((64, self.actor.obs_shape), device=self.device)
-
-        # Capture forward pass
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(3):  # warmup
-                self.actor(self.static_batch)
-
-            # Capture the graph
-            self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph):
-                self.static_output = self.actor(self.static_batch)
-
-        torch.cuda.current_stream().wait_stream(s)
+        """Create and set up CUDA graphs for accelerated inference."""
+        try:
+            # Only create static batch with appropriate dimensions
+            if hasattr(self.actor, 'obs_shape'):
+                batch_size = min(64, self.batch_size)  # Use smaller batch size to avoid OOM
+                self.static_batch = torch.zeros((batch_size, self.actor.obs_shape), device=self.device)
+                
+                # Create a dedicated stream for graph capture
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                
+                with torch.cuda.stream(s):
+                    # More thorough warmup to stabilize memory allocation
+                    for _ in range(5):
+                        self.actor(self.static_batch)
+                    
+                    # Capture the graph with proper error handling
+                    try:
+                        self.graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(self.graph):
+                            self.static_output = self.actor(self.static_batch)
+                    except Exception as e:
+                        self.debug_print(f"CUDA graph capture failed: {e}")
+                        self.cuda_graphs_enabled = False
+                        return
+                
+                # Wait for the graph capture to complete
+                torch.cuda.current_stream().wait_stream(s)
+                self.debug_print("CUDA graph successfully captured")
+            else:
+                self.cuda_graphs_enabled = False
+                self.debug_print("Actor doesn't have obs_shape attribute, disabling CUDA graphs")
+        except Exception as e:
+            self.debug_print(f"CUDA graph setup failed: {e}")
+            self.cuda_graphs_enabled = False
 
     def _create_compiled_gae(self):
         """Create a compiled version of GAE computation for tensor inputs."""

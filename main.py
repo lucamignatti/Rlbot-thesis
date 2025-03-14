@@ -29,6 +29,7 @@ from envs.factory import get_env
 from envs.vectorized import VectorizedEnv
 from envs.rlbot_vectorized import RLBotVectorizedEnv
 from curriculum import create_curriculum
+import gc
 
 def run_training(
     actor,
@@ -423,6 +424,13 @@ def run_training(
 
                 collected_experiences = 0
                 last_update_time = time.time()
+
+                # Add this after each update in the main training loop
+                if collected_experiences % (update_interval * 10) == 0:  # Every 10 updates
+                    # Force garbage collection and clear CUDA cache
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             # Update the experience count in the progress bar.
             stats_dict["Exp"] = f"{collected_experiences}/{update_interval}"
