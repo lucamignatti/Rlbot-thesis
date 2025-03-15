@@ -65,7 +65,13 @@ def run_training(
     auxiliary: bool = True,
     sr_weight: float = 1.0,
     rp_weight: float = 1.0,
-    test: bool = False
+    test: bool = False,
+    # Pre-training parameters
+    use_pretraining: bool = False,
+    pretraining_fraction: float = 0.1,
+    pretraining_sr_weight: float = 10.0,
+    pretraining_rp_weight: float = 5.0,
+    pretraining_transition_steps: int = 1000,
 ):
     """
     Main training loop.  This sets up the agent, environment, and training process,
@@ -111,8 +117,19 @@ def run_training(
         use_auxiliary_tasks=auxiliary,
         sr_weight=sr_weight * aux_scale,  # Apply scaling to auxiliary task weights
         rp_weight=rp_weight * aux_scale,
-        aux_amp=aux_amp
+        aux_amp=aux_amp,
+        use_pretraining=use_pretraining,
+        pretraining_fraction=pretraining_fraction,
+        pretraining_sr_weight=pretraining_sr_weight,
+        pretraining_rp_weight=pretraining_rp_weight,
+        pretraining_transition_steps=pretraining_transition_steps
     )
+    
+    # Set total_episodes and training_time attributes for pretraining calculation
+    if total_episodes is not None:
+        trainer.total_episode_target = total_episodes
+    if training_time is not None:
+        trainer.training_time_target = training_time
 
     #  Use train mode for training and eval for testing
     if test:
@@ -188,6 +205,14 @@ def run_training(
         "SR_Loss": "0.0", # State reconstruction loss
         "RP_Loss": "0.0"  # Reward prediction loss
     }
+    
+    # Add pretraining info if enabled
+    if use_pretraining:
+        pretraining_end_step = int(total_episodes * pretraining_fraction) if total_episodes else int(5000 * pretraining_fraction)
+        stats_dict.update({
+            "Mode": "PreTraining",
+            "PT_Progress": f"0/{pretraining_end_step}"
+        })
 
     # Add curriculum info if enabled
     if curriculum_manager:
@@ -434,6 +459,35 @@ def run_training(
 
             # Update the experience count in the progress bar.
             stats_dict["Exp"] = f"{collected_experiences}/{update_interval}"
+            
+            # Update pretraining progress if enabled
+            if use_pretraining:
+                pretraining_end_step = trainer._get_pretraining_end_step() 
+                in_pretraining = not trainer.pretraining_completed
+                in_transition = trainer.in_transition_phase
+                
+                # Force check of pretraining completion status based on current episode count
+                current_step = total_episodes_so_far + trainer.total_episodes_offset
+                if current_step >= pretraining_end_step and not trainer.pretraining_completed and not trainer.in_transition_phase:
+                    print(f"Triggering pretraining transition at episode {current_step}/{pretraining_end_step}")
+                    trainer.in_transition_phase = True
+                    trainer.transition_start_step = current_step
+                
+                if in_pretraining:
+                    stats_dict["Mode"] = "PreTraining"
+                    stats_dict["PT_Progress"] = f"{current_step}/{pretraining_end_step}"
+                elif in_transition:
+                    stats_dict["Mode"] = "PT_Transition"
+                    transition_progress = min(100, int(100 * (current_step - trainer.transition_start_step) / 
+                                              trainer.pretraining_transition_steps))
+                    stats_dict["PT_Progress"] = f"{transition_progress}%"
+                else:
+                    # Remove pretraining info from stats once completed
+                    if "Mode" in stats_dict:
+                        stats_dict.pop("Mode", None)
+                    if "PT_Progress" in stats_dict:
+                        stats_dict.pop("PT_Progress", None)
+            
             progress_bar.set_postfix(stats_dict)
 
     except KeyboardInterrupt:
@@ -606,6 +660,14 @@ if __name__ == "__main__":
     parser.add_argument('--aux_scale', type=float, default=0.005,
                         help='Scaling factor for auxiliary task losses')
 
+    # Pre-training parameters
+    parser.add_argument('--pretraining', action='store_true', help='Enable unsupervised pre-training phase at the start')
+    parser.add_argument('--no-pretraining', action='store_false', dest='pretraining', help='Disable unsupervised pre-training')
+    parser.set_defaults(pretraining=False)
+    parser.add_argument('--pretraining-fraction', type=float, default=0.1, help='Fraction of total training time/episodes to use for pre-training (default: 0.1)')
+    parser.add_argument('--pretraining-sr-weight', type=float, default=10.0, help='Weight for State Representation task during pre-training (default: 10.0)')
+    parser.add_argument('--pretraining-rp-weight', type=float, default=5.0, help='Weight for Reward Prediction task during pre-training (default: 5.0)')
+    parser.add_argument('--pretraining-transition-steps', type=int, default=1000, help='Number of steps for smooth transition from pre-training to RL training (default: 1000)')
 
     # Backwards compatibility.
     parser.add_argument('-p', '--processes', type=int, default=None,
@@ -863,7 +925,17 @@ if __name__ == "__main__":
         max_grad_norm=args.max_grad_norm,
         ppo_epochs=args.ppo_epochs,
         batch_size=args.batch_size,
-        aux_amp=args.aux_amp if args.aux_amp is not None else args.amp
+        aux_amp=args.aux_amp if args.aux_amp is not None else args.amp,
+        aux_scale=args.aux_scale,
+        auxiliary=args.auxiliary,
+        sr_weight=args.sr_weight,
+        rp_weight=args.rp_weight,
+        test=args.test,
+        use_pretraining=args.pretraining,
+        pretraining_fraction=args.pretraining_fraction,
+        pretraining_sr_weight=args.pretraining_sr_weight,
+        pretraining_rp_weight=args.pretraining_rp_weight,
+        pretraining_transition_steps=args.pretraining_transition_steps
     )
 
 

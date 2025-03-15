@@ -254,6 +254,11 @@ class CurriculumManager:
         # Initialize step counter
         self._last_wandb_step = 0
 
+        # Initialize rehearsal variables
+        self.current_rehearsal = None
+        self.rehearsal_difficulty = 0.0
+        self.difficulty_threshold = 0.95  # Threshold for stage progression
+
         if max_rehearsal_stages < 0:
             raise ValueError("max_rehearsal_stages must be non-negative")
 
@@ -264,9 +269,25 @@ class CurriculumManager:
         self.rehearsal_decay_factor = rehearsal_decay_factor
         self._testing = testing
 
-    def register_trainer(self, trainer) -> None:
-        """Register the PPO trainer for hyperparameter adjustment."""
-        self.trainer = trainer
+    def register_trainer(self, trainer):
+        """Register a trainer object for hyperparameter adjustments"""
+        # Only register if not already registered to prevent infinite recursion
+        if self.trainer != trainer:
+            self.trainer = trainer
+            # Only register back with trainer if not already registered
+            if hasattr(trainer, 'register_curriculum_manager'):
+                if not hasattr(trainer, '_curriculum_manager') or trainer._curriculum_manager != self:
+                    trainer.register_curriculum_manager(self)
+            
+            # After registering, check if we have a pretraining stage and connect it
+            if len(self.stages) > 0:
+                first_stage = self.stages[0]
+                if hasattr(first_stage, 'is_pretraining') and first_stage.is_pretraining:
+                    # Register trainer with the pretraining stage
+                    first_stage.register_trainer(trainer)
+                    
+                    if self.debug:
+                        print(f"[DEBUG] Registered trainer with pre-training stage: {first_stage.name}")
 
     def _get_current_step(self) -> Optional[int]:
         """Get current training step for wandb logging"""
@@ -353,6 +374,32 @@ class CurriculumManager:
 
         return config
 
+    def get_environment_config(self):
+        """Get the current environment configuration based on the active stage and difficulty level."""
+        # Check if we're in pretraining mode
+        current_stage = self.stages[self.current_stage_index]
+        is_pretraining = (hasattr(current_stage, 'is_pretraining') and current_stage.is_pretraining and 
+                         hasattr(self, 'trainer') and not getattr(self.trainer, 'pretraining_completed', True))
+        
+        if self.current_rehearsal is not None:
+            # We're in rehearsal mode, use the rehearsal stage
+            stage = self.stages[self.current_rehearsal]
+            config = stage.get_config_with_difficulty(self.rehearsal_difficulty)
+            config["is_rehearsal"] = True
+            if self.debug:
+                print(f"[DEBUG] Rehearsing stage {stage.name} at difficulty {self.rehearsal_difficulty:.2f}")
+        else:
+            # Normal mode, use the current stage
+            stage = current_stage
+            config = stage.get_config_with_difficulty(self.current_difficulty)
+            config["is_rehearsal"] = False
+            
+            # Add pretraining flag if applicable
+            if is_pretraining:
+                config["is_pretraining"] = True
+                
+        return config
+
     def update_progression_stats(self, episode_metrics: Dict[str, Any]) -> None:
         """Update statistics based on completed episode metrics."""
         current_stage = self.stages[self.current_stage_index]
@@ -419,6 +466,41 @@ class CurriculumManager:
                     return True
 
         return False
+
+    def _evaluate_progression(self):
+        """
+        Evaluate if the current stage should progress to the next stage.
+        Returns True if progression occurred, False otherwise.
+        """
+        current_stage = self.stages[self.current_stage_index]
+        
+        # Special handling for pretraining stage
+        if hasattr(current_stage, 'is_pretraining') and current_stage.is_pretraining:
+            if hasattr(self, 'trainer') and getattr(self.trainer, 'pretraining_completed', False):
+                # Pretraining is complete, proceed to the next stage
+                self._progress_to_next_stage()
+                return True
+            # Pretraining is still ongoing
+            return False
+            
+        # Regular stage progression logic
+        if current_stage.validate_progression():
+            if self.current_difficulty >= self.difficulty_threshold or self.current_stage_index == len(self.stages) - 1:
+                self._progress_to_next_stage()
+                return True
+            else:
+                # Increase difficulty but stay on the same stage
+                self.current_difficulty = min(1.0, self.current_difficulty + self.difficulty_increase_rate)
+                if self.debug:
+                    print(f"[DEBUG] Increased difficulty to {self.current_difficulty:.2f} for stage {current_stage.name}")
+                return False
+        else:
+            # Optionally decrease difficulty if performance is consistently poor
+            if hasattr(current_stage, 'moving_success_rate') and current_stage.moving_success_rate < 0.3 and self.current_difficulty > 0.2:
+                self.current_difficulty = max(0.0, self.current_difficulty - self.difficulty_increase_rate * 0.5)
+                if self.debug:
+                    print(f"[DEBUG] Decreased difficulty to {self.current_difficulty:.2f} due to poor performance")
+            return False
 
     def _get_rehearsal_probability(self) -> float:
         """Get the probability of using a rehearsal stage instead of the current stage."""
@@ -607,6 +689,57 @@ class CurriculumManager:
             "stage_progress": self.get_stage_progress(),
             "overall_progress": self.get_overall_progress()
         }
+
+    def get_curriculum_stats(self):
+        """Get current curriculum statistics for display and logging."""
+        current_stage = self.stages[self.current_stage_index]
+        
+        # Handle pretraining special case
+        is_pretraining = hasattr(current_stage, 'is_pretraining') and current_stage.is_pretraining
+        if is_pretraining and hasattr(self, 'trainer'):
+            pretraining_completed = getattr(self.trainer, 'pretraining_completed', False)
+            pretraining_transition = getattr(self.trainer, 'in_transition_phase', False)
+            
+            # Get progress info from trainer if available
+            pretraining_step = getattr(self.trainer, 'training_steps', 0) 
+            pretraining_end_step = getattr(self.trainer, '_get_pretraining_end_step', lambda: 0)()
+            
+            if pretraining_end_step > 0:
+                pretraining_progress = min(1.0, pretraining_step / pretraining_end_step)
+            else:
+                pretraining_progress = 0
+                
+        else:
+            pretraining_completed = True
+            pretraining_transition = False
+            pretraining_progress = 1.0
+            pretraining_step = 0
+            pretraining_end_step = 0
+        
+        stats = {
+            "current_stage_index": self.current_stage_index,
+            "current_stage_name": current_stage.name,
+            "difficulty_level": self.current_difficulty,
+            "total_episodes": self.total_episodes,
+            "in_rehearsal": self.current_rehearsal is not None,
+            "is_pretraining": is_pretraining and not pretraining_completed,
+            "pretraining_completed": pretraining_completed if is_pretraining else None,
+            "pretraining_transition": pretraining_transition if is_pretraining else None,
+            "pretraining_progress": pretraining_progress if is_pretraining else None,
+            "pretraining_step": pretraining_step if is_pretraining else None,
+            "pretraining_end_step": pretraining_end_step if is_pretraining else None
+        }
+        
+        # Add current stage statistics
+        try:
+            stage_stats = current_stage.get_statistics()
+            stats["current_stage_stats"] = stage_stats
+        except Exception as e:
+            if self.debug:
+                print(f"[DEBUG] Error getting stage statistics: {str(e)}")
+            stats["current_stage_stats"] = {}
+            
+        return stats
 
     def get_stage_progress(self) -> float:
         """Get progress through current stage (0-1)"""

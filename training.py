@@ -287,7 +287,13 @@ class PPOTrainer:
         use_auxiliary_tasks: bool = True,
         sr_weight: float = 1.0,
         rp_weight: float = 1.0,
-        aux_amp: bool = False
+        aux_amp: bool = False,
+        use_pretraining: bool = False,
+        pretraining_fraction: float = 0.1,
+        pretraining_sr_weight: float = 10.0,
+        pretraining_rp_weight: float = 5.0,
+        pretraining_transition_steps: int = 1000,
+        total_episode_target: int = None
     ):
 
         self.use_wandb = use_wandb
@@ -460,6 +466,40 @@ class PPOTrainer:
 
         print_model_info(self.actor, model_name="Actor", print_amp=self.use_amp, debug=self.debug)
         print_model_info(self.critic, model_name="Critic", print_amp=self.use_amp, debug=self.debug)
+
+        # Pre-training parameters
+        self.use_pretraining = use_pretraining
+        self.pretraining_fraction = pretraining_fraction
+        self.pretraining_sr_weight = pretraining_sr_weight
+        self.pretraining_rp_weight = pretraining_rp_weight
+        self.pretraining_transition_steps = pretraining_transition_steps
+
+        self.training_steps = 0
+        self.training_step_offset = 0
+        self.total_episodes = 0
+        self.total_episodes_offset = 0
+        self.pretraining_completed = False
+        self.in_transition_phase = False
+        self.base_sr_weight = sr_weight
+        self.base_rp_weight = rp_weight
+
+        # Store total episode target for pretraining calculations
+        self.total_episode_target = total_episode_target
+
+        # If total episodes target is set, log the pretraining plan
+        if self.use_pretraining and self.total_episode_target:
+            pretraining_end_step = self._get_pretraining_end_step()
+            print(f"Pretraining will run until episode {pretraining_end_step} ({self.pretraining_fraction*100:.1f}% of {self.total_episode_target})")
+            print(f"Pretraining transition will take {self.pretraining_transition_steps} steps")
+
+            if self.debug:
+                print(f"[DEBUG] Pretraining parameters:")
+                print(f"[DEBUG] - End episode: {pretraining_end_step}")
+                print(f"[DEBUG] - Transition steps: {self.pretraining_transition_steps}")
+                print(f"[DEBUG] - SR weight during pretraining: {self.pretraining_sr_weight}")
+                print(f"[DEBUG] - RP weight during pretraining: {self.pretraining_rp_weight}")
+                print(f"[DEBUG] - SR weight after pretraining: {self.base_sr_weight}")
+                print(f"[DEBUG] - RP weight after pretraining: {self.base_rp_weight}")
 
     def _setup_cuda_graphs(self):
         """Create and set up CUDA graphs for accelerated inference."""
@@ -1123,6 +1163,54 @@ class PPOTrainer:
         """Update policy and value networks using the PPO algorithm, with optimizations for AMP."""
         update_start = time.time()
 
+        # Update pretraining state if needed
+        if self.use_pretraining and not self.pretraining_completed:
+            # Calculate when pretraining should end
+            pretraining_end_step = self._get_pretraining_end_step()
+            current_step = self.total_episodes + self.total_episodes_offset
+            
+            if self.debug:
+                print(f"\n[DEBUG] Pretraining check: Episode {current_step}/{pretraining_end_step}, "
+                      f"completed: {self.pretraining_completed}, transition: {self.in_transition_phase}")
+                print(f"[DEBUG] Episode tracking: total_episodes={self.total_episodes}, "
+                      f"offset={self.total_episodes_offset}, target={self.total_episode_target}")
+            
+            # Check if we should end pretraining
+            if current_step >= pretraining_end_step:
+                if not self.in_transition_phase:
+                    self.in_transition_phase = True
+                    self.transition_start_step = current_step
+                    print(f"Starting transition from pretraining to RL at step {current_step}")
+                    if self.debug:
+                        print(f"[DEBUG] Pretraining transition started at step {current_step}")
+                    if self.use_wandb:
+                        wandb.log({
+                            "pretraining/status": "transition_started",
+                            "pretraining/step": current_step
+                        })
+                
+                # Check if we should complete the transition
+                if current_step >= (self.transition_start_step + self.pretraining_transition_steps):
+                    self.pretraining_completed = True
+                    self.in_transition_phase = False
+                    print(f"Pretraining completed at step {current_step}")
+                    if self.debug:
+                        print(f"[DEBUG] Pretraining completed at step {current_step}")
+                    if self.use_wandb:
+                        wandb.log({
+                            "pretraining/status": "completed",
+                            "pretraining/step": current_step
+                        })
+            
+            # Update auxiliary weights based on pretraining state
+            self._update_auxiliary_weights()
+        
+        # Increment training steps counter
+        self.training_steps += 1
+
+        # Update episode counter
+        episodes_ended = 0
+
         # Retrieve data from the memory buffer.
         states, actions, old_log_probs, rewards, values, dones = self.memory.get()
         if len(states) == 0:
@@ -1133,6 +1221,13 @@ class PPOTrainer:
 
         # Calculate how many episodes are represented in this batch of data.
         episodes_ended = torch.sum(dones.int()).item() if isinstance(dones, torch.Tensor) else np.sum(dones) if len(dones) > 0 else 0
+        
+        # Update total episode counter
+        self.total_episodes += episodes_ended
+        
+        if self.debug and episodes_ended > 0:
+            print(f"[DEBUG] Episodes ended in this update: {episodes_ended}, new total: {self.total_episodes}")
+
         # Calculate per-episode metrics like total reward and length.
         episode_rewards = []
         episode_reward = 0
@@ -1602,7 +1697,9 @@ class PPOTrainer:
             "update_time": time.time() - update_start,
             "sr_loss": avg_sr_loss, # Return auxiliary loss
             "rp_loss": avg_rp_loss, # Return auxiliary loss
-            "aux_loss": avg_aux_loss # Return auxiliary loss
+            "aux_loss": avg_aux_loss, # Return auxiliary loss
+            "in_pretraining": not self.pretraining_completed,
+            "in_transition": self.in_transition_phase,
         }
 
         return return_metrics
@@ -1776,3 +1873,56 @@ class PPOTrainer:
                 # Synchronize step counters
                 self._true_training_steps = max(self._true_training_steps, curriculum_manager._last_wandb_step)
                 curriculum_manager._last_wandb_step = self._true_training_steps
+
+    def _get_pretraining_end_step(self):
+        """Calculate the step at which pretraining should end based on available targets"""
+        # Check if total_episode_target attribute exists before accessing
+        if hasattr(self, 'total_episode_target') and self.total_episode_target:
+            return int(self.total_episode_target * self.pretraining_fraction)
+        # Check if training_time_target attribute exists before accessing
+        if hasattr(self, 'training_time_target') and self.training_time_target:
+            return int(self.training_time_target * self.pretraining_fraction)
+        # Default fallback - use a fixed number of steps
+        return int(5000 * self.pretraining_fraction)
+
+    def _update_auxiliary_weights(self):
+        if not self.use_auxiliary_tasks or not self.use_pretraining:
+            return
+        current_sr_weight = self.base_sr_weight
+        current_rp_weight = self.base_rp_weight
+        if not self.pretraining_completed:
+            current_sr_weight = self.pretraining_sr_weight
+            current_rp_weight = self.pretraining_rp_weight
+        elif self.in_transition_phase:
+            transition_progress = min(1.0, (self.training_steps - self.transition_start_step) / self.pretraining_transition_steps)
+            if transition_progress >= 1.0:
+                self.in_transition_phase = False
+                if self.debug:
+                    print(f"[DEBUG] Transition phase completed at step {self.training_steps}")
+            else:
+                current_sr_weight = self.pretraining_sr_weight + transition_progress * (self.base_sr_weight - self.pretraining_sr_weight)
+                current_rp_weight = self.pretraining_rp_weight + transition_progress * (self.base_rp_weight - self.pretraining_rp_weight)
+        self.aux_task_manager.sr_weight = current_sr_weight
+        self.aux_task_manager.rp_weight = current_rp_weight
+        if self.use_wandb and self.training_steps % 10 == 0:
+            wandb.log({
+                "pretraining/sr_weight": current_sr_weight,
+                "pretraining/rp_weight": current_rp_weight,
+                "pretraining/active": not self.pretraining_completed,
+                "pretraining/transition": self.in_transition_phase,
+            }, step=self._get_wandb_step())
+
+    def _get_wandb_step(self):
+        return self.training_steps + self.training_step_offset
+
+    # Add method to set the total episode target after initialization
+    def set_total_episode_target(self, total_episodes):
+        """Set the target for total training episodes, used for pretraining calculations."""
+        self.total_episode_target = total_episodes
+        
+        if self.use_pretraining and self.total_episode_target:
+            pretraining_end = self._get_pretraining_end_step()
+            print(f"Updated pretraining plan: will run until episode {pretraining_end} "
+                  f"({self.pretraining_fraction*100:.1f}% of {self.total_episode_target})")
+        
+        return self._get_pretraining_end_step()

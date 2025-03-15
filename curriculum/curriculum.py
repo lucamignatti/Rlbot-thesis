@@ -564,6 +564,32 @@ def create_curriculum(debug=False):
         BallVelocityToGoalReward(team_goal_y=5120),
         create_distance_weighted_alignment_reward(5120)
     ])
+
+    # ======== STAGE 0: PRE-TRAINING ========
+    # This is a special stage focused only on unsupervised learning
+    pretraining = RLBotSkillStage(
+        name="Unsupervised Pre-training",
+        base_task_state_mutator=MutatorSequence(
+            FixedTeamSizeMutator(blue_size=1, orange_size=0),
+            CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(get_strategic_car_position)),
+            BallPositionMutator(position_function=SafePositionWrapper(safe_ball_position))
+        ),
+        base_task_reward_function=CombinedReward(
+            (BallProximityReward(dispersion=1.0), 1.0),
+            (PlayerVelocityTowardBallReward(), 0.8),
+            (SaveBoostReward(weight=0.5), 0.3)
+        ),
+        base_task_termination_condition=goal_condition,
+        base_task_truncation_condition=short_timeout,
+        progression_requirements=ProgressionRequirements(
+            min_success_rate=0.0,  # No success requirement for pre-training
+            min_avg_reward=0.0,    # No reward requirement for pre-training
+            min_episodes=100,      # Just need enough data to do useful pre-training
+            max_std_dev=10.0,      # Very permissive 
+            required_consecutive_successes=1  # Set to minimum valid value (1) instead of 0
+        ),
+        is_pretraining=True  # Mark this as a special pre-training stage
+    )
     
     # ======== STAGE 1: MOVEMENT FOUNDATIONS ========
     movement_foundations = RLBotSkillStage(
@@ -887,6 +913,7 @@ def create_curriculum(debug=False):
     
     # Create the full curriculum
     stages = [
+        pretraining,       # Start with pre-training stage
         movement_foundations,
         ball_engagement,
         ball_control,
