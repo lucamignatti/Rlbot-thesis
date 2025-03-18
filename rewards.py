@@ -1,8 +1,28 @@
 from typing import List, Dict, Any, Tuple, Union, Optional
 from rlgym.api import RewardFunction, AgentID
 from rlgym.rocket_league.api import GameState
-from rlgym.rocket_league import common_values
 import numpy as np
+
+
+class DummyReward(RewardFunction[AgentID, GameState, float]):
+    """A reward function that always returns zero.
+    
+    This is used for unsupervised pre-training where we want intrinsic rewards only,
+    with no domain-specific extrinsic rewards.
+    """
+    def __init__(self):
+        super().__init__()
+        
+    def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
+        """Reset any state in the reward function"""
+        pass
+    
+    def get_rewards(self, agents: List[AgentID], state: GameState,
+                   is_terminated: Dict[AgentID, bool],
+                   is_truncated: Dict[AgentID, bool],
+                   shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
+        """Return zero rewards for all agents"""
+        return {agent: 0.0 for agent in agents}
 
 
 class NormalizedReward(RewardFunction[AgentID, GameState, float]):
@@ -593,6 +613,7 @@ class KRCRewardFunction(BaseRewardFunction):
             abs_rewards = [abs(r) for r in rewards]
             # Calculate geometric mean (n√∏|Ri|)
             geometric_mean = np.prod(abs_rewards) ** (1.0 / len(rewards))
+            # Sign is determined by all components - positive only when all are positive
             # Sign is determined by all components - positive only when all are positive
             sign = 1.0 if all(r >= 0 for r in rewards) else -1.0
             krc_reward = sign * geometric_mean

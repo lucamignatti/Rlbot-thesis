@@ -72,6 +72,11 @@ def run_training(
     pretraining_sr_weight: float = 10.0,
     pretraining_rp_weight: float = 5.0,
     pretraining_transition_steps: int = 1000,
+    # Intrinsic rewards parameters
+    use_intrinsic_rewards: bool = True,
+    intrinsic_reward_scale: float = 0.1,
+    curiosity_weight: float = 0.5,
+    rnd_weight: float = 0.5,
 ):
     """
     Main training loop.  This sets up the agent, environment, and training process,
@@ -110,6 +115,7 @@ def run_training(
         max_grad_norm=max_grad_norm,
         ppo_epochs=ppo_epochs,
         batch_size=batch_size,
+        training_step_offset=training_step_offset,
         use_wandb=use_wandb,
         debug=debug,
         use_compile=use_compile,
@@ -122,7 +128,12 @@ def run_training(
         pretraining_fraction=pretraining_fraction,
         pretraining_sr_weight=pretraining_sr_weight,
         pretraining_rp_weight=pretraining_rp_weight,
-        pretraining_transition_steps=pretraining_transition_steps
+        pretraining_transition_steps=pretraining_transition_steps,
+        # New intrinsic reward parameters
+        use_intrinsic_rewards=use_intrinsic_rewards,
+        intrinsic_reward_scale=intrinsic_reward_scale,
+        curiosity_weight=curiosity_weight,
+        rnd_weight=rnd_weight
     )
     
     # Set total_episodes and training_time attributes for pretraining calculation
@@ -142,36 +153,37 @@ def run_training(
     # Initialize curriculum if enabled
     curriculum_manager = None
     if use_curriculum:
-        curriculum_manager = create_curriculum(debug=debug)
-        # Bidirectional registration for proper wandb step synchronization
-        curriculum_manager.register_trainer(trainer)
-        trainer.register_curriculum_manager(curriculum_manager)
+        try:
+            curriculum_manager = create_curriculum(debug=debug)
+            # Register trainer with curriculum manager
+            curriculum_manager.register_trainer(trainer)
+            if debug:
+                print(f"[DEBUG] Initialized curriculum with {len(curriculum_manager.stages)} stages")
+                print(f"[DEBUG] Starting at stage: {curriculum_manager.current_stage.name}")
+        except Exception as e:
+            print(f"Failed to initialize curriculum: {e}")
+            print("Continuing without curriculum")
+            use_curriculum = False
+
+    # Use a vectorized environment for parallel data collection.
+    env_class = VectorizedEnv  # Default
+    if curriculum_manager and curriculum_manager.requires_bots():
+        env_class = RLBotVectorizedEnv
         
-        if debug:
-            print("[DEBUG] Curriculum learning enabled with basic curriculum")
-
-        # Use a vectorized environment for parallel data collection.
-        env_class = VectorizedEnv  # Default
-        if curriculum_manager and curriculum_manager.requires_bots():
-            env_class = RLBotVectorizedEnv
-
-        vec_env = env_class(
-            num_envs=num_envs,
-            render=render,
-            action_stacker=action_stacker,
-            curriculum_manager=curriculum_manager,
-            rlbotpack_path=os.path.join(os.path.dirname(__file__), "RLBotPack"),
-            debug=debug
-        )
-    else:
-        # Use a default vectorized environment without curriculum
-        env_class = VectorizedEnv
-        vec_env = env_class(
-            num_envs=num_envs,
-            render=render,
-            action_stacker=action_stacker,
-            debug=debug
-        )
+    # Create environment constructor arguments based on the class
+    env_args = {
+        'num_envs': num_envs,
+        'render': render,
+        'action_stacker': action_stacker,
+        'curriculum_manager': curriculum_manager,
+        'debug': debug
+    }
+    
+    # Only add rlbotpack_path if using RLBotVectorizedEnv
+    if env_class == RLBotVectorizedEnv:
+        env_args['rlbotpack_path'] = os.path.join(os.path.dirname(__file__), "RLBotPack")
+        
+    vec_env = env_class(**env_args)
 
     # For time-based training, we'll need to know when we started.
     start_time = time.time()
@@ -669,6 +681,20 @@ if __name__ == "__main__":
     parser.add_argument('--pretraining-rp-weight', type=float, default=5.0, help='Weight for Reward Prediction task during pre-training (default: 5.0)')
     parser.add_argument('--pretraining-transition-steps', type=int, default=1000, help='Number of steps for smooth transition from pre-training to RL training (default: 1000)')
 
+    # Intrinsic reward parameters
+    parser.add_argument('--use-intrinsic', action='store_true', help='Use intrinsic rewards during pre-training')
+    parser.add_argument('--no-intrinsic', action='store_false', dest='use_intrinsic', help='Disable intrinsic rewards during pre-training')
+    parser.set_defaults(use_intrinsic=True)
+    
+    parser.add_argument('--intrinsic-scale', type=float, default=0.1, 
+                       help='Scaling factor for intrinsic rewards (default: 0.1)')
+    
+    parser.add_argument('--curiosity-weight', type=float, default=0.5,
+                       help='Weight for curiosity-based intrinsic rewards (default: 0.5)')
+    
+    parser.add_argument('--rnd-weight', type=float, default=0.5,
+                       help='Weight for Random Network Distillation rewards (default: 0.5)')
+
     # Backwards compatibility.
     parser.add_argument('-p', '--processes', type=int, default=None,
                         help='Legacy parameter; use --num_envs instead')
@@ -935,7 +961,12 @@ if __name__ == "__main__":
         pretraining_fraction=args.pretraining_fraction,
         pretraining_sr_weight=args.pretraining_sr_weight,
         pretraining_rp_weight=args.pretraining_rp_weight,
-        pretraining_transition_steps=args.pretraining_transition_steps
+        pretraining_transition_steps=args.pretraining_transition_steps,
+        # New intrinsic reward parameters
+        use_intrinsic_rewards=args.use_intrinsic,
+        intrinsic_reward_scale=args.intrinsic_scale,
+        curiosity_weight=args.curiosity_weight,
+        rnd_weight=args.rnd_weight
     )
 
 

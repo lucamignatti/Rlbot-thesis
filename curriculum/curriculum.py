@@ -6,16 +6,16 @@ from .mutators import (
 )
 from rlgym.rocket_league.done_conditions import GoalCondition, TimeoutCondition, NoTouchTimeoutCondition
 from rlgym.rocket_league.reward_functions import CombinedReward, GoalReward, TouchReward
-import numpy as np
-import random
-from curriculum.rlbot import RLBotSkillStage
-from rlgym.rocket_league.state_mutators import KickoffMutator
 from rewards import (
     TouchBallReward, PlayerVelocityTowardBallReward, create_offensive_potential_reward,
     BallVelocityToGoalReward, TouchBallToGoalAccelerationReward, SaveBoostReward,
     create_distance_weighted_alignment_reward, BallToGoalDistanceReward, create_lucy_skg_reward, 
-    BallProximityReward, KRCRewardFunction
+    BallProximityReward, KRCRewardFunction, DummyReward
 )
+import numpy as np
+import random
+from curriculum.rlbot import RLBotSkillStage
+from rlgym.rocket_league.state_mutators import KickoffMutator
 from functools import partial
 from typing import Tuple, List, Dict, Any, Optional
 
@@ -566,7 +566,7 @@ def create_curriculum(debug=False):
     ])
 
     # ======== STAGE 0: PRE-TRAINING ========
-    # This is a special stage focused only on unsupervised learning
+    # This is a special stage focused only on unsupervised learning with purely intrinsic rewards
     pretraining = RLBotSkillStage(
         name="Unsupervised Pre-training",
         base_task_state_mutator=MutatorSequence(
@@ -574,11 +574,9 @@ def create_curriculum(debug=False):
             CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(get_strategic_car_position)),
             BallPositionMutator(position_function=SafePositionWrapper(safe_ball_position))
         ),
-        base_task_reward_function=CombinedReward(
-            (BallProximityReward(dispersion=1.0), 1.0),
-            (PlayerVelocityTowardBallReward(), 0.8),
-            (SaveBoostReward(weight=0.5), 0.3)
-        ),
+        # Use a "dummy" reward function that always returns zero
+        # The actual rewards will come entirely from intrinsic motivation
+        base_task_reward_function=DummyReward(),
         base_task_termination_condition=goal_condition,
         base_task_truncation_condition=short_timeout,
         progression_requirements=ProgressionRequirements(

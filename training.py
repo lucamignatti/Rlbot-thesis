@@ -7,6 +7,7 @@ from torch.amp import autocast, GradScaler
 from models import fix_compiled_state_dict, print_model_info
 from typing import Union, Tuple
 from auxiliary import AuxiliaryTaskManager
+from intrinsic_rewards import create_intrinsic_reward_generator, IntrinsicRewardEnsemble
 import time
 import wandb
 import os
@@ -298,7 +299,13 @@ class PPOTrainer:
         pretraining_sr_weight: float = 10.0,
         pretraining_rp_weight: float = 5.0,
         pretraining_transition_steps: int = 1000,
-        total_episode_target: int = None
+        total_episode_target: int = None,
+        training_step_offset: int = 0,  # Added this parameter
+        # New intrinsic reward parameters
+        use_intrinsic_rewards: bool = True,
+        intrinsic_reward_scale: float = 1.0,
+        curiosity_weight: float = 0.5,
+        rnd_weight: float = 0.5
     ):
 
         self.use_wandb = use_wandb
@@ -505,6 +512,42 @@ class PPOTrainer:
                 print(f"[DEBUG] - RP weight during pretraining: {self.pretraining_rp_weight}")
                 print(f"[DEBUG] - SR weight after pretraining: {self.base_sr_weight}")
                 print(f"[DEBUG] - RP weight after pretraining: {self.base_rp_weight}")
+
+        # Initialize intrinsic reward generator for pre-training if enabled
+        self.use_intrinsic_rewards = use_intrinsic_rewards and use_pretraining
+        self.intrinsic_reward_scale = intrinsic_reward_scale
+        self.intrinsic_reward_generator = None
+        
+        if self.use_intrinsic_rewards:
+            # Extract observation dimension from actor
+            if hasattr(self.actor, 'obs_shape'):
+                obs_dim = self.actor.obs_shape
+            else:
+                obs_dim = 542  # Default size
+                if self.debug:
+                    print(f"[DEBUG] Could not determine observation dimension, using default: {obs_dim}")
+            
+            # Determine action dimension for intrinsic rewards
+            if action_space_type == "discrete":
+                if isinstance(action_dim, int):
+                    intrinsic_action_dim = action_dim
+                else:
+                    intrinsic_action_dim = sum(action_dim) if isinstance(action_dim, (list, tuple)) else 64
+            else:
+                if isinstance(action_dim, int):
+                    intrinsic_action_dim = action_dim
+                else:
+                    intrinsic_action_dim = len(action_dim) if isinstance(action_dim, (list, tuple)) else 8
+            
+            self.intrinsic_reward_generator = create_intrinsic_reward_generator(
+                input_dim=obs_dim,
+                action_dim=intrinsic_action_dim,
+                device=self.device,
+                curiosity_weight=curiosity_weight,
+                rnd_weight=rnd_weight
+            )
+            
+            self.debug_print(f"Initialized intrinsic reward generator for pre-training with scale {intrinsic_reward_scale}")
 
     def _setup_cuda_graphs(self):
         """Create and set up CUDA graphs for accelerated inference."""
@@ -766,24 +809,74 @@ class PPOTrainer:
         return self.device
 
     def store_experience(self, state, action, log_prob, reward, value, done):
-        """
-        Store experience directly in memory buffer.
-        Handles different data types for consistent storage.
-        """
-        # Convert done to the appropriate type based on memory configuration.
-        if self.memory.use_device_tensors and not isinstance(done, torch.Tensor):
-            # Convert Python/numpy boolean to PyTorch boolean tensor.
-            done_tensor = torch.tensor(bool(done), dtype=torch.bool, device=self.device)
-            self.memory.store(state, action, log_prob, reward, value, done_tensor)
-        else:
-            self.memory.store(state, action, log_prob, reward, value, done)
+        """Store a single step of experience in the memory buffer."""
+        # Convert inputs to the appropriate format for the memory buffer.
+        if isinstance(state, torch.Tensor):
+            state = state.detach().cpu().numpy()
+        if isinstance(action, torch.Tensor):
+            action = action.detach().cpu().numpy()
+        if isinstance(log_prob, torch.Tensor):
+            log_prob = log_prob.detach().cpu().numpy()
+        if isinstance(reward, torch.Tensor):
+            reward = reward.detach().cpu().numpy()
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().numpy()
+        if isinstance(done, torch.Tensor):
+            done = done.detach().cpu().numpy()
 
-        # Update auxiliary task history
-        if self.use_auxiliary_tasks and state is not None and reward is not None:
-            state_tensor = torch.FloatTensor(state).to(self.device) if not isinstance(state, torch.Tensor) else state
-            reward_tensor = torch.tensor(reward, dtype=torch.float32, device=self.device)
+        # Add intrinsic rewards during pretraining
+        if self.use_intrinsic_rewards and (not self.pretraining_completed or self.in_transition_phase):
+            # Get the next state for curiosity calculation (if available, otherwise use current)
+            next_state = None  # Will be set by environment interaction
 
-            # Add batch dimension if needed
+            # Convert state and action to tensor for intrinsic reward calculation
+            state_tensor = torch.FloatTensor(state).to(self.device)
+            action_tensor = torch.FloatTensor(action).to(self.device)
+            
+            # Store original reward for metrics
+            original_reward = reward
+            
+            # Apply transition factor if in transition phase
+            intrinsic_scale = self.intrinsic_reward_scale
+            if self.in_transition_phase:
+                transition_progress = min(1.0, (self.total_episodes - self.transition_start_step) / 
+                                           self.pretraining_transition_steps)
+                # Gradually reduce intrinsic rewards during transition
+                intrinsic_scale = self.intrinsic_reward_scale * (1.0 - transition_progress)
+
+            # Track experiences for later intrinsic reward updates when next_state becomes available
+            self._last_state = state_tensor
+            self._last_action = action_tensor
+            
+            # Use RND reward since it doesn't need next_state
+            if self.intrinsic_reward_generator and hasattr(self.intrinsic_reward_generator.generators, "rnd"):
+                rnd_reward = self.intrinsic_reward_generator.generators["rnd"][0].compute_reward(state_tensor)
+                intrinsic_reward = rnd_reward * intrinsic_scale
+                reward = reward + intrinsic_reward
+                
+                if self.use_wandb and self.training_steps % 10 == 0:
+                    wandb.log({
+                        "pretraining/rnd_reward": rnd_reward,
+                        "pretraining/intrinsic_reward": intrinsic_reward,
+                        "pretraining/extrinsic_reward": original_reward,
+                        "pretraining/total_reward": reward
+                    }, step=self._get_wandb_step())
+
+        # Store the experience in memory.
+        self.memory.store(state, action, log_prob, reward, value, done)
+
+        # Update auxiliary task models if enabled and after storing experience
+        if self.use_auxiliary_tasks and hasattr(self, 'aux_task_manager'):
+            # Convert to tensor for auxiliary task update
+            if not isinstance(state, torch.Tensor):
+                state_tensor = torch.FloatTensor(state).to(self.device)
+            else:
+                state_tensor = state
+            if not isinstance(reward, torch.Tensor):
+                reward_tensor = torch.FloatTensor([reward]).to(self.device)
+            else:
+                reward_tensor = reward
+                
             if state_tensor.dim() == 1:
                 state_tensor = state_tensor.unsqueeze(0)
             if not isinstance(reward_tensor, torch.Tensor) or reward_tensor.dim() == 0:
@@ -1931,3 +2024,19 @@ class PPOTrainer:
                   f"({self.pretraining_fraction*100:.1f}% of {self.total_episode_target})")
         
         return self._get_pretraining_end_step()
+
+    def update_intrinsic_models(self, state, action, next_state, done=False):
+        """Update intrinsic reward models with new experience"""
+        if not self.use_intrinsic_rewards or self.intrinsic_reward_generator is None:
+            return {}
+            
+        if not isinstance(state, torch.Tensor):
+            state = torch.FloatTensor(state).to(self.device)
+        if not isinstance(action, torch.Tensor):
+            action = torch.FloatTensor(action).to(self.device)
+        if not isinstance(next_state, torch.Tensor):
+            next_state = torch.FloatTensor(next_state).to(self.device)
+            
+        # Update intrinsic reward models
+        metrics = self.intrinsic_reward_generator.update(state, action, next_state, done)
+        return metrics
