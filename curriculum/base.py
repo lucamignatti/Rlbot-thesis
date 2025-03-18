@@ -676,20 +676,9 @@ class CurriculumManager:
         Get the current statistics of the curriculum.
         Used by the training loop to display progress.
         """
-        current_stage = self.stages[self.current_stage_index]
-        current_stage_stats = current_stage.get_statistics()
-
-        return {
-            "current_stage": self.current_stage_index,
-            "total_stages": len(self.stages),
-            "current_stage_name": current_stage.name,
-            "difficulty_level": self.current_difficulty,
-            "total_episodes": self.total_episodes,
-            "current_stage_stats": current_stage_stats,
-            "stage_progress": self.get_stage_progress(),
-            "overall_progress": self.get_overall_progress()
-        }
-
+        # This method is being removed in favor of the more comprehensive implementation below
+        return self.get_curriculum_stats()
+        
     def get_curriculum_stats(self):
         """Get current curriculum statistics for display and logging."""
         current_stage = self.stages[self.current_stage_index]
@@ -717,8 +706,10 @@ class CurriculumManager:
             pretraining_end_step = 0
         
         stats = {
+            "current_stage": self.current_stage_index,  # Adding this for backward compatibility
             "current_stage_index": self.current_stage_index,
             "current_stage_name": current_stage.name,
+            "total_stages": len(self.stages),  # Adding this for backward compatibility
             "difficulty_level": self.current_difficulty,
             "total_episodes": self.total_episodes,
             "in_rehearsal": self.current_rehearsal is not None,

@@ -546,9 +546,22 @@ class VectorizedEnv:
                         process.start()
                         new_work_remote.close()
                         
+                        # Properly terminate the old process before replacing it
+                        old_process = self.processes[i]
+                        try:
+                            old_process.terminate()
+                            old_process.join(timeout=2.0)  # Wait for termination
+                            if old_process.is_alive():
+                                if self.debug:
+                                    print(f"[DEBUG] Process {i} still alive after terminate, killing...")
+                                old_process.kill()  # Force kill if still alive
+                                old_process.join(timeout=1.0)
+                        except Exception as e:
+                            if self.debug:
+                                print(f"[DEBUG] Error cleaning up old process {i}: {e}")
+                        
                         # Replace the old remote with the new one
                         self.remotes[i] = new_remote
-                        self.processes[i].terminate()  # Terminate old process
                         self.processes[i] = process
                         
                         # Reset this environment
@@ -754,31 +767,69 @@ class VectorizedEnv:
         if self.mode == "thread":
             # Close the thread pool
             if hasattr(self, 'executor'):
-                self.executor.shutdown()
+                self.executor.shutdown(wait=True)  # Wait for all tasks to complete
 
             # Close all environments
             if hasattr(self, 'envs'):
                 for env in self.envs:
-                    env.close()
+                    try:
+                        env.close()
+                    except Exception as e:
+                        if self.debug:
+                            print(f"[DEBUG] Error closing environment: {e}")
 
         else:  # multiprocess mode
-            # Close multiprocessing environments
+            # First try sending close command to all workers
             if hasattr(self, 'remotes'):
-                for remote in self.remotes:
+                for i, remote in enumerate(self.remotes):
                     try:
                         remote.send(('close', None))
-                    except (BrokenPipeError, EOFError):
-                        pass  # Already closed
+                        if self.debug:
+                            print(f"[DEBUG] Sent close command to worker {i}")
+                    except (BrokenPipeError, EOFError) as e:
+                        if self.debug:
+                            print(f"[DEBUG] Error sending close to worker {i}: {e}")
 
+            # Wait a moment for workers to process the close command
+            time.sleep(0.5)
+            
+            # Then terminate and clean up processes
             if hasattr(self, 'processes'):
-                for process in self.processes:
-                    process.join(timeout=1.0)
-                    if process.is_alive():
-                        process.terminate()
+                for i, process in enumerate(self.processes):
+                    try:
+                        process.join(timeout=2.0)
+                        if process.is_alive():
+                            process.terminate()
+                            process.join(timeout=1.0)
+                            if process.is_alive() and hasattr(process, 'kill'):
+                                if self.debug:
+                                    print(f"[DEBUG] Force killing worker {i}")
+                                process.kill()
+                                process.join(timeout=1.0)
+                    except Exception as e:
+                        if self.debug:
+                            print(f"[DEBUG] Error terminating process {i}: {e}")
 
+            # Finally close all pipe connections
             if hasattr(self, 'remotes'):
-                for remote in self.remotes:
+                for i, remote in enumerate(self.remotes):
                     try:
                         remote.close()
-                    except:
-                        pass  # Already closed
+                    except Exception as e:
+                        if self.debug:
+                            print(f"[DEBUG] Error closing pipe for worker {i}: {e}")
+            
+            if hasattr(self, 'work_remotes'):
+                for i, work_remote in enumerate(self.work_remotes):
+                    try:
+                        if work_remote is not None:
+                            work_remote.close()
+                    except Exception:
+                        pass
+        
+        # Force garbage collection to clean up any remaining references
+        try:
+            import gc
+            gc.collect()
+        except ImportError:
+            pass

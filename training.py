@@ -132,6 +132,11 @@ class PPOMemory:
         """
         self.pos = 0
         self.size = 0
+        
+        # Force CUDA memory cleanup if using device tensors on CUDA
+        if self.use_device_tensors and self.device.startswith('cuda'):
+            # Explicitly release unused memory
+            torch.cuda.empty_cache()
 
     def get(self):
         """Get all data currently stored in the buffer."""

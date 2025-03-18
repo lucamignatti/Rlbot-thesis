@@ -283,13 +283,29 @@ class RLBotVectorizedEnv(VectorizedEnv):
                 except Exception as e:
                     if self.debug:
                         print(f"[DEBUG] Error stopping bot: {str(e)}")
+                        
+            # Clean up any bot adapters stored in the main process
+            if hasattr(self, '_bot_adapters'):
+                for adapter_key, adapter in list(self._bot_adapters.items()):
+                    try:
+                        if hasattr(adapter, 'stop'):
+                            adapter.stop()
+                    except Exception as e:
+                        if self.debug:
+                            print(f"[DEBUG] Error stopping adapter {adapter_key}: {str(e)}")
+                self._bot_adapters.clear()
         else:
             # In multiprocessing mode, worker processes handle bot cleanup
             # We just need to send unregister commands for all bots
             for (env_idx, agent_id) in list(self.bot_agents.keys()):
                 if env_idx < len(self.remotes):
                     try:
+                        # Use a short timeout to avoid hanging when sending commands
                         self.remotes[env_idx].send(('unregister_bot', (env_idx, agent_id)))
+                        if hasattr(select, 'select'):
+                            # Wait briefly for acknowledgment but don't block if not received
+                            if select.select([self.remotes[env_idx]], [], [], 1.0)[0]:
+                                self.remotes[env_idx].recv()
                     except Exception as e:
                         if self.debug:
                             print(f"[DEBUG] Error sending unregister_bot command: {str(e)}")
