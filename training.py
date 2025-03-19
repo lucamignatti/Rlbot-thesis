@@ -328,10 +328,16 @@ class PPOTrainer:
         self.actor = actor.to(self.device)
         self.critic = critic.to(self.device)
 
-        # We'll decay the entropy coefficient over time to encourage exploration শুরুতে, and exploitation later.
+        # We'll decay the entropy coefficient over time to encourage exploration, and exploitation later.
         self.entropy_coef = entropy_coef if entropy_coef else 0.01
         self.entropy_coef_decay = entropy_coef_decay if entropy_coef_decay else 0.999  # Slower decay
         self.min_entropy_coef = 0.005  # Higher minimum
+        
+        # Pretraining entropy management
+        self.base_entropy_coef = entropy_coef
+        self.pretraining_entropy_scale = 10.0  # Default to 10x higher during pretraining
+        self.min_entropy_coef = 0.005  # Minimum value
+
 
         try:
             self.debug_print(f"Compiling models for {self.device}...")
@@ -2007,8 +2013,27 @@ class PPOTrainer:
                 current_rp_weight = self.pretraining_rp_weight + transition_progress * (self.base_rp_weight - self.pretraining_rp_weight)
         self.aux_task_manager.sr_weight = current_sr_weight
         self.aux_task_manager.rp_weight = current_rp_weight
+
+        # Also update entropy coefficient based on pretraining status
+        if not self.pretraining_completed:
+            # Use high entropy during pretraining (5-10x base value)
+            self.entropy_coef = min(0.1, self.base_entropy_coef * self.pretraining_entropy_scale)
+        elif self.in_transition_phase:
+            # Gradually reduce entropy during transition phase
+            transition_progress = min(1.0, (self.training_steps - self.transition_start_step) / 
+                                    self.pretraining_transition_steps)
+            high_entropy = min(0.1, self.base_entropy_coef * self.pretraining_entropy_scale)
+            self.entropy_coef = high_entropy - transition_progress * (high_entropy - self.base_entropy_coef)
+        else:
+            # During normal training, apply regular entropy decay
+            if self.entropy_coef > self.min_entropy_coef:
+                self.entropy_coef = max(self.min_entropy_coef,
+                                        self.entropy_coef * self.entropy_coef_decay)
+
+
         if self.use_wandb and self.training_steps % 10 == 0:
             wandb.log({
+                "pretraining/entropy_coef": self.entropy_coef,
                 "pretraining/sr_weight": current_sr_weight,
                 "pretraining/rp_weight": current_rp_weight,
                 "pretraining/active": not self.pretraining_completed,

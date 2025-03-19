@@ -405,6 +405,10 @@ def run_training(
             # Check if it's time to update the policy.
             enough_experiences = collected_experiences >= update_interval
 
+            # Reset intrinsic models periodically
+            if args.pretraining and total_episodes_so_far % 50 == 0 and hasattr(trainer, 'intrinsic_reward_generator'):
+                trainer.intrinsic_reward_generator.reset_models()
+
             # Update only if we've collected enough experiences - removed time-based fallback
             if enough_experiences and not test:
                 if debug:
@@ -686,8 +690,8 @@ if __name__ == "__main__":
     parser.add_argument('--no-intrinsic', action='store_false', dest='use_intrinsic', help='Disable intrinsic rewards during pre-training')
     parser.set_defaults(use_intrinsic=True)
     
-    parser.add_argument('--intrinsic-scale', type=float, default=0.1, 
-                       help='Scaling factor for intrinsic rewards (default: 0.1)')
+    parser.add_argument('--intrinsic-scale', type=float, default=0.7, 
+                       help='Scaling factor for intrinsic rewards (default: 0.7)')
     
     parser.add_argument('--curiosity-weight', type=float, default=0.5,
                        help='Weight for curiosity-based intrinsic rewards (default: 0.5)')

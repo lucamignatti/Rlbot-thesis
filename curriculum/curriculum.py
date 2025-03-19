@@ -570,13 +570,20 @@ def create_curriculum(debug=False):
     pretraining = RLBotSkillStage(
         name="Unsupervised Pre-training",
         base_task_state_mutator=MutatorSequence(
-            FixedTeamSizeMutator(blue_size=1, orange_size=0),
+            FixedTeamSizeMutator(blue_size=2, orange_size=2),
             CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(get_strategic_car_position)),
             BallPositionMutator(position_function=SafePositionWrapper(safe_ball_position))
         ),
-        # Use a "dummy" reward function that always returns zero
-        # The actual rewards will come entirely from intrinsic motivation
-        base_task_reward_function=DummyReward(),
+        # Use rewards for various extrinisic tasks to discourage repetitive or unproductive behaviour
+        # For pretraining phase, use this simpler reward structure
+        base_task_reward_function = CombinedReward(
+            (BallProximityReward(), 0.3),
+            (TouchBallReward(), 0.3),
+            (PlayerVelocityTowardBallReward(), 0.2), 
+            (SaveBoostReward(), 0.1),
+            # Only one goal orientation to avoid confusion
+            (BallToGoalDistanceReward(team_goal_y=5120), 0.1),
+        ),
         base_task_termination_condition=goal_condition,
         base_task_truncation_condition=short_timeout,
         progression_requirements=ProgressionRequirements(
