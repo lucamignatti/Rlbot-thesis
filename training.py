@@ -1625,14 +1625,19 @@ class PPOTrainer:
                     import traceback
                     traceback.print_exc()
                     continue
-
-        # Step learning rate schedulers
-        self.actor_scheduler.step()
-        self.critic_scheduler.step()
-        if self.use_auxiliary_tasks:
-            self.aux_task_manager.sr_scheduler.step()
-            self.aux_task_manager.rp_scheduler.step()
-
+                    
+        # Step learning rate schedulers only when NOT in pretraining
+        # This keeps learning rates constant during pretraining to avoid optimization bias
+        if self.pretraining_completed and not self.in_transition_phase:
+            self.actor_scheduler.step()
+            self.critic_scheduler.step()
+            if self.use_auxiliary_tasks:
+                self.aux_task_manager.sr_scheduler.step()
+                self.aux_task_manager.rp_scheduler.step()
+        else:
+            if self.debug and self.training_steps % 100 == 0:
+                print(f"[DEBUG] Skipping LR scheduler step during pretraining (step {self.training_steps})")
+                
         # Apply entropy decay more slowly
         if self.entropy_coef > self.min_entropy_coef:
             self.entropy_coef = max(self.min_entropy_coef, 
