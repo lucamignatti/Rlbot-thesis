@@ -3,6 +3,7 @@ import time
 import multiprocessing as mp
 from multiprocessing import Process, Pipe
 import numpy as np
+import torch  # Add missing torch import for tensor handling
 from typing import List, Tuple, Dict
 from rlgym.rocket_league.rlviser import RLViserRenderer
 from rlgym.rocket_league.state_mutators import FixedTeamSizeMutator
@@ -60,7 +61,6 @@ def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacke
             set_initial_tick(env.truncation_cond)
             
         curr_config = curriculum_config  # Keep track of current curriculum config
-
         while True:
             try:
                 # Don't use select here - it can cause issues with some platforms
@@ -71,10 +71,32 @@ def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacke
                     # Format actions for RLGym API
                     formatted_actions = {}
                     for agent_id, action in actions_dict.items():
-                        if isinstance(action, np.ndarray):
+                        # Handle tensor conversion properly
+                        if isinstance(action, torch.Tensor):
+                            # Properly convert tensor to numpy, regardless of dimensions
+                            action_np = action.cpu().detach().numpy()
+                            
+                            # If action is a one-hot vector, convert it to an index
+                            if len(action_np.shape) == 1 and action_np.shape[0] > 1:
+                                # Get the index of the maximum value (one-hot to index)
+                                action_idx = np.argmax(action_np)
+                                formatted_actions[agent_id] = np.array([action_idx])
+                            else:
+                                # Use the numpy array directly
+                                formatted_actions[agent_id] = action_np
+                        elif isinstance(action, np.ndarray):
                             formatted_actions[agent_id] = action
+                        elif isinstance(action, int):
+                            formatted_actions[agent_id] = np.array([action])
                         else:
-                            formatted_actions[agent_id] = np.array([action if isinstance(action, int) else int(action)])
+                            # For any other type, try to convert to numpy array
+                            try:
+                                formatted_actions[agent_id] = np.array([action])
+                            except:
+                                if debug:
+                                    print(f"[DEBUG] Unable to process action of type {type(action)}, using default action")
+                                formatted_actions[agent_id] = np.array([0])  # Default action
+                                
                         # Add action to stacker history
                         if action_stacker is not None:
                             action_stacker.add_action(agent_id, formatted_actions[agent_id])
@@ -362,10 +384,31 @@ class VectorizedEnv:
         # Format actions for RLGym API
         formatted_actions = {}
         for agent_id, action in actions_dict.items():
-            if isinstance(action, np.ndarray):
+            # Handle tensor conversion properly
+            if isinstance(action, torch.Tensor):
+                # Properly convert tensor to numpy, regardless of dimensions
+                action_np = action.cpu().detach().numpy()
+                
+                # If action is a one-hot vector, convert it to an index
+                if len(action_np.shape) == 1 and action_np.shape[0] > 1:
+                    # Get the index of the maximum value (one-hot to index)
+                    action_idx = np.argmax(action_np)
+                    formatted_actions[agent_id] = np.array([action_idx])
+                else:
+                    # Use the numpy array directly
+                    formatted_actions[agent_id] = action_np
+            elif isinstance(action, np.ndarray):
                 formatted_actions[agent_id] = action
+            elif isinstance(action, int):
+                formatted_actions[agent_id] = np.array([action])
             else:
-                formatted_actions[agent_id] = np.array([action if isinstance(action, int) else int(action)])
+                # For any other type, try to convert to numpy array
+                try:
+                    formatted_actions[agent_id] = np.array([action])
+                except:
+                    if self.debug:
+                        print(f"[DEBUG] Unable to process action of type {type(action)}, using default action")
+                    formatted_actions[agent_id] = np.array([0])  # Default action
 
             # Add action to the stacker history
             if self.action_stacker is not None:

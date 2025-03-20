@@ -13,7 +13,8 @@ from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMut
 from rewards import BallProximityReward, BallToGoalDistanceReward, BallVelocityToGoalReward, TouchBallReward, TouchBallToGoalAccelerationReward, AlignBallToGoalReward, PlayerVelocityTowardBallReward, KRCReward
 from models import BasicModel, SimBa, fix_compiled_state_dict, extract_model_dimensions, load_partial_state_dict
 from observation import StackedActionsObs, ActionStacker
-from training import PPOTrainer
+from training import Trainer
+from learning_algorithms import PPOAlgorithm, StreamACAlgorithm  # Import the new learning algorithms
 import concurrent.futures
 import time
 import argparse
@@ -61,6 +62,8 @@ def run_training(
     batch_size: int = 64,
     aux_amp: bool = False,
     aux_scale: float = 0.005,
+    # Algorithm selection
+    algorithm: str = "ppo",
     # Additional args
     auxiliary: bool = True,
     sr_weight: float = 1.0,
@@ -77,6 +80,17 @@ def run_training(
     intrinsic_reward_scale: float = 0.1,
     curiosity_weight: float = 0.5,
     rnd_weight: float = 0.5,
+    # StreamAC specific parameters
+    adaptive_learning_rate: bool = True,
+    target_step_size: float = 0.025,
+    backtracking_patience: int = 10,
+    backtracking_zeta: float = 0.85,
+    min_lr_factor: float = 0.1,
+    max_lr_factor: float = 10.0,
+    use_obgd: bool = True,
+    stream_buffer_size: int = 32,
+    use_sparse_init: bool = True,
+    update_freq: int = 1,
 ):
     """
     Main training loop.  This sets up the agent, environment, and training process,
@@ -99,10 +113,12 @@ def run_training(
     # Initialize action stacker for keeping track of previous actions
     action_stacker = ActionStacker(stack_size=5, action_size=actor.action_shape)
 
-    # Initialize the PPO trainer, which handles the core learning algorithm.
-    trainer = PPOTrainer(
+    # Initialize the Trainer with the appropriate algorithm
+    trainer = Trainer(
         actor,
         critic,
+        algorithm_type=algorithm,  # Use the specified algorithm
+        action_space_type="discrete",  # For RLBot, we use discrete actions
         action_dim=actor.action_shape,
         device=device,
         lr_actor=lr_actor,
@@ -133,7 +149,18 @@ def run_training(
         use_intrinsic_rewards=use_intrinsic_rewards,
         intrinsic_reward_scale=intrinsic_reward_scale,
         curiosity_weight=curiosity_weight,
-        rnd_weight=rnd_weight
+        rnd_weight=rnd_weight,
+        # StreamAC specific parameters
+        adaptive_learning_rate=adaptive_learning_rate,
+        target_step_size=target_step_size,
+        backtracking_patience=backtracking_patience,
+        backtracking_zeta=backtracking_zeta,
+        min_lr_factor=min_lr_factor,
+        max_lr_factor=max_lr_factor,
+        use_obgd=use_obgd,
+        stream_buffer_size=stream_buffer_size,
+        use_sparse_init=use_sparse_init,
+        update_freq=update_freq,
     )
     
     # Set total_episodes and training_time attributes for pretraining calculation
@@ -208,14 +235,14 @@ def run_training(
     stats_dict = {
         "Device": device,
         "Envs": num_envs,
-        "Exp": "0/0",  # Experiences collected / experiences per update
         "Episodes": 0,  # Total episodes completed
         "Reward": "0.0",  # Average reward per episode
         "PLoss": "0.0",  # Actor loss
         "VLoss": "0.0",  # Critic loss
         "Entropy": "0.0", # Entropy loss
         "SR_Loss": "0.0", # State reconstruction loss
-        "RP_Loss": "0.0"  # Reward prediction loss
+        "RP_Loss": "0.0",  # Reward prediction loss
+        "Algorithm": algorithm  # Display which algorithm is being used
     }
     
     # Add pretraining info if enabled
@@ -232,6 +259,14 @@ def run_training(
         stats_dict.update({
             "Stage": curriculum_stats["current_stage_name"],
             "Diff": f"{curriculum_stats['difficulty_level']:.2f}"
+        })
+
+    # Add StreamAC specific info if using that algorithm
+    if algorithm == "streamac":
+        stats_dict.update({
+            "StepSize": "0.0",  # Effective step size
+            "ActorLR": f"{lr_actor:.6f}",  # Display actor learning rate (will change with adaptive LR)
+            "CriticLR": f"{lr_critic:.6f}"  # Display critic learning rate
         })
 
     progress_bar.set_postfix(stats_dict)
@@ -305,7 +340,14 @@ def run_training(
                 for i, (action, log_prob, value) in enumerate(zip(action_batch, log_prob_batch, value_batch)):
                     env_idx = all_env_indices[i]
                     agent_id = all_agent_ids[i]
-                    actions_dict_list[env_idx][agent_id] = action
+                    
+                    # Make sure actions sent to environments are CPU tensors or numpy arrays
+                    # This prevents CUDA/HIP errors when sending tensors between processes
+                    if isinstance(action, torch.Tensor) and action.is_cuda:
+                        cpu_action = action.detach().cpu()
+                        actions_dict_list[env_idx][agent_id] = cpu_action
+                    else:
+                        actions_dict_list[env_idx][agent_id] = action
 
                     # Store the experience (observations, actions, etc.).
                     # Reward and done are placeholders for now; we'll update them after the environment step.
@@ -317,7 +359,7 @@ def run_training(
                         value,
                         False
                     )
-
+                    # Increment experience counter
                     collected_experiences += 1
 
             # Step all environments forward in parallel - optimized implementation
@@ -348,11 +390,20 @@ def run_training(
                         trainer.reset_auxiliary_tasks()
 
                     # Update the stored experience with the correct reward and done flag.
-                    mem_idx = trainer.memory.pos - len(all_obs) + exp_idx
-                    if mem_idx < 0:  # Handle wrap-around in the circular buffer.
-                        mem_idx += trainer.memory.buffer_size
+                    if algorithm == "ppo":
+                        # For PPO, we have a memory buffer with indices
+                        mem_idx = trainer.memory.pos - len(all_obs) + exp_idx
+                        if mem_idx < 0:  # Handle wrap-around in the circular buffer.
+                            mem_idx += trainer.memory.buffer_size
 
-                    trainer.store_experience_at_idx(mem_idx, None, None, None, reward, None, done)
+                        trainer.store_experience_at_idx(mem_idx, None, None, None, reward, None, done)
+                    else:
+                        # For StreamAC, we directly update the latest experience
+                        # (the store_experience call already happened above)
+                        if hasattr(trainer.algorithm, 'experience_buffer') and len(trainer.algorithm.experience_buffer) > 0:
+                            # Update the next state for intrinsic reward calculation
+                            # This is only needed for algorithms that track state transitions
+                            pass
 
                     # Accumulate rewards.
                     episode_rewards[env_idx][agent_id] += reward
@@ -402,14 +453,39 @@ def run_training(
                             print(f"Episode {episode_counts[env_idx]} in env {env_idx} completed with avg reward: {avg_reward:.2f}")
                         episode_rewards[env_idx] = {agent_id: 0 for agent_id in vec_env.obs_dicts[env_idx]}
 
-            # Check if it's time to update the policy.
-            enough_experiences = collected_experiences >= update_interval
+            # Determine if it's time to update the policy
+            enough_experiences = False
+            
+            if algorithm == "ppo":
+                # For PPO, we use a batch update approach
+                enough_experiences = collected_experiences >= update_interval
+            else:
+                # For StreamAC, updates happen online, but we may want to log periodically
+                # Actual updates happen with every step, this is just for UI logging
+                enough_experiences = collected_experiences % update_interval == 0
+                
+                # Add more frequent update status for StreamAC (every 100 steps)
+                if collected_experiences % 100 == 0 and collected_experiences > 0 and debug:
+                    print(f"[DEBUG] StreamAC has processed {collected_experiences} steps " +
+                          f"(with updates every {args.update_freq} step(s))")
+                    # Update StreamAC-specific metrics in stats_dict for more frequent UI updates
+                    if hasattr(trainer.algorithm, "successful_steps") and hasattr(trainer.algorithm, "last_step_sizes"):
+                        step_sizes = getattr(trainer.algorithm, "last_step_sizes", [0])
+                        last_step = step_sizes[-1] if len(step_sizes) > 0 else 0
+                        
+                        stats_dict.update({
+                            "StepSize": f"{last_step:.4f}",
+                            "ActorLR": f"{getattr(trainer.algorithm, 'lr_actor', args.lra):.6f}",
+                            "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', args.lrc):.6f}",
+                            "Updates": getattr(trainer.algorithm, "successful_steps", 0)
+                        })
+                        progress_bar.set_postfix(stats_dict)
 
             # Reset intrinsic models periodically
             if args.pretraining and total_episodes_so_far % 50 == 0 and hasattr(trainer, 'intrinsic_reward_generator'):
                 trainer.intrinsic_reward_generator.reset_models()
 
-            # Update only if we've collected enough experiences - removed time-based fallback
+            # Update only if we've collected enough experiences and not in test mode
             if enough_experiences and not test:
                 if debug:
                     print(f"[DEBUG] Updating policy with {collected_experiences} experiences after {time.time() - last_update_time:.2f}s")
@@ -421,7 +497,6 @@ def run_training(
                 stats_dict.update({
                     "Device": device,
                     "Envs": num_envs,
-                    "Exp": f"0/{update_interval}",  # Reset experience count
                     "Episodes": total_episodes_so_far,
                     "Reward": f"{stats.get('mean_episode_reward', 0):.2f}",
                     "PLoss": f"{stats.get('actor_loss', 0):.4f}",
@@ -430,6 +505,19 @@ def run_training(
                     "SR_Loss": f"{stats.get('sr_loss', 0):.4f}",
                     "RP_Loss": f"{stats.get('rp_loss', 0):.4f}"
                 })
+
+                # Add Exp counter only for PPO algorithm
+                if algorithm == "ppo":
+                    stats_dict["Exp"] = f"0/{update_interval}"
+
+                # Update StreamAC specific metrics if using that algorithm
+                if algorithm == "streamac":
+                    stats_dict.update({
+                        "StepSize": f"{stats.get('effective_step_size', 0):.4f}",
+                        "ActorLR": f"{getattr(trainer.algorithm, 'lr_actor', lr_actor):.6f}",
+                        "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic):.6f}",
+                        "Updates": getattr(trainer.algorithm, "successful_steps", 0)
+                    })
 
                 # Update curriculum stats if enabled
                 if curriculum_manager:
@@ -445,7 +533,7 @@ def run_training(
                         
                         # Use trainer's _true_training_steps as source of truth for step counting
                         # This ensures we're using EXACTLY the same step as the trainer just used
-                        current_step = trainer._true_training_steps
+                        current_step = trainer.training_steps + trainer.training_step_offset
                         
                         # Synchronize curriculum manager step counter to match trainer exactly
                         curriculum_manager._last_wandb_step = current_step
@@ -466,15 +554,16 @@ def run_training(
                 collected_experiences = 0
                 last_update_time = time.time()
 
-                # Add this after each update in the main training loop
+                # Garbage collection after updates
                 if collected_experiences % (update_interval * 10) == 0:  # Every 10 updates
                     # Force garbage collection and clear CUDA cache
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-            # Update the experience count in the progress bar.
-            stats_dict["Exp"] = f"{collected_experiences}/{update_interval}"
+            # Update the experience count in the progress bar - ONLY for PPO
+            if algorithm == "ppo":
+                stats_dict["Exp"] = f"{collected_experiences}/{update_interval}"
             
             # Update pretraining progress if enabled
             if use_pretraining:
@@ -604,6 +693,9 @@ if __name__ == "__main__":
                     help='Disable curriculum learning')
     parser.set_defaults(curriculum=True)
 
+    # Algorithm choice
+    parser.add_argument('--algorithm', type=str, default='ppo', choices=['ppo', 'streamac'],
+                       help='Learning algorithm to use: ppo (default) or streamac')
 
     # Learning rates
     parser.add_argument('--lra', type=float, default=5e-5, help='Learning rate for actor network')
@@ -699,6 +791,47 @@ if __name__ == "__main__":
     parser.add_argument('--rnd-weight', type=float, default=0.5,
                        help='Weight for Random Network Distillation rewards (default: 0.5)')
 
+    # StreamAC specific parameters
+    streamac_group = parser.add_argument_group('StreamAC parameters')
+    streamac_group.add_argument('--adaptive-lr', action='store_true', dest='adaptive_learning_rate',
+                              help='Enable adaptive learning rate for StreamAC (default: True)')
+    streamac_group.add_argument('--no-adaptive-lr', action='store_false', dest='adaptive_learning_rate',
+                               help='Disable adaptive learning rate for StreamAC')
+    parser.set_defaults(adaptive_learning_rate=True)
+    
+    streamac_group.add_argument('--target-step-size', type=float, default=0.025,
+                               help='Target effective step size for StreamAC (default: 0.025)')
+    
+    streamac_group.add_argument('--backtracking-patience', type=int, default=10,
+                                help='Number of steps before backtracking parameters (default: 10)')
+    
+    streamac_group.add_argument('--backtracking-zeta', type=float, default=0.85,
+                               help='Scaling factor for learning rate during backtracking (default: 0.85)')
+    
+    streamac_group.add_argument('--min-lr-factor', type=float, default=0.1,
+                               help='Minimum learning rate factor relative to initial (default: 0.1)')
+    
+    streamac_group.add_argument('--max-lr-factor', type=float, default=10.0,
+                               help='Maximum learning rate factor relative to initial (default: 10.0)')
+    
+    streamac_group.add_argument('--obgd', action='store_true', dest='use_obgd',
+                               help='Enable Online Backpropagation with Decoupled Gradient (default: True)')
+    streamac_group.add_argument('--no-obgd', action='store_false', dest='use_obgd',
+                                help='Disable Online Backpropagation with Decoupled Gradient')
+    parser.set_defaults(use_obgd=True)
+    
+    streamac_group.add_argument('--stream-buffer-size', type=int, default=32,
+                               help='Size of experience buffer for StreamAC (default: 32)')
+    
+    streamac_group.add_argument('--sparse-init', action='store_true', dest='use_sparse_init',
+                               help='Use SparseInit for network initialization (default: True)')
+    streamac_group.add_argument('--no-sparse-init', action='store_false', dest='use_sparse_init',
+                                help='Use default PyTorch initialization instead of SparseInit')
+    parser.set_defaults(use_sparse_init=True)
+    
+    streamac_group.add_argument('--update-freq', type=int, default=1,
+                               help='Frequency of updates for StreamAC (default: 1, update every step)')
+    
     # Backwards compatibility.
     parser.add_argument('-p', '--processes', type=int, default=None,
                         help='Legacy parameter; use --num_envs instead')
@@ -800,6 +933,9 @@ if __name__ == "__main__":
             project="rlbot-training",
             resume="allow",  # Allow resuming previous runs
             config={
+                # Algorithm
+                "algorithm": args.algorithm,
+                
                 # Hyperparameters
                 "learning_rate_actor": args.lra,
                 "learning_rate_critic": args.lrc,
@@ -832,12 +968,26 @@ if __name__ == "__main__":
                 "update_interval": args.update_interval,
                 "device": device,
             },
-            name=f"PPO_{time.strftime('%Y%m%d-%H%M%S')}",
+            name=f"{args.algorithm.upper()}_{time.strftime('%Y%m%d-%H%M%S')}",
             monitor_gym=False,  # Don't use wandb's default gym monitoring
         )
+        
+        # Add StreamAC specific config if using that algorithm
+        if args.algorithm == "streamac":
+            wandb.config.update({
+                "adaptive_learning_rate": args.adaptive_learning_rate,
+                "target_step_size": args.target_step_size,
+                "backtracking_patience": args.backtracking_patience,
+                "backtracking_zeta": args.backtracking_zeta,
+                "use_obgd": args.use_obgd,
+                "stream_buffer_size": args.stream_buffer_size,
+                "use_sparse_init": args.use_sparse_init,
+                "update_freq": args.update_freq
+            })
 
     if args.debug:
         print(f"[DEBUG] Starting training with {args.num_envs} environments on {device}")
+        print(f"[DEBUG] Using {args.algorithm.upper()} algorithm")
         print(f"[DEBUG] Actor model: {actor}")
         print(f"[DEBUG] Critic model: {critic}")
         print(f"[DEBUG] Action stacking size: {args.stack_size}")
@@ -944,6 +1094,8 @@ if __name__ == "__main__":
         save_interval=args.save_interval,
         output_path=args.out,
         use_curriculum=args.curriculum,
+        # Algorithm selection
+        algorithm=args.algorithm,
         # Hyperparameters
         lr_actor=args.lra,
         lr_critic=args.lrc,
@@ -966,14 +1118,23 @@ if __name__ == "__main__":
         pretraining_sr_weight=args.pretraining_sr_weight,
         pretraining_rp_weight=args.pretraining_rp_weight,
         pretraining_transition_steps=args.pretraining_transition_steps,
-        # New intrinsic reward parameters
+        # Intrinsic reward parameters
         use_intrinsic_rewards=args.use_intrinsic,
         intrinsic_reward_scale=args.intrinsic_scale,
         curiosity_weight=args.curiosity_weight,
-        rnd_weight=args.rnd_weight
+        rnd_weight=args.rnd_weight,
+        # StreamAC specific parameters
+        adaptive_learning_rate=args.adaptive_learning_rate,
+        target_step_size=args.target_step_size,
+        backtracking_patience=args.backtracking_patience,
+        backtracking_zeta=args.backtracking_zeta,
+        min_lr_factor=args.min_lr_factor,
+        max_lr_factor=args.max_lr_factor,
+        use_obgd=args.use_obgd,
+        stream_buffer_size=args.stream_buffer_size,
+        use_sparse_init=args.use_sparse_init,
+        update_freq=args.update_freq,
     )
-
-
 
     # Save the final trained models, unless we're in test mode or training failed.
     saved_path = None
@@ -982,8 +1143,9 @@ if __name__ == "__main__":
         output_path = args.out if args.out else None
         # Save model with step count and wandb info
         metadata = {
-            'training_step': getattr(trainer, '_true_training_steps', 0),
-            'wandb_run_id': wandb.run.id if args.wandb and wandb.run else None
+            'training_step': getattr(trainer, 'training_steps', 0) + getattr(trainer, 'training_step_offset', 0),
+            'wandb_run_id': wandb.run.id if args.wandb and wandb.run else None,
+            'algorithm': args.algorithm  # Save which algorithm was used
         }
         saved_path = trainer.save_models(output_path, metadata)  # Capture the returned path
         print(f"Training complete - Model saved to {saved_path} at step {metadata['training_step']}")
@@ -996,7 +1158,7 @@ if __name__ == "__main__":
             import wandb
             if wandb.run is not None:
                 # Create a name for the artifact
-                artifact_name = f"model_{wandb.run.id}"
+                artifact_name = f"{args.algorithm}_{wandb.run.id}"
                 if args.time is not None:
                     artifact_name += f"_t{int(parse_time(args.time) if args.time else 0)}s"
                 else:
@@ -1006,7 +1168,7 @@ if __name__ == "__main__":
                 artifact = wandb.Artifact(
                     name=artifact_name,
                     type="model",
-                    description=f"RL model trained for {args.episodes if args.time is None else args.time}"
+                    description=f"RL model trained with {args.algorithm.upper()} for {args.episodes if args.time is None else args.time}"
                 )
 
                 # Add the model file
@@ -1014,6 +1176,7 @@ if __name__ == "__main__":
 
                 # Add metadata
                 metadata = {
+                    "algorithm": args.algorithm,
                     "episodes": args.episodes if args.time is None else None,
                     "training_time": args.time,
                     "device": str(device),
@@ -1034,6 +1197,18 @@ if __name__ == "__main__":
                         'dropout': args.dropout
                     },
                 }
+                
+                # Add StreamAC specific metadata if relevant
+                if args.algorithm == "streamac":
+                    metadata.update({
+                        "adaptive_learning_rate": args.adaptive_learning_rate,
+                        "target_step_size": args.target_step_size,
+                        "backtracking_patience": args.backtracking_patience,
+                        "backtracking_zeta": args.backtracking_zeta,
+                        "use_obgd": args.use_obgd,
+                        "stream_buffer_size": args.stream_buffer_size,
+                        "use_sparse_init": args.use_sparse_init
+                    })
 
                 # Add metadata to the artifact
                 for key, value in metadata.items():

@@ -1,16 +1,18 @@
-import numpy as np
-import torch
-import torch.nn.functional as F
-import torch.optim as optim
 from torch.distributions import Categorical, Normal
 from torch.amp import autocast, GradScaler
 from models import fix_compiled_state_dict, print_model_info
-from typing import Union, Tuple
+from typing import Union, Tuple, Optional, Dict, Any
 from auxiliary import AuxiliaryTaskManager
 from intrinsic_rewards import create_intrinsic_reward_generator, IntrinsicRewardEnsemble
+from learning_algorithms import BaseAlgorithm, PPOAlgorithm, StreamACAlgorithm
 import time
 import wandb
 import os
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import numpy as np
 
 class PPOMemory:
     """
@@ -33,19 +35,15 @@ class PPOMemory:
             self.logprobs = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
             self.rewards = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
             self.values = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
-            self.dones = torch.zeros((buffer_size,), dtype=torch.bool, device=device)
-            # Priorities for prioritized experience replay. Initialized to 1.0.
-            self.priorities = torch.ones(buffer_size, device=device)
+            self.dones = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
         else:
-            # We're on CPU. Use numpy arrays, which are more efficient here.
-            self.states = np.zeros((buffer_size, 1), dtype=np.float32)
-            self.actions = np.zeros((buffer_size,), dtype=np.float32)
+            # We're on a CPU, use numpy arrays which are more efficient on CPU.
+            self.states = None  # Will be initialized when we get our first state
+            self.actions = None  # Will be initialized when we get our first action
             self.logprobs = np.zeros((buffer_size,), dtype=np.float32)
             self.rewards = np.zeros((buffer_size,), dtype=np.float32)
             self.values = np.zeros((buffer_size,), dtype=np.float32)
-            self.dones = np.zeros((buffer_size,), dtype=bool)
-            # Priorities for prioritized experience replay.  Initialized to 1.0.
-            self.priorities = np.ones(buffer_size, dtype=np.float32)
+            self.dones = np.zeros((buffer_size,), dtype=np.float32)
 
         self.state_initialized = False
         self.action_initialized = False
@@ -57,70 +55,207 @@ class PPOMemory:
 
         # Initialize state storage, if needed, and determine its dimensions.
         if not self.state_initialized and state is not None:
-            state_shape = np.asarray(state).shape
-
             if self.use_device_tensors:
-                self.states = torch.zeros((self.buffer_size,) + state_shape,
-                                         dtype=torch.float32, device=self.device)
+                # If it's a tensor, create a tensor of the right shape.
+                if isinstance(state, torch.Tensor):
+                    state_shape = state.shape
+                    # Check dimensions to handle both batched (2D) and unbatched (1D) inputs
+                    if len(state_shape) == 1:
+                        # Unbatched input, create a 2D states tensor [buffer_size, state_dim]
+                        self.states = torch.zeros((self.buffer_size, state_shape[0]), 
+                                                  device=self.device, dtype=torch.float32)
+                    else:
+                        # Batched input, match the dimensions [buffer_size, batch_dim, state_dim]
+                        self.states = torch.zeros((self.buffer_size, *state_shape[1:]), 
+                                                  device=self.device, dtype=torch.float32)
+                else:
+                    # If it's a numpy array or list, determine shape and create tensor.
+                    state_array = np.array(state)
+                    state_shape = state_array.shape
+                    # Check dimensions
+                    if len(state_shape) == 1:
+                        # Unbatched input
+                        self.states = torch.zeros((self.buffer_size, state_shape[0]),
+                                                  device=self.device, dtype=torch.float32)
+                    else:
+                        # Batched input
+                        self.states = torch.zeros((self.buffer_size, *state_shape[1:]),
+                                                  device=self.device, dtype=torch.float32)
             else:
-                self.states = np.zeros((self.buffer_size,) + state_shape, dtype=np.float32)
-
+                # We're on CPU, use numpy arrays.
+                if isinstance(state, torch.Tensor):
+                    state_array = state.cpu().numpy()
+                else:
+                    state_array = np.array(state)
+                    
+                state_shape = state_array.shape
+                # Check dimensions
+                if len(state_shape) == 1:
+                    # Unbatched input
+                    self.states = np.zeros((self.buffer_size, state_shape[0]), dtype=np.float32)
+                else:
+                    # Batched input
+                    self.states = np.zeros((self.buffer_size, *state_shape[1:]), dtype=np.float32)
+            
             self.state_initialized = True
 
         # Initialize action storage, if needed, and figure out if actions are discrete or continuous.
         if not self.action_initialized and action is not None:
-            action_array = np.asarray(action)
-
-            if action_array.size == 1:  # Discrete action
-                if self.use_device_tensors:
-                    self.actions = torch.zeros(self.buffer_size, dtype=torch.int64, device=self.device)
+            if self.use_device_tensors:
+                # If it's a tensor, create a tensor of the right shape.
+                if isinstance(action, torch.Tensor):
+                    action_shape = action.shape
+                    # Check if we have scalar actions (discrete) or vector actions (continuous)
+                    if action_shape == () or (len(action_shape) == 1 and action_shape[0] == 1):
+                        # Scalar/discrete actions
+                        self.actions = torch.zeros((self.buffer_size,), 
+                                                   device=self.device, dtype=torch.long)
+                    elif len(action_shape) == 1:
+                        # Vector actions with a single dimension (e.g., [batch])
+                        self.actions = torch.zeros((self.buffer_size, 1), 
+                                                   device=self.device, dtype=torch.float32)
+                    else:
+                        # Vector actions with multiple dimensions (e.g., [batch, action_dim])
+                        self.actions = torch.zeros((self.buffer_size, *action_shape[1:]), 
+                                                   device=self.device, dtype=torch.float32)
                 else:
-                    self.actions = np.zeros(self.buffer_size, dtype=np.int64)
-            else:  # Continuous action
-                if self.use_device_tensors:
-                    self.actions = torch.zeros((self.buffer_size,) + action_array.shape,
-                                              dtype=torch.float32, device=self.device)
+                    # If it's a numpy array, list, or scalar, determine shape and create tensor.
+                    if isinstance(action, (int, float)):
+                        # Scalar action (discrete)
+                        self.actions = torch.zeros((self.buffer_size,), 
+                                                   device=self.device, dtype=torch.long)
+                    else:
+                        # Vector action (continuous)
+                        action_array = np.array(action)
+                        action_shape = action_array.shape
+                        if not action_shape:  # Scalar numpy array
+                            self.actions = torch.zeros((self.buffer_size,), 
+                                                       device=self.device, dtype=torch.long)
+                        elif len(action_shape) == 1:
+                            # Vector with a single dimension
+                            self.actions = torch.zeros((self.buffer_size, action_shape[0]),
+                                                       device=self.device, dtype=torch.float32)
+                        else:
+                            # Vector with multiple dimensions
+                            self.actions = torch.zeros((self.buffer_size, *action_shape[1:]),
+                                                       device=self.device, dtype=torch.float32)
+            else:
+                # We're on CPU, use numpy arrays.
+                if isinstance(action, torch.Tensor):
+                    action_array = action.cpu().numpy()
+                elif isinstance(action, (int, float)):
+                    # Scalar action (discrete)
+                    self.actions = np.zeros((self.buffer_size,), dtype=np.int64)
+                    action_array = np.array(action, dtype=np.int64)
                 else:
-                    self.actions = np.zeros((self.buffer_size,) + action_array.shape, dtype=np.float32)
-
+                    # Vector action (continuous)
+                    action_array = np.array(action)
+                    
+                action_shape = action_array.shape
+                if not action_shape:  # Scalar numpy array
+                    self.actions = np.zeros((self.buffer_size,), dtype=np.int64)
+                elif len(action_shape) == 1:
+                    # Vector with a single dimension
+                    self.actions = np.zeros((self.buffer_size, action_shape[0]), dtype=np.float32)
+                else:
+                    # Vector with multiple dimensions
+                    self.actions = np.zeros((self.buffer_size, *action_shape[1:]), dtype=np.float32)
+            
             self.action_initialized = True
 
         # Actually store the provided values.
         if self.use_device_tensors:
-            if state is not None:
-                self.states[self.pos] = torch.as_tensor(state, dtype=torch.float32, device=self.device)
-
-            if action is not None:
-                action_array = np.asarray(action)
-                if action_array.size == 1:  # Discrete action.
-                    self.actions[self.pos] = int(action_array.item())
-                else:  # Continuous action.
-                    self.actions[self.pos] = torch.as_tensor(action_array, dtype=torch.float32, device=self.device)
-
-            self.logprobs[self.pos] = torch.tensor(float(logprob if logprob is not None else 0), device=self.device)
-            self.rewards[self.pos] = torch.tensor(float(reward if reward is not None else 0), device=self.device)
-            self.values[self.pos] = torch.tensor(float(value if value is not None else 0), device=self.device)
-            self.dones[self.pos] = torch.tensor(bool(done if done is not None else False), device=self.device)
-            # For prioritized experience replay - start with max priority.
-            self.priorities[self.pos] = 1.0
-        else:
-            # We are on the CPU, so use numpy.
-            if state is not None:
-                self.states[self.pos] = np.asarray(state, dtype=np.float32)
-
-            if action is not None:
-                action_array = np.asarray(action)
-                if action_array.size == 1:
-                    self.actions[self.pos] = int(action_array.item())
+            # Convert all inputs to tensors if they're not already, and ensure on correct device.
+            if state is not None and self.state_initialized:
+                if isinstance(state, torch.Tensor):
+                    self.states[self.pos] = state.to(self.device)
                 else:
-                    self.actions[self.pos] = action_array
-
-            self.logprobs[self.pos] = float(logprob if logprob is not None else 0)
-            self.rewards[self.pos] = float(reward if reward is not None else 0)
-            self.values[self.pos] = float(value if value is not None else 0)
-            self.dones[self.pos] = bool(done if done is not None else False)
-            # For prioritized experience replay - start with max priority.
-            self.priorities[self.pos] = 1.0
+                    self.states[self.pos] = torch.tensor(state, device=self.device, dtype=torch.float32)
+                    
+            if action is not None and self.action_initialized:
+                if isinstance(action, torch.Tensor):
+                    self.actions[self.pos] = action.to(self.device)
+                else:
+                    # Handle both discrete and continuous cases
+                    if isinstance(self.actions, torch.Tensor) and self.actions.dtype == torch.long:
+                        # Discrete action
+                        self.actions[self.pos] = torch.tensor(action, device=self.device, dtype=torch.long)
+                    else:
+                        # Continuous action
+                        self.actions[self.pos] = torch.tensor(action, device=self.device, dtype=torch.float32)
+                
+            if logprob is not None:
+                if isinstance(logprob, torch.Tensor):
+                    self.logprobs[self.pos] = logprob.to(self.device)
+                else:
+                    self.logprobs[self.pos] = torch.tensor(logprob, device=self.device, dtype=torch.float32)
+                    
+            if reward is not None:
+                if isinstance(reward, torch.Tensor):
+                    self.rewards[self.pos] = reward.to(self.device)
+                else:
+                    self.rewards[self.pos] = torch.tensor(reward, device=self.device, dtype=torch.float32)
+                    
+            if value is not None:
+                if isinstance(value, torch.Tensor):
+                    self.values[self.pos] = value.to(self.device)
+                else:
+                    self.values[self.pos] = torch.tensor(value, device=self.device, dtype=torch.float32)
+                    
+            if done is not None:
+                if isinstance(done, torch.Tensor):
+                    self.dones[self.pos] = done.to(self.device)
+                else:
+                    self.dones[self.pos] = torch.tensor(float(done), dtype=torch.float32, device=self.device)
+        else:
+            # Store using numpy arrays for CPU.
+            if state is not None and self.state_initialized:
+                if isinstance(state, torch.Tensor):
+                    self.states[self.pos] = state.cpu().numpy()
+                else:
+                    self.states[self.pos] = np.array(state, dtype=np.float32)
+                    
+            if action is not None and self.action_initialized:
+                if isinstance(action, torch.Tensor):
+                    # Convert tensor to numpy, handling both discrete and continuous
+                    if isinstance(self.actions, np.ndarray) and self.actions.dtype == np.int64:
+                        # Discrete action
+                        self.actions[self.pos] = action.cpu().numpy().astype(np.int64)
+                    else:
+                        # Continuous action
+                        self.actions[self.pos] = action.cpu().numpy().astype(np.float32)
+                else:
+                    # Handle both discrete and continuous cases
+                    if isinstance(self.actions, np.ndarray) and self.actions.dtype == np.int64:
+                        # Discrete action
+                        self.actions[self.pos] = np.array(action, dtype=np.int64)
+                    else:
+                        # Continuous action
+                        self.actions[self.pos] = np.array(action, dtype=np.float32)
+                        
+            if logprob is not None:
+                if isinstance(logprob, torch.Tensor):
+                    self.logprobs[self.pos] = logprob.cpu().numpy()
+                else:
+                    self.logprobs[self.pos] = np.array(logprob, dtype=np.float32)
+                    
+            if reward is not None:
+                if isinstance(reward, torch.Tensor):
+                    self.rewards[self.pos] = reward.cpu().numpy()
+                else:
+                    self.rewards[self.pos] = np.array(reward, dtype=np.float32)
+                    
+            if value is not None:
+                if isinstance(value, torch.Tensor):
+                    self.values[self.pos] = value.cpu().numpy()
+                else:
+                    self.values[self.pos] = np.array(value, dtype=np.float32)
+                    
+            if done is not None:
+                if isinstance(done, torch.Tensor):
+                    self.dones[self.pos] = done.cpu().numpy()
+                else:
+                    self.dones[self.pos] = np.array(float(done), dtype=np.float32)
 
         # Update the current position and size of the buffer (circular buffer).
         self.pos = (self.pos + 1) % self.buffer_size
@@ -136,36 +271,47 @@ class PPOMemory:
         
         # Force CUDA memory cleanup if using device tensors on CUDA
         if self.use_device_tensors and self.device.startswith('cuda'):
-            # Explicitly release unused memory
             torch.cuda.empty_cache()
 
     def get(self):
         """Get all data currently stored in the buffer."""
         if self.size == 0 or not self.state_initialized:
-            return [], [], [], [], [], []
+            return (np.array([]), np.array([]), np.array([]), np.array([]), np.array([]), np.array([]))
 
         if self.use_device_tensors:
-            # Data is already on the GPU, just return slices.
-            valid_states = self.states[:self.size]
-            valid_actions = self.actions[:self.size]
-            valid_logprobs = self.logprobs[:self.size]
-            valid_rewards = self.rewards[:self.size]
-            valid_values = self.values[:self.size]
-            valid_dones = self.dones[:self.size]
+            # Get the used portion of each tensor, handling circular buffer wraparound.
+            if self.pos < self.size:  # Buffer hasn't wrapped around
+                valid_states = self.states[:self.size]
+                valid_actions = self.actions[:self.size]
+                valid_logprobs = self.logprobs[:self.size]
+                valid_rewards = self.rewards[:self.size]
+                valid_values = self.values[:self.size]
+                valid_dones = self.dones[:self.size]
+            else:  # Buffer has wrapped around
+                # Concatenate the end of the buffer with the beginning.
+                valid_states = torch.cat([self.states[-(self.size - self.pos):], self.states[:self.pos]])
+                valid_actions = torch.cat([self.actions[-(self.size - self.pos):], self.actions[:self.pos]])
+                valid_logprobs = torch.cat([self.logprobs[-(self.size - self.pos):], self.logprobs[:self.pos]])
+                valid_rewards = torch.cat([self.rewards[-(self.size - self.pos):], self.rewards[:self.pos]])
+                valid_values = torch.cat([self.values[-(self.size - self.pos):], self.values[:self.pos]])
+                valid_dones = torch.cat([self.dones[-(self.size - self.pos):], self.dones[:self.pos]])
         else:
-            # We're on CPU, convert numpy arrays to tensors and move to the specified device.
-            valid_states = torch.tensor(self.states[:self.size], dtype=torch.float32, device=self.device)
-
-            # Actions can be discrete (int) or continuous (float).
-            if np.issubdtype(self.actions.dtype, np.integer):
-                valid_actions = torch.tensor(self.actions[:self.size], dtype=torch.long, device=self.device)
-            else:
-                valid_actions = torch.tensor(self.actions[:self.size], dtype=torch.float32, device=self.device)
-
-            valid_logprobs = torch.tensor(self.logprobs[:self.size], dtype=torch.float32, device=self.device)
-            valid_rewards = torch.tensor(self.rewards[:self.size], dtype=torch.float32, device=self.device)
-            valid_values = torch.tensor(self.values[:self.size], dtype=torch.float32, device=self.device)
-            valid_dones = torch.tensor(self.dones[:self.size], dtype=torch.bool, device=self.device)
+            # Same logic but with numpy arrays.
+            if self.pos < self.size:  # Buffer hasn't wrapped around
+                valid_states = self.states[:self.size]
+                valid_actions = self.actions[:self.size]
+                valid_logprobs = self.logprobs[:self.size]
+                valid_rewards = self.rewards[:self.size]
+                valid_values = self.values[:self.size]
+                valid_dones = self.dones[:self.size]
+            else:  # Buffer has wrapped around
+                # Concatenate the end of the buffer with the beginning.
+                valid_states = np.concatenate([self.states[-(self.size - self.pos):], self.states[:self.pos]])
+                valid_actions = np.concatenate([self.actions[-(self.size - self.pos):], self.actions[:self.pos]])
+                valid_logprobs = np.concatenate([self.logprobs[-(self.size - self.pos):], self.logprobs[:self.pos]])
+                valid_rewards = np.concatenate([self.rewards[-(self.size - self.pos):], self.rewards[:self.pos]])
+                valid_values = np.concatenate([self.values[-(self.size - self.pos):], self.values[:self.pos]])
+                valid_dones = np.concatenate([self.dones[-(self.size - self.pos):], self.dones[:self.pos]])
 
         return (valid_states, valid_actions, valid_logprobs, valid_rewards, valid_values, valid_dones)
 
@@ -178,57 +324,112 @@ class PPOMemory:
 
         # Calculate normalized probabilities for prioritized sampling.
         if self.use_device_tensors:
-            probs = self.priorities[:self.size] / self.priorities[:self.size].sum()
-
-            # Generate batches by sampling indices based on the calculated probabilities.
-            batches = []
-            num_complete_batches = self.size // self.batch_size
-
-            for i in range(num_complete_batches):
-                batch_indices = torch.multinomial(probs, self.batch_size, replacement=True)
-                batches.append(batch_indices)
-
-            # Handle any leftover data.
-            if self.size % self.batch_size != 0:
-                remaining = self.size - (num_complete_batches * self.batch_size)
-                if remaining > 0:
-                    batch_indices = torch.multinomial(probs, remaining, replacement=True)
-                    # Pad the last batch to the full batch size.
-                    needed = self.batch_size - remaining
-                    padding_indices = torch.multinomial(probs, needed, replacement=True)
-                    # Make sure everything is on the same device before combining.
-                    batch_indices = torch.cat([batch_indices, padding_indices])
-                    batches.append(batch_indices)
+            indices = torch.randperm(self.size).to(self.device)
+            batches = [indices[i:i + self.batch_size] for i in range(0, self.size, self.batch_size)]
         else:
-            # Same logic, but using numpy for CPU operations.
-            probs = self.priorities[:self.size] / self.priorities[:self.size].sum()
-
-            batches = []
-            num_complete_batches = self.size // self.batch_size
-
-            for i in range(num_complete_batches):
-                # Sample indices based on priority.
-                batch_indices = np.random.choice(
-                    self.size, self.batch_size, replace=True, p=probs
-                )
-                batches.append(batch_indices)
-
-            # Handle leftovers.
-            if self.size % self.batch_size != 0:
-                remaining = self.size - (num_complete_batches * self.batch_size)
-                if remaining > 0:
-                    batch_indices = np.random.choice(
-                        self.size, remaining, replace=True, p=probs
-                    )
-                    # Pad to full batch size.
-                    needed = self.batch_size - remaining
-                    padding_indices = np.random.choice(
-                        self.size, needed, replace=True, p=probs
-                    )
-                    batch_indices = np.concatenate([batch_indices, padding_indices])
-                    batches.append(batch_indices)
+            indices = np.random.permutation(self.size)
+            batches = [indices[i:i + self.batch_size] for i in range(0, self.size, self.batch_size)]
 
         return batches
+    
+    def store_experience_at_idx(self, idx, state=None, action=None, log_prob=None, reward=None, value=None, done=None):
+        """Update only specific values at an index, rather than a complete experience."""
+        if idx >= self.buffer_size:
+            return  # Index out of range
+
+        # Update only the provided values (non-None values).
+        if self.use_device_tensors:
+            if state is not None and self.state_initialized:
+                if isinstance(state, torch.Tensor):
+                    self.states[idx] = state.to(self.device)
+                else:
+                    self.states[idx] = torch.tensor(state, device=self.device, dtype=torch.float32)
+                    
+            if action is not None and self.action_initialized:
+                if isinstance(action, torch.Tensor):
+                    self.actions[idx] = action.to(self.device)
+                else:
+                    # Handle both discrete and continuous cases
+                    if isinstance(self.actions, torch.Tensor) and self.actions.dtype == torch.long:
+                        # Discrete action
+                        self.actions[idx] = torch.tensor(action, device=self.device, dtype=torch.long)
+                    else:
+                        # Continuous action
+                        self.actions[idx] = torch.tensor(action, device=self.device, dtype=torch.float32)
+                        
+            if log_prob is not None:
+                if isinstance(log_prob, torch.Tensor):
+                    self.logprobs[idx] = log_prob.to(self.device)
+                else:
+                    self.logprobs[idx] = torch.tensor(log_prob, device=self.device, dtype=torch.float32)
+                    
+            if reward is not None:
+                if isinstance(reward, torch.Tensor):
+                    self.rewards[idx] = reward.to(self.device)
+                else:
+                    self.rewards[idx] = torch.tensor(reward, device=self.device, dtype=torch.float32)
+                    
+            if value is not None:
+                if isinstance(value, torch.Tensor):
+                    self.values[idx] = value.to(self.device)
+                else:
+                    self.values[idx] = torch.tensor(value, device=self.device, dtype=torch.float32)
+                    
+            if done is not None:
+                if isinstance(done, torch.Tensor):
+                    self.dones[idx] = done.to(self.device)
+                else:
+                    self.dones[idx] = torch.tensor(float(done), dtype=torch.float32, device=self.device)
+        else:
+            # Do the same with numpy arrays for CPU.
+            if state is not None and self.state_initialized:
+                if isinstance(state, torch.Tensor):
+                    self.states[idx] = state.cpu().numpy()
+                else:
+                    self.states[idx] = np.array(state, dtype=np.float32)
+                    
+            if action is not None and self.action_initialized:
+                if isinstance(action, torch.Tensor):
+                    # Convert tensor to numpy, handling both discrete and continuous
+                    if isinstance(self.actions, np.ndarray) and self.actions.dtype == np.int64:
+                        # Discrete action
+                        self.actions[idx] = action.cpu().numpy().astype(np.int64)
+                    else:
+                        # Continuous action
+                        self.actions[idx] = action.cpu().numpy().astype(np.float32)
+                else:
+                    # Handle both discrete and continuous cases
+                    if isinstance(self.actions, np.ndarray) and self.actions.dtype == np.int64:
+                        # Discrete action
+                        self.actions[idx] = np.array(action, dtype=np.int64)
+                    else:
+                        # Continuous action
+                        self.actions[idx] = np.array(action, dtype=np.float32)
+                        
+            if log_prob is not None:
+                if isinstance(log_prob, torch.Tensor):
+                    self.logprobs[idx] = log_prob.cpu().numpy()
+                else:
+                    self.logprobs[idx] = np.array(log_prob, dtype=np.float32)
+                    
+            if reward is not None:
+                if isinstance(reward, torch.Tensor):
+                    self.rewards[idx] = reward.cpu().numpy()
+                else:
+                    self.rewards[idx] = np.array(reward, dtype=np.float32)
+                    
+            if value is not None:
+                if isinstance(value, torch.Tensor):
+                    self.values[idx] = value.cpu().numpy()
+                else:
+                    self.values[idx] = np.array(value, dtype=np.float32)
+                    
+            if done is not None:
+                if isinstance(done, torch.Tensor):
+                    self.dones[idx] = done.cpu().numpy()
+                else:
+                    self.dones[idx] = np.array(float(done), dtype=np.float32)
+
 
 class RunningMeanStd:
     def __init__(self, epsilon=1e-4, shape=()):
@@ -266,11 +467,17 @@ class RunningMeanStd:
         self.var = new_var
         self.count = new_count
 
-class PPOTrainer:
+
+class Trainer:
+    """
+    Base trainer class that manages the training of reinforcement learning algorithms.
+    Supports both PPO and StreamAC algorithms.
+    """
     def __init__(
         self,
-        actor,
-        critic,
+        actor: nn.Module,
+        critic: nn.Module,
+        algorithm_type: str = "ppo",
         action_space_type: str = "discrete",
         action_dim: Union[int, Tuple[int]] = None,
         action_bounds: Tuple[float, float] = (-1.0, 1.0),
@@ -289,7 +496,7 @@ class PPOTrainer:
         use_wandb: bool = False,
         debug: bool = False,
         use_compile: bool = True,
-        use_amp: bool = False,  # Changed default to False
+        use_amp: bool = False,  
         use_auxiliary_tasks: bool = True,
         sr_weight: float = 1.0,
         rp_weight: float = 1.0,
@@ -300,22 +507,32 @@ class PPOTrainer:
         pretraining_rp_weight: float = 5.0,
         pretraining_transition_steps: int = 1000,
         total_episode_target: int = None,
-        training_step_offset: int = 0,  # Added this parameter
-        # New intrinsic reward parameters
+        training_step_offset: int = 0,
+        # Intrinsic reward parameters
         use_intrinsic_rewards: bool = True,
         intrinsic_reward_scale: float = 1.0,
         curiosity_weight: float = 0.5,
-        rnd_weight: float = 0.5
+        rnd_weight: float = 0.5,
+        # StreamAC specific parameters
+        adaptive_learning_rate: bool = True,
+        target_step_size: float = 0.025,
+        backtracking_patience: int = 10,
+        backtracking_zeta: float = 0.85,
+        min_lr_factor: float = 0.1,
+        max_lr_factor: float = 10.0,
+        use_obgd: bool = True,
+        stream_buffer_size: int = 32,
+        use_sparse_init: bool = True,
+        update_freq: int = 1,
     ):
-
         self.use_wandb = use_wandb
         self.debug = debug
 
-        # Figure out which device (CPU, CUDA, MPS) to use.  Prioritize CUDA, then MPS, then CPU.
+        # Figure out which device (CPU, CUDA, MPS) to use
         if device is None:
             if torch.cuda.is_available():
                 device = "cuda"
-            elif torch.backends.mps.is_available():
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
                 device = "mps"
             else:
                 device = "cpu"
@@ -328,64 +545,21 @@ class PPOTrainer:
         self.actor = actor.to(self.device)
         self.critic = critic.to(self.device)
 
-        # We'll decay the entropy coefficient over time to encourage exploration, and exploitation later.
+        # We'll decay the entropy coefficient over time to encourage exploration, then exploitation
         self.entropy_coef = entropy_coef if entropy_coef else 0.01
-        self.entropy_coef_decay = entropy_coef_decay if entropy_coef_decay else 0.999  # Slower decay
-        self.min_entropy_coef = 0.005  # Higher minimum
+        self.entropy_coef_decay = entropy_coef_decay if entropy_coef_decay else 0.999
+        self.min_entropy_coef = 0.005
         
         # Pretraining entropy management
         self.base_entropy_coef = entropy_coef
-        self.pretraining_entropy_scale = 10.0  # Default to 10x higher during pretraining
-        self.min_entropy_coef = 0.005  # Minimum value
+        self.pretraining_entropy_scale = 10.0  # Higher entropy during pretraining
+        self.min_entropy_coef = 0.005
 
-
-        try:
-            self.debug_print(f"Compiling models for {self.device}...")
-
-            # Options for compilation - we don't capture the full graph and allow dynamic shapes.
-            compile_options = {
-                "mode": "default",
-                "fullgraph": False,
-                "dynamic": True,
-            }
-
-            if self.device == "mps":
-                # Use aot_eager backend, which is compatible with Apple Silicon.
-                self.actor = torch.compile(self.actor, backend="aot_eager", **compile_options)
-                self.critic = torch.compile(self.critic, backend="aot_eager", **compile_options)
-            elif self.device == "cuda":
-                # For CUDA, use the inductor backend and allow cudagraph operations.
-                if hasattr(torch._dynamo, "config") and hasattr(torch._dynamo.config, "allow_cudagraph_ops"):
-                    torch._dynamo.config.allow_cudagraph_ops = True
-
-                self.cuda_graphs_enabled = device == "cuda" and torch.cuda.is_available()
-                if self.cuda_graphs_enabled:
-                    self._setup_cuda_graphs()
-
-                backend = "inductor"
-
-                self.actor = torch.compile(self.actor, backend=backend, **compile_options)
-                self.critic = torch.compile(self.critic, backend=backend, **compile_options)
-            elif device == "cpu" and not use_compile:
-                try:
-                    self.actor = torch.jit.script(self.actor)
-                    self.critic = torch.jit.script(self.critic)
-                except Exception as e:
-                    self.debug_print(f"JIT compilation failed: {e}")
-            else:
-                # For CPU, also use inductor.
-                self.actor = torch.compile(self.actor, backend="inductor", **compile_options)
-                self.critic = torch.compile(self.critic, backend="inductor", **compile_options)
-
-        except Exception as e:
-            self.debug_print(f"Model compilation failed: {str(e)}")
-            self.use_compile = False
-
-        # Put models into training mode.
+        # Set to training mode
         self.actor.train()
         self.critic.train()
 
-        # Store PPO hyperparameters.
+        # Store hyperparameters
         self.gamma = gamma
         self.gae_lambda = gae_lambda
         self.clip_epsilon = clip_epsilon
@@ -394,34 +568,77 @@ class PPOTrainer:
         self.ppo_epochs = ppo_epochs
         self.batch_size = batch_size
 
-        # Create optimizers for actor and critic.
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr_actor)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_critic)
+        # Learning rates
+        self.lr_actor = lr_actor
+        self.lr_critic = lr_critic
 
-        # We'll initialize learning rate schedulers later during the first update.
-        self.actor_scheduler = None
-        self.critic_scheduler = None
+        # Create the learning algorithm based on type
+        self.algorithm_type = algorithm_type.lower()
+        
+        if self.algorithm_type == "ppo":
+            self.algorithm = PPOAlgorithm(
+                actor=self.actor,
+                critic=self.critic,
+                action_space_type=action_space_type,
+                action_dim=action_dim,
+                action_bounds=action_bounds,
+                device=device,
+                lr_actor=lr_actor,
+                lr_critic=lr_critic,
+                gamma=gamma,
+                gae_lambda=gae_lambda,
+                clip_epsilon=clip_epsilon,
+                critic_coef=critic_coef,
+                entropy_coef=entropy_coef,
+                max_grad_norm=max_grad_norm,
+                ppo_epochs=ppo_epochs,
+                batch_size=batch_size,
+                use_amp=use_amp,
+                debug=debug,
+                use_wandb=use_wandb
+            )
+            # For compatibility with existing code, keep a reference to the memory
+            self.memory = self.algorithm.memory
+        elif self.algorithm_type == "streamac":
+            self.algorithm = StreamACAlgorithm(
+                actor=self.actor,
+                critic=self.critic,
+                action_space_type=action_space_type,
+                action_dim=action_dim,
+                action_bounds=action_bounds,
+                device=device,
+                lr_actor=lr_actor,
+                lr_critic=lr_critic,
+                gamma=gamma,
+                critic_coef=critic_coef,
+                entropy_coef=entropy_coef,
+                max_grad_norm=max_grad_norm,
+                use_amp=use_amp,
+                debug=debug,
+                use_wandb=use_wandb,
+                # StreamAC specific parameters
+                adaptive_learning_rate=adaptive_learning_rate,
+                target_step_size=target_step_size,
+                backtracking_patience=backtracking_patience,
+                backtracking_zeta=backtracking_zeta,
+                min_lr_factor=min_lr_factor,
+                max_lr_factor=max_lr_factor,
+                use_obgd=use_obgd,
+                buffer_size=stream_buffer_size,
+                use_sparse_init=use_sparse_init,
+                update_freq=update_freq
+            )
+            # For compatibility, create an empty PPOMemory
+            self.memory = PPOMemory(batch_size, buffer_size=1, device=device)
+        else:
+            raise ValueError(f"Unknown algorithm type: {algorithm_type}. Use 'ppo' or 'streamac'.")
 
-        # Initialize the memory buffer to store experiences.
-        self.memory = PPOMemory(batch_size, buffer_size=10000, device=device)
-
-        self.ret_rms = RunningMeanStd(shape=())
-
-        # Use Automatic Mixed Precision (AMP) if we're on CUDA and it's requested.
+        # Use Automatic Mixed Precision (AMP) if requested and on CUDA
         self.use_amp = "cuda" in str(device) and use_amp
         if self.use_amp:
-            self.scaler = GradScaler(
-                init_scale=2**8,  # Reduced from 2**10
-                growth_factor=1.5,  # Reduced from 2.0
-                backoff_factor=0.5,
-                growth_interval=2000,
-                enabled=True
-            )
-            self.debug_print("Automatic Mixed Precision (AMP) enabled")
-        else:
-            self.debug_print("Automatic Mixed Precision (AMP) disabled: requires CUDA")
+            self.scaler = GradScaler()
 
-        # Keep track of training metrics.
+        # Track metrics
         self.actor_losses = []
         self.critic_losses = []
         self.entropy_losses = []
@@ -430,58 +647,58 @@ class PPOTrainer:
         # Initialize auxiliary tasks if enabled
         self.use_auxiliary_tasks = use_auxiliary_tasks
         if self.use_auxiliary_tasks:
-            # Extract observation dimension from actor
-            if hasattr(self.actor, 'obs_shape'):
-                obs_dim = self.actor.obs_shape
-            else:
-                obs_dim = 542  # Default size
-                if self.debug:
-                    print(f"[DEBUG] Could not determine observation dimension, using default: {obs_dim}")
-
-            # Initialize auxiliary task manager with optimized settings
+            # Get observation dimension from model if available or derive from action_dim
+            obs_dim = getattr(actor, 'obs_shape', action_dim * 2)  # Use action_dim * 2 as fallback
+            
             self.aux_task_manager = AuxiliaryTaskManager(
-                actor=actor,
+                actor=self.actor,
                 obs_dim=obs_dim,
                 sr_weight=sr_weight,
                 rp_weight=rp_weight,
                 device=self.device,
-                use_amp=aux_amp,  # Use the passed aux_amp parameter
-                update_frequency=8,  # Only update every 8 steps for better performance
-                sr_hidden_dim=128,  # Smaller network for efficiency
-                rp_sequence_length=5  # Shorter history for efficiency
+                use_amp=aux_amp,
+                update_frequency=8  # Update auxiliary tasks every 8 steps
             )
-            self.debug_print("Auxiliary tasks initialized with performance optimizations")
 
         if self.debug:
-            print(f"[DEBUG] PPOTrainer initialized with target device: {self.device}")
+            print(f"[DEBUG] Initialized {self.algorithm_type.upper()} algorithm on {self.device}")
+            print(f"[DEBUG] Actor: {actor.__class__.__name__}, Critic: {critic.__class__.__name__}")
 
         if self.use_wandb:
-            wandb.log({"device": self.device})
+            wandb.config.update({
+                "algorithm": self.algorithm_type,
+                "action_space_type": action_space_type,
+                "lr_actor": lr_actor,
+                "lr_critic": lr_critic,
+                "gamma": gamma,
+                "gae_lambda": gae_lambda,
+                "clip_epsilon": clip_epsilon,
+                "critic_coef": critic_coef,
+                "entropy_coef": entropy_coef,
+                "max_grad_norm": max_grad_norm,
+                "use_auxiliary_tasks": use_auxiliary_tasks,
+                "sr_weight": sr_weight,
+                "rp_weight": rp_weight,
+                "use_pretraining": use_pretraining,
+                "use_amp": use_amp
+            })
 
-        # If requested and available, compile the model for performance.
+        # If requested and available, compile the models for performance
         self.use_compile = use_compile and hasattr(torch, 'compile')
         if self.use_compile:
             try:
-                self.debug_print("Compiling performance-critical functions...")
-
-                # Create compiled versions of functions for later use.
-                self._compute_gae_fn = self._create_compiled_gae()
-                self.debug_print("GAE function compiled")
-
-                self._policy_eval_fn = self._create_compiled_policy_eval()
-                self.debug_print("Policy evaluation function compiled")
-
-                self._process_batch_fn = self._create_compiled_batch_processor()
-                self.debug_print("Batch processor function compiled")
-
-                # "Warm up" compiled functions. This helps avoid compilation delays later.
-                self._prewarm_compiled_functions()
-                self.debug_print("Compiled functions pre-warmed")
-
+                if self.debug:
+                    print("[DEBUG] Using torch.compile for models...")
+                self.actor = torch.compile(self.actor)
+                self.critic = torch.compile(self.critic)
+                if self.debug:
+                    print("[DEBUG] Models compiled successfully")
             except Exception as e:
-                self.debug_print(f"Function compilation failed: {str(e)}")
+                print(f"Error compiling models: {e}")
+                print("Continuing without compilation")
                 self.use_compile = False
 
+        # Print model info
         print_model_info(self.actor, model_name="Actor", print_amp=self.use_amp, debug=self.debug)
         print_model_info(self.critic, model_name="Critic", print_amp=self.use_amp, debug=self.debug)
 
@@ -493,7 +710,7 @@ class PPOTrainer:
         self.pretraining_transition_steps = pretraining_transition_steps
 
         self.training_steps = 0
-        self.training_step_offset = 0
+        self.training_step_offset = training_step_offset
         self.total_episodes = 0
         self.total_episodes_offset = 0
         self.pretraining_completed = False
@@ -506,18 +723,10 @@ class PPOTrainer:
 
         # If total episodes target is set, log the pretraining plan
         if self.use_pretraining and self.total_episode_target:
-            pretraining_end_step = self._get_pretraining_end_step()
-            print(f"Pretraining will run until episode {pretraining_end_step} ({self.pretraining_fraction*100:.1f}% of {self.total_episode_target})")
-            print(f"Pretraining transition will take {self.pretraining_transition_steps} steps")
-
+            pretraining_end = int(self.total_episode_target * self.pretraining_fraction)
             if self.debug:
-                print(f"[DEBUG] Pretraining parameters:")
-                print(f"[DEBUG] - End episode: {pretraining_end_step}")
-                print(f"[DEBUG] - Transition steps: {self.pretraining_transition_steps}")
-                print(f"[DEBUG] - SR weight during pretraining: {self.pretraining_sr_weight}")
-                print(f"[DEBUG] - RP weight during pretraining: {self.pretraining_rp_weight}")
-                print(f"[DEBUG] - SR weight after pretraining: {self.base_sr_weight}")
-                print(f"[DEBUG] - RP weight after pretraining: {self.base_rp_weight}")
+                print(f"[DEBUG] Pretraining will run for {pretraining_end} episodes")
+                print(f"[DEBUG] Transition phase will last {self.pretraining_transition_steps} steps")
 
         # Initialize intrinsic reward generator for pre-training if enabled
         self.use_intrinsic_rewards = use_intrinsic_rewards and use_pretraining
@@ -525,1296 +734,204 @@ class PPOTrainer:
         self.intrinsic_reward_generator = None
         
         if self.use_intrinsic_rewards:
-            # Extract observation dimension from actor
-            if hasattr(self.actor, 'obs_shape'):
-                obs_dim = self.actor.obs_shape
-            else:
-                obs_dim = 542  # Default size
-                if self.debug:
-                    print(f"[DEBUG] Could not determine observation dimension, using default: {obs_dim}")
-            
-            # Determine action dimension for intrinsic rewards
-            if action_space_type == "discrete":
-                if isinstance(action_dim, int):
-                    intrinsic_action_dim = action_dim
-                else:
-                    intrinsic_action_dim = sum(action_dim) if isinstance(action_dim, (list, tuple)) else 64
-            else:
-                if isinstance(action_dim, int):
-                    intrinsic_action_dim = action_dim
-                else:
-                    intrinsic_action_dim = len(action_dim) if isinstance(action_dim, (list, tuple)) else 8
-            
+            obs_dim = getattr(actor, 'obs_shape', action_dim * 2)  # Use action_dim * 2 as fallback
             self.intrinsic_reward_generator = create_intrinsic_reward_generator(
                 input_dim=obs_dim,
-                action_dim=intrinsic_action_dim,
-                device=self.device,
+                action_dim=action_dim,
+                device=device,
                 curiosity_weight=curiosity_weight,
                 rnd_weight=rnd_weight
             )
-            
-            self.debug_print(f"Initialized intrinsic reward generator for pre-training with scale {intrinsic_reward_scale}")
-
-    def _setup_cuda_graphs(self):
-        """Create and set up CUDA graphs for accelerated inference."""
-        try:
-            # Only create static batch with appropriate dimensions
-            if hasattr(self.actor, 'obs_shape'):
-                batch_size = min(64, self.batch_size)  # Use smaller batch size to avoid OOM
-                self.static_batch = torch.zeros((batch_size, self.actor.obs_shape), device=self.device)
-                
-                # Create a dedicated stream for graph capture
-                s = torch.cuda.Stream()
-                s.wait_stream(torch.cuda.current_stream())
-                
-                with torch.cuda.stream(s):
-                    # More thorough warmup to stabilize memory allocation
-                    for _ in range(5):
-                        self.actor(self.static_batch)
-                    
-                    # Capture the graph with proper error handling
-                    try:
-                        self.graph = torch.cuda.CUDAGraph()
-                        with torch.cuda.graph(self.graph):
-                            self.static_output = self.actor(self.static_batch)
-                    except Exception as e:
-                        self.debug_print(f"CUDA graph capture failed: {e}")
-                        self.cuda_graphs_enabled = False
-                        return
-                
-                # Wait for the graph capture to complete
-                torch.cuda.current_stream().wait_stream(s)
-                self.debug_print("CUDA graph successfully captured")
-            else:
-                self.cuda_graphs_enabled = False
-                self.debug_print("Actor doesn't have obs_shape attribute, disabling CUDA graphs")
-        except Exception as e:
-            self.debug_print(f"CUDA graph setup failed: {e}")
-            self.cuda_graphs_enabled = False
-
-    def _create_compiled_gae(self):
-        """Create a compiled version of GAE computation for tensor inputs."""
-        def _tensor_gae(rewards, values, dones, next_value):
-            """
-            Inner function to compute GAE, designed for compilation.
-            This is where the actual GAE calculation happens, optimized for tensor operations.
-            """
-            advantages = torch.zeros_like(rewards, device=self.device)
-            last_gae = torch.tensor(0.0, device=self.device)  # Initialize the last GAE value.
-
-            # Make sure next_value is the same shape as values for concatenation.
-            next_value_shaped = next_value.reshape(*[1] + list(values.shape[1:]))
-            all_values = torch.cat([values, next_value_shaped], dim=0)
-
-            # Iterate backwards through the rewards to calculate GAE.
-            for t in reversed(range(len(rewards))):
-                # If the episode is done at this step, only consider the immediate reward.
-                mask = ~dones[t]
-                if not mask:
-                    delta = rewards[t] - values[t]
-                    last_gae = delta
-                # Otherwise, take into account the discounted future rewards.
-                else:
-                    delta = rewards[t] + self.gamma * all_values[t+1] - values[t]
-                    last_gae = delta + self.gamma * self.gae_lambda * last_gae
-                advantages[t] = last_gae
-
-            returns = advantages + values  # Calculate the returns by adding advantages to the state values.
-            return advantages, returns
-
-        # Compile the GAE function using the appropriate backend for the device.
-        if self.device == "mps":
-            return torch.compile(_tensor_gae, backend="aot_eager")
-        elif self.device == "cuda":
-            return torch.compile(_tensor_gae, mode="max-autotune") # Use max-autotune for best performance on CUDA.
-        else:
-            return torch.compile(_tensor_gae, mode="reduce-overhead") # For CPU.
-
-    def _create_compiled_policy_eval(self):
-        """Create a compiled version of the policy evaluation logic."""
-        def _policy_eval(states, actions, old_log_probs, advantages):
-            """
-            Inner function to evaluate the policy, designed for compilation.
-            This function calculates the actor loss, entropy loss, and entropy.
-            """
-            if self.action_space_type == "discrete":
-                logits = self.actor(states)
-                action_probs = F.softmax(logits, dim=1)
-                dist = Categorical(action_probs)
-                new_log_probs = dist.log_prob(actions)
-                entropy = dist.entropy().mean()
-            else:
-                mu, sigma_raw = self.actor(states)
-                # Ensure sigma is positive and prevent very small values.
-                sigma = F.softplus(sigma_raw) + 1e-5
-                dist = Normal(mu, sigma)
-                new_log_probs = dist.log_prob(actions)
-                # Sum log probabilities for multi-dimensional actions.
-                if len(new_log_probs.shape) > 1:
-                    new_log_probs = new_log_probs.sum(dim=1)
-                entropy = dist.entropy().mean()
-
-            # Calculate the probability ratio between new and old policies.
-            ratio = torch.exp(new_log_probs - old_log_probs)
-            # Calculate surrogate losses.
-            surr1 = ratio * advantages
-            surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * advantages
-
-            # PPO objective is to maximize the minimum of the two surrogate losses.
-            actor_loss = -torch.min(surr1, surr2).mean()
-            # Encourage exploration by maximizing entropy.
-            entropy_loss = -self.entropy_coef * entropy
-
-            return actor_loss, entropy_loss, entropy
-
-        # Compile the policy evaluation function using the right backend.
-        if self.device == "mps":
-            return torch.compile(_policy_eval, backend="aot_eager")
-        elif self.device == "cuda":
-            return torch.compile(_policy_eval, mode="max-autotune")
-        else:
-            return torch.compile(_policy_eval, mode="reduce-overhead")
-
-    def _create_compiled_batch_processor(self):
-        """Create compiled version of the batch processing logic."""
-        def _process_batch(batch_states, batch_actions, batch_old_log_probs,
-                            batch_advantages, batch_returns):
-            """
-            Inner function to process a batch of experiences, designed for compilation.
-            Calculates the actor, critic, and entropy losses for a given batch.
-            """
-            values = self.critic(batch_states).squeeze()
-
-            # Use the compiled policy evaluation function.
-            actor_loss, entropy_loss, entropy = self._policy_eval_fn(
-                batch_states, batch_actions, batch_old_log_probs, batch_advantages
-            )
-
-            # Critic loss is the mean squared error between predicted values and returns.
-            critic_loss = F.mse_loss(values, batch_returns)
-
-            # Total loss combines actor, critic, and entropy losses.
-            total_loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
-
-            return actor_loss, critic_loss, entropy_loss, total_loss, entropy
-
-        # Compile using the appropriate backend.
-        if self.device == "mps":
-            return torch.compile(_process_batch, backend="aot_eager")
-        elif self.device == "cuda":
-            return torch.compile(_process_batch, mode="max-autotune")
-        else:
-            return torch.compile(_process_batch, mode="reduce-overhead")
-
-    def _uncompiled_policy_eval(self, states, actions, old_log_probs, advantages):
-        """Uncompiled fallback for policy evaluation."""
-        # This function does the same as _policy_eval, but is not compiled.
-        # It serves as a fallback if compilation fails or is not supported.
-        if self.action_space_type == "discrete":
-            logits = self.actor(states)
-            action_probs = F.softmax(logits, dim=1)
-            dist = Categorical(action_probs)
-            new_log_probs = dist.log_prob(actions)
-            entropy = dist.entropy().mean()
-        else:
-            mu, sigma_raw = self.actor(states)
-            sigma = F.softplus(sigma_raw) + 1e-5
-            dist = Normal(mu, sigma)
-            new_log_probs = dist.log_prob(actions)
-            if len(new_log_probs.shape) > 1:
-                new_log_probs = new_log_probs.sum(dim=1)
-            entropy = dist.entropy().mean()
-
-        ratio = torch.exp(new_log_probs - old_log_probs)
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * advantages
-
-        actor_loss = -torch.min(surr1, surr2).mean()
-        entropy_loss = -self.entropy_coef * entropy
-
-        return actor_loss, entropy_loss, entropy
-
-    def _uncompiled_process_batch(self, batch_states, batch_actions, batch_old_log_probs,
-                            batch_advantages, batch_returns):
-        """Uncompiled fallback for batch processing."""
-        # Similar to _process_batch, but without compilation.  A fallback.
-        values = self.critic(batch_states).squeeze()
-
-        actor_loss, entropy_loss, entropy = self._uncompiled_policy_eval(
-            batch_states, batch_actions, batch_old_log_probs, batch_advantages
-        )
-
-        critic_loss = F.mse_loss(values, batch_returns)
-        total_loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
-
-        return actor_loss, critic_loss, entropy_loss, total_loss, entropy
-
-    def _prewarm_compiled_functions(self):
-        """Pre-warm compiled functions with dummy data to complete compilation."""
-        if not self.use_compile:
-            return
-
-        self.debug_print("Pre-warming compiled functions...")
-
-        try:
-            # We create dummy tensors to run through the compiled functions once.
-            # This forces the compilation to happen here, so it doesn't cause delays later.
-            dummy_size = 4  # Small batch size for pre-warming
-
-            # Use a fixed gamma value for prewarming to avoid using self.gamma
-            # which might not be initialized yet
-            dummy_gamma = 0.99
-            dummy_gae_lambda = 0.95
-
-            # Pre-warm the GAE function.
-            if hasattr(self, '_compute_gae_fn'):
-                def _tensor_gae_prewarm(rewards, values, dones, next_value):
-                    """Simplified GAE function for pre-warming only"""
-                    advantages = torch.zeros_like(rewards, device=self.device)
-                    last_gae = torch.tensor(0.0, device=self.device)
-                    next_value_shaped = next_value.reshape(1)
-                    all_values = torch.cat([values, next_value_shaped], dim=0)
-
-                    for t in reversed(range(len(rewards))):
-                        if dones[t]:
-                            delta = rewards[t] - values[t]
-                            last_gae = delta
-                        else:
-                            delta = rewards[t] + dummy_gamma * all_values[t+1] - values[t]
-                            last_gae = delta + dummy_gamma * dummy_gae_lambda * last_gae
-                        advantages[t] = last_gae
-
-                    returns = advantages + values
-                    return advantages, returns
-
-                # Create dummy data for pre-warming
-                dummy_rewards = torch.zeros(dummy_size, device=self.device)
-                dummy_values = torch.zeros(dummy_size, device=self.device)
-                dummy_dones = torch.zeros(dummy_size, dtype=torch.bool, device=self.device)
-                dummy_next_value = torch.zeros(1, device=self.device)
-
-                # Run the compiled function once with our temporary function implementation
-                # This avoids using self.gamma during prewarming
-                _ = _tensor_gae_prewarm(dummy_rewards, dummy_values, dummy_dones, dummy_next_value)
-                self.debug_print("GAE function pre-warmed")
-
-            # Rest of the prewarming code...
-            # (Keep the policy evaluation and batch processing prewarming as they were)
-
-        except Exception as e:
-            self.debug_print(f"Function pre-warming failed: {str(e)}")
-            self.use_compile = False # If prewarming fails, disable compilation.
-
-    def debug_print(self, message):
-        """Print debug messages only when debug mode is enabled."""
-        if self.debug:
-            print(f"[DEBUG] {message}")
-
-    def get_device_for_inference(self):
-        """Get the appropriate device for inference operations"""
-        return self.device
+            if self.debug:
+                print(f"[DEBUG] Initialized intrinsic reward generator with scale {intrinsic_reward_scale}")
 
     def store_experience(self, state, action, log_prob, reward, value, done):
-        """Store a single step of experience in the memory buffer."""
-        # Convert inputs to the appropriate format for the memory buffer.
-        if isinstance(state, torch.Tensor):
-            state = state.detach().cpu().numpy()
-        if isinstance(action, torch.Tensor):
-            action = action.detach().cpu().numpy()
-        if isinstance(log_prob, torch.Tensor):
-            log_prob = log_prob.detach().cpu().numpy()
-        if isinstance(reward, torch.Tensor):
-            reward = reward.detach().cpu().numpy()
-        if isinstance(value, torch.Tensor):
-            value = value.detach().cpu().numpy()
-        if isinstance(done, torch.Tensor):
-            done = done.detach().cpu().numpy()
-
-        # Add intrinsic rewards during pretraining
+        """Forward to algorithm's store_experience method"""
+        # Add intrinsic rewards during pretraining if enabled
         if self.use_intrinsic_rewards and (not self.pretraining_completed or self.in_transition_phase):
-            # Get the next state for curiosity calculation (if available, otherwise use current)
-            next_state = None  # Will be set by environment interaction
-
-            # Convert state and action to tensor for intrinsic reward calculation
-            state_tensor = torch.FloatTensor(state).to(self.device)
-            action_tensor = torch.FloatTensor(action).to(self.device)
-            
-            # Store original reward for metrics
-            original_reward = reward
-            
-            # Apply transition factor if in transition phase
-            intrinsic_scale = self.intrinsic_reward_scale
-            if self.in_transition_phase:
-                transition_progress = min(1.0, (self.total_episodes - self.transition_start_step) / 
-                                           self.pretraining_transition_steps)
-                # Gradually reduce intrinsic rewards during transition
-                intrinsic_scale = self.intrinsic_reward_scale * (1.0 - transition_progress)
-
-            # Track experiences for later intrinsic reward updates when next_state becomes available
-            self._last_state = state_tensor
-            self._last_action = action_tensor
-            
-            # Use RND reward since it doesn't need next_state
-            if self.intrinsic_reward_generator and hasattr(self.intrinsic_reward_generator.generators, "rnd"):
-                rnd_reward = self.intrinsic_reward_generator.generators["rnd"][0].compute_reward(state_tensor)
-                intrinsic_reward = rnd_reward * intrinsic_scale
-                reward = reward + intrinsic_reward
-                
-                if self.use_wandb and self.training_steps % 10 == 0:
-                    wandb.log({
-                        "pretraining/rnd_reward": rnd_reward,
-                        "pretraining/intrinsic_reward": intrinsic_reward,
-                        "pretraining/extrinsic_reward": original_reward,
-                        "pretraining/total_reward": reward
-                    }, step=self._get_wandb_step())
-
-        # Store the experience in memory.
-        self.memory.store(state, action, log_prob, reward, value, done)
-
-        # Update auxiliary task models if enabled and after storing experience
-        if self.use_auxiliary_tasks and hasattr(self, 'aux_task_manager'):
-            # Convert to tensor for auxiliary task update
+            # Convert inputs to tensor format for intrinsic reward computation
             if not isinstance(state, torch.Tensor):
                 state_tensor = torch.FloatTensor(state).to(self.device)
+                if state_tensor.dim() == 1:
+                    state_tensor = state_tensor.unsqueeze(0)
             else:
-                state_tensor = state
-            if not isinstance(reward, torch.Tensor):
-                reward_tensor = torch.FloatTensor([reward]).to(self.device)
-            else:
-                reward_tensor = reward
+                state_tensor = state.to(self.device)
                 
-            if state_tensor.dim() == 1:
-                state_tensor = state_tensor.unsqueeze(0)
-            if not isinstance(reward_tensor, torch.Tensor) or reward_tensor.dim() == 0:
-                reward_tensor = reward_tensor.unsqueeze(0)
+            if not isinstance(action, torch.Tensor):
+                if self.action_space_type == "discrete":
+                    action_tensor = torch.LongTensor([action]).to(self.device)
+                else:
+                    action_tensor = torch.FloatTensor(action).to(self.device)
+                    if action_tensor.dim() == 1:
+                        action_tensor = action_tensor.unsqueeze(0)
+            else:
+                action_tensor = action.to(self.device)
+                
+            # Get next state if available in buffer (for StreamAC)
+            next_state = None
+            if hasattr(self.algorithm, 'experience_buffer') and len(self.algorithm.experience_buffer) > 0:
+                next_state = self.algorithm.experience_buffer[-1][0]
+                next_state = torch.FloatTensor(next_state).to(self.device).unsqueeze(0)
+                
+                # Compute intrinsic reward
+                if next_state is not None:
+                    intrinsic_reward = self.intrinsic_reward_generator.compute_reward(
+                        state_tensor, action_tensor, next_state
+                    )
+                    
+                    # Scale and add to extrinsic reward
+                    ir_scale = self.intrinsic_reward_scale
+                    # Gradually reduce intrinsic rewards during transition phase
+                    if self.in_transition_phase:
+                        progress = min(1.0, (self.training_steps - self.transition_start_step) / 
+                                      self.pretraining_transition_steps)
+                        ir_scale *= (1.0 - progress)
+                        
+                    # Add scaled intrinsic reward to extrinsic reward
+                    if isinstance(reward, torch.Tensor):
+                        reward = reward + ir_scale * intrinsic_reward.to(reward.device)
+                    else:
+                        reward = reward + ir_scale * intrinsic_reward.cpu().numpy()
 
-            self.aux_task_manager.update(state_tensor, reward_tensor)
+        # Store the experience using the algorithm
+        self.algorithm.store_experience(state, action, log_prob, reward, value, done)
+
+        # Update auxiliary task models if enabled
+        if self.use_auxiliary_tasks and hasattr(self, 'aux_task_manager'):
+            # Extract features if the actor supports it
+            features = None
+            if hasattr(self.actor, 'extract_features'):
+                with torch.no_grad():
+                    features = self.actor.extract_features(
+                        torch.FloatTensor(state).unsqueeze(0).to(self.device)
+                    )
+                    
+            # Update auxiliary tasks
+            self.aux_task_manager.update(
+                observations=state,
+                rewards=reward,
+                features=features
+            )
 
     def store_experience_at_idx(self, idx, state, action, log_prob, reward, value, done):
-        """
-        Update specific fields of an existing experience entry.
-        Only updates the provided values (non-None values).
-        """
-        if idx >= self.memory.buffer_size:
-            raise ValueError(f"Index {idx} out of bounds for buffer size {self.memory.buffer_size}")
-
-        # Only update fields that are provided (not None).
-        if self.memory.use_device_tensors:
-            if reward is not None:
-                self.memory.rewards[idx] = torch.tensor(float(reward), device=self.device)
-
-            if done is not None:
-                if isinstance(done, torch.Tensor):
-                    self.memory.dones[idx] = done.to(self.device)
-                else:
-                    self.memory.dones[idx] = torch.tensor(bool(done), device=self.device)
+        """Forward to algorithm's store_experience_at_idx method if it exists"""
+        # Delegate to algorithm's method if available, otherwise use our own
+        if hasattr(self.algorithm, 'store_experience_at_idx'):
+            self.algorithm.store_experience_at_idx(idx, obs=state, action=action, log_prob=log_prob, reward=reward, value=value, done=done)
         else:
-            if reward is not None:
-                self.memory.rewards[idx] = float(reward)
-
-            if done is not None:
-                self.memory.dones[idx] = bool(done)
+            # Only PPO uses this method via memory, so use memory directly
+            self.memory.store_experience_at_idx(idx, state=state, action=action, log_prob=log_prob, reward=reward, value=value, done=done)
 
     def get_action(self, state, evaluate=False, return_features=False):
-        """
-        Get an action and its log probability from the actor network, given a state.
-        Optimized for both single and batched inputs, and handles both discrete and continuous action spaces.
-        """
-        # Before anything, if we're using CUDA, let's make sure we're all synced up.
-        if "cuda" in str(self.device):
-            try:
-                torch.cuda.synchronize()
-                torch.compiler.cudagraph_mark_step_begin()
-            except Exception as e:
-                # If synchronization fails, just log it and move on.
-                if self.debug:
-                    print(f"[DEBUG] CUDA sync warning: {str(e)}")
-
-        # If the state isn't already a tensor, make it one, and ensure it has a batch dimension.
-        if not isinstance(state, torch.Tensor):
-            state = torch.FloatTensor(state)
-            if state.dim() == 1 or (len(state.shape) == 2 and state.shape[0] == 1 and state.shape[1] > 1):
-                state = state.unsqueeze(0)
-
-        # We clone the state to avoid modifying the original.  We'll keep this clone on the CPU.
-        state_clone = state.clone()
-
-        # Move the state to the correct device (CPU, CUDA, or MPS).
-        state_device = state_clone.to(self.device)
-
-        with torch.no_grad():  # We don't need gradients for inference.
-            with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):  # Only enable AMP with CUDA
-                # For CUDA graphs, we mark the start of each step.
-                if "cuda" in str(self.device):
-                    torch.compiler.cudagraph_mark_step_begin()
-
-                # First, get the estimated value of this state from the critic.
-                value = self.critic(state_device)
-                value = value.clone()  # Clone to avoid in-place modifications which can mess with the computation graph.
-
-                # Mark step before actor execution.
-                if "cuda" in str(self.device):
-                    torch.compiler.cudagraph_mark_step_begin()
-
-                # Now, get the action distribution from the actor with features.
-                if self.action_space_type == "discrete":
-                    logits, features = self.actor(state_device, return_features=True)
-                    logits = logits.clone()
-
-                    # Mark step after model execution.
-                    if "cuda" in str(self.device):
-                        torch.compiler.cudagraph_mark_step_begin()
-
-                    # Convert the logits to probabilities.
-                    action_probs = F.softmax(logits, dim=1)
-                    dist = Categorical(action_probs)  # Create a categorical distribution.
-
-                    if evaluate:
-                        # If we're evaluating the policy, take the action with the highest probability.
-                        action = torch.argmax(action_probs, dim=1)
-                    else:
-                        # Otherwise (during training), sample an action from the distribution.
-                        action = dist.sample()
-
-                    log_prob = dist.log_prob(action)  # Get the log probability of the chosen action.
-                else:
-                    # For continuous action spaces, the actor outputs the mean and (raw) standard deviation of a normal distribution.
-                    output, features = self.actor(state_device, return_features=True)
-                    if isinstance(output, tuple):
-                        mu, sigma_raw = output
-                    else:
-                        # Split the output if it's combined
-                        split_size = output.shape[-1] // 2
-                        mu, sigma_raw = output[:, :split_size], output[:, split_size:]
-
-                    mu = mu.clone()  # Clone the mean to avoid in-place modifications.
-                    sigma_raw = sigma_raw.clone() if isinstance(sigma_raw, torch.Tensor) else sigma_raw # Clone sigma, checking its type first.
-
-                    # Mark step after model execution.
-                    if "cuda" in str(self.device):
-                        torch.compiler.cudagraph_mark_step_begin()
-
-                    # Make sure the standard deviation is positive and not too small.
-                    sigma = F.softplus(sigma_raw) + 1e-5
-                    dist = Normal(mu, sigma)  # Create a normal distribution.
-
-                    if evaluate:
-                        # For evaluation, use the mean of the distribution (the "expected" action).
-                        action = mu
-                    else:
-                        # For training, sample from the distribution.
-                        action = dist.sample()
-
-                    log_prob = dist.log_prob(action)  # Log prob of the action.
-                    # If the action has multiple dimensions, sum the log probabilities.
-                    if len(log_prob.shape) > 1:
-                        log_prob = log_prob.sum(dim=-1)
-
-                    # Make sure the action stays within the allowed bounds.
-                    action = torch.clamp(action, self.action_bounds[0], self.action_bounds[1])
-
-                # Clone outputs to make absolutely sure we're not modifying tensors in-place.
-                action = action.clone()
-                log_prob = log_prob.clone()
-                value = value.clone()
-                features = features.clone()
-
-        # Return actions, log probabilities, values and features for auxiliary tasks
-        if return_features:
-            return action.cpu().numpy(), log_prob.cpu().numpy(), value.cpu().numpy(), features.cpu().numpy()
-        return action.cpu().numpy(), log_prob.cpu().numpy(), value.cpu().numpy()
-
-    def compute_gae(self, rewards, values, dones, next_value):
-        """Compute Generalized Advantage Estimation (GAE). Supports both PyTorch tensors and NumPy arrays.
-        Also includes improved numerical stability checks and handling."""
-
-        # Use compiled GAE function if it's available and enabled.
-        if self.use_compile and hasattr(self, '_compute_gae_fn'):
-            return self._compute_gae_fn(rewards, values, dones, next_value)
-
-        # Determine if we're working with tensors or numpy arrays.
-        is_tensor = isinstance(rewards, torch.Tensor)
-
-        # Update return statistics, but only if we are using numpy, as tensor operations are handled elsewhere.
-        if hasattr(self, 'ret_rms') and not is_tensor:
-            episode_returns = []
-            curr_return = 0
-            for r, d in zip(rewards, dones):
-                curr_return += r
-                # If this is the end of an episode, store the total return.
-                if d:
-                    episode_returns.append(curr_return)
-                    curr_return = 0
-
-            # Only update if we have complete episodes to avoid skewing stats.
-            if episode_returns:
-                self.ret_rms.update(np.array(episode_returns))
-
-        if is_tensor:
-            # Initialize the advantages tensor.
-            advantages = torch.zeros_like(rewards, device=self.device)
-            last_gae = torch.tensor(0.0, device=self.device)  # Keep track of the last GAE value.
-
-            # Handle dimension mismatches between `next_value` and `values`.
-            if next_value.dim() != values.dim():
-                if next_value.dim() > values.dim():
-                    # Remove extra dimensions.
-                    next_value = next_value.squeeze()
-
-                # Add dimensions if needed.
-                while next_value.dim() < values.dim():
-                    next_value = next_value.unsqueeze(0)
-
-            # Create a tensor with compatible shape for concatenation.
-            if len(values.shape) == 1:
-                next_value_shaped = next_value.reshape(1)
-            else:
-                # Ensure `next_value` matches the shape of `values` for concatenation.
-                next_value_shaped = next_value.reshape(*[1] + list(values.shape[1:]))
-
-            # Concatenate `values` and `next_value` for easier calculations.
-            try:
-                all_values = torch.cat([values, next_value_shaped], dim=0)
-            except RuntimeError as e:
-                # If concatenation fails, print detailed shape information for debugging.
-                print(f"values shape: {values.shape}, next_value shape: {next_value_shaped.shape}")
-                print(f"values dim: {values.dim()}, next_value dim: {next_value_shaped.dim()}")
-                raise RuntimeError(f"Error in torch.cat: {e}. Shape mismatch between values and next_value.")
-
-            # Loop backwards through the rewards to calculate GAE.
-            for t in reversed(range(len(rewards))):
-                # Determine if the episode ended at this step.
-                mask = ~dones[t] if isinstance(dones[t], torch.Tensor) else not dones[t]
-                if not mask:
-                    # If the episode ended, the advantage is just the immediate reward minus the value estimate.
-                    delta = rewards[t] - values[t]
-                    last_gae = delta
-                else:
-                    # If the episode continues, consider discounted future rewards and the next value estimate.
-                    delta = rewards[t] + self.gamma * all_values[t+1] - values[t]
-                    last_gae = delta + self.gamma * self.gae_lambda * last_gae
-
-                advantages[t] = last_gae  # Store the calculated GAE.
-        else:
-            # Numpy implementation for CPU.
-            advantages = np.zeros(len(rewards), dtype=np.float32)
-            last_gae = 0
-
-            # Ensure inputs are numpy arrays.
-            if not isinstance(rewards, np.ndarray):
-                rewards = np.array(rewards)
-            if not isinstance(values, np.ndarray):
-                values = np.array(values)
-            if not isinstance(dones, np.ndarray):
-                dones = np.array(dones)
-
-            # Convert `next_value` to a numpy array if it's a tensor.
-            if isinstance(next_value, torch.Tensor):
-                next_value = next_value.cpu().detach().numpy()
-
-            # Reshape `next_value` to be compatible with `values`.
-            if values.ndim == 1:
-                next_value = np.array([next_value]).flatten()
-            else:
-                next_value = np.reshape(next_value, (1,) + values.shape[1:])
-
-            # Concatenate `values` and `next_value`.
-            all_values = np.concatenate([values, next_value], axis=0)
-
-            # Loop backwards through rewards to calculate GAE (same logic as tensor version).
-            for t in reversed(range(len(rewards))):
-                if dones[t]:
-                    delta = rewards[t] - values[t]
-                    last_gae = delta
-                else:
-                    delta = rewards[t] + self.gamma * all_values[t+1] - values[t]
-                    last_gae = delta + self.gamma * self.gae_lambda * last_gae
-
-                advantages[t] = last_gae
-
-        # Check for numerical instability (NaN or Inf) in the advantages.
-        if is_tensor:
-            if torch.isnan(advantages).any() or torch.isinf(advantages).any():
-                self.debug_print("Warning: NaN or Inf in GAE advantages, attempting to fix...")
-                # Replace NaN/Inf values with reasonable defaults.
-                advantages = torch.nan_to_num(advantages, nan=0.0, posinf=10.0, neginf=-10.0)
-        else:
-            if np.isnan(advantages).any() or np.isinf(advantages).any():
-                if hasattr(self, 'debug_print'):
-                    self.debug_print("Warning: NaN or Inf in GAE advantages, attempting to fix...")
-                # Replace NaN/Inf values with reasonable defaults.
-                advantages = np.nan_to_num(advantages, nan=0.0, posinf=10.0, neginf=-10.0)
-
-        # Calculate returns by adding advantages to state values.
-        returns = advantages + values
-        return advantages, returns
-
-    def _detect_abnormal(self, tensor, name="tensor"):
-        """Helper function to check for NaN or Inf values in a tensor."""
-        if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-            self.debug_print(f"Warning: Detected NaN or Inf in {name}")
-            return True
-        return False
-
-    def _policy_eval_amp_safe(self, states, actions, old_log_probs, advantages):
-        """
-        Evaluates the policy in a way that's safe for Automatic Mixed Precision (AMP).
-        Includes safeguards against numerical instability.
-        """
-        # Forward pass of the actor network. Use AMP autocasting only where it's safe and beneficial.
-        if self.action_space_type == "discrete":
-            with autocast(enabled=self.use_amp, device_type="cuda"):
-                logits = self.actor(states)
-                action_probs = F.softmax(logits, dim=1)  # Probabilities from logits.
-            dist = Categorical(action_probs)  # Create a categorical distribution.
-            new_log_probs = dist.log_prob(actions)  # Log probability of the actions.
-            entropy = dist.entropy().mean()  # Calculate the entropy of the distribution.
-        else:
-            # For continuous action spaces.
-            with autocast(enabled=self.use_amp, device_type="cuda"):
-                mu, sigma_raw = self.actor(states)  # Get mean and raw standard deviation.
-
-            # Perform calculations that require more precision in full (float32) precision.
-            mu = mu.float()
-            if isinstance(sigma_raw, torch.Tensor):
-                sigma_raw = sigma_raw.float()  # Ensure sigma_raw is float32.
-            sigma = F.softplus(sigma_raw) + 1e-5   # Ensure positivity and prevent very small values.
-            dist = Normal(mu, sigma)  # Create a normal distribution.
-            new_log_probs = dist.log_prob(actions) # Log probability.
-            if len(new_log_probs.shape) > 1:
-                new_log_probs = new_log_probs.sum(dim=1)  # Sum if multi-dimensional action.
-            entropy = dist.entropy().mean()  # Entropy of the distribution.
-
-        # Calculate the PPO objective, ensuring numerical stability.  Do this in full precision.
-        log_ratio = new_log_probs - old_log_probs.float()
-        # Clamp the log ratio to prevent extreme values that can lead to instability.
-        log_ratio = torch.clamp(log_ratio, -15.0, 15.0)
-        ratio = torch.exp(log_ratio) # The ratio of new to old probabilities.
-
-        # If we detect NaN values in the ratio, replace them with reasonable defaults.
-        if self._detect_abnormal(ratio, "ratio"):
-            ratio = torch.nan_to_num(ratio, nan=1.0, posinf=10.0, neginf=0.1)
-
-        # Calculate the two surrogate losses for PPO.
-        surr1 = ratio * advantages.float()
-        surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * advantages.float()
-
-        # The actor loss is the negative of the minimum of the two surrogates (we want to *maximize* the objective).
-        actor_loss = -torch.min(surr1, surr2).mean()
-        entropy_loss = -self.entropy_coef * entropy  # Encourage exploration by maximizing entropy.
-
-        # Final checks for NaN values before returning.  If we find any, use fallback values.
-        if self._detect_abnormal(actor_loss, "actor_loss"):
-            self.debug_print("Using fallback value for actor_loss")
-            actor_loss = torch.tensor(1.0, device=self.device, requires_grad=True)  # Fallback value.
-
-        if self._detect_abnormal(entropy_loss, "entropy_loss"):
-            self.debug_print("Using fallback value for entropy_loss")
-            entropy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)  # Fallback value.
-
-        return actor_loss, entropy_loss, entropy
-
-    def _process_batch_amp_safe(self, batch_states, batch_actions, batch_old_log_probs,
-                            batch_advantages, batch_returns):
-        """
-        Processes a batch of experiences, calculating losses.
-        Designed to be safe for Automatic Mixed Precision (AMP) and includes numerical safeguards.
-        """
-
-        # Get the value predictions from the critic. Use AMP for the network forward pass.
-        with autocast(enabled=self.use_amp, device_type="cuda"):
-            values = self.critic(batch_states).squeeze()
-
-        # Evaluate the policy (get actor loss, entropy loss, and entropy).
-        actor_loss, entropy_loss, entropy = self._policy_eval_amp_safe(
-            batch_states, batch_actions, batch_old_log_probs, batch_advantages
-        )
-
-        # Calculate the critic loss (mean squared error between predicted values and returns).
-        # Do this in full precision for better accuracy.
-        values = values.float()
-        batch_returns = batch_returns.float()
-        critic_loss = F.mse_loss(values, batch_returns)
-
-        # Check for NaNs in the critic loss.
-        if self._detect_abnormal(critic_loss, "critic_loss"):
-            critic_loss = torch.tensor(1.0, device=self.device, requires_grad=True)  # Fallback value.
-
-        # Combine the losses.
-        total_loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
-
-        # Final check for any NaN values in the total loss.
-        if self._detect_abnormal(total_loss, "total_loss"):
-            self.debug_print("Warning: NaN in final loss detected - using fallback loss")
-            # If we have a NaN, try to recover by using just the critic loss (usually more stable).
-            if not torch.isnan(critic_loss).any():
-                total_loss = self.critic_coef * critic_loss
-            else:
-                # As a last resort, create a dummy loss to prevent training from completely failing.
-                total_loss = torch.tensor(1.0, device=self.device, requires_grad=True)
-
-        return actor_loss, critic_loss, entropy_loss, total_loss, entropy
-
-    def _safe_loss(self, loss_tensor):
-        """Safely handle potentially NaN losses"""
-        if torch.isnan(loss_tensor).any() or torch.isinf(loss_tensor).any():
-            if self.debug:
-                print(f"[DEBUG] NaN or Inf detected in loss - replacing with safe value")
-            return torch.tensor(0.01, device=self.device, requires_grad=True)
-        return loss_tensor
+        """Forward to algorithm's get_action method"""
+        return self.algorithm.get_action(state, evaluate, return_features)
 
     def update(self):
-        """Update policy and value networks using the PPO algorithm, with optimizations for AMP."""
+        """Update policy and value networks using the selected algorithm"""
         update_start = time.time()
-
         # Update pretraining state if needed
         if self.use_pretraining and not self.pretraining_completed:
-            # Calculate when pretraining should end
-            pretraining_end_step = self._get_pretraining_end_step()
-            current_step = self.total_episodes + self.total_episodes_offset
-            
-            if self.debug:
-                print(f"\n[DEBUG] Pretraining check: Episode {current_step}/{pretraining_end_step}, "
-                      f"completed: {self.pretraining_completed}, transition: {self.in_transition_phase}")
-                print(f"[DEBUG] Episode tracking: total_episodes={self.total_episodes}, "
-                      f"offset={self.total_episodes_offset}, target={self.total_episode_target}")
-            
-            # Check if we should end pretraining
-            if current_step >= pretraining_end_step:
-                if not self.in_transition_phase:
-                    self.in_transition_phase = True
-                    self.transition_start_step = current_step
-                    print(f"Starting transition from pretraining to RL at step {current_step}")
-                    if self.debug:
-                        print(f"[DEBUG] Pretraining transition started at step {current_step}")
-                    if self.use_wandb:
-                        wandb.log({
-                            "pretraining/status": "transition_started",
-                            "pretraining/step": current_step
-                        })
-                
-                # Check if we should complete the transition
-                if current_step >= (self.transition_start_step + self.pretraining_transition_steps):
-                    self.pretraining_completed = True
-                    self.in_transition_phase = False
-                    print(f"Pretraining completed at step {current_step}")
-                    if self.debug:
-                        print(f"[DEBUG] Pretraining completed at step {current_step}")
-                    if self.use_wandb:
-                        wandb.log({
-                            "pretraining/status": "completed",
-                            "pretraining/step": current_step
-                        })
-            
-            # Update auxiliary weights based on pretraining state
-            self._update_auxiliary_weights()
+            self._update_pretraining_state()
         
         # Increment training steps counter
         self.training_steps += 1
-
-        # Update episode counter
+        
+        # Get episode count based on algorithm type
         episodes_ended = 0
-
-        # Retrieve data from the memory buffer.
-        states, actions, old_log_probs, rewards, values, dones = self.memory.get()
-        if len(states) == 0:
-            # If there's nothing to train on, return early with default values.
-            return {"actor_loss": 0, "critic_loss": 0, "entropy_loss": 0, "total_loss": 0,
-                    "mean_episode_reward": 0, "value_explained_variance": 0, "kl_divergence": 0,
-                    "sr_loss":0, "rp_loss":0}  # Return 0 for aux losses too
-
-        # Calculate how many episodes are represented in this batch of data.
-        episodes_ended = torch.sum(dones.int()).item() if isinstance(dones, torch.Tensor) else np.sum(dones) if len(dones) > 0 else 0
+        if self.algorithm_type == "ppo" and hasattr(self.memory, "dones"):
+            # For PPO, count completed episodes from memory
+            dones = self.memory.dones
+            episodes_ended = torch.sum(dones.int()).item() if isinstance(dones, torch.Tensor) else np.sum(dones) if len(dones) > 0 else 0
         
         # Update total episode counter
         self.total_episodes += episodes_ended
         
         if self.debug and episodes_ended > 0:
-            print(f"[DEBUG] Episodes ended in this update: {episodes_ended}, new total: {self.total_episodes}")
-
-        # Calculate per-episode metrics like total reward and length.
-        episode_rewards = []
-        episode_reward = 0
-        episode_lengths = []
-        episode_length = 0
-
-        for i, (reward, done) in enumerate(zip(rewards, dones)):
-            # Handle different data types (tensor vs. numpy).
-            r_val = reward.item() if isinstance(reward, torch.Tensor) else reward
-            d_val = done.item() if isinstance(done, torch.Tensor) else done
-
-            episode_reward += r_val
-            episode_length += 1
-
-            # If an episode ended, store the accumulated reward and length.
-            if d_val or i == len(rewards) - 1:
-                episode_rewards.append(episode_reward)
-                episode_lengths.append(episode_length)
-                episode_reward = 0
-                episode_length = 0
-
-        avg_episode_reward = np.mean(episode_rewards)
-        avg_episode_length = np.mean(episode_lengths)
-
-        # Compute the next value estimate, which is needed for GAE.
-        # We only do this if the last state in the buffer isn't a terminal state.
-        if len(states) > 0 and not dones[-1]:
-            with torch.no_grad():  # No gradients needed for this.
-                next_state = states[-1].unsqueeze(0) if isinstance(states, torch.Tensor) else \
-                            torch.FloatTensor(states[-1]).unsqueeze(0).to(self.device)
-                with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):
-                    next_value = self.critic(next_state)
-        else:
-            # If the last state *was* terminal, the next value is just 0.
-            next_value = torch.tensor([0.0], device=self.device) if isinstance(values, torch.Tensor) else 0.0
-
-        # Calculate advantages and returns using Generalized Advantage Estimation (GAE).
-        advantages, returns = self.compute_gae(rewards, values, dones, next_value)
-
-        # Normalize the advantages.  This helps stabilize training.
-        if isinstance(advantages, torch.Tensor) and len(advantages) > 0:
-            adv_mean = advantages.mean()
-            adv_std = advantages.std() + 1e-8  # Add a small constant to avoid division by zero.
-            if not torch.isnan(adv_mean) and not torch.isnan(adv_std):
-                advantages = (advantages - adv_mean) / adv_std
-
-        # Initialize variables to track the total losses across all epochs and batches.
-        total_actor_loss = 0
-        total_critic_loss = 0
-        total_entropy_loss = 0
-        total_aux_loss = 0 # For auxiliary tasks
-        total_sr_loss = 0  # Add this
-        total_rp_loss = 0  # Add this
-        total_loss = 0
-        old_probs = None
-        old_mu = None
-        old_sigma = None
-
-        # Store the policy's output *before* any updates.  This is needed to calculate the KL divergence later,
-        # which is a measure of how much the policy has changed.
-        with torch.no_grad():
-            if self.action_space_type == "discrete":
-                with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):
-                    old_logits = self.actor(states)
-                old_probs = F.softmax(old_logits, dim=1)  # Convert logits to probabilities.
-            else:
-                with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):
-                    old_mu, old_sigma_raw = self.actor(states)
-                old_sigma = F.softplus(old_sigma_raw) + 1e-5  # Ensure standard deviation is positive.
-
-        # Get a set of batches from memory for training.
-        batches = self.memory.generate_batches()
-
-        # Dynamically adjust the clipping epsilon.  This can help improve performance.
-        # The idea is to reduce clipping as training progresses.
-        effective_clip_epsilon = max(0.1, self.clip_epsilon * (1 - episodes_ended / 1000))  # Adjust divisor for total episodes.
-
-        # Initialize learning rate schedulers for the actor and critic, if they haven't been initialized yet.
-        if self.actor_scheduler is None:
-            self.actor_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.actor_optimizer,
-                T_max=1000000,
-                eta_min=1e-5
-            )
-
-        if self.critic_scheduler is None:
-            self.critic_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.critic_optimizer,
-                T_max=1000000,  # Adjust based on expected training steps.
-                eta_min=3e-5
-            )
-
-        # Initialize auxiliary task schedulers, if applicable
-        if self.use_auxiliary_tasks:
-            if not hasattr(self.aux_task_manager, 'sr_scheduler'):
-                self.aux_task_manager.sr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                    self.aux_task_manager.sr_optimizer, T_max=1000000, eta_min=1e-5)
-            if not hasattr(self.aux_task_manager, 'rp_scheduler'):
-                self.aux_task_manager.rp_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                    self.aux_task_manager.rp_optimizer, T_max=1000000, eta_min=1e-5)
-
-        # Initialize reward normalizer.
-        if not hasattr(self, 'ret_rms'):
-            class RunningMeanStd:
-                def __init__(self, epsilon=1e-4, shape=()):
-                    self.mean = np.zeros(shape, 'float64')
-                    self.var = np.ones(shape, 'float64')
-                    self.count = epsilon
-
-                def update(self, x):
-                    batch_mean = np.mean(x, axis=0)
-                    batch_var = np.var(x, axis=0)
-                    batch_count = x.shape[0]
-                    self.update_from_moments(batch_mean, batch_var, batch_count)
-
-                def update_from_moments(self, batch_mean, batch_var, batch_count):
-                    delta = batch_mean - self.mean
-                    tot_count = self.count + batch_count
-                    new_mean = self.mean + delta * batch_count / tot_count
-                    m_a = self.var * self.count
-                    m_b = batch_var * batch_count
-                    M2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
-                    new_var = M2 / tot_count
-                    new_count = tot_count
-                    self.mean = new_mean
-                    self.var = new_var
-                    self.count = new_count
-
-            self.ret_rms = RunningMeanStd(shape=())
-
-        # Update return statistics.
-        episode_returns = []
-        for r_arr in episode_rewards:
-            episode_returns.append(r_arr)
-
-        if episode_returns:
-            self.ret_rms.update(np.array(episode_returns))
-
-        # Main training loop: iterate over epochs and mini-batches.
-        for epoch in range(self.ppo_epochs):
-            for batch_idx, batch_indices in enumerate(batches):
-                # Prepare the data for this specific batch.  Handles both tensor and numpy inputs.
-                if isinstance(states, torch.Tensor):
-                    batch_states = states[batch_indices]
-                    batch_actions = actions[batch_indices]
-                    batch_old_log_probs = old_log_probs[batch_indices]
-                    batch_advantages = advantages[batch_indices]
-                    batch_returns = returns[batch_indices]
-                else:
-                    batch_states = torch.tensor(states[batch_indices], dtype=torch.float32, device=self.device)
-                    # Ensure actions are tensors, with correct type based on action space
-                    batch_actions = torch.tensor(actions[batch_indices],
-                                                 dtype=torch.long if self.action_space_type == "discrete" else torch.float32,
-                                                 device=self.device)
-                    batch_old_log_probs = torch.tensor(old_log_probs[batch_indices], dtype=torch.float32, device=self.device)
-                    batch_advantages = torch.tensor(advantages[batch_indices], dtype=torch.float32, device=self.device)
-                    batch_returns = torch.tensor(returns[batch_indices], dtype=torch.float32, device=self.device)
-
-                # Reset the gradients of the optimizers.
-                self.actor_optimizer.zero_grad(set_to_none=True)
-                self.critic_optimizer.zero_grad(set_to_none=True)
-
-                # Only reset auxiliary task optimizers if using auxiliary tasks and it's a batch where we'll do aux updates
-                if self.use_auxiliary_tasks and (batch_idx % 4 == 0):  # Reduce frequency of aux updates
-                    self.aux_task_manager.sr_optimizer.zero_grad(set_to_none=True)
-                    self.aux_task_manager.rp_optimizer.zero_grad(set_to_none=True)
-
-                try:
-                    # Use a single autocast context for the entire forward pass when AMP is enabled.
-                    with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):
-                        # Forward pass through actor to get policy outputs and shared features
-                        if self.action_space_type == "discrete":
-                            logits, features = self.actor(batch_states, return_features=True)
-                            action_probs = F.softmax(logits, dim=1)
-                            dist = Categorical(action_probs)
-                            new_log_probs = dist.log_prob(batch_actions)  # Already correct type
-                            entropy = dist.entropy().mean()
-                        else:
-                            output, features = self.actor(batch_states, return_features=True)
-                            if isinstance(output, tuple):
-                                mu, sigma_raw = output
-                            else:
-                                # Split the output if it's combined
-                                split_size = output.shape[-1] // 2
-                                mu, sigma_raw = output[:, :split_size], output[:, split_size:]
-
-                            sigma = F.softplus(sigma_raw) + 1e-5
-                            dist = Normal(mu, sigma)
-                            new_log_probs = dist.log_prob(batch_actions)
-                            if len(new_log_probs.shape) > 1:
-                                new_log_probs = new_log_probs.sum(dim=1)
-                            entropy = dist.entropy().mean()
-
-                        # Forward pass through critic
-                        values = self.critic(batch_states).squeeze()
-
-                        # Calculate PPO losses (in full precision even with AMP)
-                        ratio = torch.exp(new_log_probs - batch_old_log_probs)
-                        ratio = torch.clamp(ratio, 0.0, 10.0) # Prevent extreme values
-                        surr1 = ratio * batch_advantages
-                        surr2 = torch.clamp(ratio, 1.0 - effective_clip_epsilon, 1.0 + effective_clip_epsilon) * batch_advantages
-                        actor_loss = -torch.min(surr1, surr2).mean()
-
-                        critic_loss = F.mse_loss(values, batch_returns)
-                        entropy_loss = -self.entropy_coef * entropy
-
-                    # Calculate auxiliary losses outside autocast (for numerical stability)
-                    # But only do it every few batches for better performance
-                    aux_loss = torch.tensor(0.0, device=self.device)
-                    if self.use_auxiliary_tasks and (batch_idx % 4 == 0):  # Reduced frequency
-                        try:
-                            # Scale down auxiliary task computation for better performance
-                            aux_scale = 0.005  # Reduced scale for auxiliary tasks
-
-                            # Use fixed size tensors for rewards history
-                            if hasattr(self.aux_task_manager, 'history_filled') and self.aux_task_manager.history_filled >= self.aux_task_manager.rp_sequence_length:
-                                # Compute auxiliary losses with minimal operations
-                                sr_loss, rp_loss = self.aux_task_manager.compute_losses(
-                                    features=features.float(),
-                                    observations=batch_states.float(),
-                                    rewards_sequence=None  # Use internal history instead
-                                )
-
-                                # Track auxiliary losses for reporting
-                                total_sr_loss += sr_loss.item()
-                                total_rp_loss += rp_loss.item()
-
-                                # Scale down and add to main loss
-                                aux_loss = (sr_loss + rp_loss) * aux_scale
-                                total_aux_loss += aux_loss.item()
-                            else:
-                                # Use stored loss values if history isn't filled
-                                total_sr_loss += self.aux_task_manager.latest_sr_loss
-                                total_rp_loss += self.aux_task_manager.latest_rp_loss
-                        except Exception as e:
-                            if self.debug:
-                                print(f"Skipping auxiliary task update: {e}")
-
-                    # Combine losses (all in full precision for stability)
-                    loss = actor_loss + self.critic_coef * critic_loss + entropy_loss + aux_loss
-
-                    # Check for nan
-                    if torch.isnan(loss):
-                      print("Warning: NaN loss detected!")
-
-                    # Backward and optimize
-                    if self.use_amp:
-                        self.scaler.scale(loss).backward()
-                        self.scaler.unscale_(self.actor_optimizer)
-                        self.scaler.unscale_(self.critic_optimizer)
-
-                        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-
-                        # Only apply auxiliary task updates at reduced frequency
-                        if self.use_auxiliary_tasks and (batch_idx % 4 == 0):
-                            self.scaler.unscale_(self.aux_task_manager.sr_optimizer)
-                            self.scaler.unscale_(self.aux_task_manager.rp_optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.aux_task_manager.sr_head.parameters(), self.max_grad_norm)
-                            torch.nn.utils.clip_grad_norm_(self.aux_task_manager.rp_lstm.parameters(), self.max_grad_norm)
-                            torch.nn.utils.clip_grad_norm_(self.aux_task_manager.rp_head.parameters(), self.max_grad_norm)
-
-                        self.scaler.step(self.actor_optimizer)
-                        self.scaler.step(self.critic_optimizer)
-
-                        if self.use_auxiliary_tasks and (batch_idx % 4 == 0):
-                            self.scaler.step(self.aux_task_manager.sr_optimizer)
-                            self.scaler.step(self.aux_task_manager.rp_optimizer)
-
-                        self.scaler.update()
-                    else:
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-
-                        if self.use_auxiliary_tasks and (batch_idx % 4 == 0):
-                            torch.nn.utils.clip_grad_norm_(self.aux_task_manager.sr_head.parameters(), self.max_grad_norm)
-                            torch.nn.utils.clip_grad_norm_(self.aux_task_manager.rp_lstm.parameters(), self.max_grad_norm)
-                            torch.nn.utils.clip_grad_norm_(self.aux_task_manager.rp_head.parameters(), self.max_grad_norm)
-
-                            self.actor_optimizer.step()
-                            self.critic_optimizer.step()
-                            self.aux_task_manager.sr_optimizer.step()
-                            self.aux_task_manager.rp_optimizer.step()
-                        else:
-                            self.actor_optimizer.step()
-                            self.critic_optimizer.step()
-
-                    # Track the losses
-                    total_actor_loss += actor_loss.item()
-                    total_critic_loss += critic_loss.item()
-                    total_entropy_loss += entropy_loss.item()
-                    total_loss += loss.item()
-
-                except Exception as e:
-                    print(f"Error in batch processing: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    continue
-                    
-        # Step learning rate schedulers only when NOT in pretraining
-        # This keeps learning rates constant during pretraining to avoid optimization bias
-        if self.pretraining_completed and not self.in_transition_phase:
-            self.actor_scheduler.step()
-            self.critic_scheduler.step()
-            if self.use_auxiliary_tasks:
-                self.aux_task_manager.sr_scheduler.step()
-                self.aux_task_manager.rp_scheduler.step()
-        else:
-            if self.debug and self.training_steps % 100 == 0:
-                print(f"[DEBUG] Skipping LR scheduler step during pretraining (step {self.training_steps})")
-                
+            print(f"[DEBUG] {episodes_ended} episodes completed, total: {self.total_episodes}")
+            
+        # Call the algorithm's update method
+        metrics = self.algorithm.update()
+        
         # Apply entropy decay more slowly
         if self.entropy_coef > self.min_entropy_coef:
             self.entropy_coef = max(self.min_entropy_coef, 
-                               self.entropy_coef * self.entropy_coef_decay)
-
-        # Calculate the average losses across all epochs and batches.
-        num_updates = max(self.ppo_epochs * len(batches), 1)
-        avg_actor_loss = total_actor_loss / num_updates
-        avg_critic_loss = total_critic_loss / num_updates
-        avg_entropy_loss = total_entropy_loss / num_updates
-        avg_sr_loss = total_sr_loss / num_updates   # average sr loss
-        avg_rp_loss = total_rp_loss / num_updates   # average rp loss
-        avg_aux_loss = total_aux_loss / num_updates # average aux loss
-        avg_loss = total_loss / num_updates
-
-        # Calculate the KL divergence between the old and new policies.
-        kl_div = 0
-        if len(states) > 0:
-            with torch.no_grad():  # No gradients needed for this.
-                if self.action_space_type == "discrete" and old_probs is not None:
-                    with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):
-                        new_logits = self.actor(states)
-                    new_probs = F.softmax(new_logits.float(), dim=1)
-                    kl = old_probs * (torch.log(old_probs + 1e-10) - torch.log(new_probs + 1e-10))
-                    if torch.isnan(kl).any() or torch.isinf(kl).any():
-                        kl = torch.nan_to_num(kl, nan=0.0, posinf=1.0, neginf=-1.0)
-                    kl_div = kl.sum(1).mean().item()
-
-                elif old_mu is not None and old_sigma is not None:
-                    with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):
-                        new_mu, new_sigma_raw = self.actor(states)
-                    new_mu = new_mu.float()
-                    new_sigma_raw = new_sigma_raw.float() if isinstance(new_sigma_raw, torch.Tensor) else new_sigma_raw
-                    new_sigma = F.softplus(new_sigma_raw) + 1e-5
-                    kl = torch.log(new_sigma/(old_sigma + 1e-10)) + (old_sigma**2 + (old_mu - new_mu)**2)/(2*new_sigma**2 + 1e-10) - 0.5
-                    if torch.isnan(kl).any() or torch.isinf(kl).any():
-                        kl = torch.nan_to_num(kl, nan=0.0, posinf=1.0, neginf=-1.0)
-                    kl_div = kl.mean().item()
-
-
-        # Calculate the explained variance.
-        explained_var = 0
-        if len(states) > 0:
-            with torch.no_grad():
-                try:
-                    with autocast(enabled=self.use_amp and "cuda" in str(self.device), device_type="cuda"):
-                        all_values_half = self.critic(states).squeeze()
-
-                    all_values = all_values_half.float().cpu().numpy().flatten()
-                    all_returns = returns.cpu().numpy().flatten() if isinstance(returns, torch.Tensor) else returns.flatten()
-
-                    min_length = min(len(all_values), len(all_returns))
-                    if min_length > 0:
-                        all_values = all_values[:min_length]
-                        all_returns = all_returns[:min_length]
-
-                        if not np.isnan(all_values).any() and not np.isnan(all_returns).any():
-                            var_returns = np.var(all_returns)
-                            if var_returns > 1e-8:  # Avoid division by zero.
-                                explained_var = 1 - np.var(all_returns - all_values) / var_returns
-                except Exception as e:
-                    print(f"Error computing explained variance: {e}")
-
-
-        # Log the training metrics using wandb, if it's enabled.
+                                   self.entropy_coef * self.entropy_coef_decay)
+            
+        # Update auxiliary task weights if pretraining is active
+        if self.use_auxiliary_tasks:
+            self._update_auxiliary_weights()
+            
+        # Add update time to metrics
+        metrics["update_time"] = time.time() - update_start
+        metrics["in_pretraining"] = not self.pretraining_completed
+        metrics["in_transition"] = self.in_transition_phase
+        
+        # Log the metrics using wandb, if enabled
         if self.use_wandb:
             try:
-                import wandb
-                if wandb.run is not None:
-                    safe_metrics = {
-                        "actor_loss": float(avg_actor_loss),
-                        "critic_loss": float(avg_critic_loss),
-                        "entropy_loss": float(avg_entropy_loss),
-                        "total_loss": float(avg_loss),
-                        "mean_episode_reward": float(avg_episode_reward),
-                        "mean_episode_length": float(avg_episode_length),
-                        "policy_kl_divergence": float(kl_div),
-                        "value_explained_variance": float(explained_var),
-                        "effective_clip_epsilon": effective_clip_epsilon,
-                        "actor_lr": self.actor_scheduler.get_last_lr()[0],
-                        "critic_lr": self.critic_scheduler.get_last_lr()[0],
-                        "sr_loss": float(avg_sr_loss),         # Auxiliary task losses
-                        "rp_loss": float(avg_rp_loss),         # Auxiliary task losses
-                        "aux_loss": float(avg_aux_loss),
-                    }
-
-                    # Add curriculum metrics if curriculum is enabled
-                    if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None:
-                        curr_stats = self.curriculum_manager.get_curriculum_stats()
-                        current_stage = curr_stats["current_stage"]
-                        current_diff = curr_stats["difficulty_level"]
-                        stage_stats = curr_stats["current_stage_stats"]
-                        
-                        # Add curriculum metrics to safe_metrics
-                        safe_metrics.update({
-                            "curriculum/difficulty": float(current_diff),
-                            "curriculum/stage": int(current_stage),
-                            "curriculum/stage_name": str(curr_stats["current_stage_name"]),
-                            "curriculum/total_stages": int(curr_stats["total_stages"]),
-                            "curriculum/total_progress": float((current_stage + current_diff) / curr_stats["total_stages"]),
-                            "curriculum/success_rate": float(stage_stats["success_rate"]),
-                            "curriculum/avg_reward": float(stage_stats["avg_reward"]),
-                            "curriculum/episodes_in_stage": int(stage_stats["episodes"]),
-                            "curriculum/stage_successes": int(stage_stats["successes"]),
-                            "curriculum/stage_failures": int(stage_stats["failures"])
-                        })
-
-                    if hasattr(self, 'aux_scale'):
-                        safe_metrics["aux_scale"] = self.aux_scale
-
-                    if isinstance(advantages, torch.Tensor):
-                        adv_mean = advantages.mean().item()
-                        if not np.isnan(adv_mean): safe_metrics["mean_advantage"] = adv_mean
-
-                    if isinstance(returns, torch.Tensor):
-                        ret_mean = returns.mean().item()
-                        if not np.isnan(ret_mean): safe_metrics["mean_return"] = ret_mean
-
-                    # Log AMP scaler value
-                    if self.use_amp:
-                        safe_metrics["amp_scale"] = self.scaler.get_scale()
-
-                    # Log reward normalization stats
-                    if hasattr(self, 'ret_rms'):
-                        safe_metrics["reward_mean"] = float(self.ret_rms.mean)
-                        safe_metrics["reward_var"] = float(self.ret_rms.var)
-
-                    # Track steps at the batch level to ensure monotonic increase
-                    if not hasattr(self, '_true_training_steps'):
-                        self._true_training_steps = 0
+                log_dict = {
+                    "actor_loss": metrics.get("actor_loss", 0),
+                    "critic_loss": metrics.get("critic_loss", 0),
+                    "entropy_loss": metrics.get("entropy_loss", 0),
+                    "total_loss": metrics.get("total_loss", 0),
+                    "entropy_coef": self.entropy_coef,
+                    "actor_lr": getattr(self.algorithm, "lr_actor", self.lr_actor),
+                    "critic_lr": getattr(self.algorithm, "lr_critic", self.lr_critic),
+                    "training_step": self.training_steps + self.training_step_offset,
+                    "total_episodes": self.total_episodes + self.total_episodes_offset,
+                }
+                
+                # Add algorithm-specific metrics
+                if self.algorithm_type == "streamac":
+                    log_dict.update({
+                        "effective_step_size": getattr(self.algorithm, "last_step_sizes", [0])[-1] 
+                            if hasattr(self.algorithm, "last_step_sizes") and len(getattr(self.algorithm, "last_step_sizes", [])) > 0 
+                            else 0,
+                        "backtracking_count": getattr(self.algorithm, "backtracking_count", 0),
+                        "successful_steps": getattr(self.algorithm, "successful_steps", 0)
+                    })
+                
+                # Add auxiliary task metrics if enabled
+                if self.use_auxiliary_tasks:
+                    log_dict.update({
+                        "sr_loss": metrics.get("sr_loss", 0),
+                        "rp_loss": metrics.get("rp_loss", 0),
+                        "aux_loss": metrics.get("aux_loss", 0),
+                        "sr_weight": getattr(self.aux_task_manager, "sr_weight", 0),
+                        "rp_weight": getattr(self.aux_task_manager, "rp_weight", 0)
+                    })
+                
+                # Add pretraining indicators
+                if self.use_pretraining:
+                    log_dict.update({
+                        "pretraining_active": 1 if not self.pretraining_completed else 0,
+                        "transition_phase": 1 if self.in_transition_phase else 0
+                    })
                     
-                    # Increment before logging to maintain correct ordering
-                    self._true_training_steps += 1
-                    global_step = self._true_training_steps
-                    
-                    # Synchronize with curriculum manager if present
-                    if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None:
-                        # Update curriculum manager's step counter
-                        self.curriculum_manager._last_wandb_step = global_step
-                        
-                    # Log with synchronized step
-                    wandb.log(safe_metrics, step=global_step)
-
+                    # If in transition phase, log progress
+                    if self.in_transition_phase:
+                        progress = min(1.0, (self.training_steps - self.transition_start_step) / 
+                                      self.pretraining_transition_steps)
+                        log_dict["transition_progress"] = progress
+                
+                # Add curriculum metrics if they exist
+                if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None:
+                    curriculum_stats = self.curriculum_manager.get_curriculum_stats()
+                    log_dict.update({
+                        "difficulty_level": curriculum_stats["difficulty_level"],
+                        "current_stage": curriculum_stats["current_stage_index"],
+                        "success_rate": curriculum_stats["success_rate"]
+                    })
+                
+                # Log to wandb
+                wandb.log(log_dict, step=self.training_steps + self.training_step_offset)
             except Exception as e:
-                print(f"[WARNING] Failed to log metrics: {e}")
+                print(f"Error logging to wandb: {e}")
 
-        # Clear the memory buffer after each update.
-        self.memory.clear()
-
-        # Return a dictionary containing all the important training metrics.
-        return_metrics = {
-            "actor_loss": avg_actor_loss,
-            "critic_loss": avg_critic_loss,
-            "entropy_loss": avg_entropy_loss,
-            "total_loss": avg_loss,
-            "mean_episode_reward": avg_episode_reward,
-            "value_explained_variance": explained_var,
-            "kl_divergence": kl_div,
-            "effective_clip_epsilon": effective_clip_epsilon,
-            "update_time": time.time() - update_start,
-            "sr_loss": avg_sr_loss, # Return auxiliary loss
-            "rp_loss": avg_rp_loss, # Return auxiliary loss
-            "aux_loss": avg_aux_loss, # Return auxiliary loss
-            "in_pretraining": not self.pretraining_completed,
-            "in_transition": self.in_transition_phase,
-        }
-
-        return return_metrics
+        return metrics
 
     def reset_auxiliary_tasks(self):
-        """Reset the auxiliary task history when episodes end"""
+        """Reset auxiliary task history when episodes end"""
         if self.use_auxiliary_tasks:
             self.aux_task_manager.reset()
 
@@ -1834,79 +951,64 @@ class PPOTrainer:
         timestamp = time.strftime("%Y%m%d-%H%M%S")
 
         if model_path is None:
-            # Default: save to models directory with timestamp.
-            os.makedirs("models", exist_ok=True)
-            model_path = f"models/rlbot_model_{timestamp}.pt"
+            model_path = f"checkpoints/model_{timestamp}.pt"
         elif os.path.isdir(model_path) or model_path.endswith('/') or model_path.endswith('\\'):
-            # If model_path is a directory, append timestamped filename.
-            os.makedirs(model_path, exist_ok=True)
-            model_path = os.path.join(model_path, f"rlbot_model_{timestamp}.pt")
+            model_path = os.path.join(model_path, f"model_{timestamp}.pt")
         
         # Make sure parent directory exists
         parent_dir = os.path.dirname(model_path)
         if parent_dir:
             os.makedirs(parent_dir, exist_ok=True)
 
-        # Get the original models if using compiled versions.
+        # Get the original models if using compiled versions
         actor_state = self.actor._orig_mod.state_dict() if hasattr(self.actor, '_orig_mod') else self.actor.state_dict()
         critic_state = self.critic._orig_mod.state_dict() if hasattr(self.critic, '_orig_mod') else self.critic.state_dict()
 
         # Get auxiliary task models if enabled
         aux_state = {}
         if self.use_auxiliary_tasks:
-            try:
-                aux_state['sr_head'] = self.aux_task_manager.sr_head.state_dict()
-                aux_state['rp_head'] = self.aux_task_manager.rp_head.state_dict()
-            except Exception as e:
-                self.debug_print(f"Failed to save auxiliary task models: {e}")
+            # Save SR model
+            aux_state['sr_task'] = self.aux_task_manager.sr_task.state_dict()
+            # Save RP model
+            aux_state['rp_task'] = self.aux_task_manager.rp_task.state_dict()
 
         # Get the WandB run ID if available
         wandb_run_id = None
         if self.use_wandb:
             try:
-                import wandb
-                if wandb.run is not None:
-                    wandb_run_id = wandb.run.id
-            except ImportError:
-                self.debug_print("WandB not available")
+                wandb_run_id = wandb.run.id
+            except:
+                pass
 
-        # Save all models to a single file.
+        # Save all models to a single file
         try:
-            save_data = {
+            # Prepare metadata
+            if metadata is None:
+                metadata = {}
+                
+            # Add training info to metadata
+            metadata.update({
+                'algorithm': self.algorithm_type,
+                'training_step': self.training_steps + self.training_step_offset,
+                'total_episodes': self.total_episodes + self.total_episodes_offset,
+                'wandb_run_id': wandb_run_id,
+                'timestamp': timestamp
+            })
+            
+            # Save everything to a single file
+            torch.save({
                 'actor': actor_state,
                 'critic': critic_state,
-                'auxiliary': aux_state,
-                'training_step': getattr(self, 'training_steps', 0) + getattr(self, 'training_step_offset', 0),
-                'total_episodes': getattr(self, 'total_episodes', 0) + getattr(self, 'total_episodes_offset', 0),
-                'timestamp': time.time(),
-                'version': '1.0',
-                'wandb_run_id': wandb_run_id
-            }
+                'aux': aux_state,
+                'metadata': metadata
+            }, model_path)
             
-            # Add any additional metadata if provided
-            if metadata:
-                save_data.update(metadata)
-
-            torch.save(save_data, model_path)
-
-            self.debug_print(f"Saved models to: {model_path}")
+            if self.debug:
+                print(f"[DEBUG] Model saved to {model_path}")
             return model_path
         except Exception as e:
-            print(f"Error saving model to {model_path}: {e}")
-            # Try to save to default location if custom path fails
-            try:
-                fallback_path = f"models/rlbot_model_{timestamp}_fallback.pt"
-                os.makedirs("models", exist_ok=True)
-                torch.save({
-                    'actor': actor_state,
-                    'critic': critic_state,
-                    'auxiliary': aux_state,
-                }, fallback_path)
-                print(f"Model saved to fallback location: {fallback_path}")
-                return fallback_path
-            except Exception as e2:
-                print(f"Failed to save model to fallback location: {e2}")
-                return None
+            print(f"Error saving models: {e}")
+            return None
 
     def load_models(self, model_path):
         """
@@ -1923,135 +1025,140 @@ class PPOTrainer:
 
         # Handle both new single-file format and legacy format
         if isinstance(checkpoint, dict) and 'actor' in checkpoint and 'critic' in checkpoint:
-            # New format - Fix the state dictionaries using the helper function
+            # Load actor and critic models
+            # Fix compiled state dicts if necessary
             actor_state = fix_compiled_state_dict(checkpoint['actor'])
             critic_state = fix_compiled_state_dict(checkpoint['critic'])
-
-            # Load the fixed state dictionaries
+            
+            # Load models
             self.actor.load_state_dict(actor_state)
             self.critic.load_state_dict(critic_state)
-
-            # Load auxiliary networks if they exist in the checkpoint and we're using auxiliary tasks
-            if self.use_auxiliary_tasks and 'auxiliary' in checkpoint:
-                if 'sr_head' in checkpoint['auxiliary']:
-                    sr_state = fix_compiled_state_dict(checkpoint['auxiliary']['sr_head'])
-                    self.aux_task_manager.sr_head.load_state_dict(sr_state)
-
-                if 'rp_head' in checkpoint['auxiliary']:
-                    rp_state = fix_compiled_state_dict(checkpoint['auxiliary']['rp_head'])
-                    self.aux_task_manager.rp_head.load_state_dict(rp_state)
-
-                self.debug_print("Loaded auxiliary task models from checkpoint")
-
-            # Get training step count if available, defaulting to 0 if not found
-            self.training_step_offset = checkpoint.get('training_step', 0)
-            self.total_episodes_offset = checkpoint.get('total_episodes', 0)
-
-            if self.use_wandb and 'wandb_run_id' in checkpoint:
-                # Resume the existing WandB run if possible
-                import wandb
-                if wandb.run is None:
-                    try:
-                        wandb.init(id=checkpoint['wandb_run_id'], resume="must")
-                    except Exception as e:
-                        self.debug_print(f"Could not resume WandB run: {e}. Starting new run.")
-
-            self.debug_print(f"Loaded models from unified checkpoint: {model_path}")
-            return True
+            
+            # Load auxiliary tasks if available and enabled
+            if self.use_auxiliary_tasks and 'aux' in checkpoint and checkpoint['aux']:
+                aux_state = checkpoint['aux']
+                if 'sr_head' in aux_state:
+                    self.aux_task_manager.sr_head.load_state_dict(aux_state['sr_head'])
+                if 'rp_lstm' in aux_state and 'rp_head' in aux_state:
+                    self.aux_task_manager.rp_lstm.load_state_dict(aux_state['rp_lstm'])
+                    self.aux_task_manager.rp_head.load_state_dict(aux_state['rp_head'])
+                    
+            # Extract metadata if available
+            if 'metadata' in checkpoint:
+                metadata = checkpoint['metadata']
+                if 'training_step' in metadata:
+                    self.training_step_offset = metadata['training_step']
+                if 'total_episodes' in metadata:
+                    self.total_episodes_offset = metadata['total_episodes']
+                if self.debug:
+                    print(f"[DEBUG] Loaded metadata: {metadata}")
+                    
+            if self.debug:
+                print(f"[DEBUG] Successfully loaded model from {model_path}")
         else:
-            # Legacy format - assume this is just the actor model
-            try:
-                # Fix the state dictionary before loading
-                fixed_state_dict = fix_compiled_state_dict(checkpoint)
-                self.actor.load_state_dict(fixed_state_dict)
-                self.debug_print(f"Loaded actor model from legacy format: {model_path}")
-                return False
-            except Exception as e:
-                raise RuntimeError(f"Failed to load model: {str(e)}")
+            # Handle legacy format - just load actor
+            self.actor.load_state_dict(checkpoint)
+            if self.debug:
+                print(f"[DEBUG] Loaded legacy model format from {model_path}")
 
     def register_curriculum_manager(self, curriculum_manager):
         """Register a curriculum manager to synchronize wandb logging"""
         self.curriculum_manager = curriculum_manager
-        if curriculum_manager is not None:
-            # Register this trainer with the curriculum manager
-            curriculum_manager.register_trainer(self)
-            # Initialize step counter if not present
-            if not hasattr(self, '_true_training_steps'):
-                self._true_training_steps = max(0, curriculum_manager._last_wandb_step)
-            else:
-                # Synchronize step counters
-                self._true_training_steps = max(self._true_training_steps, curriculum_manager._last_wandb_step)
-                curriculum_manager._last_wandb_step = self._true_training_steps
+        if curriculum_manager is not None and self.debug:
+            print(f"[DEBUG] Registered curriculum manager with {len(curriculum_manager.stages)} stages")
 
     def _get_pretraining_end_step(self):
         """Calculate the step at which pretraining should end based on available targets"""
         # Check if total_episode_target attribute exists before accessing
         if hasattr(self, 'total_episode_target') and self.total_episode_target:
             return int(self.total_episode_target * self.pretraining_fraction)
+            
         # Check if training_time_target attribute exists before accessing
         if hasattr(self, 'training_time_target') and self.training_time_target:
             return int(self.training_time_target * self.pretraining_fraction)
+            
         # Default fallback - use a fixed number of steps
         return int(5000 * self.pretraining_fraction)
 
+    def _update_pretraining_state(self):
+        """Update pretraining state based on current step"""
+        # Check if we should exit pretraining
+        pretraining_end_step = self._get_pretraining_end_step()
+        current_step = self.total_episodes + self.total_episodes_offset
+        
+        # If we've reached the end of pretraining and not in transition phase yet
+        if current_step >= pretraining_end_step and not self.pretraining_completed and not self.in_transition_phase:
+            if self.debug:
+                print(f"[DEBUG] Starting pretraining transition phase at episode {current_step}/{pretraining_end_step}")
+            self.in_transition_phase = True
+            self.transition_start_step = current_step
+            
+        # If we're in the transition phase and have completed it
+        elif self.in_transition_phase:
+            transition_progress = current_step - self.transition_start_step
+            if transition_progress >= self.pretraining_transition_steps:
+                if self.debug:
+                    print(f"[DEBUG] Completed pretraining transition phase at episode {current_step}")
+                self.pretraining_completed = True
+                self.in_transition_phase = False
+
     def _update_auxiliary_weights(self):
+        """Update auxiliary task weights based on pretraining phase"""
         if not self.use_auxiliary_tasks or not self.use_pretraining:
             return
+            
         current_sr_weight = self.base_sr_weight
         current_rp_weight = self.base_rp_weight
+        
         if not self.pretraining_completed:
+            # In pretraining phase, use higher weights
             current_sr_weight = self.pretraining_sr_weight
             current_rp_weight = self.pretraining_rp_weight
         elif self.in_transition_phase:
-            transition_progress = min(1.0, (self.training_steps - self.transition_start_step) / self.pretraining_transition_steps)
-            if transition_progress >= 1.0:
-                self.in_transition_phase = False
-                if self.debug:
-                    print(f"[DEBUG] Transition phase completed at step {self.training_steps}")
-            else:
-                current_sr_weight = self.pretraining_sr_weight + transition_progress * (self.base_sr_weight - self.pretraining_sr_weight)
-                current_rp_weight = self.pretraining_rp_weight + transition_progress * (self.base_rp_weight - self.pretraining_rp_weight)
+            # In transition phase, gradually reduce weights
+            progress = min(1.0, (self.training_steps - self.transition_start_step) / 
+                          self.pretraining_transition_steps)
+            current_sr_weight = self.pretraining_sr_weight + progress * (self.base_sr_weight - self.pretraining_sr_weight)
+            current_rp_weight = self.pretraining_rp_weight + progress * (self.base_rp_weight - self.pretraining_rp_weight)
+            
+        # Update the weights in the manager
         self.aux_task_manager.sr_weight = current_sr_weight
         self.aux_task_manager.rp_weight = current_rp_weight
 
         # Also update entropy coefficient based on pretraining status
         if not self.pretraining_completed:
-            # Use high entropy during pretraining (5-10x base value)
-            self.entropy_coef = min(0.1, self.base_entropy_coef * self.pretraining_entropy_scale)
+            # Higher entropy during pretraining to encourage exploration
+            self.entropy_coef = self.base_entropy_coef * self.pretraining_entropy_scale
         elif self.in_transition_phase:
-            # Gradually reduce entropy during transition phase
-            transition_progress = min(1.0, (self.training_steps - self.transition_start_step) / 
-                                    self.pretraining_transition_steps)
-            high_entropy = min(0.1, self.base_entropy_coef * self.pretraining_entropy_scale)
-            self.entropy_coef = high_entropy - transition_progress * (high_entropy - self.base_entropy_coef)
+            # Gradually reduce entropy during transition
+            progress = min(1.0, (self.training_steps - self.transition_start_step) / 
+                          self.pretraining_transition_steps)
+            self.entropy_coef = self.base_entropy_coef * self.pretraining_entropy_scale + \
+                               progress * (self.base_entropy_coef - self.base_entropy_coef * self.pretraining_entropy_scale)
         else:
-            # During normal training, apply regular entropy decay
-            if self.entropy_coef > self.min_entropy_coef:
-                self.entropy_coef = max(self.min_entropy_coef,
-                                        self.entropy_coef * self.entropy_coef_decay)
+            # Use base entropy with normal decay during regular training
+            self.entropy_coef = self.base_entropy_coef
 
-
+        # Log to wandb
         if self.use_wandb and self.training_steps % 10 == 0:
             wandb.log({
-                "pretraining/entropy_coef": self.entropy_coef,
-                "pretraining/sr_weight": current_sr_weight,
-                "pretraining/rp_weight": current_rp_weight,
-                "pretraining/active": not self.pretraining_completed,
-                "pretraining/transition": self.in_transition_phase,
+                "sr_weight": current_sr_weight,
+                "rp_weight": current_rp_weight,
+                "entropy_coef": self.entropy_coef
             }, step=self._get_wandb_step())
 
     def _get_wandb_step(self):
+        """Get the correct step for wandb logging"""
         return self.training_steps + self.training_step_offset
 
-    # Add method to set the total episode target after initialization
     def set_total_episode_target(self, total_episodes):
         """Set the target for total training episodes, used for pretraining calculations."""
         self.total_episode_target = total_episodes
         
-        if self.use_pretraining and self.total_episode_target:
+        if self.use_pretraining and self.total_episode_target and self.debug:
             pretraining_end = self._get_pretraining_end_step()
-            print(f"Updated pretraining plan: will run until episode {pretraining_end} "
-                  f"({self.pretraining_fraction*100:.1f}% of {self.total_episode_target})")
+            print(f"[DEBUG] Set total episode target to {total_episodes}")
+            print(f"[DEBUG] Pretraining will end at episode {pretraining_end}")
         
         return self._get_pretraining_end_step()
 
@@ -2060,13 +1167,30 @@ class PPOTrainer:
         if not self.use_intrinsic_rewards or self.intrinsic_reward_generator is None:
             return {}
             
+        # Convert inputs to tensor format for intrinsic reward update
         if not isinstance(state, torch.Tensor):
-            state = torch.FloatTensor(state).to(self.device)
+            state_tensor = torch.FloatTensor(state).to(self.device)
+            if state_tensor.dim() == 1:
+                state_tensor = state_tensor.unsqueeze(0)
+        else:
+            state_tensor = state.to(self.device)
+            
         if not isinstance(action, torch.Tensor):
-            action = torch.FloatTensor(action).to(self.device)
+            if self.action_space_type == "discrete":
+                action_tensor = torch.LongTensor([action]).to(self.device)
+            else:
+                action_tensor = torch.FloatTensor(action).to(self.device)
+                if action_tensor.dim() == 1:
+                    action_tensor = action_tensor.unsqueeze(0)
+        else:
+            action_tensor = action.to(self.device)
+            
         if not isinstance(next_state, torch.Tensor):
-            next_state = torch.FloatTensor(next_state).to(self.device)
+            next_state_tensor = torch.FloatTensor(next_state).to(self.device)
+            if next_state_tensor.dim() == 1:
+                next_state_tensor = next_state_tensor.unsqueeze(0)
+        else:
+            next_state_tensor = next_state.to(self.device)
             
         # Update intrinsic reward models
-        metrics = self.intrinsic_reward_generator.update(state, action, next_state, done)
-        return metrics
+        return self.intrinsic_reward_generator.update(state_tensor, action_tensor, next_state_tensor, done)

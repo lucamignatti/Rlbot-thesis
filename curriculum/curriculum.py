@@ -571,7 +571,13 @@ def create_curriculum(debug=False):
         name="Unsupervised Pre-training",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=2, orange_size=2),
+            # Position blue team
             CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(get_strategic_car_position)),
+            CarPositionMutator(car_id="blue-1", position_function=SafePositionWrapper(get_blue_attacker_position)),
+            # Position orange team
+            CarPositionMutator(car_id="orange-0", position_function=SafePositionWrapper(get_orange_primary_defender_position)),
+            CarPositionMutator(car_id="orange-1", position_function=SafePositionWrapper(get_orange_attacker_position)),
+            # Position the ball
             BallPositionMutator(position_function=SafePositionWrapper(safe_ball_position))
         ),
         # Use rewards for various extrinisic tasks to discourage repetitive or unproductive behaviour
