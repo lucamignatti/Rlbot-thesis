@@ -177,6 +177,10 @@ def run_training(
         trainer.actor.train()
         trainer.critic.train()
 
+    # Add test mode flag to trainer
+    if test:
+        trainer.test_mode = True
+
     # Initialize curriculum if enabled
     curriculum_manager = None
     if use_curriculum:
@@ -837,6 +841,9 @@ if __name__ == "__main__":
                         help='Legacy parameter; use --num_envs instead')
 
     args = parser.parse_args()
+
+    if args.model is not None:
+        args.use_sparse_init = False
 
     # If a training time is provided, parse it into seconds.
     training_time_seconds = None

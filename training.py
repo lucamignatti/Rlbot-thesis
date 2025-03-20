@@ -747,6 +747,9 @@ class Trainer:
 
     def store_experience(self, state, action, log_prob, reward, value, done):
         """Forward to algorithm's store_experience method"""
+        # Get whether we're in test mode - add this line
+        test_mode = getattr(self, 'test_mode', False)
+        
         # Add intrinsic rewards during pretraining if enabled
         if self.use_intrinsic_rewards and (not self.pretraining_completed or self.in_transition_phase):
             # Convert inputs to tensor format for intrinsic reward computation
@@ -793,9 +796,22 @@ class Trainer:
                     else:
                         reward = reward + ir_scale * intrinsic_reward.cpu().numpy()
 
-        # Store the experience using the algorithm
-        self.algorithm.store_experience(state, action, log_prob, reward, value, done)
-
+        # Store the experience using the algorithm - only update if not in test mode
+        if not test_mode:
+            self.algorithm.store_experience(state, action, log_prob, reward, value, done)
+        else:
+            # In test mode, just store without updating (for StreamAC)
+            if hasattr(self.algorithm, 'experience_buffer'):
+                exp = {
+                    'obs': state,
+                    'action': action,
+                    'log_prob': log_prob,
+                    'reward': reward,
+                    'value': value,
+                    'done': done
+                }
+                self.algorithm.experience_buffer.append(exp)
+    
         # Update auxiliary task models if enabled
         if self.use_auxiliary_tasks and hasattr(self, 'aux_task_manager'):
             # Extract features if the actor supports it
