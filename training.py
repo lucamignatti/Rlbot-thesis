@@ -851,9 +851,9 @@ class Trainer:
                         if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None:
                             curriculum_stats = self.curriculum_manager.get_curriculum_stats()
                             log_dict.update({
-                                "difficulty_level": curriculum_stats["difficulty_level"],
-                                "current_stage": curriculum_stats["current_stage_index"],
-                                "success_rate": curriculum_stats["success_rate"]
+                                "difficulty_level": curriculum_stats.get("difficulty_level", 0),
+                                "current_stage": curriculum_stats.get("current_stage_index", 0),
+                                "success_rate": curriculum_stats.get("success_rate", 0)
                             })
                         
                         # Log to wandb
@@ -1009,9 +1009,9 @@ class Trainer:
                 if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None:
                     curriculum_stats = self.curriculum_manager.get_curriculum_stats()
                     log_dict.update({
-                        "difficulty_level": curriculum_stats["difficulty_level"],
-                        "current_stage": curriculum_stats["current_stage_index"],
-                        "success_rate": curriculum_stats["success_rate"]
+                        "difficulty_level": curriculum_stats.get("difficulty_level", 0),
+                        "current_stage": curriculum_stats.get("current_stage_index", 0),
+                        "success_rate": curriculum_stats.get("success_rate", 0)
                     })
                 
                 # Log to wandb
