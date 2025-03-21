@@ -883,16 +883,26 @@ class Trainer:
             features = None
             if hasattr(self.actor, 'extract_features'):
                 with torch.no_grad():
-                    features = self.actor.extract_features(
-                        torch.FloatTensor(state).unsqueeze(0).to(self.device)
-                    )
+                    features = self.actor.extract_features(state)
                     
-            # Update auxiliary tasks
-            self.aux_task_manager.update(
+            # Update auxiliary tasks and get metrics
+            aux_metrics = self.aux_task_manager.update(
                 observations=state,
                 rewards=reward,
                 features=features
             )
+            
+            # For StreamAC, log metrics immediately
+            if self.algorithm_type == "streamac" and self.use_wandb:
+                try:
+                    wandb.log({
+                        "sr_loss": aux_metrics.get("sr_loss", 0),
+                        "rp_loss": aux_metrics.get("rp_loss", 0),
+                        "aux_loss": aux_metrics.get("sr_loss", 0) + aux_metrics.get("rp_loss", 0)
+                    }, step=self.training_steps + self.training_step_offset)
+                except Exception as e:
+                    if self.debug:
+                        print(f"[DEBUG] Error logging auxiliary metrics: {e}")
 
     def store_experience_at_idx(self, idx, state, action, log_prob, reward, value, done):
         """Forward to algorithm's store_experience_at_idx method if it exists"""
