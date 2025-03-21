@@ -658,8 +658,12 @@ class Trainer:
                 rp_weight=rp_weight,
                 device=self.device,
                 use_amp=aux_amp,
-                update_frequency=8  # Update auxiliary tasks every 8 steps
+                update_frequency=1,
+                learning_mode="stream" if algorithm_type == "streamac" else "batch"  # Explicitly set mode
             )
+            
+            # Enable debug mode for auxiliary tasks
+            self.aux_task_manager.debug = self.debug
 
         if self.debug:
             print(f"[DEBUG] Initialized {self.algorithm_type.upper()} algorithm on {self.device}")
@@ -751,29 +755,14 @@ class Trainer:
         return self.training_steps + self.training_step_offset
     
     def _log_to_wandb(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
-        """Centralized wandb logging with step validation and metric organization
-        
-        Args:
-            metrics: Dictionary of metrics to log
-            step: Optional step number to use for logging
-        """
+        """Centralized wandb logging with step validation and metric organization"""
         if not self.use_wandb or wandb.run is None:
             return
         
         # Get current step if not explicitly provided
         current_step = step if step is not None else self._true_training_steps()
         
-        if self.debug:
-            print(f"[STEP DEBUG] Trainer._log_to_wandb called with step: {step}, calculated current_step: {current_step}")
-            print(f"[STEP DEBUG] _last_wandb_step before check: {getattr(self, '_last_wandb_step', 'not set')}")
-        
-        # Skip logging if we can't get a valid step
-        if current_step is None:
-            if self.debug:
-                print("[STEP DEBUG] Skipping wandb logging - couldn't get valid step")
-            return
-        
-        # Never log to a step that's less than or equal to our last logged step
+        # Skip logging if we've already logged this step
         if hasattr(self, '_last_wandb_step') and current_step <= self._last_wandb_step:
             if self.debug:
                 print(f"[STEP DEBUG] Skipping wandb log for step {current_step} (≤ {self._last_wandb_step})")
@@ -833,11 +822,49 @@ class Trainer:
         # --- Auxiliary metrics ---
         if self.use_auxiliary_tasks:
             auxiliary_metrics = grouped_metrics['auxiliary']
-            auxiliary_metrics["AUX/state_representation_loss"] = metrics.get("sr_loss", 0)
-            auxiliary_metrics["AUX/reward_prediction_loss"] = metrics.get("rp_loss", 0)
-            auxiliary_metrics["AUX/total_loss"] = metrics.get("aux_loss", 0)
-            auxiliary_metrics["AUX/sr_weight"] = getattr(self.aux_task_manager, "sr_weight", 0)
-            auxiliary_metrics["AUX/rp_weight"] = getattr(self.aux_task_manager, "rp_weight", 0)
+            
+            # Always include auxiliary metrics in the log, even if they're 0
+            # This ensures consistent logging and makes debugging easier
+            
+            # Check if we have the metrics coming from trainer.update() update or direct aux manager
+            sr_loss = metrics.get("sr_loss", 0)
+            rp_loss = metrics.get("rp_loss", 0)
+            aux_loss = metrics.get("aux_loss", 0)
+            
+            # Debug info for auxiliary metrics
+            if self.debug and (sr_loss > 0 or rp_loss > 0):
+                print(f"[WANDB DEBUG] Logging auxiliary metrics - SR: {sr_loss:.6f}, RP: {rp_loss:.6f}")
+                
+            # If aux_loss is not provided but sr_loss and rp_loss are, calculate it
+            if aux_loss == 0 and (sr_loss > 0 or rp_loss > 0):
+                aux_loss = sr_loss + rp_loss
+            
+            # Get weights directly from aux_task_manager if available
+            sr_weight = getattr(self.aux_task_manager, "sr_weight", 0) if hasattr(self, 'aux_task_manager') else 0
+            rp_weight = getattr(self.aux_task_manager, "rp_weight", 0) if hasattr(self, 'aux_task_manager') else 0
+            
+            # Log the unweighted losses (more meaningful values for trends)
+            auxiliary_metrics["AUX/state_representation_loss"] = sr_loss
+            auxiliary_metrics["AUX/reward_prediction_loss"] = rp_loss
+            auxiliary_metrics["AUX/total_loss"] = aux_loss
+            
+            # Also log the weights
+            auxiliary_metrics["AUX/sr_weight"] = sr_weight
+            auxiliary_metrics["AUX/rp_weight"] = rp_weight
+            
+            # Log actual last values from auxiliary manager if available
+            if hasattr(self, 'aux_task_manager'):
+                if hasattr(self.aux_task_manager, 'last_sr_loss') and self.aux_task_manager.last_sr_loss > 0:
+                    sr_value = self.aux_task_manager.last_sr_loss
+                    auxiliary_metrics["AUX/state_representation_loss"] = sr_value
+                    
+                if hasattr(self.aux_task_manager, 'last_rp_loss') and self.aux_task_manager.last_rp_loss > 0:
+                    rp_value = self.aux_task_manager.last_rp_loss
+                    auxiliary_metrics["AUX/reward_prediction_loss"] = rp_value
+                    
+                # Recalculate total if we got updated values
+                if auxiliary_metrics["AUX/state_representation_loss"] > 0 or auxiliary_metrics["AUX/reward_prediction_loss"] > 0:
+                    auxiliary_metrics["AUX/total_loss"] = auxiliary_metrics["AUX/state_representation_loss"] + auxiliary_metrics["AUX/reward_prediction_loss"]
         
         # --- Curriculum metrics ---
         if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None:
@@ -1113,57 +1140,57 @@ class Trainer:
             self.episode_rewards = []
 
         # Update auxiliary tasks if enabled
-        if self.use_auxiliary_tasks and self.aux_task_manager and not self.test_mode:
+        if self.use_auxiliary_tasks and hasattr(self, 'aux_task_manager') and not self.test_mode:
             # For Stream mode, auxiliary tasks are already updated during store_experience
             # For PPO batch mode, we update here with data from memory
             if self.algorithm_type == "ppo":
                 try:
-                    # Sample batch of observations for auxiliary task update
-                    batch_size = min(64, self.algorithm.memory.size())
-                    if batch_size > 0 and hasattr(self.algorithm.memory, 'obs') and self.algorithm.memory.obs is not None:
-                        # Get random indices from memory
+                    # Sample batch of observations and features for auxiliary task update
+                    if hasattr(self.algorithm, 'memory') and self.algorithm.memory.size() > 0:
+                        # Get indices from memory
+                        batch_size = min(64, self.algorithm.memory.size())
                         indices = torch.randperm(self.algorithm.memory.size())[:batch_size]
                         
-                        # Extract observations and values
-                        obs_batch = self.algorithm.memory.obs[indices].to(self.device)
-                        
-                        # Extract features if actor supports it
-                        features = None
-                        with torch.no_grad():
-                            if hasattr(self.actor, 'extract_features'):
-                                features = self.actor.extract_features(obs_batch)
-                            else:
-                                # Use forward pass with feature extraction
-                                try:
-                                    if hasattr(self.actor, 'forward') and 'return_features' in self.actor.forward.__code__.co_varnames:
-                                        _, features = self.actor(obs_batch, return_features=True)
-                                    else:
-                                        # If actor doesn't support return_features, use a default approach
-                                        features = self.actor(obs_batch)
-                                        if isinstance(features, tuple):
-                                            features = features[0]  # Try to get first item if it's a tuple
-                                except Exception as e:
-                                    if self.debug:
-                                        print(f"[DEBUG] Error extracting features: {e}")
-                                    # Use observations as features if extraction fails
-                                    features = obs_batch
-                        
-                        # Extract rewards
-                        rewards = self.algorithm.memory.rewards[indices].to(self.device)
-                        
-                        # Update auxiliary tasks
-                        aux_metrics = self.aux_task_manager.update(
-                            observations=obs_batch, 
-                            rewards=rewards, 
-                            features=features
-                        )
-                        
-                        # Log auxiliary metrics if there are valid losses
-                        if aux_metrics.get('sr_loss', 0) > 0 or aux_metrics.get('rp_loss', 0) > 0:
+                        # Extract observations
+                        if hasattr(self.algorithm.memory, 'obs'):
+                            obs_batch = self.algorithm.memory.obs[indices].to(self.device)
+                            rewards_batch = self.algorithm.memory.rewards[indices].to(self.device)
+                            
+                            # Extract features if actor supports it
+                            features = None
+                            with torch.no_grad():
+                                if hasattr(self.actor, 'get_features'):
+                                    features = self.actor.get_features(obs_batch)
+                                elif hasattr(self.actor, 'extract_features'):
+                                    features = self.actor.extract_features(obs_batch)
+                                else:
+                                    # Use forward pass with feature extraction if possible
+                                    try:
+                                        if hasattr(self.actor, 'forward') and 'return_features' in self.actor.forward.__code__.co_varnames:
+                                            _, features = self.actor(obs_batch, return_features=True)
+                                        else:
+                                            # Default approach
+                                            features = self.actor(obs_batch)
+                                            if isinstance(features, tuple):
+                                                features = features[0]
+                                    except Exception as e:
+                                        if self.debug:
+                                            print(f"[DEBUG] Error extracting features: {e}")
+                                        # Use observations as features if extraction fails
+                                        features = obs_batch
+                            
+                            # Update auxiliary tasks
+                            aux_metrics = self.aux_task_manager.update(
+                                observations=obs_batch, 
+                                rewards=rewards_batch,
+                                features=features
+                            )
+                            
+                            # Always include auxiliary metrics in the main metrics dictionary
                             metrics.update(aux_metrics)
                             metrics['aux_loss'] = aux_metrics.get('sr_loss', 0) + aux_metrics.get('rp_loss', 0)
                             if self.debug:
-                                print(f"[DEBUG] Aux task metrics: SR loss={aux_metrics.get('sr_loss', 0):.6f}, RP loss={aux_metrics.get('rp_loss', 0):.6f}")
+                                print(f"[DEBUG] Auxiliary task update: SR={aux_metrics.get('sr_loss', 0):.6f}, RP={aux_metrics.get('rp_loss', 0):.6f}")
                 except Exception as e:
                     if self.debug:
                         print(f"[DEBUG] Error updating auxiliary tasks: {e}")

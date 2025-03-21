@@ -851,6 +851,10 @@ class StreamACAlgorithm(BaseAlgorithm):
             self.actor_grad_accum = {}
             self.critic_grad_accum = {}
             self._init_grad_accumulators()
+        
+        self.actor_trace = None
+        self.critic_trace = None
+        self._init_traces()
     
     def apply_sparse_init(self, model):
         """Apply SparseInit initialization as described in the paper
@@ -917,6 +921,15 @@ class StreamACAlgorithm(BaseAlgorithm):
             if param.requires_grad:
                 self.critic_grad_accum[name] = torch.zeros_like(param.data)
     
+    def _init_traces(self):
+        """Initialize eligibility trace vectors for actor and critic"""
+        self.actor_trace = torch.zeros_like(self._get_parameter_vector(self.actor))
+        self.critic_trace = torch.zeros_like(self._get_parameter_vector(self.critic))
+
+    def _get_parameter_vector(self, network):
+        """Get parameters of a specific network as a vector"""
+        return torch.cat([p.data.view(-1) for p in network.parameters()])
+
     def get_action(self, obs, deterministic=False, return_features=False):
         """Get action for a given observation
         
@@ -1029,6 +1042,22 @@ class StreamACAlgorithm(BaseAlgorithm):
         if not isinstance(done, torch.Tensor):
             done = torch.tensor(done, dtype=torch.bool, device=self.device)
         
+        # Initialize if not already done
+        if not hasattr(self, 'obs_mean'):
+            self.obs_mean = torch.zeros_like(obs)
+            self.obs_var = torch.ones_like(obs)
+            self.obs_count = 0
+            self.reward_stats = {'mean': 0.0, 'var': 1.0}
+            self.reward_count = 0
+
+        # Normalize observation
+        obs, self.obs_mean, self.obs_var, self.obs_count = self.normalize_observation(
+            obs, self.obs_mean, self.obs_var, self.obs_count)
+
+        # Scale reward
+        reward, self.reward_stats, self.reward_count = self.scale_reward(
+            reward, self.gamma, self.reward_stats, done, self.reward_count)
+        
         # Store experience as a dictionary
         experience = {
             'obs': obs,
@@ -1081,23 +1110,12 @@ class StreamACAlgorithm(BaseAlgorithm):
                 
         return self.metrics, did_update
     
-    def update(self, experiences=None):
+    def update(self):
         """Update policy using the latest experience"""
         # Increment training steps counter
         self.training_steps += 1
         
-        # Add timestamp for debugging
-        if self.debug:
-            print(f"\n[STREAMAC UPDATE] Called at step {self.training_steps}")
-        
-        # Skip if buffer is empty
-        if len(self.experience_buffer) == 0:
-            if self.debug:
-                print("[STREAMAC UPDATE] Buffer empty, skipping update")
-            return self.metrics
-        
-        # Use only the latest experience for the StreamAC update
-        # The paper recommends using just the latest experience for true online learning
+        # Get latest experience
         exp = self.experience_buffer[-1]
         obs = exp['obs']
         action = exp['action']
@@ -1106,276 +1124,82 @@ class StreamACAlgorithm(BaseAlgorithm):
         old_value = exp['value']
         done = exp['done']
         
-        # Compute returns and advantages for the single experience
-        returns = reward
+        # Compute TD error
         if not done:
             with torch.no_grad():
                 next_value = self.critic(obs).squeeze(-1)
-                
-                # Debug log the value prediction
-                if self.debug and next_value.item() == 0:
-                    print(f"[WARNING] Zero next_value predicted for non-terminal state")
-                    print(f"[WARNING] This will cause zero returns and may prevent learning")
-                    
-                returns = reward + self.gamma * next_value
+                delta = reward + self.gamma * next_value - old_value
+        else:
+            delta = reward - old_value
         
-        # Try adding a small epsilon to ensure non-zero returns/advantages
-        min_return_value = 1e-6
-        if isinstance(returns, torch.Tensor) and returns.abs().max().item() < min_return_value:
-            # Create a proper tensor for epsilon with the right device and dtype
-            if returns.item() == 0:
-                # If returns is zero, use a small positive value
-                epsilon_value = torch.tensor(min_return_value, device=returns.device, dtype=returns.dtype)
-            else:
-                # Otherwise use the sign of returns
-                epsilon_value = torch.sign(returns) * torch.tensor(min_return_value, device=returns.device, dtype=returns.dtype)
-            
-            # Add epsilon to returns
-            returns = returns + epsilon_value
-            
-            # Debug print with safe access to item()
-            if self.debug:
-                epsilon_print = epsilon_value.item() if isinstance(epsilon_value, torch.Tensor) else epsilon_value
-                print(f"[RETURNS DEBUG] Adding epsilon {epsilon_print} to prevent zero returns")
+        # Update eligibility traces
+        self.actor_optimizer.zero_grad()
         
-        advantages = returns - old_value
-        
-        # Save current parameters for step size calculation
-        if self.last_parameter_update is None:
-            self.last_parameter_update = self._get_parameter_vector()
-        
-        # Forward pass
-        # Get new action distribution and values
+        # Compute actor gradients
         if self.action_space_type == "discrete":
             action_probs = self.actor(obs)
-            
-            # Handle numerical instability
             action_probs = torch.clamp(action_probs, 1e-10, 1.0)
             action_probs = action_probs / action_probs.sum(dim=-1, keepdim=True)
-            
-            # Get one-hot action indices
+            dist = torch.distributions.Categorical(probs=action_probs)
             action_idx = torch.argmax(action, dim=-1)
             
-            # Calculate log probability
-            dist = torch.distributions.Categorical(probs=action_probs)
+            # Get log probability and entropy
             new_log_prob = dist.log_prob(action_idx)
+            entropy = dist.entropy()
             
-            # Calculate entropy
-            entropy = dist.entropy().mean()
+            # Compute actor loss for gradient calculation
+            actor_loss = -new_log_prob
+            actor_loss.backward(retain_graph=True)
+            
+            # Extract gradients for trace update
+            actor_grad = torch.cat([p.grad.view(-1) for p in self.actor.parameters()])
+            
+            # Compute entropy gradient if needed for trace
+            entropy_grad = torch.autograd.grad(entropy, self.actor.parameters(), 
+                                                retain_graph=True, create_graph=False)
+            entropy_grad = torch.cat([g.view(-1) for g in entropy_grad])
+            
+            # Update actor trace with policy and entropy gradients
+            self.actor_trace = self.gamma * self.gae_lambda * self.actor_trace + \
+                               actor_grad + self.entropy_coef * torch.sign(delta) * entropy_grad
         else:
+            # Similar logic for continuous actions
             dist = self.actor(obs)
             new_log_prob = dist.log_prob(action).sum(dim=-1)
             entropy = dist.entropy().mean()
+            
+            actor_loss = -new_log_prob
+            actor_loss.backward(retain_graph=True)
+            
+            actor_grad = torch.cat([p.grad.view(-1) for p in self.actor.parameters()])
+            self.actor_trace = self.gamma * self.gae_lambda * self.actor_trace + actor_grad
         
-        # Get new value
+        # Update critic trace
+        self.critic_optimizer.zero_grad()
         new_value = self.critic(obs).squeeze(-1)
+        critic_loss = F.mse_loss(new_value, old_value + delta)
+        critic_loss.backward()
+        critic_grad = torch.cat([p.grad.view(-1) for p in self.critic.parameters()])
+        self.critic_trace = self.gamma * self.gae_lambda * self.critic_trace + critic_grad
         
-        # Calculate ratio and clipped ratio for PPO-style update
-        ratio = torch.exp(new_log_prob - old_log_prob)
+        # Apply ObGD update
+        self.apply_obgd_update(self.actor, self.actor_optimizer, self.actor_trace, delta)
+        self.apply_obgd_update(self.critic, self.critic_optimizer, self.critic_trace, delta)
         
-        # Clamp ratio for numerical stability
-        ratio = torch.clamp(ratio, 0.01, 100.0)
-        
-        # Calculate surrogate objectives
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * advantages
-        
-        # Calculate actor loss (negative because we're maximizing)
-        actor_loss = -torch.min(surr1, surr2).mean()
-        
-        # Calculate critic loss - ensure this is properly calculated
-        critic_loss = F.mse_loss(new_value, returns)
-        
-        # Calculate entropy loss (negative because we're maximizing)
-        entropy_loss = -entropy * self.entropy_coef
-        
-        # Calculate total loss
-        total_loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
-        
-        # Calculate KL divergence between old and new policy
-        kl_divergence = (old_log_prob - new_log_prob).mean().item()
-        
-        # Perform gradient update with OBGD or standard update
-        if self.use_obgd:
-            # Online Backpropagation Gradient Descent (OBGD)
-            # Clear gradients
-            self.actor_optimizer.zero_grad()
-            self.critic_optimizer.zero_grad()
-            
-            # Compute gradients
-            total_loss.backward()
-            
-            # Update accumulated gradients
-            for name, param in self.actor.named_parameters():
-                if param.requires_grad and param.grad is not None:
-                    # Simple moving average of gradients
-                    self.actor_grad_accum[name] = 0.9 * self.actor_grad_accum[name] + 0.1 * param.grad
-                    
-                    # Overwrite gradient with accumulated gradient
-                    param.grad = self.actor_grad_accum[name].clone()
-            
-            for name, param in self.critic.named_parameters():
-                if param.requires_grad and param.grad is not None:
-                    # Simple moving average of gradients
-                    self.critic_grad_accum[name] = 0.9 * self.critic_grad_accum[name] + 0.1 * param.grad
-                    
-                    # Overwrite gradient with accumulated gradient
-                    param.grad = self.critic_grad_accum[name].clone()
-            
-            # Apply gradient clipping
-            if self.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-            
-            # Step optimizers
-            self.actor_optimizer.step()
-            self.critic_optimizer.step()
-        else:
-            # Standard update
-            self.actor_optimizer.zero_grad()
-            self.critic_optimizer.zero_grad()
-            total_loss.backward()
-            
-            # Apply gradient clipping
-            if self.max_grad_norm > 0:
-                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-            
-            # Step optimizers
-            self.actor_optimizer.step()
-            self.critic_optimizer.step()
-            
-        # Calculate effective step size - THIS IS THE CRITICAL FIX
-        current_params = self._get_parameter_vector()
-        if self.last_parameter_update is None:
-            self.last_parameter_update = current_params.clone()  # Make sure we clone here
-            effective_step_size = 0.0
-        else:
-            param_diff = current_params - self.last_parameter_update
-            effective_step_size = torch.norm(param_diff).item()
-            
-            # Debug log to verify step size calculation
-            if self.debug:
-                non_zero_params = (param_diff != 0).float().sum().item()
-                print(f"[STEP SIZE DEBUG] Non-zero parameter changes: {non_zero_params}/{param_diff.numel()}")
-                print(f"[STEP SIZE DEBUG] Raw step size: {effective_step_size}")
-                if effective_step_size == 0:
-                    print("[STEP SIZE DEBUG] WARNING: Zero step size detected!")
-        
-        # Set last_parameter_update AFTER calculating the diff
-        self.last_parameter_update = current_params.clone()  # Need to clone to avoid reference issues
-        
-        # Store effective step size for backtracking
-        self.effective_step_size_history.append(effective_step_size)
-        
-        # Implement adaptive learning rate adjustment
-        if self.adaptive_learning_rate:
-            # Only adapt the learning rate after we have enough history
-            if len(self.effective_step_size_history) > 10:
-                # Check if we need to adjust the learning rate
-                # If step size is too large or too small compared to target
-                if effective_step_size > self.target_step_size * 1.1:
-                    # Step size too large, decrease learning rate
-                    self.lr_actor *= 0.95
-                    self.lr_critic *= 0.95
-                    
-                    # Update optimizer learning rates
-                    for param_group in self.actor_optimizer.param_groups:
-                        param_group['lr'] = self.lr_actor
-                    for param_group in self.critic_optimizer.param_groups:
-                        param_group['lr'] = self.lr_critic
-                elif effective_step_size < self.target_step_size * 0.9:
-                    # Step size too small, increase learning rate
-                    self.lr_actor *= 1.05
-                    self.lr_critic *= 1.05
-                    
-                    # Update optimizer learning rates
-                    for param_group in self.actor_optimizer.param_groups:
-                        param_group['lr'] = self.lr_actor
-                    for param_group in self.critic_optimizer.param_groups:
-                        param_group['lr'] = self.lr_critic
-                
-                # Enforce limits on learning rate
-                self.lr_actor = max(self.base_lr_actor * self.min_lr_factor, 
-                                  min(self.base_lr_actor * self.max_lr_factor, self.lr_actor))
-                self.lr_critic = max(self.base_lr_critic * self.min_lr_factor, 
-                                   min(self.base_lr_critic * self.max_lr_factor, self.lr_critic))
-        
-        # Implement backtracking for better stability
-        self.steps_since_backtrack += 1
-        
-        # Check if we need to apply backtracking
-        if (self.steps_since_backtrack >= self.backtracking_patience and 
-            len(self.effective_step_size_history) >= self.backtracking_patience):
-            
-            # Calculate average of recent step sizes
-            recent_avg = sum(self.effective_step_size_history[-self.backtracking_patience:]) / self.backtracking_patience
-            
-            # Debug log the backtracking condition
-            if self.debug:
-                print(f"[BACKTRACK DEBUG] Checking backtracking condition:")
-                print(f"  steps_since_backtrack: {self.steps_since_backtrack}/{self.backtracking_patience}")
-                print(f"  recent_avg_step_size: {recent_avg}")
-                print(f"  target * 2.0: {self.target_step_size * 2.0}")
-                print(f"  condition met: {recent_avg > self.target_step_size * 2.0}")
-            
-            # If average step size is much larger than target, reduce learning rate more aggressively
-            if recent_avg > self.target_step_size * 2.0:
-                self.lr_actor *= self.backtracking_zeta
-                self.lr_critic *= self.backtracking_zeta
-                
-                # Update optimizer learning rates
-                for param_group in self.actor_optimizer.param_groups:
-                    param_group['lr'] = self.lr_actor
-                for param_group in self.critic_optimizer.param_groups:
-                    param_group['lr'] = self.lr_critic
-                
-                # Update metrics
-                self.metrics['backtracking_count'] += 1
-                
-                # Reset backtracking counter
-                self.steps_since_backtrack = 0
-                
-                if self.debug:
-                    print(f"[BACKTRACK DEBUG] Applied backtracking: new lr_actor={self.lr_actor}, new lr_critic={self.lr_critic}")
+        # Calculate effective step size for metrics and adaptation
+        delta_bar = max(abs(delta), 1.0)
+        actor_trace_norm = torch.norm(self.actor_trace, p=1).item()
+        critic_trace_norm = torch.norm(self.critic_trace, p=1).item()
+        effective_step_size = (self.lr_actor * delta_bar * actor_trace_norm + 
+                               self.lr_critic * delta_bar * critic_trace_norm) / 2
         
         # Update metrics
         self.metrics.update({
-            'actor_loss': actor_loss.item(),
-            'critic_loss': critic_loss.item(),
-            'entropy_loss': entropy_loss.item(),
-            'total_loss': total_loss.item(),
             'effective_step_size': effective_step_size,
             'actor_lr': self.lr_actor,
             'critic_lr': self.lr_critic,
-            'kl_divergence': kl_divergence,
-            'mean_advantage': advantages.mean().item(),
-            'mean_return': returns.mean().item()
+            # ... other metrics ...
         })
-        
-        # Debug returns calculation
-        if self.debug:
-            print(f"[STREAM DEBUG] Returns calculation:")
-            print(f"  reward: {reward.item() if isinstance(reward, torch.Tensor) else reward}")
-            print(f"  done: {done}")
-            if not done:
-                print(f"  next_value: {next_value.item() if isinstance(next_value, torch.Tensor) else next_value}")
-            print(f"  final returns: {returns.item() if isinstance(returns, torch.Tensor) else returns}")
-        
-        # Just before returning the metrics at the end of the method
-        if hasattr(self, 'debug') and self.debug:
-            print(f"[STREAMAC DEBUG] Metrics before return:")
-            print(f"  mean_return: {self.metrics.get('mean_return', 'not set')}")
-            print(f"  entropy_loss: {self.metrics.get('entropy_loss', 'not set')}")
-            print(f"  effective_step_size: {self.metrics.get('effective_step_size', 'not set')}")
-            print(f"  backtracking_count: {self.metrics.get('backtracking_count', 'not set')}")
-            print(f"  actor_lr: {self.metrics.get('actor_lr', 'not set')}")
-            print(f"  critic_lr: {self.metrics.get('critic_lr', 'not set')}")
-            
-            # Print the actual values used in calculations
-            print(f"  returns: {returns.mean().item() if isinstance(returns, torch.Tensor) else returns}")
-            print(f"  entropy: {entropy.item() if isinstance(entropy, torch.Tensor) else entropy}")
-            print(f"  advantage: {advantages.mean().item() if isinstance(advantages, torch.Tensor) else advantages}")
         
         return self.metrics
     
@@ -1397,3 +1221,73 @@ class StreamACAlgorithm(BaseAlgorithm):
         self.effective_step_size_history = []
         if self.use_obgd:
             self._init_grad_accumulators()
+    
+    def apply_obgd_update(self, network, optimizer, trace, delta):
+        """Apply ObGD update as per Algorithm 3 in the paper"""
+        # Calculate max step size based on L1 norm of trace
+        delta_bar = max(abs(delta), 1.0)
+        trace_norm = torch.norm(trace, p=1)
+        
+        # Calculate maximum effective step size M
+        M = self.lr_actor * self.kappa * delta_bar * trace_norm
+        
+        # Bound step size
+        effective_lr = min(self.lr_actor, self.lr_actor / M) if M > 0 else self.lr_actor
+        
+        # Apply update with bounded step size
+        idx = 0
+        for param in network.parameters():
+            param_size = param.numel()
+            param_trace = trace[idx:idx+param_size].view(param.shape)
+            param.data.add_(effective_lr * delta * param_trace)
+            idx += param_size
+
+    def normalize_observation(self, obs, obs_mean, obs_var, count):
+        """Normalize observation using running statistics (Algorithm 4)"""
+        # Update count
+        count += 1
+        
+        # Update mean
+        mean_delta = (obs - obs_mean) / count
+        new_mean = obs_mean + mean_delta
+        
+        # Update variance
+        var_delta = (obs - obs_mean) * (obs - new_mean)
+        new_var = obs_var + var_delta
+        
+        # Calculate standard deviation
+        if count >= 2:
+            std = torch.sqrt(new_var / (count - 1) + 1e-8)
+        else:
+            std = torch.ones_like(new_var)
+        
+        # Normalize observation
+        normalized_obs = (obs - new_mean) / std
+        
+        return normalized_obs, new_mean, new_var, count
+
+    def scale_reward(self, reward, gamma, running_stats, done, count):
+        """Scale reward using running statistics (Algorithm 5)"""
+        # Update running average of returns
+        if not hasattr(self, 'return_estimate'):
+            self.return_estimate = 0.0
+            
+        self.return_estimate = gamma * (1 - done) * self.return_estimate + reward
+        
+        # Update statistics using SampleMeanVar
+        count += 1
+        mean_delta = (self.return_estimate - running_stats['mean']) / count
+        new_mean = running_stats['mean'] + mean_delta
+        var_delta = (self.return_estimate - running_stats['mean']) * (self.return_estimate - new_mean)
+        new_var = running_stats['var'] + var_delta
+        
+        # Calculate standard deviation
+        if count >= 2:
+            std = torch.sqrt(new_var / (count - 1) + 1e-8)
+        else:
+            std = torch.ones_like(new_var)
+        
+        # Scale reward
+        scaled_reward = reward / (std + 1e-8)
+        
+        return scaled_reward, {'mean': new_mean, 'var': new_var}, count

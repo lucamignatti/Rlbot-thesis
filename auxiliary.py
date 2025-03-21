@@ -63,11 +63,12 @@ class RewardPredictionTask(nn.Module):
     LSTM-based network for Reward Prediction (RP) auxiliary task.
     Predicts immediate rewards based on a sequence of observations.
     """
-    def __init__(self, input_dim, hidden_dim=64, sequence_length=20, device="cpu"):
+    def __init__(self, input_dim, hidden_dim=64, sequence_length=20, device="cpu", debug=False):  # Add debug parameter
         super(RewardPredictionTask, self).__init__()
         self.device = device
         self.hidden_dim = hidden_dim
         self.sequence_length = sequence_length
+        self.debug = debug  # Store debug flag
 
         # LSTM layer to process observation sequences
         self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
@@ -75,9 +76,15 @@ class RewardPredictionTask(nn.Module):
         # Output layer for 3-class classification (negative, near-zero, positive reward)
         self.output_layer = nn.Linear(hidden_dim, 3)
 
-        # Thresholds for classifying rewards
-        self.pos_threshold = 0.009
-        self.neg_threshold = -0.009
+        # Lower thresholds for classifying rewards - adjusted for typical reward scales
+        self.pos_threshold = 0.001  # Reduced from 0.009
+        self.neg_threshold = -0.001  # Reduced from -0.009
+        
+        # Debug counters for reward distribution
+        self.debug_reward_counts = {"negative": 0, "zero": 0, "positive": 0}
+        self.debug_total_rewards = 0
+        self.debug_reward_history = []
+        self.debug_threshold_adjust_counter = 0
 
         self.to(self.device)
 
@@ -103,9 +110,119 @@ class RewardPredictionTask(nn.Module):
         labels[rewards < self.neg_threshold] = 0
         labels[(rewards >= self.neg_threshold) & (rewards <= self.pos_threshold)] = 1
 
+        # Calculate class distributions for debugging
+        self.debug_total_rewards += len(rewards)
+        neg_count = (labels == 0).sum().item()
+        zero_count = (labels == 1).sum().item() 
+        pos_count = (labels == 2).sum().item()
+        
+        self.debug_reward_counts["negative"] += neg_count
+        self.debug_reward_counts["zero"] += zero_count
+        self.debug_reward_counts["positive"] += pos_count
+        
+        # Store some raw reward values for debugging
+        for r in rewards.cpu().tolist()[:10]:  # Limit to first 10 to avoid memory issues
+            self.debug_reward_history.append(r)
+            if len(self.debug_reward_history) > 100:
+                self.debug_reward_history.pop(0)
+        
+        # Print detailed debug info periodically only if debug mode is enabled
+        if self.debug and self.debug_total_rewards % 500 == 0:
+            total = self.debug_reward_counts["negative"] + self.debug_reward_counts["zero"] + self.debug_reward_counts["positive"]
+            neg_pct = 100 * self.debug_reward_counts["negative"] / max(1, total)
+            zero_pct = 100 * self.debug_reward_counts["zero"] / max(1, total)
+            pos_pct = 100 * self.debug_reward_counts["positive"] / max(1, total)
+            
+            print(f"[RP DEBUG] Reward class distribution after {self.debug_total_rewards} rewards:")
+            print(f"[RP DEBUG]   Negative: {self.debug_reward_counts['negative']} ({neg_pct:.1f}%)")
+            print(f"[RP DEBUG]   Zero: {self.debug_reward_counts['zero']} ({zero_pct:.1f}%)")
+            print(f"[RP DEBUG]   Positive: {self.debug_reward_counts['positive']} ({pos_pct:.1f}%)")
+            print(f"[RP DEBUG] Current batch - Neg: {neg_count}, Zero: {zero_count}, Pos: {pos_count}")
+            print(f"[RP DEBUG] Current batch rewards sample: {rewards[:5].cpu().tolist()}")
+            print(f"[RP DEBUG] Current thresholds - Pos: {self.pos_threshold}, Neg: {self.neg_threshold}")
+            
+            # Show statistics on recent rewards
+            if self.debug_reward_history:
+                min_reward = min(self.debug_reward_history)
+                max_reward = max(self.debug_reward_history)
+                avg_reward = sum(self.debug_reward_history) / len(self.debug_reward_history)
+                print(f"[RP DEBUG] Recent rewards stats - Min: {min_reward:.6f}, Max: {max_reward:.6f}, Avg: {avg_reward:.6f}")
+                
+            # Check if class imbalance is severe (>95% in one class)
+            if neg_pct > 95 or zero_pct > 95 or pos_pct > 95:
+                print(f"[RP DEBUG] WARNING: Severe class imbalance detected in reward classes!")
+                
+                # Suggest adjusting thresholds if needed
+                if zero_pct > 95:
+                    print(f"[RP DEBUG] Most rewards are classified as 'zero' - consider decreasing thresholds.")
+                    suggested_pos = self.pos_threshold / 2
+                    suggested_neg = self.neg_threshold / 2
+                    print(f"[RP DEBUG] Suggested new thresholds - Pos: {suggested_pos:.6f}, Neg: {suggested_neg:.6f}")
+                elif pos_pct > 95:
+                    print(f"[RP DEBUG] Most rewards are classified as 'positive' - consider increasing positive threshold.")
+                    suggested_pos = self.pos_threshold * 2
+                    print(f"[RP DEBUG] Suggested new threshold - Pos: {suggested_pos:.6f}")
+                elif neg_pct > 95:
+                    print(f"[RP DEBUG] Most rewards are classified as 'negative' - consider decreasing negative threshold.")
+                    suggested_neg = self.neg_threshold * 2
+                    print(f"[RP DEBUG] Suggested new threshold - Neg: {suggested_neg:.6f}")
+
         # Calculate cross-entropy loss
         loss = F.cross_entropy(logits, labels)
+        
+        # Debug prediction quality only if debug mode is enabled
+        if self.debug:
+            with torch.no_grad():
+                predictions = torch.argmax(logits, dim=1)
+                accuracy = (predictions == labels).float().mean().item()
+                if self.debug_total_rewards % 500 == 0:
+                    print(f"[RP DEBUG] Prediction accuracy: {accuracy:.4f}")
+                    
+                    # Check if all predictions are the same class
+                    pred_classes = predictions.unique()
+                    if len(pred_classes) == 1:
+                        print(f"[RP DEBUG] WARNING: All predictions are class {pred_classes.item()}!")
+                    
+                    # Get confidence scores
+                    softmax_probs = F.softmax(logits, dim=1)
+                    avg_confidence = softmax_probs.max(dim=1)[0].mean().item()
+                    print(f"[RP DEBUG] Average prediction confidence: {avg_confidence:.4f}")
+                    print(f"[RP DEBUG] Logits sample: {logits[0].cpu().tolist()}")
+                
         return loss
+
+def _adjust_reward_thresholds(self, rewards):
+    """Dynamically adjust reward thresholds to better balance classes"""
+    # Only adjust if we have enough data
+    if len(self.debug_reward_history) < 50:
+        return
+        
+    rewards_tensor = torch.tensor(self.debug_reward_history)
+    
+    # Calculate percentiles
+    sorted_rewards, _ = torch.sort(rewards_tensor)
+    num_rewards = len(sorted_rewards)
+    
+    # Set thresholds to the 33rd and 67th percentiles for a balanced 3-way split
+    idx_neg = max(0, int(num_rewards * 0.33) - 1)
+    idx_pos = min(num_rewards - 1, int(num_rewards * 0.67))
+    
+    new_neg_threshold = sorted_rewards[idx_neg].item()
+    new_pos_threshold = sorted_rewards[idx_pos].item()
+    
+    # Ensure minimum separation between thresholds
+    min_separation = 0.005
+    if new_pos_threshold - new_neg_threshold < min_separation:
+        mid_point = (new_pos_threshold + new_neg_threshold) / 2
+        new_neg_threshold = mid_point - min_separation/2
+        new_pos_threshold = mid_point + min_separation/2
+    
+    # Update thresholds with some momentum to avoid rapid changes
+    momentum = 0.9
+    self.neg_threshold = momentum * self.neg_threshold + (1-momentum) * new_neg_threshold
+    self.pos_threshold = momentum * self.pos_threshold + (1-momentum) * new_pos_threshold
+    
+    print(f"[RP DEBUG] Adjusted thresholds - Neg: {self.neg_threshold:.6f}, Pos: {self.pos_threshold:.6f}")
 
 
 class AuxiliaryTaskManager:
@@ -117,7 +234,7 @@ class AuxiliaryTaskManager:
                  sr_hidden_dim=128, sr_latent_dim=32,
                  rp_hidden_dim=64, rp_sequence_length=5, 
                  device="cpu", use_amp=False, update_frequency=8,
-                 learning_mode="batch"):
+                 learning_mode="batch", debug=False):  # Add debug parameter with default False
         """
         Initialize the auxiliary task manager
         
@@ -140,18 +257,20 @@ class AuxiliaryTaskManager:
         self.rp_weight = rp_weight
         self.rp_sequence_length = rp_sequence_length
         self.actor = actor
-        self.debug = False
+        self.debug = debug  # Use the passed debug parameter
         self.use_amp = use_amp
         self.learning_mode = learning_mode
-
         # Store update frequency counter
         self.update_counter = 0
         self.update_frequency = update_frequency
         self.history_filled = 0
-
         # Ensure hidden_dim exists
         self.hidden_dim = getattr(actor, 'hidden_dim', 1536)
-
+        
+        print(f"[AUX INIT] Initializing AuxiliaryTaskManager with sr_weight={sr_weight}, rp_weight={rp_weight}")
+        print(f"[AUX INIT] Device: {device}, Learning mode: {learning_mode}, Update frequency: {update_frequency}")
+        print(f"[AUX INIT] Observation dimension: {obs_dim}, Hidden dimension: {self.hidden_dim}")
+        
         # State representation task
         self.sr_task = StateRepresentationTask(
             input_dim=obs_dim,
@@ -159,19 +278,17 @@ class AuxiliaryTaskManager:
             latent_dim=sr_latent_dim,
             device=device
         )
-
         # Reward prediction task
         self.rp_task = RewardPredictionTask(
             input_dim=self.hidden_dim,
             hidden_dim=rp_hidden_dim,
             sequence_length=rp_sequence_length,
-            device=device
+            device=device,
+            debug=debug  # Pass debug flag to RewardPredictionTask
         )
-
         # Initialize optimizers
         self.sr_optimizer = torch.optim.Adam(self.sr_task.parameters(), lr=3e-4)
         self.rp_optimizer = torch.optim.Adam(self.rp_task.parameters(), lr=3e-4)
-
         # Initialize history buffers with fixed-size tensors for better memory management
         # For batch learning (PPO), use large buffers
         if learning_mode == "batch":
@@ -183,6 +300,11 @@ class AuxiliaryTaskManager:
             self.obs_history = deque(maxlen=rp_sequence_length * 2)
             self.feature_history = deque(maxlen=rp_sequence_length * 2)
             self.reward_history = deque(maxlen=rp_sequence_length * 2)
+            
+        # Add counter for updates - will help track if we're actually updating
+        self.update_count = 0
+        self.last_sr_loss = 0.0
+        self.last_rp_loss = 0.0
 
     def update(self, observations, rewards, features=None):
         """
@@ -235,6 +357,11 @@ class AuxiliaryTaskManager:
         if features.dim() == 1:
             features = features.unsqueeze(0)
             
+        # Log input shapes and stats if in debug mode
+        if self.debug and self.update_counter % 100 == 0:
+            print(f"[AUX DEBUG] Input shapes - Observations: {observations.shape}, Rewards: {rewards.shape}, Features: {features.shape}")
+            print(f"[AUX DEBUG] Rewards stats - Min: {rewards.min().item():.6f}, Max: {rewards.max().item():.6f}, Mean: {rewards.mean().item():.6f}")
+            
         # Add experiences to history
         for i in range(observations.shape[0]):
             self.obs_history.append(observations[i].detach().cpu())
@@ -257,12 +384,10 @@ class AuxiliaryTaskManager:
             if len(self.obs_history) >= self.rp_sequence_length:
                 # Compute losses and update models
                 losses = self.compute_losses()
-                
-                # Debug logging to diagnose zeroed out losses
-                if self.debug:
-                    print(f"[AUX DEBUG] SR loss: {losses['sr_loss']:.6f}, RP loss: {losses['rp_loss']:.6f}")
-                    print(f"[AUX DEBUG] History lengths: Obs={len(self.obs_history)}, Features={len(self.feature_history)}, Rewards={len(self.reward_history)}")
-                
+                self.update_count += 1
+                self.last_sr_loss = losses['sr_loss']
+                self.last_rp_loss = losses['rp_loss']
+                                
                 # Ensure losses are valid (not NaN or zero)
                 if math.isnan(losses['sr_loss']) or math.isnan(losses['rp_loss']):
                     if self.debug:
@@ -276,7 +401,11 @@ class AuxiliaryTaskManager:
                     print(f"[AUX DEBUG] Not enough history for auxiliary tasks: {len(self.obs_history)}/{self.rp_sequence_length}")
                     
         # If we don't update, still return the latest metrics but with zero values
-        return {"sr_loss": 0.0, "rp_loss": 0.0}
+        if self.debug and self.update_counter % 100 == 0:
+            print(f"[AUX DEBUG] Skipping update, counter at {self.update_counter}/{update_threshold}")
+            print(f"[AUX DEBUG] Last losses - SR: {self.last_sr_loss:.6f}, RP: {self.last_rp_loss:.6f}")
+            
+        return {"sr_loss": self.last_sr_loss, "rp_loss": self.last_rp_loss}
 
     def compute_losses(self, features=None, observations=None, rewards_sequence=None):
         """
@@ -292,6 +421,8 @@ class AuxiliaryTaskManager:
         """
         # Skip if not enough history - but this shouldn't happen with our checks in update()
         if len(self.obs_history) < self.rp_sequence_length:
+            if self.debug:
+                print(f"[AUX COMPUTE] Not enough history: {len(self.obs_history)} < {self.rp_sequence_length}")
             return {"sr_loss": 0.0, "rp_loss": 0.0}
             
         # For state representation, use the most recent observation if not provided
@@ -356,42 +487,93 @@ class AuxiliaryTaskManager:
         # Initialize loss values
         sr_loss_value = 0.0
         rp_loss_value = 0.0
+
+        # Debug information
+        if self.debug:
+            print(f"[AUX COMPUTE] Observations shape: {observations.shape}, dtype: {observations.dtype}")
+            print(f"[AUX COMPUTE] Feature sequences shape: {feature_sequences.shape}, dtype: {feature_sequences.dtype}")
+            print(f"[AUX COMPUTE] Reward targets shape: {reward_targets.shape}, dtype: {reward_targets.dtype}")
+            print(f"[AUX COMPUTE] SR weight: {self.sr_weight}, RP weight: {self.rp_weight}")
+            print(f"[AUX COMPUTE] Observation stats - Min: {observations.min().item():.4f}, Max: {observations.max().item():.4f}")
             
         # Compute SR loss
         try:
-            with torch.amp.autocast(device_type='cuda' if self.device == 'cuda' else 'cpu', enabled=self.use_amp):
+            with torch.amp.autocast(device_type='cuda' if 'cuda' in str(self.device) else 'cpu', enabled=self.use_amp):
                 sr_loss = self.sr_task.get_loss(observations)
+                sr_loss_value = sr_loss.item()  # Store before applying weight
                 sr_loss = sr_loss * self.sr_weight
-                sr_loss_value = sr_loss.item() / self.sr_weight
+                
+            # Check if SR loss is zero and debug
+            if sr_loss_value == 0.0 and self.debug:
+                print("[AUX COMPUTE] WARNING: SR loss is exactly zero!")
+                # Check if model parameters are zero
+                sr_params_norm = sum(p.norm().item() for p in self.sr_task.parameters())
+                print(f"[AUX COMPUTE] SR model parameters norm: {sr_params_norm:.6f}")
+                
+                # Test with random input
+                test_input = torch.rand_like(observations)
+                test_loss = self.sr_task.get_loss(test_input).item()
+                print(f"[AUX COMPUTE] SR test loss with random input: {test_loss:.6f}")
                 
             # Update SR model
             self.sr_optimizer.zero_grad()
             sr_loss.backward()
+            # Check gradients
+            sr_grad_nonzero = any(p.grad is not None and p.grad.abs().max().item() > 0 for p in self.sr_task.parameters())
+            if self.debug and not sr_grad_nonzero:
+                print("[AUX COMPUTE] WARNING: SR gradients are all zero!")
             self.sr_optimizer.step()
         except Exception as e:
             if self.debug:
-                print(f"[AUX DEBUG] Error computing SR loss: {e}")
+                print(f"[AUX COMPUTE] Error computing SR loss: {e}")
+                import traceback
+                traceback.print_exc()
             
         # Compute RP loss
         try:
-            with torch.amp.autocast(device_type='cuda' if self.device == 'cuda' else 'cpu', enabled=self.use_amp):
+            with torch.amp.autocast(device_type='cuda' if 'cuda' in str(self.device) else 'cpu', enabled=self.use_amp):
                 rp_loss = self.rp_task.get_loss(feature_sequences, reward_targets)
+                rp_loss_value = rp_loss.item()  # Store before applying weight
                 rp_loss = rp_loss * self.rp_weight
-                rp_loss_value = rp_loss.item() / self.rp_weight
+                
+            # Check if RP loss is zero and debug
+            if rp_loss_value == 0.0 and self.debug:
+                print("[AUX COMPUTE] WARNING: RP loss is exactly zero!")
+                # Check reward distribution
+                reward_classes = torch.zeros(3, device=self.device)
+                pos_mask = reward_targets > self.rp_task.pos_threshold
+                neg_mask = reward_targets < self.rp_task.neg_threshold
+                zero_mask = ~(pos_mask | neg_mask)
+                reward_classes[0] = neg_mask.sum().item()
+                reward_classes[1] = zero_mask.sum().item()
+                reward_classes[2] = pos_mask.sum().item()
+                print(f"[AUX COMPUTE] Reward classes distribution: {reward_classes}")
+                
+                # Test with random input
+                test_input = torch.rand_like(feature_sequences)
+                test_targets = torch.randint(0, 3, (reward_targets.shape[0],), device=self.device)
+                test_loss = F.cross_entropy(self.rp_task.forward(test_input), test_targets).item()
+                print(f"[AUX COMPUTE] RP test loss with random input: {test_loss:.6f}")
                 
             # Update RP model
             self.rp_optimizer.zero_grad()
             rp_loss.backward()
+            # Check gradients
+            rp_grad_nonzero = any(p.grad is not None and p.grad.abs().max().item() > 0 for p in self.rp_task.parameters())
+            if self.debug and not rp_grad_nonzero:
+                print("[AUX COMPUTE] WARNING: RP gradients are all zero!")
             self.rp_optimizer.step()
         except Exception as e:
             if self.debug:
-                print(f"[AUX DEBUG] Error computing RP loss: {e}")
+                print(f"[AUX COMPUTE] Error computing RP loss: {e}")
+                import traceback
+                traceback.print_exc()
             
         return {
             "sr_loss": sr_loss_value,
             "rp_loss": rp_loss_value
         }
-
+        
     def reset(self):
         """Reset history buffers when episodes end"""
         if self.learning_mode == "stream":
@@ -400,6 +582,43 @@ class AuxiliaryTaskManager:
             self.feature_history.clear()
             self.reward_history.clear()
         # For batch learning, we retain the history across episodes
+        
+        if self.debug:
+            print("[AUX RESET] Reset called - cleared history buffers for stream mode")
+        
+    def reset_auxiliary_tasks(self):
+        """Reset auxiliary task models (weights and optimizers)"""
+        # Re-initialize SR task with the same parameters
+        self.sr_task = StateRepresentationTask(
+            input_dim=self.sr_task.input_dim,
+            hidden_dim=self.sr_task.hidden_dim,
+            latent_dim=self.sr_task.latent_dim,
+            device=self.device
+        )
+        # Re-initialize RP task with the same parameters
+        self.rp_task = RewardPredictionTask(
+            input_dim=self.hidden_dim,
+            hidden_dim=self.rp_task.hidden_dim,
+            sequence_length=self.rp_sequence_length,
+            device=self.device,
+            debug=self.debug  # Pass debug flag when recreating
+        )
+        # Re-initialize optimizers
+        self.sr_optimizer = torch.optim.Adam(self.sr_task.parameters(), lr=3e-4)
+        self.rp_optimizer = torch.optim.Adam(self.rp_task.parameters(), lr=3e-4)
+        
+        # Reset history buffers too
+        self.reset()
+        
+        # Reset counters
+        self.update_counter = 0
+        self.history_filled = 0
+        self.update_count = 0
+        self.last_sr_loss = 0.0
+        self.last_rp_loss = 0.0
+        
+        if self.debug:
+            print("[AUX RESET] Complete reset of auxiliary task models and optimizers")
         
     def set_learning_mode(self, mode):
         """
@@ -445,6 +664,10 @@ class AuxiliaryTaskManager:
                 self.feature_history.extend(temp_features)
                 self.reward_history.extend(temp_rewards)
                 
+            if self.debug:
+                print(f"[AUX MODE] Changed learning mode from {prev_mode} to {mode}")
+                print(f"[AUX MODE] New history sizes - Obs: {len(self.obs_history)}, Features: {len(self.feature_history)}, Rewards: {len(self.reward_history)}")
+                
     def get_state_dict(self):
         """Get state dict for saving models"""
         return {
@@ -460,3 +683,6 @@ class AuxiliaryTaskManager:
         self.rp_task.load_state_dict(state_dict['rp_task'])
         self.sr_optimizer.load_state_dict(state_dict['sr_optimizer'])
         self.rp_optimizer.load_state_dict(state_dict['rp_optimizer'])
+        
+        if self.debug:
+            print("[AUX LOAD] Loaded auxiliary task models from state dict")
