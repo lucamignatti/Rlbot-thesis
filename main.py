@@ -459,20 +459,20 @@ def run_training(
 
             # Determine if it's time to update the policy
             enough_experiences = False
-            
+
             if algorithm == "ppo":
                 # For PPO, we use a batch update approach
                 enough_experiences = collected_experiences >= update_interval
             else:
-                # For StreamAC, updates happen online, but we may want to log periodically
-                # Actual updates happen with every step, this is just for UI logging
+                # For StreamAC, updates happen online with immediate wandb logging
+                # We still want to update progress bar and UI periodically
                 enough_experiences = collected_experiences % update_interval == 0
                 
-                # Add more frequent update status for StreamAC (every 100 steps)
+                # Add more frequent update status for StreamAC UI (every 100 steps)
                 if collected_experiences % 100 == 0 and collected_experiences > 0 and debug:
                     print(f"[DEBUG] StreamAC has processed {collected_experiences} steps " +
                           f"(with updates every {args.update_freq} step(s))")
-                    # Update StreamAC-specific metrics in stats_dict for more frequent UI updates
+                    # Update StreamAC-specific metrics in stats_dict for UI updates only
                     if hasattr(trainer.algorithm, "successful_steps") and hasattr(trainer.algorithm, "last_step_sizes"):
                         step_sizes = getattr(trainer.algorithm, "last_step_sizes", [0])
                         last_step = step_sizes[-1] if len(step_sizes) > 0 else 0
@@ -495,7 +495,13 @@ def run_training(
                     print(f"[DEBUG] Updating policy with {collected_experiences} experiences after {time.time() - last_update_time:.2f}s")
 
                 # Perform the policy update.
-                stats = trainer.update()
+                if algorithm == "ppo":
+                    # For PPO, do a normal batch update
+                    stats = trainer.update()
+                else:
+                    # For StreamAC, we've already been updating with each step
+                    # Just get the latest metrics without triggering a full update
+                    stats = trainer.algorithm.get_metrics()
 
                 # Update the statistics displayed in the progress bar.
                 stats_dict.update({

@@ -681,7 +681,7 @@ class Trainer:
                 "rp_weight": rp_weight,
                 "use_pretraining": use_pretraining,
                 "use_amp": use_amp
-            })
+            }, allow_val_change=True)  # Add allow_val_change=True
 
         # If requested and available, compile the models for performance
         self.use_compile = use_compile and hasattr(torch, 'compile')
@@ -798,7 +798,72 @@ class Trainer:
 
         # Store the experience using the algorithm - only update if not in test mode
         if not test_mode:
-            self.algorithm.store_experience(state, action, log_prob, reward, value, done)
+            if self.algorithm_type == "streamac":
+                # For StreamAC, check if an update was performed
+                metrics, did_update = self.algorithm.store_experience(state, action, log_prob, reward, value, done)
+                
+                # If StreamAC performed an update, log to wandb immediately
+                if did_update and self.use_wandb:
+                    try:
+                        # Increment training steps counter
+                        self.training_steps += 1
+                        
+                        # Log metrics to wandb
+                        log_dict = {
+                            "actor_loss": metrics.get("actor_loss", 0),
+                            "critic_loss": metrics.get("critic_loss", 0),
+                            "entropy_loss": metrics.get("entropy_loss", 0),
+                            "total_loss": metrics.get("total_loss", 0),
+                            "entropy_coef": self.entropy_coef,
+                            "actor_lr": getattr(self.algorithm, "lr_actor", self.lr_actor),
+                            "critic_lr": getattr(self.algorithm, "lr_critic", self.lr_critic),
+                            "training_step": self.training_steps + self.training_step_offset,
+                            "total_episodes": self.total_episodes + self.total_episodes_offset,
+                            "effective_step_size": metrics.get("effective_step_size", 0),
+                            "backtracking_count": metrics.get("backtracking_count", 0),
+                            "successful_steps": getattr(self.algorithm, "successful_steps", 0) if hasattr(self.algorithm, "successful_steps") else 0
+                        }
+                        
+                        # Add auxiliary task metrics if enabled
+                        if self.use_auxiliary_tasks:
+                            log_dict.update({
+                                "sr_loss": metrics.get("sr_loss", 0),
+                                "rp_loss": metrics.get("rp_loss", 0),
+                                "aux_loss": metrics.get("aux_loss", 0),
+                                "sr_weight": getattr(self.aux_task_manager, "sr_weight", 0),
+                                "rp_weight": getattr(self.aux_task_manager, "rp_weight", 0)
+                            })
+                        
+                        # Add pretraining indicators
+                        if self.use_pretraining:
+                            log_dict.update({
+                                "pretraining_active": 1 if not self.pretraining_completed else 0,
+                                "transition_phase": 1 if self.in_transition_phase else 0
+                            })
+                            
+                            # If in transition phase, log progress
+                            if self.in_transition_phase:
+                                progress = min(1.0, (self.training_steps - self.transition_start_step) / 
+                                              self.pretraining_transition_steps)
+                                log_dict["transition_progress"] = progress
+                        
+                        # Add curriculum metrics if they exist
+                        if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None:
+                            curriculum_stats = self.curriculum_manager.get_curriculum_stats()
+                            log_dict.update({
+                                "difficulty_level": curriculum_stats["difficulty_level"],
+                                "current_stage": curriculum_stats["current_stage_index"],
+                                "success_rate": curriculum_stats["success_rate"]
+                            })
+                        
+                        # Log to wandb
+                        wandb.log(log_dict, step=self.training_steps + self.training_step_offset)
+                    except Exception as e:
+                        if self.debug:
+                            print(f"[DEBUG] Error logging to wandb: {e}")
+            else:
+                # For other algorithms like PPO, just store normally
+                self.algorithm.store_experience(state, action, log_prob, reward, value, done)
         else:
             # In test mode, just store without updating (for StreamAC)
             if hasattr(self.algorithm, 'experience_buffer'):

@@ -942,11 +942,13 @@ class StreamACAlgorithm(BaseAlgorithm):
         
         # Update after every experience if update_freq is 1
         self.update_counter += 1
+        did_update = False
         if self.update_counter >= self.update_freq:
-            self.update()
+            metrics = self.update()
             self.update_counter = 0
+            did_update = True
         
-        return self.metrics
+        return self.metrics, did_update
     
     def update(self, experiences=None):
         """Update policy using the latest experience
