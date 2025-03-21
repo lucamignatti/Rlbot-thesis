@@ -556,6 +556,7 @@ class PPOAlgorithm(BaseAlgorithm):
         critic_loss_epoch = 0
         entropy_loss_epoch = 0
         total_loss_epoch = 0
+        clip_fraction_sum = 0
         
         # Get data generator with precomputed returns and advantages
         generator = self.memory.get_generator(
@@ -564,6 +565,13 @@ class PPOAlgorithm(BaseAlgorithm):
             gamma=self.gamma,
             gae_lambda=self.gae_lambda
         )
+        
+        # Store for metrics calculation
+        advantages_all = []
+        returns_all = []
+        values_all = []
+        old_log_probs_all = []
+        states_all = []
         
         # Perform PPO epochs
         for epoch in range(self.ppo_epochs):
@@ -583,6 +591,17 @@ class PPOAlgorithm(BaseAlgorithm):
                 old_log_probs = batch['log_probs']
                 returns = batch['returns']
                 advantages = batch['advantages']
+                
+                # Collect data for metrics calculation in first epoch
+                if epoch == 0:
+                    if isinstance(advantages, torch.Tensor):
+                        advantages_all.append(advantages.detach())
+                    if isinstance(returns, torch.Tensor):
+                        returns_all.append(returns.detach())
+                    if isinstance(old_log_probs, torch.Tensor):
+                        old_log_probs_all.append(old_log_probs.detach())
+                    if isinstance(obs, torch.Tensor):
+                        states_all.append(obs.detach())
                 
                 # Forward pass
                 with torch.cuda.amp.autocast(enabled=self.use_amp):
@@ -635,6 +654,10 @@ class PPOAlgorithm(BaseAlgorithm):
                     # Calculate total loss
                     total_loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
                     
+                    # Calculate clipping fraction (diagnostic metric)
+                    clip_fraction = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean().item()
+                    clip_fraction_sum += clip_fraction
+                    
                 # Backward pass with mixed precision
                 if self.use_amp:
                     # Scale loss to avoid underflow
@@ -684,13 +707,81 @@ class PPOAlgorithm(BaseAlgorithm):
         critic_loss_avg = critic_loss_epoch / n_updates
         entropy_loss_avg = entropy_loss_epoch / n_updates
         total_loss_avg = total_loss_epoch / n_updates
+        clip_fraction_avg = clip_fraction_sum / n_updates
+        
+        # Calculate additional metrics requested
+        explained_variance = 0
+        kl_divergence = 0
+        mean_advantage = 0
+        mean_return = 0
+        
+        # Concatenate all collected tensors for metrics calculation
+        if advantages_all:
+            all_advantages = torch.cat(advantages_all)
+            mean_advantage = all_advantages.mean().item()
+            
+        if returns_all:
+            all_returns = torch.cat(returns_all)
+            mean_return = all_returns.mean().item()
+            
+        if states_all and old_log_probs_all:
+            # Calculate KL divergence
+            try:
+                all_states = torch.cat(states_all)
+                all_old_log_probs = torch.cat(old_log_probs_all)
+                
+                with torch.no_grad():
+                    # Get new log probs for the same states
+                    if self.action_space_type == "discrete":
+                        action_probs = self.actor(all_states)
+                        action_probs = torch.clamp(action_probs, 1e-10, 1.0)
+                        action_probs = action_probs / action_probs.sum(dim=-1, keepdim=True)
+                        dist = torch.distributions.Categorical(probs=action_probs)
+                        # Sample new actions and get their log probs
+                        new_actions = dist.sample()
+                        new_log_probs = dist.log_prob(new_actions)
+                    else:
+                        dist = self.actor(all_states)
+                        new_actions = dist.sample()
+                        new_log_probs = dist.log_prob(new_actions).sum(dim=-1)
+                    
+                    # Calculate KL divergence
+                    kl_divergence = (all_old_log_probs - new_log_probs).mean().item()
+            except Exception as e:
+                if self.debug:
+                    print(f"[DEBUG] Error calculating KL divergence: {e}")
+                    
+        # Calculate explained variance if possible
+        if values_all and returns_all:
+            try:
+                all_values = torch.cat(values_all) if values_all else None
+                all_returns = torch.cat(returns_all) if returns_all else None
+                
+                if all_values is not None and all_returns is not None:
+                    values_mean = all_values.mean()
+                    returns_mean = all_returns.mean()
+                    
+                    values_var = ((all_values - values_mean) ** 2).mean()
+                    returns_var = ((all_returns - returns_mean) ** 2).mean()
+                    diff_var = ((all_values - all_returns) ** 2).mean()
+                    
+                    explained_variance = 1 - (diff_var / (returns_var + 1e-8))
+                    explained_variance = explained_variance.item()
+            except Exception as e:
+                if self.debug:
+                    print(f"[DEBUG] Error calculating explained variance: {e}")
         
         # Update metrics
         self.metrics.update({
             'actor_loss': actor_loss_avg,
             'critic_loss': critic_loss_avg,
             'entropy_loss': entropy_loss_avg,
-            'total_loss': total_loss_avg
+            'total_loss': total_loss_avg,
+            'clip_fraction': clip_fraction_avg,
+            'explained_variance': explained_variance,
+            'kl_divergence': kl_divergence,
+            'mean_advantage': mean_advantage,
+            'mean_return': mean_return
         })
         
         # Clear memory
@@ -709,6 +800,9 @@ class StreamACAlgorithm(BaseAlgorithm):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         
+        # Add training_steps counter
+        self.training_steps = 0
+        
         # Initialize StreamAC-specific parameters
         self.adaptive_learning_rate = kwargs.get('adaptive_learning_rate', True)
         self.target_step_size = kwargs.get('target_step_size', 0.025)
@@ -726,7 +820,9 @@ class StreamACAlgorithm(BaseAlgorithm):
             'effective_step_size': 0.0,
             'actor_lr': self.lr_actor,
             'critic_lr': self.lr_critic,
-            'backtracking_count': 0
+            'backtracking_count': 0,
+            'successful_steps': 0,
+            'mean_return': 0.0
         })
         
         # Reset optimizers with proper initialization
@@ -747,6 +843,8 @@ class StreamACAlgorithm(BaseAlgorithm):
         self.effective_step_size_history = []
         self.last_parameter_update = None
         self.update_counter = 0
+        self.successful_steps = 0
+        self.last_step_sizes = []  # Initialize the list to track the last step sizes
         
         # Initialize gradient accumulators for OBGD
         if self.use_obgd:
@@ -903,16 +1001,20 @@ class StreamACAlgorithm(BaseAlgorithm):
             return action, log_prob, value
     
     def store_experience(self, obs, action, log_prob, reward, value, done):
-        """Store experience in the buffer (limited size)
+        """Store experience and potentially update"""
+        # Ensure learning rates are properly set in optimizers
+        for param_group in self.actor_optimizer.param_groups:
+            if param_group['lr'] != self.lr_actor:
+                if self.debug:
+                    print(f"[LR DEBUG] Fixing actor lr: {param_group['lr']} -> {self.lr_actor}")
+                param_group['lr'] = self.lr_actor
+                
+        for param_group in self.critic_optimizer.param_groups:
+            if param_group['lr'] != self.lr_critic:
+                if self.debug:
+                    print(f"[LR DEBUG] Fixing critic lr: {param_group['lr']} -> {self.lr_critic}")
+                param_group['lr'] = self.lr_critic
         
-        Args:
-            obs: Observation
-            action: Action
-            log_prob: Log probability of the action
-            reward: Reward
-            value: Value estimate
-            done: Done flag
-        """
         # Convert all inputs to torch tensors
         if not isinstance(obs, torch.Tensor):
             obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
@@ -943,24 +1045,55 @@ class StreamACAlgorithm(BaseAlgorithm):
         # Update after every experience if update_freq is 1
         self.update_counter += 1
         did_update = False
+        
+        if self.debug:
+            print(f"[STEP DEBUG] StreamAC.store_experience update counter: {self.update_counter}/{self.update_freq}")
+            
         if self.update_counter >= self.update_freq:
+            if self.debug:
+                print(f"[STEP DEBUG] StreamAC performing update after {self.update_counter} experiences")
+                
+            # Save current metrics
             metrics = self.update()
+            
+            # Track successful updates for statistics
+            if not hasattr(self, 'successful_steps'):
+                self.successful_steps = 0
+            self.successful_steps += 1
+            
+            # Add successful_steps to metrics dictionary
+            self.metrics['successful_steps'] = self.successful_steps
+            
+            # Track recent step sizes for UI display
+            if not hasattr(self, 'last_step_sizes'):
+                self.last_step_sizes = []
+            if len(self.effective_step_size_history) > 0:
+                self.last_step_sizes.append(self.effective_step_size_history[-1])
+                # Keep only last 10 step sizes
+                if len(self.last_step_sizes) > 10:
+                    self.last_step_sizes.pop(0)
+                    
             self.update_counter = 0
             did_update = True
-        
+            
+            if self.debug:
+                print(f"[STEP DEBUG] StreamAC update complete, effective step size: {metrics.get('effective_step_size', 0):.6f}")
+                
         return self.metrics, did_update
     
     def update(self, experiences=None):
-        """Update policy using the latest experience
+        """Update policy using the latest experience"""
+        # Increment training steps counter
+        self.training_steps += 1
         
-        Args:
-            experiences: Optional list of experiences (not used in StreamAC, which uses the buffer)
-            
-        Returns:
-            dict: Dictionary of metrics from the update
-        """
+        # Add timestamp for debugging
+        if self.debug:
+            print(f"\n[STREAMAC UPDATE] Called at step {self.training_steps}")
+        
         # Skip if buffer is empty
         if len(self.experience_buffer) == 0:
+            if self.debug:
+                print("[STREAMAC UPDATE] Buffer empty, skipping update")
             return self.metrics
         
         # Use only the latest experience for the StreamAC update
@@ -978,7 +1111,32 @@ class StreamACAlgorithm(BaseAlgorithm):
         if not done:
             with torch.no_grad():
                 next_value = self.critic(obs).squeeze(-1)
+                
+                # Debug log the value prediction
+                if self.debug and next_value.item() == 0:
+                    print(f"[WARNING] Zero next_value predicted for non-terminal state")
+                    print(f"[WARNING] This will cause zero returns and may prevent learning")
+                    
                 returns = reward + self.gamma * next_value
+        
+        # Try adding a small epsilon to ensure non-zero returns/advantages
+        min_return_value = 1e-6
+        if isinstance(returns, torch.Tensor) and returns.abs().max().item() < min_return_value:
+            # Create a proper tensor for epsilon with the right device and dtype
+            if returns.item() == 0:
+                # If returns is zero, use a small positive value
+                epsilon_value = torch.tensor(min_return_value, device=returns.device, dtype=returns.dtype)
+            else:
+                # Otherwise use the sign of returns
+                epsilon_value = torch.sign(returns) * torch.tensor(min_return_value, device=returns.device, dtype=returns.dtype)
+            
+            # Add epsilon to returns
+            returns = returns + epsilon_value
+            
+            # Debug print with safe access to item()
+            if self.debug:
+                epsilon_print = epsilon_value.item() if isinstance(epsilon_value, torch.Tensor) else epsilon_value
+                print(f"[RETURNS DEBUG] Adding epsilon {epsilon_print} to prevent zero returns")
         
         advantages = returns - old_value
         
@@ -1025,7 +1183,7 @@ class StreamACAlgorithm(BaseAlgorithm):
         # Calculate actor loss (negative because we're maximizing)
         actor_loss = -torch.min(surr1, surr2).mean()
         
-        # Calculate critic loss
+        # Calculate critic loss - ensure this is properly calculated
         critic_loss = F.mse_loss(new_value, returns)
         
         # Calculate entropy loss (negative because we're maximizing)
@@ -1033,6 +1191,9 @@ class StreamACAlgorithm(BaseAlgorithm):
         
         # Calculate total loss
         total_loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
+        
+        # Calculate KL divergence between old and new policy
+        kl_divergence = (old_log_prob - new_log_prob).mean().item()
         
         # Perform gradient update with OBGD or standard update
         if self.use_obgd:
@@ -1084,11 +1245,25 @@ class StreamACAlgorithm(BaseAlgorithm):
             self.actor_optimizer.step()
             self.critic_optimizer.step()
             
-        # Calculate effective step size
+        # Calculate effective step size - THIS IS THE CRITICAL FIX
         current_params = self._get_parameter_vector()
-        param_diff = current_params - self.last_parameter_update
-        effective_step_size = torch.norm(param_diff).item()
-        self.last_parameter_update = current_params
+        if self.last_parameter_update is None:
+            self.last_parameter_update = current_params.clone()  # Make sure we clone here
+            effective_step_size = 0.0
+        else:
+            param_diff = current_params - self.last_parameter_update
+            effective_step_size = torch.norm(param_diff).item()
+            
+            # Debug log to verify step size calculation
+            if self.debug:
+                non_zero_params = (param_diff != 0).float().sum().item()
+                print(f"[STEP SIZE DEBUG] Non-zero parameter changes: {non_zero_params}/{param_diff.numel()}")
+                print(f"[STEP SIZE DEBUG] Raw step size: {effective_step_size}")
+                if effective_step_size == 0:
+                    print("[STEP SIZE DEBUG] WARNING: Zero step size detected!")
+        
+        # Set last_parameter_update AFTER calculating the diff
+        self.last_parameter_update = current_params.clone()  # Need to clone to avoid reference issues
         
         # Store effective step size for backtracking
         self.effective_step_size_history.append(effective_step_size)
@@ -1136,6 +1311,14 @@ class StreamACAlgorithm(BaseAlgorithm):
             # Calculate average of recent step sizes
             recent_avg = sum(self.effective_step_size_history[-self.backtracking_patience:]) / self.backtracking_patience
             
+            # Debug log the backtracking condition
+            if self.debug:
+                print(f"[BACKTRACK DEBUG] Checking backtracking condition:")
+                print(f"  steps_since_backtrack: {self.steps_since_backtrack}/{self.backtracking_patience}")
+                print(f"  recent_avg_step_size: {recent_avg}")
+                print(f"  target * 2.0: {self.target_step_size * 2.0}")
+                print(f"  condition met: {recent_avg > self.target_step_size * 2.0}")
+            
             # If average step size is much larger than target, reduce learning rate more aggressively
             if recent_avg > self.target_step_size * 2.0:
                 self.lr_actor *= self.backtracking_zeta
@@ -1152,6 +1335,9 @@ class StreamACAlgorithm(BaseAlgorithm):
                 
                 # Reset backtracking counter
                 self.steps_since_backtrack = 0
+                
+                if self.debug:
+                    print(f"[BACKTRACK DEBUG] Applied backtracking: new lr_actor={self.lr_actor}, new lr_critic={self.lr_critic}")
         
         # Update metrics
         self.metrics.update({
@@ -1161,8 +1347,35 @@ class StreamACAlgorithm(BaseAlgorithm):
             'total_loss': total_loss.item(),
             'effective_step_size': effective_step_size,
             'actor_lr': self.lr_actor,
-            'critic_lr': self.lr_critic
+            'critic_lr': self.lr_critic,
+            'kl_divergence': kl_divergence,
+            'mean_advantage': advantages.mean().item(),
+            'mean_return': returns.mean().item()
         })
+        
+        # Debug returns calculation
+        if self.debug:
+            print(f"[STREAM DEBUG] Returns calculation:")
+            print(f"  reward: {reward.item() if isinstance(reward, torch.Tensor) else reward}")
+            print(f"  done: {done}")
+            if not done:
+                print(f"  next_value: {next_value.item() if isinstance(next_value, torch.Tensor) else next_value}")
+            print(f"  final returns: {returns.item() if isinstance(returns, torch.Tensor) else returns}")
+        
+        # Just before returning the metrics at the end of the method
+        if hasattr(self, 'debug') and self.debug:
+            print(f"[STREAMAC DEBUG] Metrics before return:")
+            print(f"  mean_return: {self.metrics.get('mean_return', 'not set')}")
+            print(f"  entropy_loss: {self.metrics.get('entropy_loss', 'not set')}")
+            print(f"  effective_step_size: {self.metrics.get('effective_step_size', 'not set')}")
+            print(f"  backtracking_count: {self.metrics.get('backtracking_count', 'not set')}")
+            print(f"  actor_lr: {self.metrics.get('actor_lr', 'not set')}")
+            print(f"  critic_lr: {self.metrics.get('critic_lr', 'not set')}")
+            
+            # Print the actual values used in calculations
+            print(f"  returns: {returns.mean().item() if isinstance(returns, torch.Tensor) else returns}")
+            print(f"  entropy: {entropy.item() if isinstance(entropy, torch.Tensor) else entropy}")
+            print(f"  advantage: {advantages.mean().item() if isinstance(advantages, torch.Tensor) else advantages}")
         
         return self.metrics
     

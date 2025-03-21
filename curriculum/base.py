@@ -291,21 +291,34 @@ class CurriculumManager:
 
     def _get_current_step(self) -> Optional[int]:
         """Get current training step for wandb logging"""
+        if self.debug:
+            print(f"[STEP DEBUG] _get_current_step called in curriculum")
+            
         if self.trainer is None:
             # If no trainer is registered, use internal counter
             self._last_wandb_step += 1
+            if self.debug:
+                print(f"[STEP DEBUG] No trainer registered, using internal counter: {self._last_wandb_step}")
             return self._last_wandb_step
             
         # Use trainer's step counter as source of truth when available
         if hasattr(self.trainer, '_true_training_steps'):
             # Use the true training steps counter from the trainer (most accurate)
-            return self.trainer._true_training_steps
+            step_value = self.trainer._true_training_steps()  # Call the method instead of accessing as property
+            if self.debug:
+                print(f"[STEP DEBUG] Using trainer._true_training_steps(): {step_value}")
+            return step_value
         elif hasattr(self.trainer, 'training_steps') and hasattr(self.trainer, 'training_step_offset'):
             # Fall back to calculated training steps if true counter isn't available
-            return self.trainer.training_steps + self.trainer.training_step_offset
+            step_value = self.trainer.training_steps + self.trainer.training_step_offset
+            if self.debug:
+                print(f"[STEP DEBUG] Using trainer.training_steps + offset: {step_value}")
+            return step_value
         else:
             # Last resort: increment internal counter if no trainer counters are available
             self._last_wandb_step += 1
+            if self.debug:
+                print(f"[STEP DEBUG] Trainer lacks step counters, using internal: {self._last_wandb_step}")
             return self._last_wandb_step
 
     def _log_to_wandb(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
@@ -324,13 +337,24 @@ class CurriculumManager:
             return
             
         # Never log to a step that's less than our last step
-        if not self._testing and current_step <= self._last_wandb_step:
+        if not self._testing and hasattr(self, '_last_wandb_step') and current_step <= self._last_wandb_step:
             if self.debug:
                 print(f"Skipping wandb log for step {current_step} (≤ {self._last_wandb_step})")
             return
             
-        # Log with the valid step
-        wandb.log(metrics, step=current_step)
+        # Use trainer's centralized logging if available
+        if self.trainer is not None and hasattr(self.trainer, '_log_to_wandb'):
+            # Create curriculum-specific metrics with CURR prefix
+            curriculum_metrics = {}
+            for key, value in metrics.items():
+                # Add CURR/ prefix to match our trainer's structure
+                curriculum_metrics[f"CURR/{key}"] = value
+            
+            # Let the trainer handle logging with proper step syncing
+            self.trainer._log_to_wandb(curriculum_metrics, current_step)
+        else:
+            # Fall back to direct wandb logging if trainer unavailable
+            wandb.log(metrics, step=current_step)
         
         # Remember this step for next time
         self._last_wandb_step = current_step

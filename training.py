@@ -527,6 +527,7 @@ class Trainer:
     ):
         self.use_wandb = use_wandb
         self.debug = debug
+        self.test_mode = False  # Initialize test_mode attribute to False by default
 
         # Figure out which device (CPU, CUDA, MPS) to use
         if device is None:
@@ -745,9 +746,167 @@ class Trainer:
             if self.debug:
                 print(f"[DEBUG] Initialized intrinsic reward generator with scale {intrinsic_reward_scale}")
 
+    def _true_training_steps(self):
+        """Get the true training step count (including offset)"""
+        return self.training_steps + self.training_step_offset
+    
+    def _log_to_wandb(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
+        """Centralized wandb logging with step validation and metric organization
+        
+        Args:
+            metrics: Dictionary of metrics to log
+            step: Optional step number to use for logging
+        """
+        if not self.use_wandb or wandb.run is None:
+            return
+        
+        # Get current step if not explicitly provided
+        current_step = step if step is not None else self._true_training_steps()
+        
+        if self.debug:
+            print(f"[STEP DEBUG] Trainer._log_to_wandb called with step: {step}, calculated current_step: {current_step}")
+            print(f"[STEP DEBUG] _last_wandb_step before check: {getattr(self, '_last_wandb_step', 'not set')}")
+        
+        # Skip logging if we can't get a valid step
+        if current_step is None:
+            if self.debug:
+                print("[STEP DEBUG] Skipping wandb logging - couldn't get valid step")
+            return
+        
+        # Never log to a step that's less than or equal to our last logged step
+        if hasattr(self, '_last_wandb_step') and current_step <= self._last_wandb_step:
+            if self.debug:
+                print(f"[STEP DEBUG] Skipping wandb log for step {current_step} (≤ {self._last_wandb_step})")
+            return
+        
+        # Organize metrics into logical groups
+        grouped_metrics = {
+            'algorithm': {},
+            'curriculum': {},
+            'auxiliary': {},
+            'system': {}
+        }
+        
+        # --- Algorithm metrics ---
+        algorithm_metrics = grouped_metrics['algorithm']
+        
+        # Add algorithm type to group as prefix
+        alg_prefix = self.algorithm_type.upper()
+        
+        # Core algorithm metrics - common for both PPO and StreamAC
+        algorithm_metrics[f"{alg_prefix}/actor_loss"] = metrics.get("actor_loss", 0)
+        algorithm_metrics[f"{alg_prefix}/critic_loss"] = metrics.get("critic_loss", 0)
+        algorithm_metrics[f"{alg_prefix}/entropy_loss"] = metrics.get("entropy_loss", 0)
+        algorithm_metrics[f"{alg_prefix}/total_loss"] = metrics.get("total_loss", 0)
+        algorithm_metrics[f"{alg_prefix}/entropy_coefficient"] = self.entropy_coef
+        algorithm_metrics[f"{alg_prefix}/actor_learning_rate"] = getattr(self.algorithm, "lr_actor", self.lr_actor)
+        algorithm_metrics[f"{alg_prefix}/critic_learning_rate"] = getattr(self.algorithm, "lr_critic", self.lr_critic)
+        
+        # Add newly requested metrics if available
+        algorithm_metrics[f"{alg_prefix}/policy_kl_divergence"] = metrics.get("kl_divergence", 0)
+        algorithm_metrics[f"{alg_prefix}/mean_advantage"] = metrics.get("mean_advantage", 0)
+        algorithm_metrics[f"{alg_prefix}/mean_return"] = metrics.get("mean_return", 0)
+        
+        # Algorithm-specific metrics
+        if self.algorithm_type == "streamac":
+            # Get algorithm instance for direct access
+            alg = self.algorithm
+            
+            # Make sure all important metrics are tracked, with fallbacks
+            algorithm_metrics[f"{alg_prefix}/effective_step_size"] = metrics.get("effective_step_size", 0)
+            algorithm_metrics[f"{alg_prefix}/backtracking_count"] = metrics.get("backtracking_count", 0)
+            algorithm_metrics[f"{alg_prefix}/mean_return"] = metrics.get("mean_return", 0)
+            algorithm_metrics[f"{alg_prefix}/entropy_loss"] = metrics.get("entropy_loss", 0)
+            algorithm_metrics[f"{alg_prefix}/critic_loss"] = metrics.get("critic_loss", 0)
+            
+            # Add direct attribute access as fallback
+            if algorithm_metrics[f"{alg_prefix}/effective_step_size"] == 0 and hasattr(alg, "effective_step_size_history"):
+                if len(alg.effective_step_size_history) > 0:
+                    algorithm_metrics[f"{alg_prefix}/effective_step_size"] = alg.effective_step_size_history[-1]
+                    
+            if algorithm_metrics[f"{alg_prefix}/backtracking_count"] == 0 and hasattr(alg, "metrics"):
+                algorithm_metrics[f"{alg_prefix}/backtracking_count"] = alg.metrics.get("backtracking_count", 0)
+        elif self.algorithm_type == "ppo":
+            algorithm_metrics[f"{alg_prefix}/clip_fraction"] = metrics.get("clip_fraction", 0)
+            algorithm_metrics[f"{alg_prefix}/explained_variance"] = metrics.get("explained_variance", 0)
+        
+        # --- Auxiliary metrics ---
+        if self.use_auxiliary_tasks:
+            auxiliary_metrics = grouped_metrics['auxiliary']
+            auxiliary_metrics["AUX/state_representation_loss"] = metrics.get("sr_loss", 0)
+            auxiliary_metrics["AUX/reward_prediction_loss"] = metrics.get("rp_loss", 0)
+            auxiliary_metrics["AUX/total_loss"] = metrics.get("aux_loss", 0)
+            auxiliary_metrics["AUX/sr_weight"] = getattr(self.aux_task_manager, "sr_weight", 0)
+            auxiliary_metrics["AUX/rp_weight"] = getattr(self.aux_task_manager, "rp_weight", 0)
+        
+        # --- Curriculum metrics ---
+        if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None:
+            curriculum_metrics = grouped_metrics['curriculum']
+            curriculum_stats = self.curriculum_manager.get_curriculum_stats()
+            
+            curriculum_metrics["CURR/difficulty"] = curriculum_stats.get("difficulty_level", 0)
+            curriculum_metrics["CURR/stage"] = curriculum_stats.get("current_stage_index", 0)
+            curriculum_metrics["CURR/stage_name"] = curriculum_stats.get("current_stage_name", "")
+            curriculum_metrics["CURR/success_rate"] = curriculum_stats.get("success_rate", 0)
+            
+            # Add detailed stage-specific metrics if available
+            for key, value in curriculum_stats.get("current_stage_stats", {}).items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    curriculum_metrics[f"CURR/stage_stats/{key}"] = value
+        
+        # --- System metrics ---
+        system_metrics = grouped_metrics['system']
+        system_metrics["SYS/training_step"] = current_step
+        system_metrics["SYS/total_episodes"] = self.total_episodes + self.total_episodes_offset
+        system_metrics["SYS/update_time"] = metrics.get("update_time", 0)
+        
+        # Pre-training indicators
+        if self.use_pretraining:
+            system_metrics["SYS/pretraining_active"] = 1 if not self.pretraining_completed else 0
+            system_metrics["SYS/transition_phase"] = 1 if self.in_transition_phase else 0
+            
+            # If in transition phase, log progress
+            if self.in_transition_phase:
+                progress = min(1.0, (self.training_steps - self.transition_start_step) / 
+                              self.pretraining_transition_steps)
+                system_metrics["SYS/transition_progress"] = progress
+        
+        # Flatten metrics for logging
+        flat_metrics = {}
+        for group, group_metrics in grouped_metrics.items():
+            for key, value in group_metrics.items():
+                flat_metrics[key] = value
+        
+        # Add extra debugging information
+        if self.debug:
+            flat_metrics["_DEBUG/step_source"] = "explicit" if step is not None else "calculated"
+            flat_metrics["_DEBUG/logging_timestamp"] = time.time()
+        
+        if self.debug:
+            print(f"[STEP DEBUG] About to log to wandb with step={current_step}, algorithm={self.algorithm_type}")
+            
+        try:
+            # Log to wandb
+            wandb.log(flat_metrics, step=current_step)
+            
+            if self.debug:
+                print(f"[STEP DEBUG] Successfully logged to wandb at step {current_step}")
+                
+            # Remember this step for next time
+            self._last_wandb_step = current_step
+            
+            if self.debug:
+                print(f"[STEP DEBUG] Updated _last_wandb_step to {self._last_wandb_step}")
+                
+        except Exception as e:
+            if self.debug:
+                print(f"[STEP DEBUG] Error logging to wandb: {e}")
+                import traceback
+                traceback.print_exc()
+
     def store_experience(self, state, action, log_prob, reward, value, done):
         """Forward to algorithm's store_experience method"""
-        # Get whether we're in test mode - add this line
+        # Get whether we're in test mode
         test_mode = getattr(self, 'test_mode', False)
         
         # Add intrinsic rewards during pretraining if enabled
@@ -800,67 +959,31 @@ class Trainer:
         if not test_mode:
             if self.algorithm_type == "streamac":
                 # For StreamAC, check if an update was performed
+                if self.debug:
+                    print(f"[STEP DEBUG] Trainer.store_experience calling StreamAC.store_experience, current step: {self._true_training_steps()}")
+                    
                 metrics, did_update = self.algorithm.store_experience(state, action, log_prob, reward, value, done)
                 
                 # If StreamAC performed an update, log to wandb immediately
                 if did_update and self.use_wandb:
                     try:
-                        # Increment training steps counter
+                        # Increment training steps counter BEFORE logging
                         self.training_steps += 1
                         
-                        # Log metrics to wandb
-                        log_dict = {
-                            "actor_loss": metrics.get("actor_loss", 0),
-                            "critic_loss": metrics.get("critic_loss", 0),
-                            "entropy_loss": metrics.get("entropy_loss", 0),
-                            "total_loss": metrics.get("total_loss", 0),
-                            "entropy_coef": self.entropy_coef,
-                            "actor_lr": getattr(self.algorithm, "lr_actor", self.lr_actor),
-                            "critic_lr": getattr(self.algorithm, "lr_critic", self.lr_critic),
-                            "training_step": self.training_steps + self.training_step_offset,
-                            "total_episodes": self.total_episodes + self.total_episodes_offset,
-                            "effective_step_size": metrics.get("effective_step_size", 0),
-                            "backtracking_count": metrics.get("backtracking_count", 0),
-                            "successful_steps": getattr(self.algorithm, "successful_steps", 0) if hasattr(self.algorithm, "successful_steps") else 0
-                        }
+                        # Get a unique step value for this update (avoid duplicate steps)
+                        unique_step = self._true_training_steps()
                         
-                        # Add auxiliary task metrics if enabled
-                        if self.use_auxiliary_tasks:
-                            log_dict.update({
-                                "sr_loss": metrics.get("sr_loss", 0),
-                                "rp_loss": metrics.get("rp_loss", 0),
-                                "aux_loss": metrics.get("aux_loss", 0),
-                                "sr_weight": getattr(self.aux_task_manager, "sr_weight", 0),
-                                "rp_weight": getattr(self.aux_task_manager, "rp_weight", 0)
-                            })
+                        if self.debug:
+                            print(f"[STEP DEBUG] StreamAC performed update, incrementing step to {self._true_training_steps()}")
+                            print(f"[STEP DEBUG] About to log to wandb with unique_step={unique_step}")
                         
-                        # Add pretraining indicators
-                        if self.use_pretraining:
-                            log_dict.update({
-                                "pretraining_active": 1 if not self.pretraining_completed else 0,
-                                "transition_phase": 1 if self.in_transition_phase else 0
-                            })
-                            
-                            # If in transition phase, log progress
-                            if self.in_transition_phase:
-                                progress = min(1.0, (self.training_steps - self.transition_start_step) / 
-                                              self.pretraining_transition_steps)
-                                log_dict["transition_progress"] = progress
-                        
-                        # Add curriculum metrics if they exist
-                        if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None:
-                            curriculum_stats = self.curriculum_manager.get_curriculum_stats()
-                            log_dict.update({
-                                "difficulty_level": curriculum_stats.get("difficulty_level", 0),
-                                "current_stage": curriculum_stats.get("current_stage_index", 0),
-                                "success_rate": curriculum_stats.get("success_rate", 0)
-                            })
-                        
-                        # Log to wandb
-                        wandb.log(log_dict, step=self.training_steps + self.training_step_offset)
+                        # Log metrics using our centralized logging function
+                        self._log_to_wandb(metrics, step=unique_step)
                     except Exception as e:
                         if self.debug:
-                            print(f"[DEBUG] Error logging to wandb: {e}")
+                            print(f"[STEP DEBUG] Error logging to wandb: {e}")
+                            import traceback
+                            traceback.print_exc()
             else:
                 # For other algorithms like PPO, just store normally
                 self.algorithm.store_experience(state, action, log_prob, reward, value, done)
@@ -893,16 +1016,34 @@ class Trainer:
             )
             
             # For StreamAC, log metrics immediately
-            if self.algorithm_type == "streamac" and self.use_wandb:
+            if self.algorithm_type == "streamac" and self.use_wandb and aux_metrics.get("sr_loss", 0) > 0:
                 try:
-                    wandb.log({
-                        "sr_loss": aux_metrics.get("sr_loss", 0),
-                        "rp_loss": aux_metrics.get("rp_loss", 0),
-                        "aux_loss": aux_metrics.get("sr_loss", 0) + aux_metrics.get("rp_loss", 0)
-                    }, step=self.training_steps + self.training_step_offset)
+                    # Set this to prevent spamming wandb with too many auxiliary updates
+                    # Use the current training step to ensure it's a valid integer
+                    current_step = self._true_training_steps()
+                    
+                    # Only log auxiliary metrics if we have new information to log
+                    if getattr(self, '_last_aux_log_step', 0) != current_step:
+                        if self.debug:
+                            print(f"[STEP DEBUG] Logging auxiliary metrics at step {current_step}")
+                        self._last_aux_log_step = current_step
+                        self._log_to_wandb(aux_metrics, step=current_step)
                 except Exception as e:
                     if self.debug:
-                        print(f"[DEBUG] Error logging auxiliary metrics: {e}")
+                        print(f"[STEP DEBUG] Error logging auxiliary metrics: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+    # Add a new helper method to get a unique wandb step
+    def _get_unique_wandb_step(self):
+        """Get a unique step value that hasn't been used for wandb logging yet"""
+        base_step = self._true_training_steps()
+        
+        # If we've already used this step, increment by 1 to make it unique
+        if hasattr(self, '_last_wandb_step') and base_step <= self._last_wandb_step:
+            return self._last_wandb_step + 1
+        
+        return base_step
 
     def store_experience_at_idx(self, idx, state, action, log_prob, reward, value, done):
         """Forward to algorithm's store_experience_at_idx method if it exists"""
@@ -918,107 +1059,125 @@ class Trainer:
         return self.algorithm.get_action(state, evaluate, return_features)
 
     def update(self):
-        """Update policy and value networks using the selected algorithm"""
-        update_start = time.time()
-        # Update pretraining state if needed
-        if self.use_pretraining and not self.pretraining_completed:
-            self._update_pretraining_state()
+        """Update policy based on collected experiences. 
+        Different implementations for PPO vs StreamAC."""
+        metrics = {}
         
-        # Increment training steps counter
-        self.training_steps += 1
-        
-        # Get episode count based on algorithm type
-        episodes_ended = 0
-        if self.algorithm_type == "ppo" and hasattr(self.memory, "dones"):
-            # For PPO, count completed episodes from memory
-            dones = self.memory.dones
-            episodes_ended = torch.sum(dones.int()).item() if isinstance(dones, torch.Tensor) else np.sum(dones) if len(dones) > 0 else 0
-        
-        # Update total episode counter
-        self.total_episodes += episodes_ended
-        
-        if self.debug and episodes_ended > 0:
-            print(f"[DEBUG] {episodes_ended} episodes completed, total: {self.total_episodes}")
-            
-        # Call the algorithm's update method
+        if not self.algorithm:
+            return metrics
+
+        if self.debug:
+            print(f"[DEBUG] Updating policy, algorithm_type={self.algorithm_type}")
+
+        # Track update time
+        update_start_time = time.time()
+
+        # Forward to specific algorithm implementation
         metrics = self.algorithm.update()
         
-        # Apply entropy decay more slowly
-        if self.entropy_coef > self.min_entropy_coef:
-            self.entropy_coef = max(self.min_entropy_coef, 
-                                   self.entropy_coef * self.entropy_coef_decay)
-            
-        # Update auxiliary task weights if pretraining is active
-        if self.use_auxiliary_tasks:
-            self._update_auxiliary_weights()
-            
-        # Add update time to metrics
-        metrics["update_time"] = time.time() - update_start
-        metrics["in_pretraining"] = not self.pretraining_completed
-        metrics["in_transition"] = self.in_transition_phase
+        # Record update time
+        update_time = time.time() - update_start_time
+        metrics['update_time'] = update_time
         
-        # Log the metrics using wandb, if enabled
+        # Ensure explained_variance is correctly calculated and reported for PPO
+        if self.algorithm_type == "ppo" and metrics.get('explained_variance', 0.0) == 0.0:
+            # If we need to recalculate it, we can look at the metrics data
+            if hasattr(self.algorithm, 'memory') and hasattr(self.algorithm.memory, 'values') and hasattr(self.algorithm.memory, 'rewards'):
+                try:
+                    values = self.algorithm.memory.values[:self.algorithm.memory.pos].detach().cpu().numpy()
+                    returns = self.algorithm.memory.rewards[:self.algorithm.memory.pos].detach().cpu().numpy()
+                    
+                    if len(values) > 1 and len(returns) > 1:
+                        # Calculate explained variance
+                        var_y = np.var(returns)
+                        explained_var = 1 - np.var(returns - values) / (var_y + 1e-8)
+                        metrics['explained_variance'] = float(explained_var)
+                        
+                        if self.debug:
+                            print(f"[DEBUG] Recalculated explained_variance = {explained_var:.4f}")
+                except Exception as e:
+                    if self.debug:
+                        print(f"[DEBUG] Error recalculating explained_variance: {e}")
+        
+        # Update training step counter
+        if self.algorithm_type != "streamac":  # For StreamAC, steps are tracked in store_experience
+            self.training_steps += 1
+            
+        # Adds basic episode stats
+        if hasattr(self, 'episode_rewards') and len(self.episode_rewards) > 0:
+            episode_rewards = list(self.episode_rewards)
+            # Calculate mean episode reward
+            if episode_rewards:
+                metrics['mean_episode_reward'] = np.mean(episode_rewards)
+            # Clear episode rewards
+            self.episode_rewards = []
+
+        # Update auxiliary tasks if enabled
+        if self.use_auxiliary_tasks and self.aux_task_manager and not self.test_mode:
+            # For Stream mode, auxiliary tasks are already updated during store_experience
+            # For PPO batch mode, we update here with data from memory
+            if self.algorithm_type == "ppo":
+                try:
+                    # Sample batch of observations for auxiliary task update
+                    batch_size = min(64, self.algorithm.memory.size())
+                    if batch_size > 0 and hasattr(self.algorithm.memory, 'obs') and self.algorithm.memory.obs is not None:
+                        # Get random indices from memory
+                        indices = torch.randperm(self.algorithm.memory.size())[:batch_size]
+                        
+                        # Extract observations and values
+                        obs_batch = self.algorithm.memory.obs[indices].to(self.device)
+                        
+                        # Extract features if actor supports it
+                        features = None
+                        with torch.no_grad():
+                            if hasattr(self.actor, 'extract_features'):
+                                features = self.actor.extract_features(obs_batch)
+                            else:
+                                # Use forward pass with feature extraction
+                                try:
+                                    if hasattr(self.actor, 'forward') and 'return_features' in self.actor.forward.__code__.co_varnames:
+                                        _, features = self.actor(obs_batch, return_features=True)
+                                    else:
+                                        # If actor doesn't support return_features, use a default approach
+                                        features = self.actor(obs_batch)
+                                        if isinstance(features, tuple):
+                                            features = features[0]  # Try to get first item if it's a tuple
+                                except Exception as e:
+                                    if self.debug:
+                                        print(f"[DEBUG] Error extracting features: {e}")
+                                    # Use observations as features if extraction fails
+                                    features = obs_batch
+                        
+                        # Extract rewards
+                        rewards = self.algorithm.memory.rewards[indices].to(self.device)
+                        
+                        # Update auxiliary tasks
+                        aux_metrics = self.aux_task_manager.update(
+                            observations=obs_batch, 
+                            rewards=rewards, 
+                            features=features
+                        )
+                        
+                        # Log auxiliary metrics if there are valid losses
+                        if aux_metrics.get('sr_loss', 0) > 0 or aux_metrics.get('rp_loss', 0) > 0:
+                            metrics.update(aux_metrics)
+                            metrics['aux_loss'] = aux_metrics.get('sr_loss', 0) + aux_metrics.get('rp_loss', 0)
+                            if self.debug:
+                                print(f"[DEBUG] Aux task metrics: SR loss={aux_metrics.get('sr_loss', 0):.6f}, RP loss={aux_metrics.get('rp_loss', 0):.6f}")
+                except Exception as e:
+                    if self.debug:
+                        print(f"[DEBUG] Error updating auxiliary tasks: {e}")
+                        import traceback
+                        traceback.print_exc()
+
+        # Log metrics
         if self.use_wandb:
             try:
-                log_dict = {
-                    "actor_loss": metrics.get("actor_loss", 0),
-                    "critic_loss": metrics.get("critic_loss", 0),
-                    "entropy_loss": metrics.get("entropy_loss", 0),
-                    "total_loss": metrics.get("total_loss", 0),
-                    "entropy_coef": self.entropy_coef,
-                    "actor_lr": getattr(self.algorithm, "lr_actor", self.lr_actor),
-                    "critic_lr": getattr(self.algorithm, "lr_critic", self.lr_critic),
-                    "training_step": self.training_steps + self.training_step_offset,
-                    "total_episodes": self.total_episodes + self.total_episodes_offset,
-                }
-                
-                # Add algorithm-specific metrics
-                if self.algorithm_type == "streamac":
-                    log_dict.update({
-                        "effective_step_size": getattr(self.algorithm, "last_step_sizes", [0])[-1] 
-                            if hasattr(self.algorithm, "last_step_sizes") and len(getattr(self.algorithm, "last_step_sizes", [])) > 0 
-                            else 0,
-                        "backtracking_count": getattr(self.algorithm, "backtracking_count", 0),
-                        "successful_steps": getattr(self.algorithm, "successful_steps", 0)
-                    })
-                
-                # Add auxiliary task metrics if enabled
-                if self.use_auxiliary_tasks:
-                    log_dict.update({
-                        "sr_loss": metrics.get("sr_loss", 0),
-                        "rp_loss": metrics.get("rp_loss", 0),
-                        "aux_loss": metrics.get("aux_loss", 0),
-                        "sr_weight": getattr(self.aux_task_manager, "sr_weight", 0),
-                        "rp_weight": getattr(self.aux_task_manager, "rp_weight", 0)
-                    })
-                
-                # Add pretraining indicators
-                if self.use_pretraining:
-                    log_dict.update({
-                        "pretraining_active": 1 if not self.pretraining_completed else 0,
-                        "transition_phase": 1 if self.in_transition_phase else 0
-                    })
-                    
-                    # If in transition phase, log progress
-                    if self.in_transition_phase:
-                        progress = min(1.0, (self.training_steps - self.transition_start_step) / 
-                                      self.pretraining_transition_steps)
-                        log_dict["transition_progress"] = progress
-                
-                # Add curriculum metrics if they exist
-                if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None:
-                    curriculum_stats = self.curriculum_manager.get_curriculum_stats()
-                    log_dict.update({
-                        "difficulty_level": curriculum_stats.get("difficulty_level", 0),
-                        "current_stage": curriculum_stats.get("current_stage_index", 0),
-                        "success_rate": curriculum_stats.get("success_rate", 0)
-                    })
-                
-                # Log to wandb
-                wandb.log(log_dict, step=self.training_steps + self.training_step_offset)
+                self._log_to_wandb(metrics)
             except Exception as e:
-                print(f"Error logging to wandb: {e}")
-
+                if self.debug:
+                    print(f"[DEBUG] Error logging to wandb: {e}")
+        
         return metrics
 
     def reset_auxiliary_tasks(self):
@@ -1221,14 +1380,14 @@ class Trainer:
             # Higher entropy during pretraining to encourage exploration
             self.entropy_coef = self.base_entropy_coef * self.pretraining_entropy_scale
         elif self.in_transition_phase:
-            # Gradually reduce entropy during transition
             progress = min(1.0, (self.training_steps - self.transition_start_step) / 
                           self.pretraining_transition_steps)
             self.entropy_coef = self.base_entropy_coef * self.pretraining_entropy_scale + \
                                progress * (self.base_entropy_coef - self.base_entropy_coef * self.pretraining_entropy_scale)
         else:
             # Use base entropy with normal decay during regular training
-            self.entropy_coef = self.base_entropy_coef
+            self.entropy_coef = max(self.min_entropy_coef, 
+                                   self.base_entropy_coef * (self.entropy_coef_decay ** self.training_steps))
 
         # Log to wandb
         if self.use_wandb and self.training_steps % 10 == 0:
