@@ -14,7 +14,7 @@ from rewards import BallProximityReward, BallToGoalDistanceReward, BallVelocityT
 from models import BasicModel, SimBa, fix_compiled_state_dict, extract_model_dimensions, load_partial_state_dict
 from observation import StackedActionsObs, ActionStacker
 from training import Trainer
-from learning_algorithms import PPOAlgorithm, StreamACAlgorithm  # Import the new learning algorithms
+from algorithms import PPOAlgorithm, StreamACAlgorithm  # Import from new algorithms package
 import concurrent.futures
 import time
 import argparse

@@ -4,7 +4,7 @@ from models import fix_compiled_state_dict, print_model_info
 from typing import Union, Tuple, Optional, Dict, Any
 from auxiliary import AuxiliaryTaskManager
 from intrinsic_rewards import create_intrinsic_reward_generator, IntrinsicRewardEnsemble
-from learning_algorithms import BaseAlgorithm, PPOAlgorithm, StreamACAlgorithm
+from algorithms import BaseAlgorithm, PPOAlgorithm, StreamACAlgorithm
 import time
 import wandb
 import os
