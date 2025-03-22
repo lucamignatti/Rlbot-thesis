@@ -782,42 +782,29 @@ class Trainer:
         # Add algorithm type to group as prefix
         alg_prefix = self.algorithm_type.upper()
         
-        # Core algorithm metrics - common for both PPO and StreamAC
-        algorithm_metrics[f"{alg_prefix}/actor_loss"] = metrics.get("actor_loss", 0)
-        algorithm_metrics[f"{alg_prefix}/critic_loss"] = metrics.get("critic_loss", 0)
-        algorithm_metrics[f"{alg_prefix}/entropy_loss"] = metrics.get("entropy_loss", 0)
-        algorithm_metrics[f"{alg_prefix}/total_loss"] = metrics.get("total_loss", 0)
+        # Define algorithm-specific metrics to include
+        ppo_metrics = {'actor_loss', 'critic_loss', 'entropy_loss', 'total_loss', 
+                      'clip_fraction', 'explained_variance', 'kl_divergence', 
+                      'mean_advantage', 'mean_return'}
+        
+        stream_metrics = {'actor_loss', 'critic_loss', 'entropy_loss', 'total_loss',
+                         'effective_step_size', 'backtracking_count', 'mean_return'}
+        
+        # Select appropriate metric set based on algorithm type
+        valid_metrics = ppo_metrics if self.algorithm_type == "ppo" else stream_metrics
+        
+        # Add algorithm metrics based on selected set
+        algo_metrics = self.algorithm.get_metrics() if hasattr(self.algorithm, 'get_metrics') else metrics
+        filtered_algo_metrics = {k: v for k, v in algo_metrics.items() if k in valid_metrics}
+        
+        # Add filtered metrics with algorithm prefix
+        for key, value in filtered_algo_metrics.items():
+            algorithm_metrics[f"{alg_prefix}/{key}"] = value
+        
+        # Add common metrics for both algorithms
         algorithm_metrics[f"{alg_prefix}/entropy_coefficient"] = self.entropy_coef
         algorithm_metrics[f"{alg_prefix}/actor_learning_rate"] = getattr(self.algorithm, "lr_actor", self.lr_actor)
         algorithm_metrics[f"{alg_prefix}/critic_learning_rate"] = getattr(self.algorithm, "lr_critic", self.lr_critic)
-        
-        # Add newly requested metrics if available
-        algorithm_metrics[f"{alg_prefix}/policy_kl_divergence"] = metrics.get("kl_divergence", 0)
-        algorithm_metrics[f"{alg_prefix}/mean_advantage"] = metrics.get("mean_advantage", 0)
-        algorithm_metrics[f"{alg_prefix}/mean_return"] = metrics.get("mean_return", 0)
-        
-        # Algorithm-specific metrics
-        if self.algorithm_type == "streamac":
-            # Get algorithm instance for direct access
-            alg = self.algorithm
-            
-            # Make sure all important metrics are tracked, with fallbacks
-            algorithm_metrics[f"{alg_prefix}/effective_step_size"] = metrics.get("effective_step_size", 0)
-            algorithm_metrics[f"{alg_prefix}/backtracking_count"] = metrics.get("backtracking_count", 0)
-            algorithm_metrics[f"{alg_prefix}/mean_return"] = metrics.get("mean_return", 0)
-            algorithm_metrics[f"{alg_prefix}/entropy_loss"] = metrics.get("entropy_loss", 0)
-            algorithm_metrics[f"{alg_prefix}/critic_loss"] = metrics.get("critic_loss", 0)
-            
-            # Add direct attribute access as fallback
-            if algorithm_metrics[f"{alg_prefix}/effective_step_size"] == 0 and hasattr(alg, "effective_step_size_history"):
-                if len(alg.effective_step_size_history) > 0:
-                    algorithm_metrics[f"{alg_prefix}/effective_step_size"] = alg.effective_step_size_history[-1]
-                    
-            if algorithm_metrics[f"{alg_prefix}/backtracking_count"] == 0 and hasattr(alg, "metrics"):
-                algorithm_metrics[f"{alg_prefix}/backtracking_count"] = alg.metrics.get("backtracking_count", 0)
-        elif self.algorithm_type == "ppo":
-            algorithm_metrics[f"{alg_prefix}/clip_fraction"] = metrics.get("clip_fraction", 0)
-            algorithm_metrics[f"{alg_prefix}/explained_variance"] = metrics.get("explained_variance", 0)
         
         # --- Auxiliary metrics ---
         if self.use_auxiliary_tasks:

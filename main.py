@@ -403,11 +403,37 @@ def run_training(
                         trainer.store_experience_at_idx(mem_idx, None, None, None, reward, None, done)
                     else:
                         # For StreamAC, we directly update the latest experience
-                        # (the store_experience call already happened above)
                         if hasattr(trainer.algorithm, 'experience_buffer') and len(trainer.algorithm.experience_buffer) > 0:
-                            # Update the next state for intrinsic reward calculation
-                            # This is only needed for algorithms that track state transitions
-                            pass
+                            # Update the most recent experience with actual reward and done flag
+                            try:
+                                latest_exp = trainer.algorithm.experience_buffer[-1]
+                                if 'reward' in latest_exp:  # Safety check
+                                    latest_exp['reward'] = torch.tensor([reward], dtype=torch.float32, device=trainer.device)
+                                    # Update reward tracking for return calculation
+                                    if hasattr(trainer.algorithm, 'update_reward_tracking'):
+                                        trainer.algorithm.update_reward_tracking(reward)
+                                if 'done' in latest_exp:  # Safety check
+                                    latest_exp['done'] = torch.tensor([float(done)], dtype=torch.float32, device=trainer.device)
+                                    
+                                    # When episode is done, explicitly track the return
+                                    if done and debug:
+                                        print(f"[DEBUG] Episode done detected for agent {agent_id} with reward {reward}")
+                                    
+                                    # If the episode is done, force calculation of the return for this episode
+                                    if done and hasattr(trainer.algorithm, 'current_episode_rewards') and len(trainer.algorithm.current_episode_rewards) > 0:
+                                        episode_return = sum(trainer.algorithm.current_episode_rewards)
+                                        if hasattr(trainer.algorithm, 'episode_returns'):
+                                            trainer.algorithm.episode_returns.append(episode_return)
+                                            # Force update of mean_return metric
+                                            mean_return = sum(trainer.algorithm.episode_returns) / len(trainer.algorithm.episode_returns)
+                                            trainer.algorithm.metrics['mean_return'] = mean_return
+                                            if debug:
+                                                print(f"[DEBUG] Calculated episode return: {episode_return:.2f}, mean: {mean_return:.2f}")
+                                        # Reset episode tracking
+                                        trainer.algorithm.current_episode_rewards = []
+                            except Exception as e:
+                                if debug:
+                                    print(f"[DEBUG] Error updating StreamAC experience: {e}")
 
                     # Accumulate rewards.
                     episode_rewards[env_idx][agent_id] += reward

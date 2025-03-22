@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import deque
+import math
 from typing import Dict, Tuple, List, Optional, Union, Any
 from .base import BaseAlgorithm
 
@@ -19,6 +20,10 @@ class PPOAlgorithm(BaseAlgorithm):
         
         # Define scaler for mixed precision training if enabled
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        
+        # Add episode return tracking
+        self.current_episode_rewards = []
+        self.episode_returns = deque(maxlen=100)  # Store last 100 episode returns
     
     class PPOMemory:
         """Memory buffer for PPO to store experiences"""
@@ -376,7 +381,7 @@ class PPOAlgorithm(BaseAlgorithm):
                     if isinstance(obs, torch.Tensor):
                         states_all.append(obs.detach())
                 
-                with torch.amp.autocast(enabled=self.use_amp):
+                with torch.amp.autocast(enabled=self.use_amp, device_type="cuda"):
                     if self.action_space_type == "discrete":
                         action_probs = self.actor(obs)
                         action_probs = torch.clamp(action_probs, 1e-10, 1.0)
@@ -448,6 +453,10 @@ class PPOAlgorithm(BaseAlgorithm):
             'mean_advantage': torch.cat(advantages_all).mean().item() if advantages_all else 0.0,
             'mean_return': torch.cat(returns_all).mean().item() if returns_all else 0.0
         })
+        
+        # Calculate mean return from episode returns
+        if len(self.episode_returns) > 0:
+            self.metrics['mean_return'] = sum(self.episode_returns) / len(self.episode_returns)
         
         self.memory.clear()
         return self.metrics
