@@ -16,12 +16,23 @@ class ObGD(torch.optim.Optimizer):
     def __init__(self, params, lr=1.0, gamma=0.99, lamda=0.8, kappa=2.0):
         defaults = dict(lr=lr, gamma=gamma, lamda=lamda, kappa=kappa)
         super(ObGD, self).__init__(params, defaults)
+        self.env_traces = {}  # Store eligibility traces per environment
         
-    def step(self, delta, reset=False):
+    def get_traces(self, env_id):
+        """Get eligibility traces for a specific environment."""
+        if env_id not in self.env_traces:
+            self.env_traces[env_id] = {}
+            for group in self.param_groups:
+                for p in group["params"]:
+                    self.env_traces[env_id][p] = torch.zeros_like(p.data)
+        return self.env_traces[env_id]
+        
+    def step(self, delta, env_id=0, reset=False):
         """
         Perform a parameter update step using TD error and eligibility traces.
         """
         z_sum = 0.0
+        env_traces = self.get_traces(env_id)
         for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None:
@@ -31,7 +42,7 @@ class ObGD(torch.optim.Optimizer):
                 if len(state) == 0:
                     state["eligibility_trace"] = torch.zeros_like(p.data)
                     
-                e = state["eligibility_trace"]
+                e = env_traces[p]
                 # Update eligibility trace: e = λγe + ∇θ
                 e.mul_(group["gamma"] * group["lamda"]).add_(p.grad, alpha=1.0)
                 z_sum += e.abs().sum().item()
@@ -51,13 +62,23 @@ class ObGD(torch.optim.Optimizer):
                     continue
                     
                 state = self.state[p]
-                e = state["eligibility_trace"]
+                e = env_traces[p]
                 # Update parameter: θ = θ - α·δ·e
                 p.data.add_(delta * e, alpha=-step_size)
                 if reset:
                     e.zero_()
                     
         return step_size
+
+    def reset_traces(self, env_id=None):
+        """Reset eligibility traces for a specific environment or all environments."""
+        if env_id is not None and env_id in self.env_traces:
+            for e in self.env_traces[env_id].values():
+                e.zero_()
+        elif env_id is None:
+            for env_traces in self.env_traces.values():
+                for e in env_traces.values():
+                    e.zero_()
 
 def sparse_init(tensor, sparsity, init_type='uniform'):
     """Initialize tensor with controlled sparsity."""
@@ -170,7 +191,7 @@ class StreamACAlgorithm(BaseAlgorithm):
         self.last_step_sizes = [0.0]  # Initialize with a default value
         
         # Initialize experience buffer
-        self.experience_buffer = []
+        self.experience_buffers = {}  # Per-environment buffers
         
         # Metrics for adaptive learning rate
         self.actor_lr_factor = 1.0
@@ -193,8 +214,7 @@ class StreamACAlgorithm(BaseAlgorithm):
         })
         
         # Track episode data
-        self.current_episode_rewards = []
-        self.current_episode_values = []
+        self.current_episode_rewards_per_env = {}  # Per-environment rewards
         
         # Add episode return tracking
         self.episode_returns = deque(maxlen=100)  # Store last 100 episode returns
@@ -317,13 +337,14 @@ class StreamACAlgorithm(BaseAlgorithm):
             
         return action_np, log_prob_np, value_np
     
-    def update_reward_tracking(self, reward):
-        """Update reward tracking for episode return calculation after delay-updating an experience"""
-        if len(self.current_episode_rewards) > 0:
-            # Update the last stored reward (replace the placeholder 0 with actual reward)
-            self.current_episode_rewards[-1] = reward.item() if hasattr(reward, 'item') else reward
+    def update_reward_tracking(self, reward, env_id=0):
+        """Update reward tracking for episode return calculation after delay-updating an experience."""
+        # Update for specific environment
+        if env_id in self.current_episode_rewards_per_env and len(self.current_episode_rewards_per_env[env_id]) > 0:
+            # Update the last stored reward (replace placeholder with actual reward)
+            self.current_episode_rewards_per_env[env_id][-1] = reward.item() if hasattr(reward, 'item') else reward
 
-    def store_experience(self, obs, action, log_prob, reward, value, done):
+    def store_experience(self, obs, action, log_prob, reward, value, done, env_id=0):
         """Store experience and perform online update if needed."""
         # Convert inputs to tensors if needed
         if not isinstance(obs, torch.Tensor):
@@ -372,33 +393,38 @@ class StreamACAlgorithm(BaseAlgorithm):
             'done': done.detach()
         }
         
+        # Initialize buffers for this environment if they don't exist yet
+        if env_id not in self.experience_buffers:
+            self.experience_buffers[env_id] = []
+            self.current_episode_rewards_per_env[env_id] = []
+            
         # Store in episode history for return calculation
         reward_value = reward.item() if hasattr(reward, 'item') else reward
-        self.current_episode_rewards.append(reward_value)
+        self.current_episode_rewards_per_env[env_id].append(reward_value)
         
         # Add to experience buffer, keeping only the most recent experiences
-        self.experience_buffer.append(experience)
-        if len(self.experience_buffer) > self.buffer_size:
-            self.experience_buffer.pop(0)
+        self.experience_buffers[env_id].append(experience)
+        if len(self.experience_buffers[env_id]) > self.buffer_size:
+            self.experience_buffers[env_id].pop(0)
         
         # Determine if we should update
         did_update = False
         metrics = {}
         
         # Update based on frequency or buffer fullness
-        if (len(self.experience_buffer) >= self.buffer_size or 
-            len(self.experience_buffer) % self.update_freq == 0 and len(self.experience_buffer) > 1):
+        if (len(self.experience_buffers[env_id]) >= self.buffer_size or 
+            len(self.experience_buffers[env_id]) % self.update_freq == 0 and len(self.experience_buffers[env_id]) > 1):
             did_update = True
-            metrics = self._update_online()
+            metrics = self._update_online(env_id=env_id)
             
         # Always update on episode completion
         if done.item() > 0.5:
             did_update = True
-            metrics = self._update_online(end_of_episode=True)
+            metrics = self._update_online(env_id=env_id, end_of_episode=True)
             
             # Calculate episode return for metrics
-            if len(self.current_episode_rewards) > 0:
-                episode_return = sum(self.current_episode_rewards)
+            if len(self.current_episode_rewards_per_env[env_id]) > 0:
+                episode_return = sum(self.current_episode_rewards_per_env[env_id])
                 self.episode_returns.append(episode_return)
                 
                 # Calculate true mean over multiple episodes
@@ -406,8 +432,7 @@ class StreamACAlgorithm(BaseAlgorithm):
                 metrics['mean_return'] = mean_return
                 
                 # Reset episode tracking
-                self.current_episode_rewards = []
-                self.current_episode_values = []
+                self.current_episode_rewards_per_env[env_id] = []
                 
                 if self.debug:
                     print(f"[DEBUG] Episode complete, return: {episode_return:.2f}")
@@ -438,7 +463,7 @@ class StreamACAlgorithm(BaseAlgorithm):
         
         return delta, td_target
 
-    def _update_online(self, end_of_episode=False):
+    def _update_online(self, env_id=0, end_of_episode=False):
         metrics = {
             'actor_loss': 0.0,
             'critic_loss': 0.0,
@@ -449,7 +474,7 @@ class StreamACAlgorithm(BaseAlgorithm):
         }
         
         # Nothing to update if buffer is empty
-        if len(self.experience_buffer) <= 1:
+        if env_id not in self.experience_buffers or len(self.experience_buffers[env_id]) <= 1:
             return metrics
         
         # Process experiences in order
@@ -459,10 +484,10 @@ class StreamACAlgorithm(BaseAlgorithm):
         
         # For OBGD, we need to process experiences one at a time
         if self.use_obgd:
-            for i in range(len(self.experience_buffer) - 1):
+            for i in range(len(self.experience_buffers[env_id]) - 1):
                 # Get current and next experience
-                current_exp = self.experience_buffer[i]
-                next_exp = self.experience_buffer[i + 1]
+                current_exp = self.experience_buffers[env_id][i]
+                next_exp = self.experience_buffers[env_id][i + 1]
                 
                 # Get experience components and ensure they're all float32
                 obs = current_exp['obs'].float() if hasattr(current_exp['obs'], 'float') else current_exp['obs']
@@ -520,8 +545,8 @@ class StreamACAlgorithm(BaseAlgorithm):
                 delta_value = delta.item()
                 
                 # Apply updates with OBGD optimizers
-                actor_step_size = self.actor_optimizer.step(delta_value, reset=done.item() > 0.5)
-                critic_step_size = self.critic_optimizer.step(delta_value, reset=done.item() > 0.5)
+                actor_step_size = self.actor_optimizer.step(delta_value, env_id=env_id, reset=done.item() > 0.5)
+                critic_step_size = self.critic_optimizer.step(delta_value, env_id=env_id, reset=done.item() > 0.5)
                 metrics['effective_step_size'] = float((actor_step_size + critic_step_size) / 2.0)  # Convert to Python float
                 self.last_step_sizes.append(metrics['effective_step_size'])
                 if len(self.last_step_sizes) > 100:  # Keep a reasonable history
@@ -535,13 +560,13 @@ class StreamACAlgorithm(BaseAlgorithm):
                 
         else:
             # Batch update with standard optimizers
-            batch_size = min(32, len(self.experience_buffer) - 1)
-            batch_indices = np.random.choice(len(self.experience_buffer) - 1, batch_size, replace=False)
+            batch_size = min(32, len(self.experience_buffers[env_id]) - 1)
+            batch_indices = np.random.choice(len(self.experience_buffers[env_id]) - 1, batch_size, replace=False)
             
             for i in batch_indices:
                 # Get current and next experience
-                current_exp = self.experience_buffer[i]
-                next_exp = self.experience_buffer[i + 1]
+                current_exp = self.experience_buffers[env_id][i]
+                next_exp = self.experience_buffers[env_id][i + 1]
                 
                 # Extract experience components
                 obs = current_exp['obs']
@@ -598,7 +623,7 @@ class StreamACAlgorithm(BaseAlgorithm):
                 total_entropy_loss += entropy_loss.item()
         
         # Calculate average losses
-        num_updates = len(self.experience_buffer) - 1 if self.use_obgd else batch_size
+        num_updates = len(self.experience_buffers[env_id]) - 1 if self.use_obgd else batch_size
         avg_value_loss = total_value_loss / max(1, num_updates)
         avg_policy_loss = total_policy_loss / max(1, num_updates)
         avg_entropy_loss = total_entropy_loss / max(1, num_updates)
@@ -658,7 +683,7 @@ class StreamACAlgorithm(BaseAlgorithm):
         
         # Clear buffer if requested
         if end_of_episode:
-            self.experience_buffer = []
+            self.experience_buffers[env_id] = []
             
         return metrics
     
@@ -675,7 +700,7 @@ class StreamACAlgorithm(BaseAlgorithm):
         # If we have enough experiences, do a full update
         metrics = {}
         
-        if len(self.experience_buffer) > 1:
+        if len(self.experience_buffers) > 1:
             metrics = self._update_online(end_of_episode=True)
             
         # Include the latest metrics
@@ -683,19 +708,20 @@ class StreamACAlgorithm(BaseAlgorithm):
         
         return metrics
     
-    def reset(self):
+    def reset(self, env_id=None):
         """Reset the algorithm state at the end of an episode"""
         # Reset eligibility traces if using OBGD
         if self.use_obgd:
-            for param_group in self.actor_optimizer.param_groups:
-                for p in param_group["params"]:
-                    if p in self.actor_optimizer.state:
-                        self.actor_optimizer.state[p]["eligibility_trace"].zero_()
-                        
-            for param_group in self.critic_optimizer.param_groups:
-                for p in param_group["params"]:
-                    if p in self.critic_optimizer.state:
-                        self.critic_optimizer.state[p]["eligibility_trace"].zero_()
+            if env_id is not None:
+                self.actor_optimizer.reset_traces(env_id)
+                self.critic_optimizer.reset_traces(env_id)
+                self.current_episode_rewards_per_env[env_id] = []
+                self.experience_buffers[env_id] = []
+            else:
+                self.actor_optimizer.reset_traces()
+                self.critic_optimizer.reset_traces()
+                self.current_episode_rewards_per_env = {}
+                self.experience_buffers = {}
         
         # Clear episode tracking data
         self.current_episode_rewards = []

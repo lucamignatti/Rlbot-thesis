@@ -918,8 +918,8 @@ class Trainer:
                 import traceback
                 traceback.print_exc()
 
-    def store_experience(self, state, action, log_prob, reward, value, done):
-        """Forward to algorithm's store_experience method"""
+    def store_experience(self, state, action, log_prob, reward, value, done, env_id=0):
+        """Store experience in the buffer with environment ID."""
         # Get whether we're in test mode
         test_mode = getattr(self, 'test_mode', False)
         
@@ -972,11 +972,11 @@ class Trainer:
         # Store the experience using the algorithm - only update if not in test mode
         if not test_mode:
             if self.algorithm_type == "streamac":
-                # For StreamAC, check if an update was performed
+                # For StreamAC, check if an update was performed and pass env_id
                 if self.debug:
                     print(f"[STEP DEBUG] Trainer.store_experience calling StreamAC.store_experience, current step: {self._true_training_steps()}")
                     
-                metrics, did_update = self.algorithm.store_experience(state, action, log_prob, reward, value, done)
+                metrics, did_update = self.algorithm.store_experience(state, action, log_prob, reward, value, done, env_id=env_id)
                 
                 # If StreamAC performed an update, log to wandb immediately
                 if did_update and self.use_wandb:
@@ -1010,9 +1010,16 @@ class Trainer:
                     'log_prob': log_prob,
                     'reward': reward,
                     'value': value,
-                    'done': done
+                    'done': done,
+                    'env_id': env_id  # Add env_id to experience
                 }
                 self.algorithm.experience_buffer.append(exp)
+                
+                # Also store in environment-specific buffer if it exists
+                if hasattr(self.algorithm, 'experience_buffers'):
+                    if env_id not in self.algorithm.experience_buffers:
+                        self.algorithm.experience_buffers[env_id] = []
+                    self.algorithm.experience_buffers[env_id].append(exp)
     
         # Update auxiliary task models if enabled
         if self.use_auxiliary_tasks and hasattr(self, 'aux_task_manager'):
