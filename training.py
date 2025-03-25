@@ -1093,6 +1093,11 @@ class Trainer:
         # Track update time
         update_start_time = time.time()
 
+        # Check and update pretraining state before policy update
+        if self.use_pretraining:
+            self._update_pretraining_state()
+            self._update_auxiliary_weights() # Also update weights based on state
+
         # Forward to specific algorithm implementation
         metrics = self.algorithm.update()
         
