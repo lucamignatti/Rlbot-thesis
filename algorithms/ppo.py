@@ -269,6 +269,15 @@ class PPOAlgorithm(BaseAlgorithm):
         
         def clear(self):
             """Clear the buffer"""
+            # Add debug logging that will work in this context
+            import inspect
+            # Check if we're called from the update method
+            stack = inspect.stack()
+            caller_name = stack[1].function if len(stack) > 1 else "unknown"
+            
+            # Only log if pos > 0 to avoid logging initial clears
+            if self.pos > 0:
+                print(f"[DEBUG] PPO Memory buffer cleared from {caller_name}(). Was at position {self.pos}/{self.buffer_size}")
             self._reset_buffers()
             
         def size(self):
@@ -332,7 +341,28 @@ class PPOAlgorithm(BaseAlgorithm):
     
     def store_experience(self, obs, action, log_prob, reward, value, done):
         """Store experience in the buffer"""
+        # Add debug logging to track experience storage
+        if getattr(self, 'debug', False) and isinstance(self.memory.pos, int) and self.memory.pos % 100 == 0:
+            buffer_size = getattr(self.memory, 'buffer_size', 0)
+            current_pos = getattr(self.memory, 'pos', 0)
+            print(f"[DEBUG PPO] Storing experience at position {current_pos}/{buffer_size}")
+            if hasattr(self.memory, 'rewards') and self.memory.rewards is not None:
+                reward_sum = self.memory.rewards.sum().item() if isinstance(self.memory.rewards, torch.Tensor) else 0
+                print(f"[DEBUG PPO] Current reward sum: {reward_sum:.4f}")
+                
         self.memory.store(obs, action, log_prob, reward, value, done)
+        
+        # Track episode reward for return calculation
+        if hasattr(self, 'current_episode_rewards'):
+            # Convert reward to a scalar if it's a tensor
+            reward_value = reward.item() if isinstance(reward, torch.Tensor) else reward
+            self.current_episode_rewards.append(reward_value)
+            
+        # When episode is done, calculate the return
+        if done and hasattr(self, 'current_episode_rewards') and hasattr(self, 'episode_returns'):
+            episode_return = sum(self.current_episode_rewards)
+            self.episode_returns.append(episode_return)
+            self.current_episode_rewards = []  # Reset for next episode
     
     def update(self):
         """Update policy using PPO"""

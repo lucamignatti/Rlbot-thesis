@@ -240,6 +240,7 @@ def run_training(
         "Device": device,
         "Envs": num_envs,
         "Episodes": 0,  # Total episodes completed
+        "Exp": f"0/{update_interval}" if algorithm == "ppo" else "",  # Move Exp counter right after Episodes
         "Reward": "0.0",  # Average reward per episode
         "PLoss": "0.0",  # Actor loss
         "VLoss": "0.0",  # Critic loss
@@ -364,6 +365,18 @@ def run_training(
                         env_id=env_idx  # Pass the environment index to support vectorized StreamAC
                     )
                     collected_experiences += 1
+                    
+                    # Add periodic debug log to verify experience collection
+                    if debug and collected_experiences % 1000 == 0:
+                        if algorithm == "ppo" and hasattr(trainer.algorithm, 'memory'):
+                            mem_buffer_size = getattr(trainer.algorithm.memory, 'buffer_size', 0)
+                            mem_pos = getattr(trainer.algorithm.memory, 'pos', 0)
+                            print(f"[DEBUG] PPO buffer status: {mem_pos}/{mem_buffer_size} filled, collected_experiences={collected_experiences}")
+                            # Check if memory has actually been initialized
+                            if hasattr(trainer.algorithm.memory, 'rewards') and trainer.algorithm.memory.rewards is not None:
+                                reward_tensor = trainer.algorithm.memory.rewards
+                                non_zero = (reward_tensor != 0).sum().item() if isinstance(reward_tensor, torch.Tensor) else 0
+                                print(f"[DEBUG] Number of non-zero rewards in buffer: {non_zero}")
 
             # Step all environments forward in parallel - optimized implementation
             results, dones, episode_counts = vec_env.step(actions_dict_list)
@@ -399,6 +412,10 @@ def run_training(
                         if mem_idx < 0:  # Handle wrap-around in the circular buffer.
                             mem_idx += trainer.memory.buffer_size
 
+                        # Debug the reward update process
+                        if debug and exp_idx == 0:  # Only log for the first agent to avoid too much output
+                            print(f"[DEBUG] Updating experience at idx {mem_idx} with reward={reward:.4f}, done={done}")
+                        
                         trainer.store_experience_at_idx(mem_idx, None, None, None, reward, None, done)
                     else:
                         # For StreamAC, we directly update the latest experience with env_idx
@@ -569,6 +586,7 @@ def run_training(
                     "Device": device,
                     "Envs": num_envs,
                     "Episodes": total_episodes_so_far,
+                    "Exp": f"{collected_experiences}/{update_interval}" if algorithm == "ppo" else "",
                     "Reward": f"{stats.get('mean_episode_reward', 0):.2f}",
                     "PLoss": f"{stats.get('actor_loss', 0):.4f}",
                     "VLoss": f"{stats.get('critic_loss', 0):.4f}",
@@ -576,10 +594,6 @@ def run_training(
                     "SR_Loss": f"{stats.get('sr_loss', 0):.4f}",
                     "RP_Loss": f"{stats.get('rp_loss', 0):.4f}"
                 })
-
-                # Add Exp counter only for PPO algorithm
-                if algorithm == "ppo":
-                    stats_dict["Exp"] = f"0/{update_interval}"
 
                 # Update StreamAC specific metrics if using that algorithm
                 if algorithm == "streamac":
@@ -635,6 +649,15 @@ def run_training(
             # Update the experience count in the progress bar - ONLY for PPO
             if algorithm == "ppo":
                 stats_dict["Exp"] = f"{collected_experiences}/{update_interval}"
+                # Add debug logging to track experience collection
+                if debug and (collected_experiences % 100 == 0 or collected_experiences == 1) and collected_experiences > 0:
+                    print(f"[DEBUG] PPO has collected {collected_experiences}/{update_interval} experiences")
+                    # Force progress bar update for better visual feedback during debugging
+                    progress_bar.set_postfix(stats_dict)
+                    progress_bar.refresh()
+                
+            # Regular update for non-debug mode or other algorithms
+            progress_bar.set_postfix(stats_dict)
             
             # Update pretraining progress if enabled
             if use_pretraining:
