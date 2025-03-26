@@ -11,7 +11,7 @@ from collections import deque
 
 class ObGD(torch.optim.Optimizer):
     """
-    Optimization-Based Gradient Descent optimizer with eligibility traces.
+    overshooting-Bounded Gradient Descent optimizer with eligibility traces.
     """
     def __init__(self, params, lr=1.0, gamma=0.99, lamda=0.8, kappa=2.0):
         defaults = dict(lr=lr, gamma=gamma, lamda=lamda, kappa=kappa)
@@ -220,7 +220,10 @@ class StreamACAlgorithm(BaseAlgorithm):
         self.metrics.update({
             'effective_step_size': 0.0,
             'backtracking_count': 0,
-            'mean_return': 0.0
+            'mean_return': 0.0,
+            'td_error_mean': 0.0,  # Add TD error tracking
+            'td_error_max': 0.0,   # Add max TD error
+            'td_error_min': 0.0    # Add min TD error
         })
         
         # Track episode data
@@ -228,6 +231,9 @@ class StreamACAlgorithm(BaseAlgorithm):
         
         # Add episode return tracking
         self.episode_returns = deque(maxlen=100)  # Store last 100 episode returns
+        
+        # Track TD errors for logging
+        self.td_error_buffer = deque(maxlen=1000)  # Store recent TD errors for statistics
         
         # Debug info
         if self.debug:
@@ -527,6 +533,19 @@ class StreamACAlgorithm(BaseAlgorithm):
         
         # TD error
         delta = td_target - value
+        
+        # Store TD errors for metrics
+        if not delta.requires_grad:
+            # Convert to numpy and add to buffer for metrics
+            delta_np = delta.cpu().numpy()
+            for d in delta_np:
+                self.td_error_buffer.append(float(d))
+            
+            # Update TD error metrics
+            if len(self.td_error_buffer) > 0:
+                self.metrics['td_error_mean'] = float(np.mean(self.td_error_buffer))
+                self.metrics['td_error_max'] = float(np.max(self.td_error_buffer))
+                self.metrics['td_error_min'] = float(np.min(self.td_error_buffer))
         
         return delta, td_target
 

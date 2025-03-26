@@ -788,7 +788,8 @@ class Trainer:
                       'mean_advantage', 'mean_return'}
         
         stream_metrics = {'actor_loss', 'critic_loss', 'entropy_loss', 'total_loss',
-                         'effective_step_size', 'backtracking_count', 'mean_return'}
+                         'effective_step_size', 'backtracking_count', 'mean_return',
+                         'td_error_mean', 'td_error_max', 'td_error_min'}
         
         # Select appropriate metric set based on algorithm type
         valid_metrics = ppo_metrics if self.algorithm_type == "ppo" else stream_metrics
@@ -840,7 +841,7 @@ class Trainer:
             auxiliary_metrics["AUX/rp_weight"] = rp_weight
             
             # Log actual last values from auxiliary manager if available
-            if hasattr(self, 'aux_task_manager'):
+            if hasattr(self.aux_task_manager):
                 if hasattr(self.aux_task_manager, 'last_sr_loss') and self.aux_task_manager.last_sr_loss > 0:
                     sr_value = self.aux_task_manager.last_sr_loss
                     auxiliary_metrics["AUX/state_representation_loss"] = sr_value
@@ -884,6 +885,23 @@ class Trainer:
                 progress = min(1.0, (self.training_steps - self.transition_start_step) / 
                               self.pretraining_transition_steps)
                 system_metrics["SYS/transition_progress"] = progress
+        
+        # --- TD Error specific metrics ---
+        if self.algorithm_type == "streamac":
+            td_metrics = {
+                "TD/mean": metrics.get("td_error_mean", 0.0),
+                "TD/max": metrics.get("td_error_max", 0.0),
+                "TD/min": metrics.get("td_error_min", 0.0)
+            }
+            grouped_metrics["td_errors"] = td_metrics
+            
+            # Also create a histogram of TD errors if available
+            if hasattr(self.algorithm, 'td_error_buffer') and len(self.algorithm.td_error_buffer) > 0:
+                # Convert deque to list to avoid serialization issues
+                td_errors = list(self.algorithm.td_error_buffer)
+                # Only create histogram if we have enough data points
+                if len(td_errors) >= 10:
+                    grouped_metrics["td_errors"]["TD/distribution"] = wandb.Histogram(np.array(td_errors))
         
         # Flatten metrics for logging
         flat_metrics = {}
