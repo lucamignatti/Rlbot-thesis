@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
+from tqdm import tqdm
 
 class PPOMemory:
     """
@@ -1097,25 +1098,21 @@ class Trainer:
         """Forward to algorithm's get_action method"""
         return self.algorithm.get_action(state, evaluate, return_features)
 
-    def update(self):
+    def update(self, completed_episode_rewards=None):
         """Update policy based on collected experiences. 
         Different implementations for PPO vs StreamAC."""
         metrics = {}
         
         if not self.algorithm:
             return metrics
-
         if self.debug:
             print(f"[DEBUG] Updating policy, algorithm_type={self.algorithm_type}")
-
         # Track update time
         update_start_time = time.time()
-
         # Check and update pretraining state before policy update
         if self.use_pretraining:
             self._update_pretraining_state()
             self._update_auxiliary_weights() # Also update weights based on state
-
         # Forward to specific algorithm implementation
         metrics = self.algorithm.update()
         
@@ -1147,8 +1144,13 @@ class Trainer:
         if self.algorithm_type != "streamac":  # For StreamAC, steps are tracked in store_experience
             self.training_steps += 1
             
-        # Adds basic episode stats
-        if hasattr(self, 'episode_rewards') and len(self.episode_rewards) > 0:
+        # Use completed episode rewards from main.py if provided (for PPO)
+        if completed_episode_rewards is not None and len(completed_episode_rewards) > 0:
+            metrics['mean_episode_reward'] = np.mean(completed_episode_rewards)
+            if self.debug:
+                print(f"[DEBUG] Using {len(completed_episode_rewards)} completed episode rewards, mean: {metrics['mean_episode_reward']:.4f}")
+        # Otherwise check internal episode rewards (fallback)
+        elif hasattr(self, 'episode_rewards') and len(self.episode_rewards) > 0:
             episode_rewards = list(self.episode_rewards)
             # Calculate mean episode reward
             if episode_rewards:

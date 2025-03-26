@@ -267,9 +267,10 @@ class AuxiliaryTaskManager:
         # Ensure hidden_dim exists
         self.hidden_dim = getattr(actor, 'hidden_dim', 1536)
         
-        print(f"[AUX INIT] Initializing AuxiliaryTaskManager with sr_weight={sr_weight}, rp_weight={rp_weight}")
-        print(f"[AUX INIT] Device: {device}, Learning mode: {learning_mode}, Update frequency: {update_frequency}")
-        print(f"[AUX INIT] Observation dimension: {obs_dim}, Hidden dimension: {self.hidden_dim}")
+        if self.debug:
+            print(f"[AUX INIT] Initializing AuxiliaryTaskManager with sr_weight={sr_weight}, rp_weight={rp_weight}")
+            print(f"[AUX INIT] Device: {device}, Learning mode: {learning_mode}, Update frequency: {update_frequency}")
+            print(f"[AUX INIT] Observation dimension: {obs_dim}, Hidden dimension: {self.hidden_dim}")
         
         # State representation task
         self.sr_task = StateRepresentationTask(

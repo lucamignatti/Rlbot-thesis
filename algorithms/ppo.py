@@ -18,8 +18,8 @@ class PPOAlgorithm(BaseAlgorithm):
         # Initialize experience buffer
         self.memory = self.PPOMemory(self.buffer_size, self.device)
         
-        # Define scaler for mixed precision training if enabled
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        # Initialize GradScaler for mixed precision training
+        self.scaler = torch.amp.GradScaler('cuda', enabled=self.use_amp)
         
         # Add episode return tracking
         self.current_episode_rewards = []
@@ -274,10 +274,7 @@ class PPOAlgorithm(BaseAlgorithm):
             # Check if we're called from the update method
             stack = inspect.stack()
             caller_name = stack[1].function if len(stack) > 1 else "unknown"
-            
-            # Only log if pos > 0 to avoid logging initial clears
-            if self.pos > 0:
-                print(f"[DEBUG] PPO Memory buffer cleared from {caller_name}(). Was at position {self.pos}/{self.buffer_size}")
+
             self._reset_buffers()
             
         def size(self):
@@ -496,7 +493,10 @@ class PPOAlgorithm(BaseAlgorithm):
         if len(self.episode_returns) > 0:
             self.metrics['mean_return'] = sum(self.episode_returns) / len(self.episode_returns)
         
+        buffer_pos = self.memory.pos
         self.memory.clear()
+        if self.debug:
+            print(f"[DEBUG] PPO Memory buffer cleared from update(). Was at position {buffer_pos}/{self.memory.buffer_size}")
         return self.metrics
     
     def _compute_explained_variance(self, values_all, returns_all):

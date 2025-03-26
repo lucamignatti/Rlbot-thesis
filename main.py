@@ -240,16 +240,31 @@ def run_training(
         "Device": device,
         "Envs": num_envs,
         "Episodes": 0,  # Total episodes completed
-        "Exp": f"0/{update_interval}" if algorithm == "ppo" else "",  # Move Exp counter right after Episodes
-        "Reward": "0.0",  # Average reward per episode
-        "PLoss": "0.0",  # Actor loss
-        "VLoss": "0.0",  # Critic loss
-        "Entropy": "0.0", # Entropy loss
-        "SR_Loss": "0.0", # State reconstruction loss
-        "RP_Loss": "0.0",  # Reward prediction loss
         "Algorithm": algorithm  # Display which algorithm is being used
     }
     
+    # Add algorithm-specific progress metrics
+    if algorithm == "ppo":
+        stats_dict["Exp"] = f"0/{update_interval}"  # Experience counter for PPO
+    else:  # StreamAC
+        stats_dict["Steps"] = 0  # Step counter for StreamAC
+        stats_dict["Updates"] = 0  # Update counter for StreamAC
+        
+    # Add common metrics
+    stats_dict.update({
+        "Reward": "0.0",  # Average reward per episode
+        "PLoss": "0.0",  # Actor loss
+        "VLoss": "0.0",  # Critic loss
+        "Entropy": "0.0"  # Entropy loss
+    })
+    
+    # Add auxiliary task metrics if enabled
+    if auxiliary:
+        stats_dict.update({
+            "SR_Loss": "0.0",  # State reconstruction loss
+            "RP_Loss": "0.0",  # Reward prediction loss
+        })
+
     # Add pretraining info if enabled
     if use_pretraining:
         pretraining_end_step = int(total_episodes * pretraining_fraction) if total_episodes else int(5000 * pretraining_fraction)
@@ -281,6 +296,7 @@ def run_training(
     total_episodes_so_far = 0
     last_update_time = time.time()
     last_save_episode = 0
+    last_progress_update_step = 0  # Track last step count when progress was updated
     
     # Add defensive initialization for episode_rewards
     episode_rewards = {}
@@ -296,6 +312,9 @@ def run_training(
         except Exception as e:
             if debug:
                 print(f"[DEBUG] Error initializing rewards for env {i}: {e}")
+    
+    # Add a list to track rewards of completed episodes between PPO updates
+    completed_episode_rewards_since_last_update = []
 
     last_progress_update = start_time  # For updating time-based progress bar
     should_continue = True  # Initialize the control variable
@@ -533,6 +552,11 @@ def run_training(
                         avg_reward = sum(episode_rewards[env_idx].values()) / len(episode_rewards[env_idx])
                         if debug:
                             print(f"Episode {episode_counts[env_idx]} in env {env_idx} completed with avg reward: {avg_reward:.2f}")
+                        
+                        # Track average episode reward for PPO updates
+                        if algorithm == "ppo":
+                            completed_episode_rewards_since_last_update.append(avg_reward)
+                        
                         episode_rewards[env_idx] = {agent_id: 0 for agent_id in vec_env.obs_dicts[env_idx]}
 
             # Determine if it's time to update the policy
@@ -546,22 +570,54 @@ def run_training(
                 # We still want to update progress bar and UI periodically
                 enough_experiences = collected_experiences % update_interval == 0
                 
-                # Add more frequent update status for StreamAC UI (every 100 steps)
-                if collected_experiences % 100 == 0 and collected_experiences > 0 and debug:
-                    print(f"[DEBUG] StreamAC has processed {collected_experiences} steps " +
-                          f"(with updates every {args.update_freq} step(s))")
-                    # Update StreamAC-specific metrics in stats_dict for UI updates only
-                    if hasattr(trainer.algorithm, "successful_steps") and hasattr(trainer.algorithm, "last_step_sizes"):
+                # Add more frequent update status for StreamAC UI (check if >= 50 steps passed since last update)
+                if algorithm == "streamac" and (collected_experiences - last_progress_update_step >= 50) and collected_experiences > 0:
+                    # Update step count and success rate metrics for StreamAC
+                    if hasattr(trainer.algorithm, "successful_steps"):
+                        successful_steps = getattr(trainer.algorithm, "successful_steps", 0)
                         step_sizes = getattr(trainer.algorithm, "last_step_sizes", [0])
                         last_step = step_sizes[-1] if len(step_sizes) > 0 else 0
                         
+                        # Update stats specifically for StreamAC progress display
                         stats_dict.update({
+                            "Steps": collected_experiences,
+                            "Updates": successful_steps,
                             "StepSize": f"{last_step:.4f}",
-                            "ActorLR": f"{getattr(trainer.algorithm, 'lr_actor', args.lra):.6f}",
-                            "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', args.lrc):.6f}",
-                            "Updates": getattr(trainer.algorithm, "successful_steps", 0)
+                            "ActorLR": f"{getattr(trainer.algorithm, 'lr_actor', lr_actor):.6f}",
+                            "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic):.6f}"
                         })
+                        
+                        # Initialize metrics with latest algorithm metrics to avoid NameError
+                        metrics = trainer.algorithm.get_metrics() if hasattr(trainer.algorithm, 'get_metrics') else {}
+                        
+                        # Update statistics from the algorithm's metrics
+                        if metrics:
+                            stats_dict.update({
+                                "Reward": f"{metrics.get('mean_return', 0):.2f}",
+                                "PLoss": f"{metrics.get('actor_loss', 0):.4f}",
+                                "VLoss": f"{metrics.get('critic_loss', 0):.4f}",
+                                "Entropy": f"{metrics.get('entropy_loss', 0):.4f}"
+                            })
+                            
+                            if 'sr_loss' in metrics or 'rp_loss' in metrics:
+                                stats_dict.update({
+                                    "SR_Loss": f"{metrics.get('sr_loss', 0):.4f}",
+                                    "RP_Loss": f"{metrics.get('rp_loss', 0):.4f}"
+                                })
+                        
+                        # Update progress bar immediately
                         progress_bar.set_postfix(stats_dict)
+                        
+                        # Record the step count at which this update happened
+                        last_progress_update_step = collected_experiences
+                
+                # Debug mode can show more details
+                if debug and collected_experiences % 100 == 0 and collected_experiences > 0:
+                    if algorithm == "streamac":
+                        print(f"[DEBUG] StreamAC has processed {collected_experiences} steps " +
+                              f"(with updates every {update_freq} step(s))")
+                    else:
+                        print(f"[DEBUG] PPO has collected {collected_experiences}/{update_interval} experiences")
 
             # Reset intrinsic models periodically
             if args.pretraining and total_episodes_so_far % 50 == 0 and hasattr(trainer, 'intrinsic_reward_generator'):
@@ -574,8 +630,10 @@ def run_training(
 
                 # Perform the policy update.
                 if algorithm == "ppo":
-                    # For PPO, do a normal batch update
-                    stats = trainer.update()
+                    # For PPO, do a normal batch update and pass the completed episode rewards
+                    stats = trainer.update(completed_episode_rewards=completed_episode_rewards_since_last_update)
+                    # Reset the list of completed episode rewards
+                    completed_episode_rewards_since_last_update = []
                 else:
                     # For StreamAC, we've already been updating with each step
                     # Just get the latest metrics without triggering a full update
@@ -598,9 +656,9 @@ def run_training(
                 # Update StreamAC specific metrics if using that algorithm
                 if algorithm == "streamac":
                     stats_dict.update({
-                        "StepSize": f"{stats.get('effective_step_size', 0):.4f}",
-                        "ActorLR": f"{getattr(trainer.algorithm, 'lr_actor', lr_actor):.6f}",
-                        "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic):.6f}",
+                        "StepSize": f"{stats.get('effective_step_size', 0)::.4f}",
+                        "ActorLR": f"{getattr(trainer.algorithm, 'lr_actor', lr_actor)::.6f}",
+                        "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic)::.6f}",
                         "Updates": getattr(trainer.algorithm, "successful_steps", 0)
                     })
 
