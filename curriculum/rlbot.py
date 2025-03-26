@@ -83,6 +83,14 @@ class RLBotSkillStage(CurriculumStage):
             # Default to linear skill progression if no ranges specified
             return (0.0, difficulty)
             
+        # For high difficulty (>= 0.7), prefer higher skill ranges
+        if difficulty >= 0.7:
+            # Find ranges with min >= 0.7
+            high_skill_ranges = [r for r in self.bot_skill_ranges.keys() if r[0] >= 0.7]
+            if high_skill_ranges:
+                # Pick any high skill range - taking the one with highest weight if multiple exist
+                return max(high_skill_ranges, key=lambda r: self.bot_skill_ranges[r])
+            
         # Use weighted random selection based on specified probabilities
         total_weight = sum(self.bot_skill_ranges.values())
         if total_weight <= 0:
@@ -193,14 +201,14 @@ class RLBotSkillStage(CurriculumStage):
             True if ready to progress, False otherwise
         """
         if self.is_pretraining:
-            # Check if pretraining flag is active in PPOTrainer
-            from training import PPOTrainer
             # Special handling for pretraining - progress only if PPOTrainer indicates pretraining is done
             # Don't check any regular progression requirements
-            return not getattr(self._trainer, "pretraining_completed", False)
+            if hasattr(self, '_trainer'):
+                return getattr(self._trainer, "pretraining_completed", False)
+            return False
             
         # Start with base progression check
-        if not super().meets_progression_requirements():
+        if not self.validate_progression():  # Use validate_progression instead of calling super()
             return False
             
         # If we have no bot performance metrics, we're done

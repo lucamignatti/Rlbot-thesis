@@ -360,68 +360,34 @@ class CurriculumManager:
         self._last_wandb_step = current_step
 
     def get_environment_config(self) -> Dict[str, Any]:
-        """
-        Get the environment configuration for the current training step,
-        potentially including rehearsal of earlier stages.
-        """
-        # Determine if we should use a rehearsal stage instead
-        if self.current_stage_index > 0 and self.max_rehearsal_stages > 0:
-            if np.random.random() < self._get_rehearsal_probability():
-                # Select a previous stage for rehearsal
-                rehearsal_index = self._select_rehearsal_stage()
-                selected_stage = self.stages[rehearsal_index]
-                is_rehearsal = True
-            else:
-                # Use current stage
-                selected_stage = self.stages[self.current_stage_index]
-                is_rehearsal = False
-        else:
-            # Always use current stage if it's the first one
-            selected_stage = self.stages[self.current_stage_index]
-            is_rehearsal = False
-
-        # Get difficulty-adjusted configuration
-        difficulty = 0.0 if is_rehearsal else self.current_difficulty
-        difficulty_config = selected_stage.get_config_with_difficulty(difficulty)
-
-        # Build complete configuration
-        config = {
-            "stage_name": selected_stage.name,
-            "state_mutator": selected_stage.state_mutator,
-            "reward_function": selected_stage.reward_function,
-            "termination_condition": selected_stage.termination_condition,
-            "truncation_condition": selected_stage.truncation_condition,
-            "is_rehearsal": is_rehearsal,
-            "difficulty_level": difficulty,
-            "difficulty_params": difficulty_config
-        }
-
-        return config
-
-    def get_environment_config(self):
         """Get the current environment configuration based on the active stage and difficulty level."""
         # Check if we're in pretraining mode
         current_stage = self.stages[self.current_stage_index]
         is_pretraining = (hasattr(current_stage, 'is_pretraining') and current_stage.is_pretraining and 
                          hasattr(self, 'trainer') and not getattr(self.trainer, 'pretraining_completed', True))
         
-        if self.current_rehearsal is not None:
-            # We're in rehearsal mode, use the rehearsal stage
-            stage = self.stages[self.current_rehearsal]
-            config = stage.get_config_with_difficulty(self.rehearsal_difficulty)
-            config["is_rehearsal"] = True
-            if self.debug:
-                print(f"[DEBUG] Rehearsing stage {stage.name} at difficulty {self.rehearsal_difficulty:.2f}")
-        else:
-            # Normal mode, use the current stage
-            stage = current_stage
-            config = stage.get_config_with_difficulty(self.current_difficulty)
-            config["is_rehearsal"] = False
-            
-            # Add pretraining flag if applicable
-            if is_pretraining:
-                config["is_pretraining"] = True
+        # Determine if we should use a rehearsal stage
+        if self.current_stage_index > 0 and self.max_rehearsal_stages > 0:
+            if np.random.random() < self._get_rehearsal_probability():
+                # Select a previous stage for rehearsal
+                rehearsal_index = self._select_rehearsal_stage()
+                stage = self.stages[rehearsal_index]
+                config = stage.get_config_with_difficulty(0.0)  # Use difficulty 0.0 for rehearsal
+                config["is_rehearsal"] = True
                 
+                if self.debug:
+                    print(f"[DEBUG] Rehearsing stage {stage.name} at difficulty 0.0")
+                    
+                return config
+        
+        # Normal mode, use the current stage
+        config = current_stage.get_config_with_difficulty(self.current_difficulty)
+        config["is_rehearsal"] = False
+        
+        # Add pretraining flag if applicable
+        if is_pretraining:
+            config["is_pretraining"] = True
+            
         return config
 
     def update_progression_stats(self, episode_metrics: Dict[str, Any]) -> None:
