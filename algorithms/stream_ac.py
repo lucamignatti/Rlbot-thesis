@@ -30,44 +30,54 @@ class ObGD(torch.optim.Optimizer):
     def step(self, delta, env_id=0, reset=False):
         """
         Perform a parameter update step using TD error and eligibility traces.
+        Combines trace update and parameter update loops for efficiency.
         """
         z_sum = 0.0
         env_traces = self.get_traces(env_id)
+        param_trace_list = [] # To store parameters and traces for the second pass
+
+        # First pass: Update traces, calculate z_sum, and store refs
         for group in self.param_groups:
+            # Store group hyperparams locally for efficiency if needed later
+            lr = group["lr"]
+            gamma = group["gamma"]
+            lamda = group["lamda"]
+            kappa = group["kappa"]
+
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                    
-                state = self.state[p]
-                if len(state) == 0:
-                    state["eligibility_trace"] = torch.zeros_like(p.data)
-                    
+
+                # Get trace for this param
                 e = env_traces[p]
+
                 # Update eligibility trace: e = λγe + ∇θ
-                e.mul_(group["gamma"] * group["lamda"]).add_(p.grad, alpha=1.0)
+                e.mul_(gamma * lamda).add_(p.grad, alpha=1.0)
                 z_sum += e.abs().sum().item()
 
-        # Calculate adaptive step size
-        delta_bar = max(abs(delta), 1.0)
-        dot_product = delta_bar * z_sum * group["lr"] * group["kappa"]
-        if dot_product > 1:
-            step_size = group["lr"] / dot_product
-        else:
-            step_size = group["lr"]
+                # Store param, trace, and group info for the update step
+                param_trace_list.append({'param': p, 'trace': e, 'group': group})
 
-        # Apply updates to parameters
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                    
-                state = self.state[p]
-                e = env_traces[p]
-                # Update parameter: θ = θ - α·δ·e
-                p.data.add_(delta * e, alpha=-step_size)
-                if reset:
-                    e.zero_()
-                    
+        # Calculate adaptive step size (using hyperparams from the last group, assumes they are the same)
+        # If hyperparams can differ per group, this calculation needs adjustment.
+        delta_bar = max(abs(delta), 1.0)
+        # Using lr and kappa from the last processed group. Ensure this is intended behavior.
+        # If groups can have different lr/kappa, the step_size calculation might need refinement.
+        dot_product = delta_bar * z_sum * lr * kappa
+        if dot_product > 1:
+            step_size = lr / dot_product
+        else:
+            step_size = lr
+
+        # Second pass: Apply updates to parameters
+        for item in param_trace_list:
+            p = item['param']
+            e = item['trace']
+            # Update parameter: θ = θ - α·δ·e
+            p.data.add_(delta * e, alpha=-step_size)
+            if reset:
+                e.zero_()
+
         return step_size
 
     def reset_traces(self, env_id=None):
@@ -357,31 +367,56 @@ class StreamACAlgorithm(BaseAlgorithm):
 
     def store_experience(self, obs, action, log_prob, reward, value, done, env_id=0):
         """Store experience and perform online update if needed."""
-        # Convert inputs to tensors if needed
+        # Convert inputs to tensors if needed - Fix slow tensor creation warnings
         if not isinstance(obs, torch.Tensor):
-            obs = torch.FloatTensor(obs).to(self.device)
+            if isinstance(obs, list):
+                obs = np.array(obs, dtype=np.float32)
+            # No need to wrap in a list if already a numpy array
+            obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
             if obs.dim() == 1:
                 obs = obs.unsqueeze(0)
-                
+        
         if not isinstance(action, torch.Tensor):
             if self.action_space_type == "discrete":
-                action = torch.LongTensor([action]).to(self.device)
+                if isinstance(action, (list, np.ndarray)) and len(action) == 1:
+                    action = action[0]  # Extract scalar from single-item list/array
+                action = torch.tensor(action, dtype=torch.long, device=self.device)
+                if action.dim() == 0:  # If scalar, add batch dimension
+                    action = action.unsqueeze(0)
             else:
-                action = torch.FloatTensor(action).to(self.device)
+                if isinstance(action, list):
+                    action = np.array(action, dtype=np.float32)
+                action = torch.tensor(action, dtype=torch.float32, device=self.device)
                 if action.dim() == 1:
                     action = action.unsqueeze(0)
                     
         if not isinstance(log_prob, torch.Tensor):
-            log_prob = torch.FloatTensor([log_prob]).to(self.device)
-            
+            if isinstance(log_prob, (list, np.ndarray)) and len(log_prob) == 1:
+                log_prob = log_prob[0]  # Extract scalar
+            log_prob = torch.tensor(log_prob, dtype=torch.float32, device=self.device)
+            if log_prob.dim() == 0:  # If scalar, add batch dimension
+                log_prob = log_prob.unsqueeze(0)
+        
         if not isinstance(reward, torch.Tensor):
-            reward = torch.FloatTensor([reward]).to(self.device)
-            
+            if isinstance(reward, (list, np.ndarray)) and len(reward) == 1:
+                reward = reward[0]  # Extract scalar
+            reward = torch.tensor(reward, dtype=torch.float32, device=self.device)
+            if reward.dim() == 0:  # If scalar, add batch dimension
+                reward = reward.unsqueeze(0)
+        
         if not isinstance(value, torch.Tensor):
-            value = torch.FloatTensor([value]).to(self.device)
-            
+            if isinstance(value, (list, np.ndarray)) and len(value) == 1:
+                value = value[0]  # Extract scalar
+            value = torch.tensor(value, dtype=torch.float32, device=self.device)
+            if value.dim() == 0:  # If scalar, add batch dimension
+                value = value.unsqueeze(0)
+        
         if not isinstance(done, torch.Tensor):
-            done = torch.FloatTensor([float(done)]).to(self.device)
+            if isinstance(done, (list, np.ndarray)) and len(done) == 1:
+                done = done[0]  # Extract scalar
+            done = torch.tensor(float(done), dtype=torch.float32, device=self.device)
+            if done.dim() == 0:  # If scalar, add batch dimension
+                done = done.unsqueeze(0)
         
         # Make sure reward and done are float32
         if isinstance(reward, torch.Tensor) and reward.dtype != torch.float32:
@@ -452,19 +487,40 @@ class StreamACAlgorithm(BaseAlgorithm):
         return metrics, did_update
     
     def _calculate_td_error(self, reward, next_value, done, value):
-        """Calculate TD error: r + γV(s') - V(s)"""
-        # Ensure all inputs are float32
-        if isinstance(reward, torch.Tensor) and reward.dtype != torch.float32:
+        """Calculate TD error: r + γV(s') - V(s). Optimized for batch processing."""
+        # Convert all inputs to float32 tensors if they aren't already
+        if not isinstance(reward, torch.Tensor):
+            reward = torch.tensor(reward, dtype=torch.float32, device=self.device)
+        elif reward.dtype != torch.float32:
             reward = reward.float()
-        if isinstance(next_value, torch.Tensor) and next_value.dtype != torch.float32:
+        
+        if not isinstance(next_value, torch.Tensor):
+            next_value = torch.tensor(next_value, dtype=torch.float32, device=self.device)
+        elif next_value.dtype != torch.float32:
             next_value = next_value.float()
-        if isinstance(done, torch.Tensor) and done.dtype != torch.float32:
-            done = done.float() 
-        if isinstance(value, torch.Tensor) and value.dtype != torch.float32:
+        
+        if not isinstance(done, torch.Tensor):
+            done = torch.tensor(done, dtype=torch.float32, device=self.device)
+        elif done.dtype != torch.float32:
+            done = done.float()
+        
+        if not isinstance(value, torch.Tensor):
+            value = torch.tensor(value, dtype=torch.float32, device=self.device)
+        elif value.dtype != torch.float32:
             value = value.float()
-            
+        
+        # Ensure all tensors have the same shape
+        if reward.dim() == 0:
+            reward = reward.unsqueeze(0)
+        if next_value.dim() == 0:
+            next_value = next_value.unsqueeze(0)
+        if done.dim() == 0:
+            done = done.unsqueeze(0)
+        if value.dim() == 0:
+            value = value.unsqueeze(0)
+        
         # done mask: 0 if done, 1 otherwise
-        done_mask = 1.0 - done.float()
+        done_mask = 1.0 - done
         
         # TD target: r + γV(s') if not done, otherwise just r
         td_target = reward + self.gamma * next_value * done_mask
@@ -493,145 +549,284 @@ class StreamACAlgorithm(BaseAlgorithm):
         total_policy_loss = 0.0
         total_entropy_loss = 0.0
         
-        # For OBGD, we need to process experiences one at a time
+        # For OBGD, we can use mini-batches to speed up forward passes
         if self.use_obgd:
-            for i in range(len(self.experience_buffers[env_id]) - 1):
-                # Get current and next experience
-                current_exp = self.experience_buffers[env_id][i]
-                next_exp = self.experience_buffers[env_id][i + 1]
+            # Define mini-batch size - too large might harm sample efficiency, too small is inefficient
+            mini_batch_size = min(8, len(self.experience_buffers[env_id]) - 1)
+            
+            for i in range(0, len(self.experience_buffers[env_id]) - 1, mini_batch_size):
+                # Get batch of experiences
+                batch_indices = range(i, min(i + mini_batch_size, len(self.experience_buffers[env_id]) - 1))
                 
-                # Get experience components and ensure they're all float32
-                obs = current_exp['obs'].float() if hasattr(current_exp['obs'], 'float') else current_exp['obs']
-                action = current_exp['action']
-                reward = current_exp['reward'].float() if hasattr(current_exp['reward'], 'float') else current_exp['reward']
-                value = current_exp['value'].float() if hasattr(current_exp['value'], 'float') else current_exp['value']
-                done = current_exp['done'].float() if hasattr(current_exp['done'], 'float') else current_exp['done']
-                next_value = next_exp['value'].float() if hasattr(next_exp['value'], 'float') else next_exp['value']
+                # Pre-allocate arrays for batch data
+                batch_obs = []
+                batch_actions = []
+                batch_rewards = []
+                batch_values = []
+                batch_dones = []
+                batch_next_values = []
                 
-                # For discrete action spaces, ensure action is the right type (long, not float)
-                if self.action_space_type == "discrete" and hasattr(action, 'long'):
-                    action = action.long()
-                elif hasattr(action, 'float'):
-                    action = action.float()
+                # Collect batch data
+                for idx in batch_indices:
+                    current_exp = self.experience_buffers[env_id][idx]
+                    next_exp = self.experience_buffers[env_id][idx + 1]
                     
-                # Calculate TD error (with float32 ensured)
-                delta, td_target = self._calculate_td_error(reward, next_value, done, value)
+                    batch_obs.append(current_exp['obs'])
+                    batch_actions.append(current_exp['action'])
+                    batch_rewards.append(current_exp['reward'])
+                    batch_values.append(current_exp['value'])
+                    batch_dones.append(current_exp['done'])
+                    batch_next_values.append(next_exp['value'])
                 
-                # Train networks
-                self.actor.train()
-                self.critic.train()
-                
-                # Forward pass
-                if self.action_space_type == "discrete":
-                    action_probs = self.actor(obs)
-                    dist = Categorical(action_probs)
-                    log_prob = dist.log_prob(action)
-                    entropy = dist.entropy()
-                else:
-                    mu, log_std = self.actor(obs)
-                    std = torch.exp(log_std)
-                    dist = Normal(mu, std)
-                    log_prob = dist.log_prob(action).sum(-1)
-                    entropy = dist.entropy().sum(-1)
-                
-                # Compute critic output
-                current_value = self.critic(obs)
-                
-                # Compute losses (all should be float32 now)
-                value_loss = F.mse_loss(current_value, td_target.detach())
-                policy_loss = -log_prob.mean()
-                entropy_loss = -entropy.mean() * self.entropy_coef * torch.sign(delta.detach())
-                
-                # Zero gradients
-                self.actor_optimizer.zero_grad()
-                self.critic_optimizer.zero_grad()
-                
-                # Backpropagation
-                policy_loss.backward(retain_graph=True)
-                if entropy_loss.item() != 0:
-                    entropy_loss.backward(retain_graph=True)
-                value_loss.backward()  # This line was causing the error
-
-                # Get delta for OBGD
-                delta_value = delta.item()
-                
-                # Apply updates with OBGD optimizers
-                actor_step_size = self.actor_optimizer.step(delta_value, env_id=env_id, reset=done.item() > 0.5)
-                critic_step_size = self.critic_optimizer.step(delta_value, env_id=env_id, reset=done.item() > 0.5)
-                metrics['effective_step_size'] = float((actor_step_size + critic_step_size) / 2.0)  # Convert to Python float
-                self.last_step_sizes.append(metrics['effective_step_size'])
-                if len(self.last_step_sizes) > 100:  # Keep a reasonable history
-                    self.last_step_sizes.pop(0)
-                self.successful_steps += 1
-                
-                # Track losses for metrics
-                total_value_loss += value_loss.item()
-                total_policy_loss += policy_loss.item()
-                total_entropy_loss += entropy_loss.item() if hasattr(entropy_loss, 'item') else 0.0
-                
+                # Stack tensors if all are same shape, otherwise process individually
+                try:
+                    # Try to stack tensors for batch processing
+                    batch_obs = torch.cat(batch_obs, dim=0)
+                    
+                    # Handle discrete vs continuous actions differently
+                    if self.action_space_type == "discrete":
+                        batch_actions = torch.cat(batch_actions, dim=0).long()
+                    else:
+                        batch_actions = torch.cat(batch_actions, dim=0).float()
+                        
+                    batch_rewards = torch.cat(batch_rewards, dim=0)
+                    batch_values = torch.cat(batch_values, dim=0)
+                    batch_dones = torch.cat(batch_dones, dim=0)
+                    batch_next_values = torch.cat(batch_next_values, dim=0)
+                    
+                    # Calculate TD errors for batch
+                    batch_deltas, batch_td_targets = self._calculate_td_error(
+                        batch_rewards, batch_next_values, batch_dones, batch_values)
+                    
+                    # Forward pass (batched)
+                    self.actor.train()
+                    self.critic.train()
+                    
+                    if self.action_space_type == "discrete":
+                        # Discrete actions
+                        action_probs = self.actor(batch_obs)
+                        dist = Categorical(action_probs)
+                        log_probs = dist.log_prob(batch_actions.squeeze())
+                        entropies = dist.entropy()
+                    else:
+                        # Continuous actions
+                        mu, log_std = self.actor(batch_obs)
+                        std = torch.exp(log_std)
+                        dist = Normal(mu, std)
+                        log_probs = dist.log_prob(batch_actions).sum(-1)
+                        entropies = dist.entropy().sum(-1)
+                    
+                    # Compute critic outputs (batched)
+                    current_values = self.critic(batch_obs)
+                    
+                    # Now we need to process each experience individually for OBGD
+                    for j in range(len(batch_indices)):
+                        # Get individual components from the batch
+                        idx = batch_indices[j]
+                        delta = batch_deltas[j]
+                        td_target = batch_td_targets[j]
+                        log_prob = log_probs[j]
+                        entropy = entropies[j]
+                        current_value = current_values[j]
+                        done = batch_dones[j]
+                        
+                        # Compute individual losses
+                        current_value_flat = current_value.reshape(-1)
+                        td_target_flat = td_target.reshape(-1)
+                        value_loss = F.mse_loss(current_value_flat, td_target_flat.detach())
+                        policy_loss = -log_prob.mean()
+                        entropy_loss = -entropy.mean() * self.entropy_coef * torch.sign(delta.detach()) if self.entropy_coef != 0 else torch.tensor(0.0, device=self.device)
+                        
+                        # Zero gradients
+                        self.actor_optimizer.zero_grad()
+                        self.critic_optimizer.zero_grad()
+                        
+                        # Backpropagate losses
+                        actor_loss = policy_loss + entropy_loss
+                        if actor_loss.requires_grad:
+                            actor_loss.backward(retain_graph=True)  # Need retain_graph for batch processing
+                        value_loss.backward(retain_graph=(j < len(batch_indices) - 1))  # No retain on last item
+                        
+                        # Apply OBGD updates
+                        delta_value = delta.item()
+                        actor_step_size = self.actor_optimizer.step(delta_value, env_id=env_id, reset=done.item() > 0.5)
+                        critic_step_size = self.critic_optimizer.step(delta_value, env_id=env_id, reset=done.item() > 0.5)
+                        
+                        # Track metrics
+                        metrics['effective_step_size'] = float((actor_step_size + critic_step_size) / 2.0)
+                        self.last_step_sizes.append(metrics['effective_step_size'])
+                        if len(self.last_step_sizes) > 100:
+                            self.last_step_sizes.pop(0)
+                        self.successful_steps += 1
+                        
+                        # Track losses
+                        total_value_loss += value_loss.item()
+                        total_policy_loss += policy_loss.item()
+                        total_entropy_loss += entropy_loss.item() if hasattr(entropy_loss, 'item') else 0.0
+                    
+                except (RuntimeError, ValueError) as e:
+                    # Fallback to original individual processing if stacking fails
+                    for idx in batch_indices:
+                        # Get current and next experience
+                        current_exp = self.experience_buffers[env_id][idx]
+                        next_exp = self.experience_buffers[env_id][idx + 1]
+                        
+                        # Get experience components and ensure they're all float32
+                        obs = current_exp['obs'].float() if hasattr(current_exp['obs'], 'float') else current_exp['obs']
+                        action = current_exp['action']
+                        reward = current_exp['reward'].float() if hasattr(current_exp['reward'], 'float') else current_exp['reward']
+                        value = current_exp['value'].float() if hasattr(current_exp['value'], 'float') else current_exp['value']
+                        done = current_exp['done'].float() if hasattr(current_exp['done'], 'float') else current_exp['done']
+                        next_value = next_exp['value'].float() if hasattr(next_exp['value'], 'float') else next_exp['value']
+                        
+                        # For discrete action spaces, ensure action is the right type
+                        if self.action_space_type == "discrete" and hasattr(action, 'long'):
+                            action = action.long()
+                        elif hasattr(action, 'float'):
+                            action = action.float()
+                            
+                        # Calculate TD error
+                        delta, td_target = self._calculate_td_error(reward, next_value, done, value)
+                        
+                        # Train networks
+                        self.actor.train()
+                        self.critic.train()
+                        
+                        # Forward pass
+                        if self.action_space_type == "discrete":
+                            action_probs = self.actor(obs)
+                            dist = Categorical(action_probs)
+                            log_prob = dist.log_prob(action)
+                            entropy = dist.entropy()
+                        else:
+                            mu, log_std = self.actor(obs)
+                            std = torch.exp(log_std)
+                            dist = Normal(mu, std)
+                            log_prob = dist.log_prob(action).sum(-1)
+                            entropy = dist.entropy().sum(-1)
+                        
+                        # Compute critic output
+                        current_value = self.critic(obs)
+                        
+                        # Compute losses
+                        current_value_flat = current_value.reshape(-1)
+                        td_target_flat = td_target.reshape(-1)
+                        value_loss = F.mse_loss(current_value_flat, td_target_flat.detach())
+                        policy_loss = -log_prob.mean()
+                        entropy_loss = -entropy.mean() * self.entropy_coef * torch.sign(delta.detach()) if self.entropy_coef != 0 else torch.tensor(0.0, device=self.device)
+                        
+                        # Zero gradients
+                        self.actor_optimizer.zero_grad()
+                        self.critic_optimizer.zero_grad()
+                        
+                        # Backpropagation - Combined actor loss
+                        actor_loss = policy_loss + entropy_loss
+                        if actor_loss.requires_grad:
+                            actor_loss.backward()
+                        value_loss.backward()
+                        
+                        # Apply updates with OBGD optimizers
+                        delta_value = delta.item()
+                        actor_step_size = self.actor_optimizer.step(delta_value, env_id=env_id, reset=done.item() > 0.5)
+                        critic_step_size = self.critic_optimizer.step(delta_value, env_id=env_id, reset=done.item() > 0.5)
+                        
+                        # Track metrics
+                        metrics['effective_step_size'] = float((actor_step_size + critic_step_size) / 2.0)
+                        self.last_step_sizes.append(metrics['effective_step_size'])
+                        if len(self.last_step_sizes) > 100:
+                            self.last_step_sizes.pop(0)
+                        self.successful_steps += 1
+                        
+                        # Track losses
+                        total_value_loss += value_loss.item()
+                        total_policy_loss += policy_loss.item()
+                        total_entropy_loss += entropy_loss.item() if hasattr(entropy_loss, 'item') else 0.0
+        
         else:
-            # Batch update with standard optimizers
-            batch_size = min(32, len(self.experience_buffers[env_id]) - 1)
+            # Batch update with standard optimizers - more efficient implementation
+            batch_size = min(64, len(self.experience_buffers[env_id]) - 1)  # Increased batch size
             batch_indices = np.random.choice(len(self.experience_buffers[env_id]) - 1, batch_size, replace=False)
             
+            # Pre-allocate lists for batching
+            batch_obs = []
+            batch_actions = []
+            batch_rewards = []
+            batch_values = []
+            batch_dones = []
+            batch_next_values = []
+            
+            # Collect batch data
             for i in batch_indices:
-                # Get current and next experience
                 current_exp = self.experience_buffers[env_id][i]
                 next_exp = self.experience_buffers[env_id][i + 1]
                 
-                # Extract experience components
-                obs = current_exp['obs']
-                action = current_exp['action']
-                reward = current_exp['reward']
-                value = current_exp['value']
-                done = current_exp['done']
-                next_value = next_exp['value']
-                
-                # Calculate TD error
-                delta, td_target = self._calculate_td_error(reward, next_value, done, value)
-                
-                # Forward pass
-                if self.action_space_type == "discrete":
-                    action_probs = self.actor(obs)
-                    dist = Categorical(action_probs)
-                    log_prob = dist.log_prob(action)
-                    entropy = dist.entropy()
-                else:
-                    mu, log_std = self.actor(obs)
-                    std = torch.exp(log_std)
-                    dist = Normal(mu, std)
-                    log_prob = dist.log_prob(action).sum(-1)
-                    entropy = dist.entropy().sum(-1)
-                
-                # Compute critic output
-                current_value = self.critic(obs)
-                
-                # Compute losses
-                value_loss = F.mse_loss(current_value, td_target.detach())
-                policy_loss = -log_prob.mean()
-                entropy_loss = -entropy.mean() * self.entropy_coef
-                
-                # Compute total loss
-                loss = policy_loss + self.critic_coef * value_loss + entropy_loss
-                
-                # Zero gradients and update
-                self.actor_optimizer.zero_grad()
-                self.critic_optimizer.zero_grad()
-                loss.backward()
-                
-                # Gradient clipping if enabled
-                if self.max_grad_norm > 0:
-                    nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                    nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-                
-                # Apply updates
-                self.actor_optimizer.step()
-                self.critic_optimizer.step()
-                
-                # Track losses for metrics
-                total_value_loss += value_loss.item()
-                total_policy_loss += policy_loss.item()
-                total_entropy_loss += entropy_loss.item()
+                batch_obs.append(current_exp['obs'])
+                batch_actions.append(current_exp['action'])
+                batch_rewards.append(current_exp['reward'])
+                batch_values.append(current_exp['value'])
+                batch_dones.append(current_exp['done'])
+                batch_next_values.append(next_exp['value'])
+            
+            # Stack tensors for batch processing
+            batch_obs = torch.cat(batch_obs, dim=0)
+            batch_rewards = torch.cat(batch_rewards, dim=0)
+            batch_values = torch.cat(batch_values, dim=0)
+            batch_dones = torch.cat(batch_dones, dim=0)
+            batch_next_values = torch.cat(batch_next_values, dim=0)
+            
+            if self.action_space_type == "discrete":
+                batch_actions = torch.cat(batch_actions, dim=0).long()
+            else:
+                batch_actions = torch.cat(batch_actions, dim=0).float()
+            
+            # Calculate TD error for the entire batch
+            batch_deltas, batch_td_targets = self._calculate_td_error(
+                batch_rewards, batch_next_values, batch_dones, batch_values)
+            
+            # Forward pass (batched)
+            if self.action_space_type == "discrete":
+                action_probs = self.actor(batch_obs)
+                dist = Categorical(action_probs)
+                log_probs = dist.log_prob(batch_actions.squeeze())
+                entropy = dist.entropy().mean()
+            else:
+                mu, log_std = self.actor(batch_obs)
+                std = torch.exp(log_std)
+                dist = Normal(mu, std)
+                log_probs = dist.log_prob(batch_actions).sum(-1)
+                entropy = dist.entropy().sum(-1).mean()
+            
+            # Compute critic output (batched)
+            current_values = self.critic(batch_obs)
+            
+            # Compute losses (batched)
+            current_value_flat = current_values.reshape(-1)
+            td_target_flat = batch_td_targets.reshape(-1)
+            value_loss = F.mse_loss(current_value_flat, td_target_flat.detach())
+            policy_loss = -log_probs.mean()
+            entropy_loss = -entropy * self.entropy_coef
+            
+            # Compute total loss
+            loss = policy_loss + self.critic_coef * value_loss + entropy_loss
+            
+            # Zero gradients and update
+            self.actor_optimizer.zero_grad()
+            self.critic_optimizer.zero_grad()
+            loss.backward()
+            
+            # Gradient clipping if enabled
+            if self.max_grad_norm > 0:
+                nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+            
+            # Apply updates
+            self.actor_optimizer.step()
+            self.critic_optimizer.step()
+            
+            # Track losses for metrics
+            total_value_loss = value_loss.item() * batch_size
+            total_policy_loss = policy_loss.item() * batch_size
+            total_entropy_loss = entropy_loss.item() * batch_size
         
         # Calculate average losses
         num_updates = len(self.experience_buffers[env_id]) - 1 if self.use_obgd else batch_size
