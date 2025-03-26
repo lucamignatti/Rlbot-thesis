@@ -26,3 +26,4 @@ runnable_bots.txt
 .pytest_cache/
 .venv/
 .vscode/
+.aider*

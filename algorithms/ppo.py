@@ -317,6 +317,14 @@ class PPOAlgorithm(BaseAlgorithm):
         if value.dim() < action.dim():
             value = value.unsqueeze(-1)
             
+        # Only move to CPU if using MPS (Apple Silicon)
+        if self.device == "mps":
+            action = action.cpu()
+            log_prob = log_prob.cpu()
+            value = value.cpu()
+            if return_features:
+                features = features.cpu()
+    
         if return_features:
             return action, log_prob, value, features
         else:

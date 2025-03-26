@@ -286,7 +286,11 @@ class StreamACAlgorithm(BaseAlgorithm):
             # Get action distribution
             if self.action_space_type == "discrete":
                 # For discrete actions
-                action_probs = self.actor(obs)
+                action_logits = self.actor(obs)
+                
+                # Add this line to ensure valid probabilities:
+                action_probs = F.softmax(action_logits, dim=-1)
+                
                 dist = Categorical(action_probs)
                 
                 if deterministic:
@@ -333,6 +337,13 @@ class StreamACAlgorithm(BaseAlgorithm):
             elif hasattr(self.actor, 'features'):
                 features = self.actor.features
                 
+            # Add checks for invalid values in logits
+            if torch.isnan(action_logits).any() or torch.isinf(action_logits).any():
+                print("[ERROR] Invalid values (NaN or Inf) detected in actor logits:")
+                print(action_logits)
+                # Optionally, raise an error or handle it
+                raise ValueError("Actor produced invalid logits (NaN or Inf)")
+            
             return action_np, log_prob_np, value_np, features
             
         return action_np, log_prob_np, value_np
