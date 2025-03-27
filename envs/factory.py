@@ -11,7 +11,70 @@ from rewards import BallProximityReward, BallToGoalDistanceReward, BallVelocityT
 from observation import StackedActionsObs
 import numpy as np
 
-# Patched RocketSim engine to handle None car positions
+# --- Helper Function for Orientation ---
+def quaternion_to_rotation_matrix(quat: np.ndarray) -> np.ndarray:
+    """Converts a quaternion (x, y, z, w) to a 3x3 rotation matrix."""
+    x, y, z, w = quat
+    
+    # Precompute squares
+    x2, y2, z2 = x*x, y*y, z*z
+    
+    # Precompute products
+    xy, xz, yz = x*y, x*z, y*z
+    wx, wy, wz = w*x, w*y, w*z
+    
+    # Rotation matrix elements
+    m00 = 1.0 - 2.0 * (y2 + z2)
+    m01 = 2.0 * (xy - wz)
+    m02 = 2.0 * (xz + wy)
+    
+    m10 = 2.0 * (xy + wz)
+    m11 = 1.0 - 2.0 * (x2 + z2)
+    m12 = 2.0 * (yz - wx)
+    
+    m20 = 2.0 * (xz - wy)
+    m21 = 2.0 * (yz + wx)
+    m22 = 1.0 - 2.0 * (x2 + y2)
+    
+    # Return as 3x3 numpy array (transposed for RocketSim's expected format if needed)
+    # RocketSim expects RotMat(m00, m01, m02, m10, m11, m12, m20, m21, m22)
+    # which corresponds to row-major flattened matrix. Numpy creates row-major by default.
+    return np.array([
+        [m00, m01, m02],
+        [m10, m11, m12],
+        [m20, m21, m22]
+    ])
+
+def euler_to_rotation_matrix(euler: np.ndarray) -> np.ndarray:
+    """Converts Euler angles (roll, pitch, yaw) to a 3x3 rotation matrix."""
+    roll, pitch, yaw = euler
+    
+    # Precompute cosines and sines of Euler angles
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    
+    # Rotation matrix elements
+    m00 = cy * cp
+    m01 = cy * sp * sr - sy * cr
+    m02 = cy * sp * cr + sy * sr
+    
+    m10 = sy * cp
+    m11 = sy * sp * sr + cy * cr
+    m12 = sy * sp * cr - cy * sr
+    
+    m20 = -sp
+    m21 = cp * sr
+    m22 = cp * cr
+    
+    return np.array([
+        [m00, m01, m02],
+        [m10, m11, m12],
+        [m20, m21, m22]
+    ])
+# --- End Helper Function ---
+
+# Patched RocketSim engine to handle None car positions and prioritize quat
 class PatchedRocketSimEngine(RocketSimEngine):
     """A patched version of RocketSimEngine that ensures car positions are never None"""
     
@@ -22,173 +85,163 @@ class PatchedRocketSimEngine(RocketSimEngine):
     def _set_car_state(self, car: rsim.Car, desired_car: any):
         """
         Sets the state of a RocketSim car to match a given car state.
-        Overrides the original method to ensure position is never None.
+        Overrides the original method to ensure position is never None and prioritizes quaternion.
         """
         try:
-            # Simplified approach - use the original implementation but catch and handle exceptions
-            if hasattr(desired_car, 'physics') and desired_car.physics is not None:
-                if not hasattr(desired_car.physics, 'position') or desired_car.physics.position is None:
-                    desired_car.physics.position = np.array([0, 0, 17])
-                
-                if not hasattr(desired_car.physics, 'linear_velocity') or desired_car.physics.linear_velocity is None:
-                    desired_car.physics.linear_velocity = np.zeros(3)
-                
-                if not hasattr(desired_car.physics, 'angular_velocity') or desired_car.physics.angular_velocity is None:
-                    desired_car.physics.angular_velocity = np.zeros(3)
-                
-                # Try to handle rotation_mtx, but it might throw
+            # --- Ensure basic physics attributes exist and are valid ---
+            if not hasattr(desired_car, 'physics') or desired_car.physics is None:
+                from rlgym.rocket_league.api import PhysicsObject
+                desired_car.physics = PhysicsObject()
+            
+            if not hasattr(desired_car.physics, 'position') or desired_car.physics.position is None:
+                desired_car.physics.position = np.array([0, 0, 17])
+            if not hasattr(desired_car.physics, 'linear_velocity') or desired_car.physics.linear_velocity is None:
+                desired_car.physics.linear_velocity = np.zeros(3)
+            if not hasattr(desired_car.physics, 'angular_velocity') or desired_car.physics.angular_velocity is None:
+                desired_car.physics.angular_velocity = np.zeros(3)
+            # --- End basic physics validation ---
+
+            # Create a new car state
+            car_state = rsim.CarState()
+            
+            # --- Set Position (Added Debugging) ---
+            position_to_set = np.array([0, 0, 17]) # Default
+            if hasattr(desired_car.physics, 'position') and desired_car.physics.position is not None:
                 try:
-                    if not hasattr(desired_car.physics, 'rotation_mtx') or desired_car.physics.rotation_mtx is None:
-                        # Create a 3x3 identity matrix
-                        desired_car.physics.rotation_mtx = np.eye(3)
-                except (ValueError, AttributeError, TypeError):
-                    pass # Will be handled by fallback
+                    # Directly use the position if it's already a numpy array
+                    if isinstance(desired_car.physics.position, np.ndarray):
+                        pos_read = desired_car.physics.position
+                    else:
+                        # Convert if it's a list/tuple
+                        pos_read = np.array(desired_car.physics.position)
+                    
+                    if pos_read.shape == (3,) and not np.isnan(pos_read).any():
+                        position_to_set = pos_read
+                        print(f"[DEBUG _set_car_state] Read Position: {position_to_set}") # Debug print
+                    else:
+                        print(f"[DEBUG _set_car_state] Invalid position read: {pos_read}, using default.")
+                except Exception as e_pos:
+                    print(f"[DEBUG _set_car_state] Error reading position: {e_pos}, using default.")
             else:
-                # Create minimal physics
-                from rlgym.rocket_league.api import Car, PhysicsObject
-                if isinstance(desired_car, Car):
-                    desired_car.physics = PhysicsObject()
-                    desired_car.physics.position = np.array([0, 0, 17])
-                    desired_car.physics.linear_velocity = np.zeros(3)
-                    desired_car.physics.angular_velocity = np.zeros(3)
-                    desired_car.physics.rotation_mtx = np.eye(3)
+                 print(f"[DEBUG _set_car_state] No position attribute found, using default.")
             
-            # Now safely create a car state with proper types
+            car_state.pos = rsim.Vec(*position_to_set)
+            # --- End Position Setting ---
+
+            # Set core physics vectors (velocity)
+            vel_to_set = np.zeros(3)
+            if hasattr(desired_car.physics, 'linear_velocity') and desired_car.physics.linear_velocity is not None:
+                 vel_to_set = np.asarray(desired_car.physics.linear_velocity)
+            car_state.vel = rsim.Vec(*vel_to_set)
+            
+            ang_vel_to_set = np.zeros(3)
+            if hasattr(desired_car.physics, 'angular_velocity') and desired_car.physics.angular_velocity is not None:
+                 ang_vel_to_set = np.asarray(desired_car.physics.angular_velocity)
+            car_state.ang_vel = rsim.Vec(*ang_vel_to_set)
+            
+            # --- Set Rotation (Read Euler from desired_car._temp_euler_rotation) ---
+            rotation_matrix_to_set = None
+            read_euler = None # Debug variable
             try:
-                # Let's avoid using the super implementation directly and instead
-                # create a completely new car state with proper sequence types
-                
-                # Get a brand new car state
-                car_state = rsim.CarState()
-                
-                # Core physics with vectors (these are expected to be Vec objects)
-                car_state.pos = rsim.Vec(*desired_car.physics.position)
-                car_state.vel = rsim.Vec(*desired_car.physics.linear_velocity)
-                car_state.ang_vel = rsim.Vec(*desired_car.physics.angular_velocity)
-                
-                # Identity matrix as fallback for rotation
-                identity_rot = np.array([1, 0, 0, 0, 1, 0, 0, 0, 1])
-                
-                try:
-                    if hasattr(desired_car.physics, 'rotation_mtx') and desired_car.physics.rotation_mtx is not None:
-                        rot = desired_car.physics.rotation_mtx.transpose().flatten()
-                        car_state.rot_mat = rsim.RotMat(*rot)
+                # Check if temporary Euler rotation exists and is valid
+                if hasattr(desired_car, '_temp_euler_rotation') and desired_car._temp_euler_rotation is not None:
+                    # Read the temporary Euler angles
+                    euler_angles = desired_car._temp_euler_rotation 
+                    read_euler = euler_angles # Store for debugging
+                    if isinstance(euler_angles, (np.ndarray, list, tuple)) and len(euler_angles) == 3:
+                        euler_angles_np = np.asarray(euler_angles)
+                        if not np.isnan(euler_angles_np).any():
+                            # Convert valid Euler angles to rotation matrix
+                            rotation_matrix_to_set = euler_to_rotation_matrix(euler_angles_np)
+                            print(f"[DEBUG _set_car_state] Used _temp_euler_rotation {euler_angles_np} -> rot_mat") # Debug print
+                        else:
+                            print(f"[DEBUG _set_car_state] Invalid _temp_euler_rotation read (contains NaN): {euler_angles_np}")
                     else:
-                        car_state.rot_mat = rsim.RotMat(*identity_rot)
-                except (ValueError, AttributeError, TypeError):
-                    car_state.rot_mat = rsim.RotMat(*identity_rot)
-                
-                # Use sequence types for attributes that require them
-                # For example wheels_with_contact might expect a list/sequence
-                try:
-                    # For attributes expecting sequences, convert to list/array
-                    wheels_contact = getattr(desired_car, 'wheels_with_contact', [0])
-                    
-                    # Ensure it's a sequence type
-                    if not isinstance(wheels_contact, (list, tuple, np.ndarray)):
-                        wheels_contact = [wheels_contact]
-                        
-                    # Some attributes in newer RocketSim might need to be set as arrays
-                    setattr(car_state, 'wheels_with_contact', wheels_contact)
-                    
-                    # The following are scalar properties - convert if needed
-                    car_state.boost = float(getattr(desired_car, 'boost_amount', 33))
-                    car_state.demo_respawn_timer = float(getattr(desired_car, 'demo_respawn_timer', 0))
-                    car_state.is_demoed = bool(getattr(desired_car, 'is_demoed', False))
-                    car_state.supersonic_time = float(getattr(desired_car, 'supersonic_time', 0))
-                    car_state.time_spent_boosting = float(getattr(desired_car, 'boost_active_time', 0))
-                    car_state.handbrake_val = bool(getattr(desired_car, 'handbrake', False))
-                    
-                    # Set jump state
-                    car_state.has_jumped = bool(getattr(desired_car, 'has_jumped', False))
-                    car_state.is_jumping = bool(getattr(desired_car, 'is_jumping', False))
-                    car_state.jump_time = float(getattr(desired_car, 'jump_time', 0))
-                    
-                    # Set flip state
-                    car_state.has_flipped = bool(getattr(desired_car, 'has_flipped', False))
-                    car_state.is_flipping = bool(getattr(desired_car, 'is_flipping', False))
-                    car_state.has_double_jumped = bool(getattr(desired_car, 'has_double_jumped', False))
-                    car_state.air_time_since_jump = float(getattr(desired_car, 'air_time_since_jump', 0))
-                    car_state.flip_time = float(getattr(desired_car, 'flip_time', 0))
-                    
-                    # Try to set flip_rel_torque
-                    if hasattr(desired_car, 'flip_torque') and desired_car.flip_torque is not None:
-                        car_state.flip_rel_torque = rsim.Vec(*desired_car.flip_torque)
-                    else:
-                        car_state.flip_rel_torque = rsim.Vec(0, 0, 0)
-                    
-                    # Set auto-flip state
-                    car_state.is_auto_flipping = bool(getattr(desired_car, 'is_autoflipping', False))
-                    car_state.auto_flip_timer = float(getattr(desired_car, 'autoflip_timer', 0))
-                    car_state.auto_flip_torque_scale = float(getattr(desired_car, 'autoflip_direction', 0))
-                    
-                    # Try to set last controls
-                    if hasattr(car_state, 'last_controls'):
-                        controls = rsim.CarControls()
-                        controls.throttle = 0
-                        controls.steer = 0
-                        controls.pitch = 0
-                        controls.yaw = 0
-                        controls.roll = 0
-                        controls.jump = bool(getattr(desired_car, 'is_holding_jump', False))
-                        controls.boost = False
-                        controls.handbrake = False
-                        car_state.last_controls = controls
-                    
-                    # Set the car state
-                    car.set_state(car_state)
-                    return
-                    
-                except TypeError as e:
-                    # This is likely due to a type mismatch - possibly a sequence vs scalar issue
-                    pass
-                    # We'll fall through to a different approach
-                
+                        print(f"[DEBUG _set_car_state] Invalid _temp_euler_rotation read (wrong type/shape): {euler_angles}")
             except Exception as e:
-                pass
-                # Continue to next fallback
+                # Print the actual exception
+                print(f"[DEBUG _set_car_state] Error processing _temp_euler_rotation: {repr(e)}") 
+                rotation_matrix_to_set = None # Fallback if conversion fails
+
+            # If still no valid rotation, use identity matrix
+            if rotation_matrix_to_set is None:
+                rotation_matrix_to_set = np.eye(3)
+                print("[DEBUG _set_car_state] Used identity matrix") # Debug print
+
+            # --- More Debugging ---
+            print(f"[DEBUG _set_car_state] Read Euler value (from _temp_euler_rotation): {read_euler}")
+            print(f"[DEBUG _set_car_state] Final rotation_matrix_to_set:\n{rotation_matrix_to_set}")
+            # --- End More Debugging ---
+
+            # Set the rotation matrix in RocketSim format (flattened row-major)
+            rot_elements = rotation_matrix_to_set.flatten()
+            print(f"[DEBUG _set_car_state] Flattened rot_elements: {rot_elements}") # Debug print
+            car_state.rot_mat = rsim.RotMat(*rot_elements)
+            # --- End Rotation Setting ---
             
-            # Try the simplest possible car state - only the essential physics
-            try:
-                minimal_state = rsim.CarState()
-                minimal_state.pos = rsim.Vec(*desired_car.physics.position)
-                minimal_state.vel = rsim.Vec(*desired_car.physics.linear_velocity)
-                minimal_state.ang_vel = rsim.Vec(*desired_car.physics.angular_velocity)
-                minimal_state.rot_mat = rsim.RotMat(*[1, 0, 0, 0, 1, 0, 0, 0, 1])
-                minimal_state.boost = 33.0
-                
-                # Apply only the essential state
-                car.set_state(minimal_state)
-                return
-            except Exception as e:
-                pass
+            # --- Set Other Car State Attributes (Simplified) ---
+            # Use getattr with defaults to avoid errors if attributes are missing
+            car_state.boost = float(getattr(desired_car, 'boost_amount', 33.3))
+            car_state.is_demoed = bool(getattr(desired_car, 'is_demoed', False))
+            car_state.demo_respawn_timer = float(getattr(desired_car, 'demo_respawn_timer', 0.0))
             
-            # If all else fails, recreate the car from scratch
-            try:
-                # We reached here because all other approaches failed
-                # Last resort: try to remove and recreate the car
-                team_num = car.team
-                car_id = car.id
-                
-                # Try to recreate the car with proper position
-                config = rsim.CarConfig()
-                car_new = self._arena.add_car(team_num, config)
-                
-                # Set just position and rotation, nothing else
-                minimal_state = rsim.CarState()
-                minimal_state.pos = rsim.Vec(*desired_car.physics.position)
-                minimal_state.rot_mat = rsim.RotMat(*[1, 0, 0, 0, 1, 0, 0, 0, 1])
-                car_new.set_state(minimal_state)
-                
-                return
-            except Exception as e:
-                # At this point we're out of options
-                raise
-                
+            # Jump/Flip related attributes (ensure boolean/float types)
+            car_state.has_jumped = bool(getattr(desired_car, 'has_jumped', False))
+            car_state.has_double_jumped = bool(getattr(desired_car, 'has_double_jumped', False))
+            car_state.has_flipped = bool(getattr(desired_car, 'has_flipped', False))
+            car_state.is_jumping = bool(getattr(desired_car, 'is_jumping', False))
+            car_state.is_flipping = bool(getattr(desired_car, 'is_flipping', False))
+            car_state.air_time_since_jump = float(getattr(desired_car, 'air_time_since_jump', 0.0))
+            car_state.jump_time = float(getattr(desired_car, 'jump_time', 0.0))
+            car_state.flip_time = float(getattr(desired_car, 'flip_time', 0.0))
+            
+            # Flip torque (needs to be Vec)
+            flip_torque_val = getattr(desired_car, 'flip_torque', np.zeros(3))
+            if flip_torque_val is None: flip_torque_val = np.zeros(3)
+            car_state.flip_rel_torque = rsim.Vec(*np.asarray(flip_torque_val))
+            
+            # Supersonic state
+            car_state.is_supersonic = bool(getattr(desired_car, 'is_supersonic', False))
+            car_state.supersonic_time = float(getattr(desired_car, 'supersonic_time', 0.0))
+            
+            # Handbrake
+            car_state.handbrake_val = float(getattr(desired_car, 'handbrake', 0.0)) # RocketSim uses float for handbrake value
+
+            # Last controls (optional, create default if missing)
+            if hasattr(car_state, 'last_controls'):
+                controls = rsim.CarControls()
+                controls.throttle = float(getattr(desired_car, 'throttle', 0.0))
+                controls.steer = float(getattr(desired_car, 'steer', 0.0))
+                controls.pitch = float(getattr(desired_car, 'pitch', 0.0))
+                controls.yaw = float(getattr(desired_car, 'yaw', 0.0))
+                controls.roll = float(getattr(desired_car, 'roll', 0.0))
+                controls.jump = bool(getattr(desired_car, 'jump_active', False))
+                controls.boost = bool(getattr(desired_car, 'boost_active', False))
+                controls.handbrake = bool(getattr(desired_car, 'handbrake_active', False))
+                car_state.last_controls = controls
+            # --- End Other Attributes ---
+
+            # Set the final state
+            car.set_state(car_state)
+            print(f"[DEBUG _set_car_state] car.set_state called successfully") # Debug print
+
         except Exception as e:
             print(f"Fatal error in patched _set_car_state: {str(e)}")
-            raise
-    
+            import traceback
+            traceback.print_exc() # Print full traceback for debugging
+            # As a last resort, try setting a minimal default state
+            try:
+                minimal_state = rsim.CarState()
+                minimal_state.pos = rsim.Vec(0, 0, 17)
+                minimal_state.vel = rsim.Vec(0, 0, 0)
+                minimal_state.ang_vel = rsim.Vec(0, 0, 0)
+                minimal_state.rot_mat = rsim.RotMat(1, 0, 0, 0, 1, 0, 0, 0, 1)
+                minimal_state.boost = 33.0
+                car.set_state(minimal_state)
+            except Exception as final_e:
+                 print(f"Failed to set even minimal state: {final_e}")
+                 raise e # Re-raise original error if fallback fails
+
     def get_state(self):
         """
         Public wrapper for _get_state to maintain API compatibility
