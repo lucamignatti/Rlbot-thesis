@@ -1,7 +1,7 @@
 """Game state mutators for curriculum learning."""
+from typing import Optional, Callable, Dict, Any, List
 import numpy as np
-from typing import Optional, Callable, Dict, Any
-from rlgym.api import StateMutator
+from rlgym.api import StateMutator, DoneCondition, AgentID
 from rlgym.rocket_league.api import GameState, PhysicsObject # Import PhysicsObject
 
 # --- Helper Functions for Orientation ---
@@ -266,3 +266,55 @@ class CarBallRelativePositionMutator(StateMutator):
                     car.rotation_mtx = np.eye(3)
             except:
                 pass
+
+# --- Add a new TouchBallCondition class ---
+class TouchBallCondition(DoneCondition[AgentID, GameState]):
+    """Termination condition that ends an episode when a player touches the ball."""
+
+    def __init__(self):
+        """Initialize the TouchBallCondition."""
+        super().__init__()
+        self.last_touch_time = {}
+
+    def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
+        """Reset the touch tracking for all agents, safely handling missing last_touch."""
+        # Safely check if initial_state has last_touch and if it's not None
+        last_touch_time = 0.0
+        if hasattr(initial_state, 'last_touch') and initial_state.last_touch:
+            if hasattr(initial_state.last_touch, 'time_seconds'):
+                 last_touch_time = initial_state.last_touch.time_seconds
+
+        self.last_touch_time = {agent: last_touch_time for agent in agents}
+
+
+    def is_done(self, agents: List[AgentID], state: GameState, shared_info: Dict[str, Any]) -> Dict[AgentID, bool]:
+        """Return whether each agent has touched the ball since the last reset."""
+        is_done = {}
+
+        # Safely check if state has last_touch and if it's not None
+        current_touch_time = 0.0
+        touching_player_index = None
+        if hasattr(state, 'last_touch') and state.last_touch:
+             if hasattr(state.last_touch, 'time_seconds'):
+                 current_touch_time = state.last_touch.time_seconds
+             if hasattr(state.last_touch, 'player_index'):
+                 touching_player_index = state.last_touch.player_index
+
+        for agent in agents:
+            # Initialize to the reset time if this agent hasn't been seen before
+            if agent not in self.last_touch_time:
+                self.last_touch_time[agent] = self.last_touch_time.get(agent, 0.0) # Use the initial reset time
+
+            # Check if there is a touch and it's more recent than what we've stored
+            if current_touch_time > self.last_touch_time[agent]:
+                # Check if this agent was the one who touched the ball
+                if touching_player_index == agent:
+                    is_done[agent] = True
+                    # Update last touch time for this agent upon detecting their touch
+                    self.last_touch_time[agent] = current_touch_time
+                    continue
+
+            # No new touch detected for this agent
+            is_done[agent] = False
+
+        return is_done

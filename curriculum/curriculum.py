@@ -2,7 +2,7 @@ from .base import CurriculumManager, ProgressionRequirements
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
 from .mutators import (
     BallTowardGoalSpawnMutator, BallPositionMutator, CarBallRelativePositionMutator,
-    CarBoostMutator, BallVelocityMutator, CarPositionMutator
+    CarBoostMutator, BallVelocityMutator, CarPositionMutator, TouchBallCondition
 )
 from rlgym.rocket_league.done_conditions import GoalCondition, TimeoutCondition, NoTouchTimeoutCondition
 from rlgym.rocket_league.reward_functions import CombinedReward, GoalReward, TouchReward
@@ -737,7 +737,7 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
                     (ball_proximity_reward, 1.0),
                     (velocity_to_ball_reward, 0.5)
                 ),
-                termination_condition=TouchReward(), # Terminate on touch
+                termination_condition=TouchBallCondition(), # Terminate on touch
                 truncation_condition=short_timeout,
                 difficulty_params={}, # No difficulty scaling needed here
                 success_threshold=0.9
@@ -799,7 +799,7 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
                     (ball_proximity_reward, 1.0),
                     (touch_ball_reward, 0.5)
                 ),
-                termination_condition=TouchReward(),
+                termination_condition=TouchBallCondition(),
                 truncation_condition=short_timeout,
                 difficulty_params={},
                 success_threshold=0.85
@@ -816,7 +816,7 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
                     (ball_proximity_reward, 0.7),
                     (touch_ball_reward, 1.0)
                 ),
-                termination_condition=TouchReward(),
+                termination_condition=TouchBallCondition(),
                 truncation_condition=short_timeout,
                 difficulty_params={},
                 success_threshold=0.75
@@ -963,7 +963,7 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
                     (touch_ball_reward, 1.0),
                     (ball_proximity_reward, 0.5)
                 ),
-                termination_condition=TouchReward(),
+                termination_condition=TouchBallCondition(),
                 truncation_condition=short_timeout,
                 difficulty_params={},
                 success_threshold=0.7
@@ -983,7 +983,7 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
                     (touch_ball_reward, 1.0),
                     (AerialControlReward(), 0.3) # Basic stability reward
                 ),
-                termination_condition=TouchReward(),
+                termination_condition=TouchBallCondition(),
                 truncation_condition=short_timeout,
                 difficulty_params={},
                 success_threshold=0.6
@@ -1299,7 +1299,7 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
                     (touch_ball_reward, 1.0),
                     (AerialControlReward(), 0.5)
                 ),
-                termination_condition=TouchReward(),
+                termination_condition=TouchBallCondition(),
                 truncation_condition=short_timeout,
                 difficulty_params={},
                 success_threshold=0.5
@@ -1319,7 +1319,7 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
                     (touch_ball_reward, 1.0),
                     (AerialDirectionalTouchReward(), 0.6)
                 ),
-                termination_condition=TouchReward(),
+                termination_condition=TouchBallCondition(),
                 truncation_condition=med_timeout,
                 difficulty_params={},
                 success_threshold=0.55
