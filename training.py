@@ -830,7 +830,7 @@ class Trainer:
             
             # Get weights directly from aux_task_manager if available
             sr_weight = getattr(self.aux_task_manager, "sr_weight", 0) if hasattr(self, 'aux_task_manager') else 0
-            rp_weight = getattr(self.aux_task_manager, "rp_weight", 0) if hasattr(self, 'aux_task_manager') else 0
+            rp_weight = getattr(self.aux_task_manager, "rp_weight", 0) if hasattr(self.aux_task_manager) else 0
             
             # Log the unweighted losses (more meaningful values for trends)
             auxiliary_metrics["AUX/state_representation_loss"] = sr_loss
@@ -942,8 +942,15 @@ class Trainer:
         # Get whether we're in test mode
         test_mode = getattr(self, 'test_mode', False)
         
-        # Add intrinsic rewards during pretraining if enabled
-        if self.use_intrinsic_rewards and (not self.pretraining_completed or self.in_transition_phase):
+        # Initialize extrinsic reward normalizer if it doesn't exist
+        if not hasattr(self, 'extrinsic_reward_normalizer'):
+            from intrinsic_rewards import ExtrinsicRewardNormalizer
+            self.extrinsic_reward_normalizer = ExtrinsicRewardNormalizer()
+            if self.debug:
+                print("[DEBUG] Initialized extrinsic reward normalizer for adaptive intrinsic scaling")
+        
+        # Add intrinsic rewards if enabled (using adaptive scaling throughout training)
+        if self.use_intrinsic_rewards:
             # Convert inputs to tensor format for intrinsic reward computation
             if not isinstance(state, torch.Tensor):
                 state_tensor = torch.FloatTensor(state).to(self.device)
@@ -962,31 +969,43 @@ class Trainer:
             else:
                 action_tensor = action.to(self.device)
                 
-            # Get next state if available in buffer (for StreamAC)
+            # Get next state if available in buffer
             next_state = None
             if hasattr(self.algorithm, 'experience_buffer') and len(self.algorithm.experience_buffer) > 0:
                 next_state = self.algorithm.experience_buffer[-1][0]
                 next_state = torch.FloatTensor(next_state).to(self.device).unsqueeze(0)
                 
-                # Compute intrinsic reward
+                # Compute intrinsic reward if we have a next state
                 if next_state is not None:
                     intrinsic_reward = self.intrinsic_reward_generator.compute_reward(
                         state_tensor, action_tensor, next_state
                     )
                     
-                    # Scale and add to extrinsic reward
-                    ir_scale = self.intrinsic_reward_scale
-                    # Gradually reduce intrinsic rewards during transition phase
-                    if self.in_transition_phase:
-                        progress = min(1.0, (self.training_steps - self.transition_start_step) / 
-                                      self.pretraining_transition_steps)
-                        ir_scale *= (1.0 - progress)
-                        
+                    # Extract extrinsic reward value for normalization
+                    extrinsic_reward = reward.item() if hasattr(reward, 'item') else reward
+                    
+                    # Normalize extrinsic reward using running statistics
+                    normalized_reward = self.extrinsic_reward_normalizer.normalize(extrinsic_reward)
+                    
+                    # Calculate adaptive scale using sigmoid function:
+                    # - Higher intrinsic reward when extrinsic reward is low
+                    # - Lower intrinsic reward when extrinsic reward is high
+                    sigmoid_factor = 1.0 / (1.0 + np.exp(2.0 * normalized_reward))
+                    adaptive_scale = self.intrinsic_reward_scale * sigmoid_factor
+                    
+                    # Ensure minimum scale to maintain some exploration
+                    adaptive_scale = max(0.1 * self.intrinsic_reward_scale, adaptive_scale)
+                    
+                    # Add scale to metrics for debugging if in debug mode
+                    if self.debug and hasattr(self, 'metrics'):
+                        self.metrics['intrinsic_scale'] = adaptive_scale
+                        self.metrics['normalized_extrinsic_reward'] = normalized_reward
+                    
                     # Add scaled intrinsic reward to extrinsic reward
                     if isinstance(reward, torch.Tensor):
-                        reward = reward + ir_scale * intrinsic_reward.to(reward.device)
+                        reward = reward + adaptive_scale * intrinsic_reward.to(reward.device)
                     else:
-                        reward = reward + ir_scale * intrinsic_reward.cpu().numpy()
+                        reward = reward + adaptive_scale * intrinsic_reward.cpu().numpy()
 
         # Store the experience using the algorithm - only update if not in test mode
         if not test_mode:

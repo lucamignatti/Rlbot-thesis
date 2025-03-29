@@ -593,3 +593,91 @@ def create_intrinsic_reward_generator(obs_dim, action_dim,
     else:
         # Return an ensemble of generators
         return IntrinsicRewardEnsemble(generators, weights)
+
+
+class ExtrinsicRewardNormalizer:
+    """Tracks statistics of extrinsic rewards for adaptive intrinsic scaling"""
+    
+    def __init__(self, epsilon=1e-4, clip_range=(-10.0, 10.0)):
+        """Initialize the reward normalizer
+        
+        Args:
+            epsilon: Small constant to avoid numerical instability
+            clip_range: Range for clipping normalized values
+        """
+        self.mean = 0.0
+        self.var = 1.0
+        self.count = epsilon  # Small epsilon to avoid division by zero
+        self.clip_range = clip_range
+        
+    def update(self, x):
+        """Update statistics with new reward values
+        
+        Args:
+            x: New reward value(s)
+        """
+        if isinstance(x, torch.Tensor):
+            x = x.cpu().numpy()
+            
+        if np.isscalar(x):
+            x = np.array([x])
+            
+        batch_mean = np.mean(x, axis=0)
+        batch_var = np.var(x, axis=0)
+        batch_count = x.size
+        
+        # Update statistics using Welford's online algorithm
+        self.update_from_moments(batch_mean, batch_var, batch_count)
+        
+    def update_from_moments(self, batch_mean, batch_var, batch_count):
+        """Update statistics using the batch mean, variance, and count
+        
+        Args:
+            batch_mean: Mean of the batch
+            batch_var: Variance of the batch
+            batch_count: Number of samples in the batch
+        """
+        delta = batch_mean - self.mean
+        tot_count = self.count + batch_count
+        
+        # Update mean
+        new_mean = self.mean + delta * batch_count / tot_count
+        
+        # Update variance
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
+        new_var = m2 / tot_count
+        
+        # Store updated values
+        self.mean = new_mean
+        self.var = new_var
+        self.count = new_count = tot_count
+        
+    def normalize(self, x):
+        """Normalize values using current statistics
+        
+        Args:
+            x: Value(s) to normalize
+            
+        Returns:
+            normalized_x: Normalized and clipped value(s)
+        """
+        if isinstance(x, torch.Tensor):
+            x = x.cpu().numpy()
+            
+        if np.isscalar(x):
+            x = np.array([x])
+            
+        # Avoid division by zero
+        std = np.sqrt(self.var) + 1e-8
+        
+        # Normalize and clip
+        normalized_x = np.clip((x - self.mean) / std, self.clip_range[0], self.clip_range[1])
+        
+        # Update stats with this reward (helps keep normalizer current)
+        self.update(x)
+        
+        if normalized_x.size == 1:
+            return normalized_x[0]
+        return normalized_x

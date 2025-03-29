@@ -1033,7 +1033,7 @@ if __name__ == "__main__":
     if device is None:
         if torch.cuda.is_available():
             device = "cuda"
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available() and False: # Disable because mps is slow
             device = "mps"
         else:
             device = "cpu"
