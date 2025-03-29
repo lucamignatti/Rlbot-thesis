@@ -250,106 +250,65 @@ class ResidualFFBlock(nn.Module):
         return x + h
 
 class RSNorm(nn.Module):
-    """Running Statistics Normalization - more stable than BatchNorm for RL"""
+    """
+    Running Statistics Normalization (RSNorm) from the SimBa paper
+    https://arxiv.org/abs/2410.09754
+    
+    Standardizes input features using running estimates of mean and variance.
+    """
     def __init__(self, num_features, momentum=0.1, eps=1e-5):
-        super().__init__()
+        super(RSNorm, self).__init__()
         self.num_features = num_features
         self.momentum = momentum
         self.eps = eps
-        self._cuda_graphs_fixed = False
-
+        
+        # Register buffers for running statistics
         self.register_buffer('running_mean', torch.zeros(num_features))
         self.register_buffer('running_var', torch.ones(num_features))
         self.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long))
-
+        
+        # Flag for cuda graphs compatibility
+        self._cuda_graphs_fixed = False
+        
     def forward(self, x):
-        # Special path for torch.compile() to avoid control flow
-        is_compiling = hasattr(torch, '_dynamo') and torch._dynamo.is_compiling()
-        
-        # For CUDA graphs compatibility, use simplified path during compilation
-        if is_compiling or getattr(self, '_cuda_graphs_fixed', False):
-            # Simple path for compilation
-            device = x.device
-            
-            if x.dim() == 1:
-                x = x.view(1, -1)  # Add batch dimension for consistency
-
-            if self.training:
-                # Calculate batch statistics
-                batch_mean = x.mean(dim=0)
-                batch_var = x.var(dim=0, unbiased=False)
-                
-                # Normalize using batch statistics
-                x_norm = (x - batch_mean[None, :]) / torch.sqrt(batch_var[None, :] + self.eps)
-                
-                # No device transfers or control flow during compilation
-                return x_norm
-            else:
-                # Use stored statistics
-                running_mean = self.running_mean.to(device)
-                running_var = self.running_var.to(device)
-                return (x - running_mean[None, :]) / torch.sqrt(running_var[None, :] + self.eps)
-        
-        # Original implementation for non-compiled execution
-        # Disable compilation on MPS device - it's causing issues
-        if "mps" in str(x.device):
-            if hasattr(torch, '_dynamo') and hasattr(torch._dynamo, 'config'):
-                torch._dynamo.config.suppress_errors = True
-
-        # Clone to avoid in-place modifications.
+        """
+        Args:
+            x: Input tensor of shape [batch_size, num_features]
+        Returns:
+            Normalized tensor of same shape
+        """
+        # Don't modify original input
         x = x.clone()
 
         # Ensure running statistics are on the same device as the input.
-        device = x.device
-        self.running_mean = self.running_mean.to(device)
-        self.running_var = self.running_var.to(device)
-        self.num_batches_tracked = self.num_batches_tracked.to(device)
-
-        # Get batch size and feature dimensions
-        if x.dim() == 1:  # Case for single vector input
-            batch_size = 1
-            feature_dim = x.size(0)
-            x = x.view(1, -1)  # Add batch dimension for consistency
-        else:  # Case for batched input
-            batch_size = x.size(0)
-            feature_dim = x.size(1)
-
-        # Ensure feature dimensions match
-        if feature_dim != self.num_features:
-            # If feature dimensions don't match, try to handle it gracefully
-            if self.training:
-                # During training, resize running stats to match input
-                self.num_features = feature_dim
-                self.running_mean = torch.zeros(feature_dim, device=device)
-                self.running_var = torch.ones(feature_dim, device=device)
-            else:
-                # During evaluation, this is an error
-                raise ValueError(f"Expected input features {self.num_features}, got {feature_dim}")
-
-        if self.training:
+        if self.running_mean.device != x.device:
+            self.running_mean = self.running_mean.to(x.device)
+            self.running_var = self.running_var.to(x.device)
+            self.num_batches_tracked = self.num_batches_tracked.to(x.device)
+            
+        if self.training and not self._cuda_graphs_fixed:
             # Calculate batch statistics
-            batch_mean = x.mean(dim=0)
-            batch_var = x.var(dim=0, unbiased=False)
-
-            # Update tracker count
+            batch_mean = x.mean(dim=0, keepdim=False)
+            batch_var = x.var(dim=0, unbiased=False, keepdim=False)
+            
+            # Update running statistics using welford's online algorithm
             with torch.no_grad():
                 self.num_batches_tracked += 1
-
-            # Update factor depends on whether this is the first batch
-            update_factor = self.momentum
-            if self.num_batches_tracked == 1:
-                update_factor = 1.0
-
-            # Update running statistics with safe operations
-            with torch.no_grad():
-                self.running_mean = (1 - update_factor) * self.running_mean + update_factor * batch_mean
-                self.running_var = (1 - update_factor) * self.running_var + update_factor * batch_var
-        else:
-            # Use running statistics for evaluation
-            batch_mean = self.running_mean
-            batch_var = self.running_var
-
-        # Normalize using current statistics
-        x_norm = (x - batch_mean[None, :]) / torch.sqrt(batch_var[None, :] + self.eps)
-        
-        return x_norm
+                if self.momentum is None:  # Use cumulative moving average
+                    momentum = 1.0 / float(self.num_batches_tracked)
+                else:  # Use exponential moving average
+                    momentum = self.momentum
+                    
+                # Update running mean and variance
+                self.running_mean = self.running_mean * (1 - momentum) + batch_mean * momentum
+                self.running_var = self.running_var * (1 - momentum) + batch_var * momentum
+                
+        # Normalize using running statistics as described in the paper (equation 4)
+        # (x_t - μ_t) / sqrt(σ_t^2 + ε)
+        return (x - self.running_mean) / torch.sqrt(self.running_var + self.eps)
+    
+    def reset_running_stats(self):
+        """Reset running statistics"""
+        self.running_mean.zero_()
+        self.running_var.fill_(1)
+        self.num_batches_tracked.zero_()

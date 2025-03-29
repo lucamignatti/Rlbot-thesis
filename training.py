@@ -1113,9 +1113,28 @@ class Trainer:
             # Only PPO uses this method via memory, so use memory directly
             self.memory.store_experience_at_idx(idx, state=state, action=action, log_prob=log_prob, reward=reward, value=value, done=done)
 
-    def get_action(self, state, evaluate=False, return_features=False):
-        """Forward to algorithm's get_action method"""
-        return self.algorithm.get_action(state, evaluate, return_features)
+    def get_action(self, obs, deterministic=False, return_features=False):
+        """
+        Get an action, log probability, and value for a given observation.
+        
+        Args:
+            obs: Observation tensor or array
+            deterministic: If True, return the most likely action without sampling
+            return_features: If True, also return extracted features (for auxiliary tasks)
+            
+        Returns:
+            Tuple containing (action, log_prob, value) and features if requested
+        """
+        # Convert observation to tensor if it's not already
+        if not isinstance(obs, torch.Tensor):
+            obs = torch.FloatTensor(obs).to(self.device)
+        
+        # Ensure observation has batch dimension
+        if obs.dim() == 1:
+            obs = obs.unsqueeze(0)
+            
+        # Forward to algorithm's get_action method
+        return self.algorithm.get_action(obs, deterministic, return_features)
 
     def update(self, completed_episode_rewards=None):
         """Update policy based on collected experiences. 
@@ -1132,6 +1151,8 @@ class Trainer:
         if self.use_pretraining:
             self._update_pretraining_state()
             self._update_auxiliary_weights() # Also update weights based on state
+        
+        # --- Algorithm Update ---
         # Forward to specific algorithm implementation
         metrics = self.algorithm.update()
         
@@ -1177,61 +1198,24 @@ class Trainer:
             # Clear episode rewards
             self.episode_rewards = []
 
-        # Update auxiliary tasks if enabled
+        # --- Auxiliary Task Update ---
         if self.use_auxiliary_tasks and hasattr(self, 'aux_task_manager') and not self.test_mode:
             # For Stream mode, auxiliary tasks are already updated during store_experience
-            # For PPO batch mode, we update here with data from memory
+            # For PPO batch mode, we compute losses here using the accumulated history
             if self.algorithm_type == "ppo":
                 try:
-                    # Sample batch of observations and features for auxiliary task update
-                    if hasattr(self.algorithm, 'memory') and self.algorithm.memory.size() > 0:
-                        # Get indices from memory
-                        batch_size = min(64, self.algorithm.memory.size())
-                        indices = torch.randperm(self.algorithm.memory.size())[:batch_size]
-                        
-                        # Extract observations
-                        if hasattr(self.algorithm.memory, 'obs'):
-                            obs_batch = self.algorithm.memory.obs[indices].to(self.device)
-                            rewards_batch = self.algorithm.memory.rewards[indices].to(self.device)
-                            
-                            # Extract features if actor supports it
-                            features = None
-                            with torch.no_grad():
-                                if hasattr(self.actor, 'get_features'):
-                                    features = self.actor.get_features(obs_batch)
-                                elif hasattr(self.actor, 'extract_features'):
-                                    features = self.actor.extract_features(obs_batch)
-                                else:
-                                    # Use forward pass with feature extraction if possible
-                                    try:
-                                        if hasattr(self.actor, 'forward') and 'return_features' in self.actor.forward.__code__.co_varnames:
-                                            _, features = self.actor(obs_batch, return_features=True)
-                                        else:
-                                            # Default approach
-                                            features = self.actor(obs_batch)
-                                            if isinstance(features, tuple):
-                                                features = features[0]
-                                    except Exception as e:
-                                        if self.debug:
-                                            print(f"[DEBUG] Error extracting features: {e}")
-                                        # Use observations as features if extraction fails
-                                        features = obs_batch
-                            
-                            # Update auxiliary tasks
-                            aux_metrics = self.aux_task_manager.update(
-                                observations=obs_batch, 
-                                rewards=rewards_batch,
-                                features=features
-                            )
-                            
-                            # Always include auxiliary metrics in the main metrics dictionary
-                            metrics.update(aux_metrics)
-                            metrics['aux_loss'] = aux_metrics.get('sr_loss', 0) + aux_metrics.get('rp_loss', 0)
-                            if self.debug:
-                                print(f"[DEBUG] Auxiliary task update: SR={aux_metrics.get('sr_loss', 0):.6f}, RP={aux_metrics.get('rp_loss', 0):.6f}")
+                    # Compute losses by sampling from the history buffers
+                    aux_metrics = self.aux_task_manager.compute_losses()
+                    
+                    # Always include auxiliary metrics in the main metrics dictionary
+                    metrics.update(aux_metrics)
+                    # Calculate total aux loss if individual losses are present
+                    metrics['aux_loss'] = aux_metrics.get('sr_loss', 0) + aux_metrics.get('rp_loss', 0)
+                    if self.debug:
+                        print(f"[DEBUG] Auxiliary task update (PPO): SR={aux_metrics.get('sr_loss', 0):.6f}, RP={aux_metrics.get('rp_loss', 0):.6f}")
                 except Exception as e:
                     if self.debug:
-                        print(f"[DEBUG] Error updating auxiliary tasks: {e}")
+                        print(f"[DEBUG] Error computing auxiliary losses (PPO): {e}")
                         import traceback
                         traceback.print_exc()
 

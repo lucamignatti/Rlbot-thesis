@@ -54,226 +54,142 @@ class IntrinsicRewardGenerator:
         raise NotImplementedError("Subclasses must implement reset_models")
 
 
-class CuriosityReward(IntrinsicRewardGenerator):
-    """Implementation of Intrinsic Curiosity Module (ICM)"""
+class CuriosityReward:
+    """
+    Intrinsic curiosity module that rewards agent for exploring novel states.
+    Uses a forward model to predict the next state features given the current state and action.
+    The prediction error is used as the intrinsic reward.
+    """
     
-    def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 128, 
-                 forward_coef: float = 0.2, inverse_coef: float = 0.8,
-                 learning_rate: float = 1e-3, device: str = "cpu"):
-        """Initialize the curiosity reward generator
+    def __init__(
+        self, 
+        observation_shape, 
+        action_shape, 
+        feature_dim=256, 
+        hidden_dim=256, 
+        lr=1e-4, 
+        device="cuda",
+        normalize_rewards=True,
+        reward_scale=1.0
+    ):
+        self.device = device
+        self.normalize_rewards = normalize_rewards
+        self.reward_scale = reward_scale
         
-        Args:
-            obs_dim: Dimension of the observation space
-            action_dim: Dimension of the action space
-            hidden_dim: Dimension of the hidden layers
-            forward_coef: Coefficient for the forward model loss
-            inverse_coef: Coefficient for the inverse model loss
-            learning_rate: Learning rate for the optimizer
-            device: Device to use for computation
-        """
-        super().__init__(obs_dim, action_dim, hidden_dim, device)
-        
-        # Feature encoder
+        # Create feature encoder for state representation
         self.feature_encoder = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.LeakyReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LeakyReLU()
+            nn.Linear(observation_shape, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, feature_dim)
         ).to(device)
         
-        # Forward model predicts next state features from current state features and action
+        # Create forward model for next state prediction
+        if isinstance(action_shape, int):
+            action_dim = action_shape
+        else:
+            action_dim = np.prod(action_shape)
+            
         self.forward_model = nn.Sequential(
-            nn.Linear(hidden_dim + action_dim, hidden_dim),
-            nn.LeakyReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+            nn.Linear(feature_dim + action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, feature_dim)
         ).to(device)
         
-        # Inverse model predicts action from current and next state features
-        self.inverse_model = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.LeakyReLU(),
-            nn.Linear(hidden_dim, action_dim)
-        ).to(device)
+        # Create optimizer
+        params = list(self.feature_encoder.parameters()) + list(self.forward_model.parameters())
+        self.optimizer = torch.optim.Adam(params, lr=lr)
         
-        # Loss weights
-        self.forward_coef = forward_coef
-        self.inverse_coef = inverse_coef
-        
-        # Optimizer
-        self.optimizer = Adam(list(self.feature_encoder.parameters()) + 
-                              list(self.forward_model.parameters()) + 
-                              list(self.inverse_model.parameters()), 
-                              lr=learning_rate)
-        
-        # Running normalization for rewards
+        # Initialize reward normalization
         self.reward_normalizer = RunningMeanStd(shape=())
         
     def compute_features(self, state):
-        """Compute features from state
-        
-        Args:
-            state: State tensor [B, obs_dim]
-            
-        Returns:
-            features: Feature tensor [B, hidden_dim]
-        """
-        # Ensure state is a torch tensor
-        if not isinstance(state, torch.Tensor):
-            state = torch.tensor(state, dtype=torch.float32, device=self.device)
-            
-        # Add batch dimension if needed
-        if state.dim() == 1:
-            state = state.unsqueeze(0)
-            
-        # Compute features
-        features = self.feature_encoder(state)
-        return features
-        
+        """Extract feature representation from state"""
+        return self.feature_encoder(state)
+    
     def compute_intrinsic_reward(self, state, action, next_state):
-        """Compute curiosity-based intrinsic reward
-        
-        Args:
-            state: Current state [B, obs_dim]
-            action: Action taken [B, action_dim]
-            next_state: Next state [B, obs_dim]
-            
-        Returns:
-            intrinsic_reward: Intrinsic reward value [B]
-        """
+        """Compute curiosity-based intrinsic reward."""
         # Switch to evaluation mode
         self.feature_encoder.eval()
         self.forward_model.eval()
         
         with torch.no_grad():
-            # Compute features
-            current_features = self.compute_features(state)
-            next_features = self.compute_features(next_state)
-            
-            # Prepare action
+            # Ensure state is a torch tensor
+            if not isinstance(state, torch.Tensor):
+                state = torch.tensor(state, dtype=torch.float32, device=self.device)
+            if not isinstance(next_state, torch.Tensor):
+                next_state = torch.tensor(next_state, dtype=torch.float32, device=self.device)
             if not isinstance(action, torch.Tensor):
                 action = torch.tensor(action, dtype=torch.float32, device=self.device)
                 
             # Add batch dimension if needed
+            if state.dim() == 1:
+                state = state.unsqueeze(0)
+            if next_state.dim() == 1:
+                next_state = next_state.unsqueeze(0)
             if action.dim() == 1:
                 action = action.unsqueeze(0)
                 
-            # Predict next features
+            # Compute features
+            current_features = self.compute_features(state)
+            next_features = self.compute_features(next_state)
+                
+            # Forward model prediction
             forward_input = torch.cat([current_features, action], dim=1)
             predicted_next_features = self.forward_model(forward_input)
+                
+            # Calculate prediction error (MSE)
+            prediction_error = F.mse_loss(predicted_next_features, next_features, reduction='none').sum(dim=1)
             
-            # Compute prediction error (intrinsic reward)
-            prediction_error = F.mse_loss(predicted_next_features, next_features, reduction='none').mean(dim=1)
-            
-            # Normalize reward if we have enough history
-            reward_np = prediction_error.cpu().numpy()
-            self.reward_normalizer.update(reward_np)
-            normalized_reward = reward_np / (np.sqrt(self.reward_normalizer.var) + 1e-8)
-            
-            # Clip rewards to prevent outliers
-            clipped_reward = np.clip(normalized_reward, 0, 5.0)
-            
+            # Normalize reward
+            raw_reward = prediction_error.cpu().numpy()
+            if self.normalize_rewards:
+                self.reward_normalizer.update(raw_reward)
+                normalized_reward = raw_reward / (np.sqrt(self.reward_normalizer.var) + 1e-8)
+                clipped_reward = np.clip(normalized_reward, 0, 5) * self.reward_scale
+            else:
+                clipped_reward = np.clip(raw_reward, 0, 5) * self.reward_scale
+        
         # Switch back to training mode
         self.feature_encoder.train()
         self.forward_model.train()
         
         return torch.tensor(clipped_reward, device=self.device)
-    
-    def update(self, state, action, next_state, done=False):
-        """Update the curiosity model based on the transition
         
-        Args:
-            state: Current state [B, obs_dim]
-            action: Action taken [B, action_dim]
-            next_state: Next state [B, obs_dim]
-            done: Whether the episode is done (not used)
-            
-        Returns:
-            loss: Loss value from the update
-        """
-        # Ensure inputs are tensors
+    def update(self, state, action, next_state, done=False):
+        """Update forward model to improve prediction accuracy"""
+        # Convert inputs to tensors if they aren't already
         if not isinstance(state, torch.Tensor):
             state = torch.tensor(state, dtype=torch.float32, device=self.device)
-        if not isinstance(action, torch.Tensor):
-            action = torch.tensor(action, dtype=torch.float32, device=self.device)
         if not isinstance(next_state, torch.Tensor):
             next_state = torch.tensor(next_state, dtype=torch.float32, device=self.device)
-        
+        if not isinstance(action, torch.Tensor):
+            action = torch.tensor(action, dtype=torch.float32, device=self.device)
+            
         # Add batch dimension if needed
         if state.dim() == 1:
             state = state.unsqueeze(0)
-        if action.dim() == 1:
-            action = action.unsqueeze(0)
         if next_state.dim() == 1:
             next_state = next_state.unsqueeze(0)
+        if action.dim() == 1:
+            action = action.unsqueeze(0)
             
-        # Zero gradients
-        self.optimizer.zero_grad()
-        
-        # Compute features
+        # Extract features
         current_features = self.compute_features(state)
         next_features = self.compute_features(next_state)
         
-        # Forward model: predict next state features
+        # Predict next features
         forward_input = torch.cat([current_features, action], dim=1)
         predicted_next_features = self.forward_model(forward_input)
         
-        # Forward model loss
+        # Calculate loss
         forward_loss = F.mse_loss(predicted_next_features, next_features.detach())
         
-        # Inverse model: predict action from state and next state
-        inverse_input = torch.cat([current_features, next_features], dim=1)
-        predicted_action = self.inverse_model(inverse_input)
-        
-        # Inverse model loss (depending on action type)
-        if action.shape[1] == 1:  # Discrete action (assuming one-hot encoded)
-            inverse_loss = F.cross_entropy(predicted_action, action.squeeze(1).long())
-        else:  # Continuous action
-            inverse_loss = F.mse_loss(predicted_action, action)
-            
-        # Total loss
-        total_loss = self.forward_coef * forward_loss + self.inverse_coef * inverse_loss
-        
-        # Backward and optimize
-        total_loss.backward()
+        # Update models
+        self.optimizer.zero_grad()
+        forward_loss.backward()
         self.optimizer.step()
         
-        return {
-            'forward_loss': forward_loss.item(),
-            'inverse_loss': inverse_loss.item(),
-            'total_loss': total_loss.item()
-        }
-        
-    def reset_models(self):
-        """Reset the models used for computing intrinsic rewards"""
-        # Reset feature encoder
-        for layer in self.feature_encoder.modules():
-            if isinstance(layer, nn.Linear):
-                nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
-                if layer.bias is not None:
-                    nn.init.zeros_(layer.bias)
-                    
-        # Reset forward model
-        for layer in self.forward_model.modules():
-            if isinstance(layer, nn.Linear):
-                nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
-                if layer.bias is not None:
-                    nn.init.zeros_(layer.bias)
-                    
-        # Reset inverse model
-        for layer in self.inverse_model.modules():
-            if isinstance(layer, nn.Linear):
-                nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
-                if layer.bias is not None:
-                    nn.init.zeros_(layer.bias)
-                    
-        # Reset optimizer
-        self.optimizer = Adam(list(self.feature_encoder.parameters()) + 
-                              list(self.forward_model.parameters()) + 
-                              list(self.inverse_model.parameters()), 
-                              lr=self.optimizer.param_groups[0]['lr'])
-                              
-        # Reset reward normalizer
-        self.reward_normalizer = RunningMeanStd(shape=())
+        return forward_loss.item()
 
 
 class RNDReward(IntrinsicRewardGenerator):
@@ -649,10 +565,13 @@ class ExtrinsicRewardNormalizer:
         m2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
         new_var = m2 / tot_count
         
+        # Update count
+        new_count = tot_count
+        
         # Store updated values
         self.mean = new_mean
         self.var = new_var
-        self.count = new_count = tot_count
+        self.count = new_count
         
     def normalize(self, x):
         """Normalize values using current statistics

@@ -233,8 +233,8 @@ class AuxiliaryTaskManager:
     def __init__(self, actor, obs_dim, sr_weight=1.0, rp_weight=1.0,
                  sr_hidden_dim=128, sr_latent_dim=32,
                  rp_hidden_dim=64, rp_sequence_length=5, 
-                 device="cpu", use_amp=False, update_frequency=8,
-                 learning_mode="batch", debug=False):  # Add debug parameter with default False
+                 device="cpu", use_amp=False, update_frequency=8, # Keep update_frequency for potential periodic calls
+                 learning_mode="batch", debug=False, batch_size=64): # Add batch_size
         """
         Initialize the auxiliary task manager
         
@@ -257,21 +257,22 @@ class AuxiliaryTaskManager:
         self.rp_weight = rp_weight
         self.rp_sequence_length = rp_sequence_length
         self.actor = actor
-        self.debug = debug  # Use the passed debug parameter
-        self.use_amp = use_amp
+        self.debug = debug
+        self.use_amp = use_amp # Note: AMP might be complex with manual loss computation
         self.learning_mode = learning_mode
-        # Store update frequency counter
-        self.update_counter = 0
-        self.update_frequency = update_frequency
-        self.history_filled = 0
+        self.update_frequency = update_frequency # How often compute_losses should be called externally
+        self.update_counter = 0 # Counter for external calls
+        self.batch_size = batch_size # Batch size for sampling from history
+
         # Ensure hidden_dim exists
         self.hidden_dim = getattr(actor, 'hidden_dim', 1536)
-        
+
         if self.debug:
             print(f"[AUX INIT] Initializing AuxiliaryTaskManager with sr_weight={sr_weight}, rp_weight={rp_weight}")
             print(f"[AUX INIT] Device: {device}, Learning mode: {learning_mode}, Update frequency: {update_frequency}")
             print(f"[AUX INIT] Observation dimension: {obs_dim}, Hidden dimension: {self.hidden_dim}")
-        
+            print(f"[AUX INIT] RP Sequence Length: {rp_sequence_length}, Batch Size: {batch_size}")
+
         # State representation task
         self.sr_task = StateRepresentationTask(
             input_dim=obs_dim,
@@ -281,323 +282,197 @@ class AuxiliaryTaskManager:
         )
         # Reward prediction task
         self.rp_task = RewardPredictionTask(
-            input_dim=self.hidden_dim,
+            input_dim=self.hidden_dim, # RP task uses features
             hidden_dim=rp_hidden_dim,
             sequence_length=rp_sequence_length,
             device=device,
-            debug=debug  # Pass debug flag to RewardPredictionTask
+            debug=debug
         )
         # Initialize optimizers
         self.sr_optimizer = torch.optim.Adam(self.sr_task.parameters(), lr=3e-4)
         self.rp_optimizer = torch.optim.Adam(self.rp_task.parameters(), lr=3e-4)
-        # Initialize history buffers with fixed-size tensors for better memory management
-        # For batch learning (PPO), use large buffers
-        if learning_mode == "batch":
-            # For testing compatibility, use small buffer if in test mode
-            if hasattr(actor, '_is_test') and actor._is_test:
-                self.obs_history = deque(maxlen=rp_sequence_length)
-                self.feature_history = deque(maxlen=rp_sequence_length)
-                self.reward_history = deque(maxlen=rp_sequence_length)
-            else:
-                # Normal case: large buffer for performance
-                self.obs_history = deque(maxlen=10000)
-                self.feature_history = deque(maxlen=10000)
-                self.reward_history = deque(maxlen=10000)
-        # For stream learning (StreamAC), use small buffers
-        else:
-            self.obs_history = deque(maxlen=rp_sequence_length * 2)
-            self.feature_history = deque(maxlen=rp_sequence_length * 2)
-            self.reward_history = deque(maxlen=rp_sequence_length * 2)
-            
-        # Add counter for updates - will help track if we're actually updating
+
+        # History buffers - Use deques for efficient appending/popping
+        # Size needs to be large enough for batch sampling + sequence length
+        history_maxlen = 10000 if learning_mode == "batch" else rp_sequence_length * 10
+        self.obs_history = deque(maxlen=history_maxlen)
+        self.feature_history = deque(maxlen=history_maxlen)
+        self.reward_history = deque(maxlen=history_maxlen)
+
+        # Counters and last loss values
         self.update_count = 0
         self.last_sr_loss = 0.0
         self.last_rp_loss = 0.0
+        self.history_size = 0 # Track current number of items in history
 
     def update(self, observations, rewards, features=None):
         """
-        Update auxiliary task models with new experiences
-        
+        Add new experiences to the history buffers. Does NOT compute losses.
+        Loss computation is handled by compute_losses().
+
         Args:
-            observations: New observations
-            rewards: New rewards
-            features: Features extracted from observations (optional)
-            
-        Returns:
-            dict: Dictionary of update metrics
+            observations: New observations (Tensor or np.array) [batch_size, obs_dim] or [obs_dim]
+            rewards: New rewards (Tensor or np.array) [batch_size] or scalar
+            features: Features extracted from observations (Tensor or np.array) [batch_size, feature_dim] or [feature_dim]
         """
-        # Ensure inputs are torch tensors
-        if not isinstance(observations, torch.Tensor):
-            observations = torch.tensor(observations, dtype=torch.float32, device=self.device)
-        if not isinstance(rewards, torch.Tensor):
-            rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
-        
-        # Validate that rewards is a 1D tensor or scalar
-        if rewards.dim() > 1:
-            raise ValueError("rewards must be a 1D tensor or scalar")
-            
+        # Ensure inputs are torch tensors on CPU (history stored on CPU)
+        if isinstance(observations, torch.Tensor):
+            observations = observations.detach().cpu()
+        else:
+            observations = torch.tensor(observations, dtype=torch.float32)
+
+        if isinstance(rewards, torch.Tensor):
+            rewards = rewards.detach().cpu()
+        else:
+            rewards = torch.tensor(rewards, dtype=torch.float32)
+
         # Extract features if not provided
         if features is None:
             with torch.no_grad():
+                obs_tensor = observations.to(self.device) # Move to device for model
                 if hasattr(self.actor, 'get_features'):
-                    features = self.actor.get_features(observations)
+                    features = self.actor.get_features(obs_tensor).detach().cpu()
+                elif hasattr(self.actor, 'extract_features'):
+                     features = self.actor.extract_features(obs_tensor).detach().cpu()
                 else:
-                    # Use a forward pass through most of the actor network
-                    try:
-                        if hasattr(self.actor, 'forward') and 'return_features' in self.actor.forward.__code__.co_varnames:
-                            features = self.actor(observations, return_features=True)[1]
-                        else:
-                            # If actor doesn't support return_features, use a default approach
-                            features = self.actor(observations)
-                            if isinstance(features, tuple):
-                                features = features[0]  # Try to get first item if it's a tuple
-                    except Exception as e:
-                        if self.debug:
-                            print(f"[AUX DEBUG] Error extracting features: {e}")
-                        # Use observations as features if extraction fails
-                        features = observations
-                    
-        # Ensure features is a torch tensor
-        if not isinstance(features, torch.Tensor):
-            features = torch.tensor(features, dtype=torch.float32, device=self.device)
-                
-        # Store experiences in history
-        if observations.dim() == 1:
+                    # Fallback: Use observations if feature extraction fails
+                    features = observations
+        elif isinstance(features, torch.Tensor):
+            features = features.detach().cpu()
+        else:
+            features = torch.tensor(features, dtype=torch.float32)
+
+        # Handle single vs batch inputs
+        if observations.dim() == 1: # Single observation
             observations = observations.unsqueeze(0)
-        if rewards.dim() == 0:
-            rewards = rewards.unsqueeze(0)
-        if features.dim() == 1:
+            rewards = rewards.unsqueeze(0) if rewards.dim() == 0 else rewards
             features = features.unsqueeze(0)
-            
-        # Log input shapes and stats if in debug mode
-        if self.debug and self.update_counter % 100 == 0:
-            print(f"[AUX DEBUG] Input shapes - Observations: {observations.shape}, Rewards: {rewards.shape}, Features: {features.shape}")
-            print(f"[AUX DEBUG] Rewards stats - Min: {rewards.min().item():.6f}, Max: {rewards.max().item():.6f}, Mean: {rewards.mean().item():.6f}")
-            
+
         # Add experiences to history
+        num_added = 0
         for i in range(observations.shape[0]):
-            self.obs_history.append(observations[i].detach().cpu())
-            self.feature_history.append(features[i].detach().cpu())
-            self.reward_history.append(rewards[i].detach().cpu())
-            
-        # Increment history counter
-        self.history_filled += 1
-            
-        # Update counter and check if we should update models
-        self.update_counter += 1
+            self.obs_history.append(observations[i])
+            self.feature_history.append(features[i])
+            self.reward_history.append(rewards[i])
+            num_added += 1
         
-        # For stream learning, update more frequently
-        update_threshold = 1 if self.learning_mode == "stream" else self.update_frequency
+        self.history_size = len(self.obs_history) # Update history size
+
+        # Return status (e.g., number of items added) - No loss computation here
+        return {"items_added": num_added}
+
+
+    def compute_losses(self):
+        """
+        Compute losses for auxiliary tasks by sampling from history buffers.
+        This should be called periodically by the Trainer.
+
+        Returns:
+            dict: Dictionary containing SR and RP losses, or empty if not enough data.
+        """
+        sr_loss = 0.0
+        rp_loss = 0.0
         
-        if self.update_counter >= update_threshold:
-            self.update_counter = 0
+        # --- State Representation Task ---
+        if self.sr_weight > 0 and self.history_size >= self.batch_size:
+            # Sample a batch of observations from history
+            indices = np.random.choice(self.history_size, self.batch_size, replace=False)
+            obs_batch = torch.stack([self.obs_history[i] for i in indices]).to(self.device)
+
+            self.sr_task.train()
+            self.sr_optimizer.zero_grad()
             
-            # Check if we have enough data to update
-            if len(self.obs_history) >= self.rp_sequence_length:
-                # Compute losses and update models
-                losses = self.compute_losses()
-                self.update_count += 1
-                self.last_sr_loss = losses['sr_loss']
-                self.last_rp_loss = losses['rp_loss']
-                                
-                # Ensure losses are valid (not NaN or zero)
-                if math.isnan(losses['sr_loss']) or math.isnan(losses['rp_loss']):
-                    if self.debug:
-                        print("[AUX DEBUG] NaN losses detected! Resetting auxiliary task models")
-                    self.reset()
-                    losses = {"sr_loss": 0.0, "rp_loss": 0.0}
-                    
-                return losses
+            # Compute SR loss
+            sr_loss_val = self.sr_task.get_loss(obs_batch) * self.sr_weight
+            
+            if not torch.isnan(sr_loss_val) and not torch.isinf(sr_loss_val):
+                sr_loss_val.backward()
+                self.sr_optimizer.step()
+                sr_loss = sr_loss_val.item()
+                self.last_sr_loss = sr_loss
             else:
                 if self.debug:
-                    print(f"[AUX DEBUG] Not enough history for auxiliary tasks: {len(self.obs_history)}/{self.rp_sequence_length}")
-                    
-        # If we don't update, still return the latest metrics but with zero values
-        if self.debug and self.update_counter % 100 == 0:
-            print(f"[AUX DEBUG] Skipping update, counter at {self.update_counter}/{update_threshold}")
-            print(f"[AUX DEBUG] Last losses - SR: {self.last_sr_loss:.6f}, RP: {self.last_rp_loss:.6f}")
+                    print(f"[AUX DEBUG] Invalid SR loss detected: {sr_loss_val.item()}")
+                self.last_sr_loss = 0.0
+        else:
+             if self.debug and self.sr_weight > 0:
+                 print(f"[AUX DEBUG] SR Task skipped: Not enough history ({self.history_size}/{self.batch_size})")
+             self.last_sr_loss = 0.0 # Ensure last loss is reset if skipped
+
+        # --- Reward Prediction Task ---
+        # Need at least rp_sequence_length steps in history to form one sequence
+        # Need enough history to sample a batch of sequences
+        min_rp_history = self.rp_sequence_length 
+        if self.rp_weight > 0 and self.history_size >= min_rp_history + self.batch_size -1 :
             
+            # Sample valid start indices for sequences
+            # A start index `i` is valid if `i + rp_sequence_length <= history_size`
+            max_start_index = self.history_size - self.rp_sequence_length
+            if max_start_index < self.batch_size -1:
+                 if self.debug:
+                     print(f"[AUX DEBUG] RP Task skipped: Not enough valid start indices ({max_start_index+1}/{self.batch_size})")
+                 self.last_rp_loss = 0.0
+                 return {"sr_loss": self.last_sr_loss, "rp_loss": self.last_rp_loss}
+
+            start_indices = np.random.choice(max_start_index + 1, self.batch_size, replace=False)
+
+            # Prepare batches for LSTM
+            feature_seq_batch = []
+            reward_target_batch = []
+
+            for start_idx in start_indices:
+                # Extract feature sequence
+                feature_seq = [self.feature_history[i] for i in range(start_idx, start_idx + self.rp_sequence_length)]
+                feature_seq_batch.append(torch.stack(feature_seq))
+                
+                # Extract target reward (reward at the end of the sequence)
+                target_reward_idx = start_idx + self.rp_sequence_length - 1
+                reward_target_batch.append(self.reward_history[target_reward_idx])
+
+            # Stack batches and move to device
+            features_seq_tensor = torch.stack(feature_seq_batch).to(self.device)
+            reward_targets_tensor = torch.stack(reward_target_batch).to(self.device)
+
+            # Compute RP loss
+            self.rp_task.train()
+            self.rp_optimizer.zero_grad()
+            
+            rp_loss_val = self.rp_task.get_loss(features_seq_tensor, reward_targets_tensor) * self.rp_weight
+            
+            if not torch.isnan(rp_loss_val) and not torch.isinf(rp_loss_val):
+                rp_loss_val.backward()
+                self.rp_optimizer.step()
+                rp_loss = rp_loss_val.item()
+                self.last_rp_loss = rp_loss
+            else:
+                if self.debug:
+                    print(f"[AUX DEBUG] Invalid RP loss detected: {rp_loss_val.item()}")
+                self.last_rp_loss = 0.0
+        else:
+            if self.debug and self.rp_weight > 0:
+                 print(f"[AUX DEBUG] RP Task skipped: Not enough history ({self.history_size}/{min_rp_history + self.batch_size -1})")
+            self.last_rp_loss = 0.0 # Ensure last loss is reset if skipped
+
+        # Log detailed results in debug mode
+        if self.debug and (sr_loss > 0 or rp_loss > 0):
+            print(f"[AUX DEBUG] Computed Losses - SR: {sr_loss:.6f}, RP: {rp_loss:.6f}")
+            
+        self.update_count += 1 # Increment internal update counter
+
         return {"sr_loss": self.last_sr_loss, "rp_loss": self.last_rp_loss}
 
-    def compute_losses(self, features=None, observations=None, rewards_sequence=None):
-        """
-        Compute losses for auxiliary tasks and update models
-        
-        Args:
-            features: Features to use for reward prediction (optional)
-            observations: Observations to use for state representation (optional)
-            rewards_sequence: Sequence of rewards for reward prediction (optional)
-            
-        Returns:
-            dict: Dictionary of loss metrics
-        """
-        # Skip if not enough history - but this shouldn't happen with our checks in update()
-        if len(self.obs_history) < self.rp_sequence_length:
-            if self.debug:
-                print(f"[AUX COMPUTE] Not enough history: {len(self.obs_history)} < {self.rp_sequence_length}")
-            return {"sr_loss": 0.0, "rp_loss": 0.0}
-            
-        # For state representation, use the most recent observation if not provided
-        if observations is None:
-            # Ensure we have at least one observation
-            observations = torch.stack([self.obs_history[-1]]).to(self.device)
-            
-        # For reward prediction, create sequences from history if not provided
-        if rewards_sequence is None:
-            # Different sampling for batch vs. stream
-            if self.learning_mode == "batch":
-                # For batch learning, randomly sample sequences if we have enough data
-                batch_size = min(32, max(1, len(self.feature_history) - self.rp_sequence_length))
-                
-                # Create sequences
-                feature_sequences = []
-                reward_targets = []
-                
-                # Ensure we don't exceed available history
-                max_start_idx = max(0, len(self.feature_history) - self.rp_sequence_length)
-                if max_start_idx > 0:
-                    # Sample random starting indices
-                    indices = np.random.randint(0, max_start_idx, batch_size)
-                    
-                    for idx in indices:
-                        # Create sequence of features
-                        seq = [self.feature_history[idx + i] for i in range(self.rp_sequence_length)]
-                        feature_sequences.append(torch.stack(seq))
-                        
-                        # Get corresponding reward (at the end of the sequence)
-                        reward_targets.append(self.reward_history[idx + self.rp_sequence_length - 1])
-                else:
-                    # Not enough history yet, use a single sequence with the available data
-                    seq = [self.feature_history[i % len(self.feature_history)] for i in range(self.rp_sequence_length)]
-                    feature_sequences.append(torch.stack(seq))
-                    reward_targets.append(self.reward_history[-1])
-                    
-                # Convert to tensors
-                feature_sequences = torch.stack(feature_sequences).to(self.device)
-                reward_targets = torch.tensor(reward_targets, device=self.device)
-                
-            else:
-                # For stream learning, use the most recent sequence
-                if len(self.feature_history) < self.rp_sequence_length:
-                    # If not enough history, pad with repeated elements
-                    seq = [self.feature_history[i % len(self.feature_history)] 
-                          for i in range(self.rp_sequence_length)]
-                    feature_sequences = torch.stack([torch.stack(seq)]).to(self.device)
-                    reward_targets = torch.tensor([self.reward_history[-1]], device=self.device)
-                else:
-                    # Create sequence from the most recent experiences
-                    feature_sequences = torch.stack([
-                        torch.stack([self.feature_history[-i-1] for i in range(self.rp_sequence_length)][::-1])
-                    ]).to(self.device)
-                    
-                    reward_targets = torch.tensor([self.reward_history[-1]], device=self.device)
-        else:
-            # Use provided sequences
-            feature_sequences = features
-            reward_targets = rewards_sequence
-            
-        # Initialize loss values
-        sr_loss_value = 0.0
-        rp_loss_value = 0.0
-
-        # Debug information
-        if self.debug:
-            print(f"[AUX COMPUTE] Observations shape: {observations.shape}, dtype: {observations.dtype}")
-            print(f"[AUX COMPUTE] Feature sequences shape: {feature_sequences.shape}, dtype: {feature_sequences.dtype}")
-            print(f"[AUX COMPUTE] Reward targets shape: {reward_targets.shape}, dtype: {reward_targets.dtype}")
-            print(f"[AUX COMPUTE] SR weight: {self.sr_weight}, RP weight: {self.rp_weight}")
-            print(f"[AUX COMPUTE] Observation stats - Min: {observations.min().item():.4f}, Max: {observations.max().item():.4f}")
-            
-        # Compute SR loss
-        try:
-            with torch.amp.autocast(device_type='cuda' if 'cuda' in str(self.device) else 'cpu', enabled=self.use_amp):
-                sr_loss = self.sr_task.get_loss(observations)
-                sr_loss_value = sr_loss.item()  # Store before applying weight
-                sr_loss = sr_loss * self.sr_weight
-                
-            # Check if SR loss is zero and debug
-            if sr_loss_value == 0.0 and self.debug:
-                print("[AUX COMPUTE] WARNING: SR loss is exactly zero!")
-                # Check if model parameters are zero
-                sr_params_norm = sum(p.norm().item() for p in self.sr_task.parameters())
-                print(f"[AUX COMPUTE] SR model parameters norm: {sr_params_norm:.6f}")
-                
-                # Test with random input
-                test_input = torch.rand_like(observations)
-                test_loss = self.sr_task.get_loss(test_input).item()
-                print(f"[AUX COMPUTE] SR test loss with random input: {test_loss:.6f}")
-                
-            # Update SR model
-            self.sr_optimizer.zero_grad()
-            sr_loss.backward()
-            # Check gradients
-            sr_grad_nonzero = any(p.grad is not None and p.grad.abs().max().item() > 0 for p in self.sr_task.parameters())
-            if self.debug and not sr_grad_nonzero:
-                print("[AUX COMPUTE] WARNING: SR gradients are all zero!")
-            self.sr_optimizer.step()
-        except Exception as e:
-            if self.debug:
-                print(f"[AUX COMPUTE] Error computing SR loss: {e}")
-                import traceback
-                traceback.print_exc()
-            
-        # Compute RP loss
-        try:
-            with torch.amp.autocast(device_type='cuda' if 'cuda' in str(self.device) else 'cpu', enabled=self.use_amp):
-                rp_loss = self.rp_task.get_loss(feature_sequences, reward_targets)
-                rp_loss_value = rp_loss.item()  # Store before applying weight
-                rp_loss = rp_loss * self.rp_weight
-                
-            # Check if RP loss is zero and debug
-            if rp_loss_value == 0.0 and self.debug:
-                print("[AUX COMPUTE] WARNING: RP loss is exactly zero!")
-                # Check reward distribution
-                reward_classes = torch.zeros(3, device=self.device)
-                pos_mask = reward_targets > self.rp_task.pos_threshold
-                neg_mask = reward_targets < self.rp_task.neg_threshold
-                zero_mask = ~(pos_mask | neg_mask)
-                reward_classes[0] = neg_mask.sum().item()
-                reward_classes[1] = zero_mask.sum().item()
-                reward_classes[2] = pos_mask.sum().item()
-                print(f"[AUX COMPUTE] Reward classes distribution: {reward_classes}")
-                
-                # Test with random input
-                test_input = torch.rand_like(feature_sequences)
-                test_targets = torch.randint(0, 3, (reward_targets.shape[0],), device=self.device)
-                test_loss = F.cross_entropy(self.rp_task.forward(test_input), test_targets).item()
-                print(f"[AUX COMPUTE] RP test loss with random input: {test_loss:.6f}")
-                
-            # Update RP model
-            self.rp_optimizer.zero_grad()
-            rp_loss.backward()
-            # Check gradients
-            rp_grad_nonzero = any(p.grad is not None and p.grad.abs().max().item() > 0 for p in self.rp_task.parameters())
-            if self.debug and not rp_grad_nonzero:
-                print("[AUX COMPUTE] WARNING: RP gradients are all zero!")
-            self.rp_optimizer.step()
-        except Exception as e:
-            if self.debug:
-                print(f"[AUX COMPUTE] Error computing RP loss: {e}")
-                import traceback
-                traceback.print_exc()
-            
-        return {
-            "sr_loss": sr_loss_value,
-            "rp_loss": rp_loss_value
-        }
-        
+    # Ensure reset() clears history buffers correctly
     def reset(self):
-        """Reset history buffers when episodes end"""
-        if self.learning_mode == "stream":
-            # For stream learning, clear the buffers completely
-            self.obs_history.clear()
-            self.feature_history.clear()
-            self.reward_history.clear()
-        # For batch learning, we retain the history across episodes
+        """Reset history buffers"""
+        # Always clear history on reset, regardless of mode, as compute_losses uses history
+        self.obs_history.clear()
+        self.feature_history.clear()
+        self.reward_history.clear()
+        self.history_size = 0 # Reset size tracker
         
         if self.debug:
-            print("[AUX RESET] Reset called - cleared history buffers for stream mode")
-        
+            print("[AUX RESET] Reset called - cleared history buffers")
+
     def reset_auxiliary_tasks(self):
         """Reset auxiliary task models (weights and optimizers)"""
         # Re-initialize SR task with the same parameters
@@ -624,7 +499,7 @@ class AuxiliaryTaskManager:
         
         # Reset counters
         self.update_counter = 0
-        self.history_filled = 0
+        self.history_size = 0
         self.update_count = 0
         self.last_sr_loss = 0.0
         self.last_rp_loss = 0.0

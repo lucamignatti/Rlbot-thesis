@@ -8,23 +8,20 @@ from collections import defaultdict
 
 
 class DummyReward(RewardFunction[AgentID, GameState, float]):
-    """A reward function that always returns zero.
+    """A reward function that always returns zero."""
     
-    This is used for unsupervised pre-training where we want intrinsic rewards only,
-    with no domain-specific extrinsic rewards.
-    """
     def __init__(self):
         super().__init__()
         
     def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
-        """Reset any state in the reward function"""
+        """Reset is called at the start of each episode."""
         pass
     
     def get_rewards(self, agents: List[AgentID], state: GameState,
                    is_terminated: Dict[AgentID, bool],
                    is_truncated: Dict[AgentID, bool],
                    shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
-        """Return zero rewards for all agents"""
+        """Return zero reward for all agents."""
         return {agent: 0.0 for agent in agents}
 
 
@@ -830,7 +827,7 @@ class KRCReward(BaseRewardFunction):
         # Reset team rewards tracking
         self.team_rewards = {0: [], 1: []}
     
-    def calculate(self, agent_id, state: GameState, previous_state: Optional[GameState] = None) -> float:
+    def calculate(self, agent_id: AgentID, state: GameState, previous_state: Optional[GameState] = None) -> float:
         # Get rewards from all components
         rewards = []
         for reward_fn, dispersion, density in self.reward_functions:
@@ -872,6 +869,16 @@ class KRCReward(BaseRewardFunction):
         return clamp_reward(krc_reward)
 
 # Helper functions for creating Lucy-SKG reward components
+def create_distance_weighted_alignment_reward(team_goal_y=5120):
+    """
+    Creates the 'Distance-weighted Alignment' KRC from the Lucy-SKG paper,
+    which combines Ball-to-Goal Alignment and Player-to-Ball Distance.
+    """
+    return DistanceWeightedAlignmentKRC(
+        team_goal_y=team_goal_y,
+        dispersion=1.1,
+        weight=0.6
+    )
 
 def create_offensive_potential_reward(team_goal_y=5120):
     """
@@ -885,18 +892,6 @@ def create_offensive_potential_reward(team_goal_y=5120):
         density=1.1, 
         weight=1.0
     )
-
-def create_distance_weighted_alignment_reward(team_goal_y=5120):
-    """
-    Creates the 'Distance-weighted Alignment' KRC from the Lucy-SKG paper,
-    which combines Ball-to-Goal Alignment and Player-to-Ball Distance.
-    """
-    return DistanceWeightedAlignmentKRC(
-        team_goal_y=team_goal_y,
-        dispersion=1.1,
-        weight=0.6
-    )
-
 
 def create_lucy_skg_reward(team_goal_y=5120):
     """

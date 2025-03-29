@@ -6,8 +6,13 @@ from rlgym.rocket_league.api import GameState, PhysicsObject # Import PhysicsObj
 
 # --- Helper Functions for Orientation ---
 def euler_to_quaternion(rotation: np.ndarray) -> np.ndarray:
-    """Converts Euler angles (pitch, yaw, roll) to a quaternion (x, y, z, w)."""
+    """
+    Converts Euler angles (pitch, yaw, roll) to a quaternion (w, x, y, z).
+    Uses the ZYX convention: first roll around X, then pitch around Y, then yaw around Z.
+    """
     pitch, yaw, roll = rotation
+    
+    # Half angles
     cy = np.cos(yaw * 0.5)
     sy = np.sin(yaw * 0.5)
     cp = np.cos(pitch * 0.5)
@@ -15,30 +20,151 @@ def euler_to_quaternion(rotation: np.ndarray) -> np.ndarray:
     cr = np.cos(roll * 0.5)
     sr = np.sin(roll * 0.5)
 
-    qw = cr * cp * cy + sr * sp * sy
-    qx = sr * cp * cy - cr * sp * sy
-    qy = cr * sp * cy + sr * cp * sy
-    qz = cr * cp * sy - sr * sp * cy
-    return np.array([qx, qy, qz, qw])
+    # Quaternion computation
+    w = cr * cp * cy + sr * sp * sy
+    x = sr * cp * cy - cr * sp * sy
+    y = cr * sp * cy + sr * cp * sy
+    z = cr * cp * sy - sr * sp * cy
+
+    return np.array([w, x, y, z])
 
 def euler_to_rotation_matrix(rotation: np.ndarray) -> np.ndarray:
-    """Converts Euler angles (pitch, yaw, roll) to a 3x3 rotation matrix."""
+    """
+    Converts Euler angles (pitch, yaw, roll) to a 3x3 rotation matrix.
+    Uses the ZYX convention: first roll around X, then pitch around Y, then yaw around Z.
+    """
     pitch, yaw, roll = rotation
-    R_x = np.array([[1, 0, 0],
-                    [0, np.cos(roll), -np.sin(roll)],
-                    [0, np.sin(roll), np.cos(roll)]])
+    
+    # Roll (X-axis rotation)
+    Rx = np.array([
+        [1, 0, 0],
+        [0, np.cos(roll), -np.sin(roll)],
+        [0, np.sin(roll), np.cos(roll)]
+    ])
+    
+    # Pitch (Y-axis rotation)
+    Ry = np.array([
+        [np.cos(pitch), 0, np.sin(pitch)],
+        [0, 1, 0],
+        [-np.sin(pitch), 0, np.cos(pitch)]
+    ])
+    
+    # Yaw (Z-axis rotation)
+    Rz = np.array([
+        [np.cos(yaw), -np.sin(yaw), 0],
+        [np.sin(yaw), np.cos(yaw), 0],
+        [0, 0, 1]
+    ])
+    
+    # Combined rotation matrix: R = Rz * Ry * Rx
+    R = Rz @ Ry @ Rx
+    return R
 
-    R_y = np.array([[np.cos(pitch), 0, np.sin(pitch)],
-                    [0, 1, 0],
-                    [-np.sin(pitch), 0, np.cos(pitch)]])
+def quaternion_to_euler(quaternion: np.ndarray) -> np.ndarray:
+    """
+    Convert quaternion (w, x, y, z) to Euler angles (pitch, yaw, roll).
+    Uses the ZYX convention.
+    """
+    w, x, y, z = quaternion
+    
+    # Roll (X-axis rotation)
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = np.arctan2(sinr_cosp, cosr_cosp)
+    
+    # Pitch (Y-axis rotation)
+    sinp = 2.0 * (w * y - z * x)
+    pitch = np.arcsin(np.clip(sinp, -1.0, 1.0))
+    
+    # Yaw (Z-axis rotation)
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = np.arctan2(siny_cosp, cosy_cosp)
+    
+    return np.array([pitch, yaw, roll])
 
-    R_z = np.array([[np.cos(yaw), -np.sin(yaw), 0],
-                    [np.sin(yaw), np.cos(yaw), 0],
-                    [0, 0, 1]])
+def quaternion_to_rotation_matrix(quaternion: np.ndarray) -> np.ndarray:
+    """
+    Convert quaternion (w, x, y, z) to 3x3 rotation matrix.
+    """
+    w, x, y, z = quaternion
+    
+    # Precompute common terms
+    x2, y2, z2 = x*x, y*y, z*z
+    wx, wy, wz = w*x, w*y, w*z
+    xy, xz, yz = x*y, x*z, y*z
+    
+    # Build rotation matrix
+    R = np.array([
+        [1 - 2*(y2 + z2), 2*(xy - wz), 2*(xz + wy)],
+        [2*(xy + wz), 1 - 2*(x2 + z2), 2*(yz - wx)],
+        [2*(xz - wy), 2*(yz + wx), 1 - 2*(x2 + y2)]
+    ])
+    
+    return R
 
-    # Combined rotation: ZYX order is common for aerospace/vehicles
-    rotation_mtx = np.dot(R_z, np.dot(R_y, R_x))
-    return rotation_mtx
+def normalize_quaternion(quaternion: np.ndarray) -> np.ndarray:
+    """Normalize a quaternion to unit length."""
+    norm = np.linalg.norm(quaternion)
+    if norm < 1e-10:
+        return np.array([1.0, 0.0, 0.0, 0.0])  # Default to identity quaternion
+    return quaternion / norm
+
+def rotation_matrix_to_quaternion(R: np.ndarray) -> np.ndarray:
+    """
+    Convert 3x3 rotation matrix to quaternion (w, x, y, z).
+    Uses Sarabandi & Thomas algorithm for robust conversion.
+    """
+    # Ensure proper 3x3 rotation matrix
+    if R.shape != (3, 3):
+        raise ValueError("Expected 3x3 rotation matrix")
+        
+    # Get trace
+    trace = np.trace(R)
+    
+    if trace > 0:
+        S = 2 * np.sqrt(trace + 1.0)
+        w = 0.25 * S
+        x = (R[2,1] - R[1,2]) / S
+        y = (R[0,2] - R[2,0]) / S
+        z = (R[1,0] - R[0,1]) / S
+    else:
+        if R[0,0] > R[1,1] and R[0,0] > R[2,2]:
+            S = 2 * np.sqrt(1.0 + R[0,0] - R[1,1] - R[2,2])
+            w = (R[2,1] - R[1,2]) / S
+            x = 0.25 * S
+            y = (R[0,1] + R[1,0]) / S
+            z = (R[0,2] + R[2,0]) / S
+        elif R[1,1] > R[2,2]:
+            S = 2 * np.sqrt(1.0 + R[1,1] - R[0,0] - R[2,2])
+            w = (R[0,2] - R[2,0]) / S
+            x = (R[0,1] + R[1,0]) / S
+            y = 0.25 * S
+            z = (R[1,2] + R[2,1]) / S
+        else:
+            S = 2 * np.sqrt(1.0 + R[2,2] - R[0,0] - R[1,1])
+            w = (R[1,0] - R[0,1]) / S
+            x = (R[0,2] + R[2,0]) / S
+            y = (R[1,2] + R[2,1]) / S
+            z = 0.25 * S
+            
+    return normalize_quaternion(np.array([w, x, y, z]))
+
+def get_forward_vector(rotation: np.ndarray) -> np.ndarray:
+    """Get forward vector from Euler angles (pitch, yaw, roll)."""
+    R = euler_to_rotation_matrix(rotation)
+    return R[:, 0]  # First column is forward vector
+
+def get_up_vector(rotation: np.ndarray) -> np.ndarray:
+    """Get up vector from Euler angles (pitch, yaw, roll)."""
+    R = euler_to_rotation_matrix(rotation)
+    return R[:, 2]  # Third column is up vector
+
+def get_right_vector(rotation: np.ndarray) -> np.ndarray:
+    """Get right vector from Euler angles (pitch, yaw, roll)."""
+    R = euler_to_rotation_matrix(rotation)
+    return R[:, 1]  # Second column is right vector
+
 # --- End Helper Functions ---
 
 class BallTowardGoalSpawnMutator(StateMutator):
@@ -80,7 +206,7 @@ class BallVelocityMutator(StateMutator):
         state.ball.angular_velocity = np.zeros(3)
 
 class CarPositionMutator(StateMutator):
-    """Sets a car's position and optionally orientation using callback functions"""
+    """Sets a car's position and orientation using callback functions"""
     def __init__(self, car_id: str, 
                  position_function: Optional[Callable[[], np.ndarray]] = None,
                  orientation_function: Optional[Callable[[], np.ndarray]] = None,
@@ -93,90 +219,81 @@ class CarPositionMutator(StateMutator):
     def apply(self, state: GameState, shared_info: Dict[str, Any]) -> None:
         car_id_str = str(self.car_id)
         if car_id_str not in state.cars:
+            if self.debug:
+                print(f"[DEBUG CarPositionMutator] Car {car_id_str} not found in state")
             return
         
         car = state.cars[car_id_str]
         
-        # --- Position Setting (Added Debugging) ---
-        position = None # Initialize position
+        # --- Position Setting ---
         try:
-            position = self.position_function()
+            position = self.position_function() if self.position_function else np.array([0.0, -2000.0, 17.0])
             if self.debug:
                 print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Generated Position: {position}")
-            if position is None or not isinstance(position, (np.ndarray, list, tuple)):
-                raise ValueError("Position function returned invalid position")
-        except Exception as e:
-            if self.debug:
-                print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Error in position_function: {e}, using default position")
-            position = np.array([0.0, -2000.0, 17.0]) # Default position
-        
-        if not isinstance(position, np.ndarray):
-            position = np.array(position)
-        
-        # Ensure physics object exists using the correct type
-        if not hasattr(car, 'physics') or car.physics is None:
-             car.physics = PhysicsObject() # Use the imported PhysicsObject
-             if self.debug:
-                 print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Created PhysicsObject instance")
-             # Initialize rotation attribute if it doesn't exist after creation
-             if not hasattr(car.physics, 'rotation'):
-                 car.physics.rotation = np.zeros(3)
-                 if self.debug:
-                     print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Initialized physics.rotation")
-        # Apply position
-        try:
-            car.physics.position = position
-            if self.debug:
-                print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Applied position: {car.physics.position}")
-        except Exception as e:
-             if self.debug:
-                 print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Error applying position: {e}")
-        # Ensure velocities exist (often needed by physics engine)
-        if not hasattr(car.physics, 'linear_velocity') or car.physics.linear_velocity is None:
-            car.physics.linear_velocity = np.zeros(3)
-        if not hasattr(car.physics, 'angular_velocity') or car.physics.angular_velocity is None:
-            car.physics.angular_velocity = np.zeros(3)
-        # --- End Position Setting ---
-        # --- Orientation Setting (Attach Euler Angles to Car Object) ---
-        if self.orientation_function:
-            try:
-                rotation_euler = self.orientation_function()
-                if self.debug:
-                    print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Generated Euler Rotation: {rotation_euler}")
-                if rotation_euler is None or not isinstance(rotation_euler, (np.ndarray, list, tuple)):
-                     raise ValueError("Orientation function returned invalid rotation")
-                if not isinstance(rotation_euler, np.ndarray):
-                    rotation_euler = np.array(rotation_euler)
+            
+            if not isinstance(position, np.ndarray):
+                position = np.array(position)
+            
+            # Ensure physics object exists with proper type
+            if not hasattr(car, 'physics') or car.physics is None:
+                car.physics = PhysicsObject()
                 
-                # Attach Euler angles directly to the car object being modified
-                try:
-                    car._temp_euler_rotation = rotation_euler
-                    if self.debug:
-                        print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Attached _temp_euler_rotation = {car._temp_euler_rotation}")
-                except Exception as e_set_temp:
-                     if self.debug:
-                         print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Error attaching _temp_euler_rotation: {repr(e_set_temp)}")
-            except Exception as e:
+            # Apply position and initialize velocities
+            car.physics.position = position
+            car.physics.linear_velocity = np.zeros(3)
+            car.physics.angular_velocity = np.zeros(3)
+            
+        except Exception as e:
+            if self.debug:
+                print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Position error: {str(e)}")
+            # Use safe default position
+            car.physics.position = np.array([0.0, -2000.0, 17.0])
+        
+        # --- Orientation Setting ---
+        try:
+            if self.orientation_function:
+                euler_rotation = self.orientation_function()
                 if self.debug:
-                    print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Error processing orientation function: {repr(e)}")
-                # Attempt to set default neutral orientation if error occurs
-                try:
-                    car._temp_euler_rotation = np.zeros(3)
-                    if self.debug:
-                        print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Attached default Euler rotation due to error.")
-                except Exception as fallback_e:
-                     if self.debug:
-                         print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Error attaching default Euler rotation: {repr(fallback_e)}")
-        else:
-             if self.debug:
-                 print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, No orientation_function provided.")
-             # Ensure default rotation exists if no function provided
-             try:
-                 if not hasattr(car, '_temp_euler_rotation'):
-                      car._temp_euler_rotation = np.zeros(3)
-             except:
-                 pass # Ignore if we can't attach
-        # --- End Orientation Setting ---
+                    print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Euler rotation: {euler_rotation}")
+                
+                if not isinstance(euler_rotation, np.ndarray):
+                    euler_rotation = np.array(euler_rotation)
+                
+                # Convert Euler angles to quaternion
+                quaternion = euler_to_quaternion(euler_rotation)
+                if self.debug:
+                    print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Quaternion: {quaternion}")
+                
+                # Convert quaternion to rotation matrix
+                rotation_matrix = quaternion_to_rotation_matrix(quaternion)
+                if self.debug:
+                    print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Rotation matrix: {rotation_matrix}")
+                
+                # Apply rotation matrix to car physics (using rotation_mtx instead of rotation)
+                car.physics.rotation_mtx = rotation_matrix  # Apply rotation matrix
+                # Store quaternion if the physics object supports it
+                if hasattr(car.physics, 'quaternion'):
+                    car.physics.quaternion = quaternion
+                
+                # Verify rotation was applied
+                if self.debug:
+                    if hasattr(car.physics, 'rotation_mtx'):
+                        print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Applied rotation matrix: {car.physics.rotation_mtx}")
+                    else:
+                        print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Warning: rotation_mtx not set")
+            else:
+                # Default to neutral orientation
+                car.physics.rotation_mtx = np.eye(3)
+                if hasattr(car.physics, 'quaternion'):
+                    car.physics.quaternion = np.array([1., 0., 0., 0.])
+                
+        except Exception as e:
+            if self.debug:
+                print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Orientation error: {str(e)}")
+            # Use safe default orientation
+            car.physics.rotation_mtx = np.eye(3)
+            if hasattr(car.physics, 'quaternion'):
+                car.physics.quaternion = np.array([1., 0., 0., 0.])
 
 class CarBoostMutator(StateMutator):
     """Sets boost amount for specific cars"""

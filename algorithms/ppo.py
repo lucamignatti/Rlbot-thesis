@@ -40,6 +40,7 @@ class PPOAlgorithm(BaseAlgorithm):
             self.device = device
             self.pos = 0
             self.full = False
+            self.use_device_tensors = device != "cpu"
             
             # Initialize buffers as empty tensors
             self._reset_buffers()
@@ -86,12 +87,22 @@ class PPOAlgorithm(BaseAlgorithm):
                     done = done.unsqueeze(0)
                 
                 # Initialize buffers with correct shapes
-                self.obs = torch.zeros((self.buffer_size, *obs.shape[1:]), dtype=torch.float32, device=self.device)
-                self.actions = torch.zeros((self.buffer_size, *action.shape[1:]), dtype=torch.float32, device=self.device)
-                self.log_probs = torch.zeros((self.buffer_size, *log_prob.shape[1:]), dtype=torch.float32, device=self.device)
-                self.rewards = torch.zeros((self.buffer_size, *reward.shape[1:]), dtype=torch.float32, device=self.device)
-                self.values = torch.zeros((self.buffer_size, *value.shape[1:]), dtype=torch.float32, device=self.device)
-                self.dones = torch.zeros((self.buffer_size, *done.shape[1:]), dtype=torch.bool, device=self.device)
+                if self.use_device_tensors:
+                    # Store tensors directly on the target device
+                    self.obs = torch.zeros((self.buffer_size, *obs.shape[1:]), dtype=torch.float32, device=self.device)
+                    self.actions = torch.zeros((self.buffer_size, *action.shape[1:]), dtype=torch.float32, device=self.device)
+                    self.log_probs = torch.zeros((self.buffer_size, *log_prob.shape[1:]), dtype=torch.float32, device=self.device)
+                    self.rewards = torch.zeros((self.buffer_size, *reward.shape[1:]), dtype=torch.float32, device=self.device)
+                    self.values = torch.zeros((self.buffer_size, *value.shape[1:]), dtype=torch.float32, device=self.device)
+                    self.dones = torch.zeros((self.buffer_size, *done.shape[1:]), dtype=torch.bool, device=self.device)
+                else:
+                    # Store tensors on CPU
+                    self.obs = torch.zeros((self.buffer_size, *obs.shape[1:]), dtype=torch.float32)
+                    self.actions = torch.zeros((self.buffer_size, *action.shape[1:]), dtype=torch.float32)
+                    self.log_probs = torch.zeros((self.buffer_size, *log_prob.shape[1:]), dtype=torch.float32)
+                    self.rewards = torch.zeros((self.buffer_size, *reward.shape[1:]), dtype=torch.float32)
+                    self.values = torch.zeros((self.buffer_size, *value.shape[1:]), dtype=torch.float32)
+                    self.dones = torch.zeros((self.buffer_size, *done.shape[1:]), dtype=torch.bool)
             
             # Convert inputs to tensors and move to device
             if not isinstance(obs, torch.Tensor):

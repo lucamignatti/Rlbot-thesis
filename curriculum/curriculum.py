@@ -7,13 +7,14 @@ from .mutators import (
 from rlgym.rocket_league.done_conditions import GoalCondition, TimeoutCondition, NoTouchTimeoutCondition
 from rlgym.rocket_league.reward_functions import CombinedReward, GoalReward, TouchReward
 from rewards import (
-    TouchBallReward, PlayerVelocityTowardBallReward, create_offensive_potential_reward,
-    BallVelocityToGoalReward, TouchBallToGoalAccelerationReward, SaveBoostReward,
-    create_distance_weighted_alignment_reward, BallToGoalDistanceReward, create_lucy_skg_reward,
-    BallProximityReward, KRCRewardFunction, DummyReward, BlockSuccessReward,
-    DefensivePositioningReward, BallClearanceReward, TeamSpacingReward, TeamPossessionReward,
+    BallProximityReward, BallToGoalDistanceReward, TouchBallReward, 
+    BallVelocityToGoalReward, AlignBallToGoalReward, SaveBoostReward,
+    KRCReward, DistanceWeightedAlignmentKRC, OffensivePotentialKRC,  
+    PlayerVelocityTowardBallReward, TouchBallToGoalAccelerationReward,
     PassCompletionReward, ScoringOpportunityCreationReward, AerialControlReward,
-    AerialDirectionalTouchReward
+    AerialDirectionalTouchReward, BlockSuccessReward, DefensivePositioningReward, 
+    BallClearanceReward, TeamSpacingReward, TeamPossessionReward,
+    create_distance_weighted_alignment_reward, create_offensive_potential_reward, create_lucy_skg_reward
 )
 import numpy as np
 import random
@@ -375,15 +376,12 @@ def get_defensive_save_ball_position() -> np.ndarray:
     ])
 
 def get_defensive_save_ball_velocity() -> np.ndarray:
-    """Get ball velocity for practicing goal-line saves
-    Returns:
-        np.ndarray: [vx, vy, vz] velocity - moving toward blue goal
-    """
-    return np.array([
-        np.random.uniform(-300, 300),
-        -2000,  # Ball moving toward blue goal
-        np.random.uniform(-100, 100)
-    ])
+    """Get a ball velocity aimed toward the goal for defensive save training"""
+    # Calculate velocity aimed approximately at the goal
+    direction = np.array([np.random.uniform(-0.4, 0.4), -1.0, np.random.uniform(-0.2, 0.5)])
+    direction = direction / np.linalg.norm(direction)  # Normalize
+    speed = np.random.uniform(1000, 2000)  # Fast ball
+    return direction * speed
 
 def get_defensive_save_car_position() -> np.ndarray:
     """Get car position for practicing goal-line saves
@@ -1073,7 +1071,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                                position_function=SafePositionWrapper(get_blue_attacker_position),
                                orientation_function=get_random_yaw_orientation)
         ),
-        base_task_reward_function=KRCRewardFunction([
+        base_task_reward_function=KRCReward([
             (offensive_potential_reward, 0.7),
             (touch_ball_reward, 0.5),
             (goal_velocity_reward, 0.5)
@@ -1284,7 +1282,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                                position_function=SafePositionWrapper(get_orange_support_position),
                                orientation_function=get_face_own_goal_orientation)
         ),
-        base_task_reward_function=KRCRewardFunction([
+        base_task_reward_function=KRCReward([
             (BlockSuccessReward(), 0.7), # Renamed from GoalPrevention
             (DefensivePositioningReward(), 0.5),
             (BallClearanceReward(), 0.6)
@@ -1320,7 +1318,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                                position_function=SafePositionWrapper(get_orange_secondary_defender_position),
                                orientation_function=get_face_own_goal_orientation)
         ),
-        base_task_reward_function=KRCRewardFunction([
+        base_task_reward_function=KRCReward([
             (goal_velocity_reward, 0.7),
             (offensive_potential_reward, 0.6),
             (PassCompletionReward(), 0.5), # Added pass reward
