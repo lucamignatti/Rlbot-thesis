@@ -641,7 +641,30 @@ def create_car_position_mutator(car_id, position_function, orientation_function=
         debug=debug
     )
 
-def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
+def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None): # Added lr_actor and lr_critic parameters
+    """
+    Create a curriculum for training.
+    
+    Args:
+        debug: Whether to print debug information
+        use_wandb: Whether to use Weights & Biases for logging
+        lr_actor: Learning rate for the actor network (overrides default values)
+        lr_critic: Learning rate for the critic network (overrides default values)
+        
+    Returns:
+        CurriculumManager: The created curriculum manager
+    """
+    # Store default learning rates to use if not provided
+    default_lr_actor = 0.0002  # Default actor learning rate
+    default_lr_critic = 0.0005  # Default critic learning rate
+    
+    # Use provided learning rates or fall back to defaults
+    lr_actor = lr_actor if lr_actor is not None else default_lr_actor
+    lr_critic = lr_critic if lr_critic is not None else default_lr_critic
+    
+    if debug:
+        print(f"[DEBUG] Creating curriculum with learning rates - Actor: {lr_actor}, Critic: {lr_critic}")
+
     # Basic constants
     SHORT_TIMEOUT = 8
     MED_TIMEOUT = 15
@@ -712,8 +735,8 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
         ),
         is_pretraining=True,
         hyperparameter_adjustments={
-            "lr_actor": 0.0003,
-            "lr_critic": 0.0007,
+            "lr_actor": lr_actor,
+            "lr_critic": lr_critic,
             "entropy_coef": 0.01
         }
     )
@@ -784,8 +807,8 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
             max_std_dev=1.0, required_consecutive_successes=3
         ),
         hyperparameter_adjustments={
-            "lr_actor": 0.00025,
-            "lr_critic": 0.0006,
+            "lr_actor": lr_actor * 1.25,  # Slightly higher learning rate for early stages
+            "lr_critic": lr_critic * 1.2,
             "entropy_coef": 0.008
         },
         debug=debug
@@ -847,8 +870,8 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
             max_std_dev=1.5, required_consecutive_successes=3
         ),
         hyperparameter_adjustments={
-            "lr_actor": 0.00022,
-            "lr_critic": 0.0005,
+            "lr_actor": lr_actor * 1.1,  # Slightly higher than base but less than movement stage
+            "lr_critic": lr_critic * 1.1,
             "entropy_coef": 0.007
         },
         debug=debug
@@ -920,8 +943,8 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
             max_std_dev=1.8, required_consecutive_successes=2
         ),
         hyperparameter_adjustments={
-            "lr_actor": 0.0002,
-            "lr_critic": 0.0005,
+            "lr_actor": lr_actor,  # Base learning rate for this stage
+            "lr_critic": lr_critic,
             "entropy_coef": 0.006
         },
         debug=debug
@@ -956,8 +979,8 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
             max_std_dev=1.8, required_consecutive_successes=2
         ),
         hyperparameter_adjustments={
-            "lr_actor": 0.00018,
-            "lr_critic": 0.00045,
+            "lr_actor": lr_actor * 0.9,  # Slightly lower learning rate as complexity increases
+            "lr_critic": lr_critic * 0.9,
             "entropy_coef": 0.005
         }
         # Skill modules could be added here later (e.g., Angled Shots)
@@ -1029,8 +1052,8 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
             max_std_dev=2.0, required_consecutive_successes=2
         ),
         hyperparameter_adjustments={
-            "lr_actor": 0.00015,
-            "lr_critic": 0.0004,
+            "lr_actor": lr_actor * 0.75,  # Lower learning rate for complex mechanics
+            "lr_critic": lr_critic * 0.8,
             "entropy_coef": 0.004
         },
         debug=debug

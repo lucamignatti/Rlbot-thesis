@@ -185,7 +185,12 @@ def run_training(
     curriculum_manager = None
     if use_curriculum:
         try:
-            curriculum_manager = create_curriculum(debug=debug)
+            curriculum_manager = create_curriculum(
+                debug=debug,
+                use_wandb=use_wandb,
+                lr_actor=lr_actor,  # Pass CLI learning rate for actor
+                lr_critic=lr_critic  # Pass CLI learning rate for critic
+            )
             # Register trainer with curriculum manager
             curriculum_manager.register_trainer(trainer)
             if debug:
