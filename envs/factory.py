@@ -78,9 +78,10 @@ def euler_to_rotation_matrix(euler: np.ndarray) -> np.ndarray:
 class PatchedRocketSimEngine(RocketSimEngine):
     """A patched version of RocketSimEngine that ensures car positions are never None"""
     
-    def __init__(self):
+    def __init__(self, debug=False):
         # The parent class no longer accepts rlbot_delay parameter
         super().__init__()
+        self.debug = debug
     
     def _set_car_state(self, car: rsim.Car, desired_car: any):
         """
@@ -100,7 +101,6 @@ class PatchedRocketSimEngine(RocketSimEngine):
             if not hasattr(desired_car.physics, 'angular_velocity') or desired_car.physics.angular_velocity is None:
                 desired_car.physics.angular_velocity = np.zeros(3)
             # --- End basic physics validation ---
-
             # Create a new car state
             car_state = rsim.CarState()
             
@@ -117,13 +117,17 @@ class PatchedRocketSimEngine(RocketSimEngine):
                     
                     if pos_read.shape == (3,) and not np.isnan(pos_read).any():
                         position_to_set = pos_read
-                        print(f"[DEBUG _set_car_state] Read Position: {position_to_set}") # Debug print
+                        if self.debug:
+                            print(f"[DEBUG _set_car_state] Read Position: {position_to_set}")
                     else:
-                        print(f"[DEBUG _set_car_state] Invalid position read: {pos_read}, using default.")
+                        if self.debug:
+                            print(f"[DEBUG _set_car_state] Invalid position read: {pos_read}, using default.")
                 except Exception as e_pos:
-                    print(f"[DEBUG _set_car_state] Error reading position: {e_pos}, using default.")
+                    if self.debug:
+                        print(f"[DEBUG _set_car_state] Error reading position: {e_pos}, using default.")
             else:
-                 print(f"[DEBUG _set_car_state] No position attribute found, using default.")
+                if self.debug:
+                    print(f"[DEBUG _set_car_state] No position attribute found, using default.")
             
             car_state.pos = rsim.Vec(*position_to_set)
             # --- End Position Setting ---
@@ -153,29 +157,36 @@ class PatchedRocketSimEngine(RocketSimEngine):
                         if not np.isnan(euler_angles_np).any():
                             # Convert valid Euler angles to rotation matrix
                             rotation_matrix_to_set = euler_to_rotation_matrix(euler_angles_np)
-                            print(f"[DEBUG _set_car_state] Used _temp_euler_rotation {euler_angles_np} -> rot_mat") # Debug print
+                            if self.debug:
+                                print(f"[DEBUG _set_car_state] Used _temp_euler_rotation {euler_angles_np} -> rot_mat")
                         else:
-                            print(f"[DEBUG _set_car_state] Invalid _temp_euler_rotation read (contains NaN): {euler_angles_np}")
+                            if self.debug:
+                                print(f"[DEBUG _set_car_state] Invalid _temp_euler_rotation read (contains NaN): {euler_angles_np}")
                     else:
-                        print(f"[DEBUG _set_car_state] Invalid _temp_euler_rotation read (wrong type/shape): {euler_angles}")
+                        if self.debug:
+                            print(f"[DEBUG _set_car_state] Invalid _temp_euler_rotation read (wrong type/shape): {euler_angles}")
             except Exception as e:
                 # Print the actual exception
-                print(f"[DEBUG _set_car_state] Error processing _temp_euler_rotation: {repr(e)}") 
+                if self.debug:
+                    print(f"[DEBUG _set_car_state] Error processing _temp_euler_rotation: {repr(e)}") 
                 rotation_matrix_to_set = None # Fallback if conversion fails
 
             # If still no valid rotation, use identity matrix
             if rotation_matrix_to_set is None:
                 rotation_matrix_to_set = np.eye(3)
-                print("[DEBUG _set_car_state] Used identity matrix") # Debug print
+                if self.debug:
+                    print("[DEBUG _set_car_state] Used identity matrix") # Debug print
 
             # --- More Debugging ---
-            print(f"[DEBUG _set_car_state] Read Euler value (from _temp_euler_rotation): {read_euler}")
-            print(f"[DEBUG _set_car_state] Final rotation_matrix_to_set:\n{rotation_matrix_to_set}")
+            if self.debug:
+                print(f"[DEBUG _set_car_state] Read Euler value (from _temp_euler_rotation): {read_euler}")
+                print(f"[DEBUG _set_car_state] Final rotation_matrix_to_set:\n{rotation_matrix_to_set}")
             # --- End More Debugging ---
 
             # Set the rotation matrix in RocketSim format (flattened row-major)
             rot_elements = rotation_matrix_to_set.flatten()
-            print(f"[DEBUG _set_car_state] Flattened rot_elements: {rot_elements}") # Debug print
+            if self.debug:
+                print(f"[DEBUG _set_car_state] Flattened rot_elements: {rot_elements}") # Debug print
             car_state.rot_mat = rsim.RotMat(*rot_elements)
             # --- End Rotation Setting ---
             
@@ -223,7 +234,8 @@ class PatchedRocketSimEngine(RocketSimEngine):
 
             # Set the final state
             car.set_state(car_state)
-            print(f"[DEBUG _set_car_state] car.set_state called successfully") # Debug print
+            if self.debug:
+                print(f"[DEBUG _set_car_state] car.set_state called successfully") # Debug print
 
         except Exception as e:
             print(f"Fatal error in patched _set_car_state: {str(e)}")
@@ -282,7 +294,7 @@ def get_env(renderer=None, action_stacker=None, curriculum_config=None, debug=Fa
             termination_cond=curriculum_config["termination_condition"],
             truncation_cond=curriculum_config["truncation_condition"],
             # Use the patched engine to handle car position issues
-            transition_engine=PatchedRocketSimEngine(),
+            transition_engine=PatchedRocketSimEngine(debug=debug),
             renderer=renderer
         )
         
@@ -355,6 +367,6 @@ def get_env(renderer=None, action_stacker=None, curriculum_config=None, debug=Fa
             NoTouchTimeoutCondition(30.)
         ),
         # Use the patched engine for default environment too
-        transition_engine=PatchedRocketSimEngine(),
+        transition_engine=PatchedRocketSimEngine(debug=debug),
         renderer=renderer
     )

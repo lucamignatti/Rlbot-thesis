@@ -83,11 +83,13 @@ class CarPositionMutator(StateMutator):
     """Sets a car's position and optionally orientation using callback functions"""
     def __init__(self, car_id: str, 
                  position_function: Optional[Callable[[], np.ndarray]] = None,
-                 orientation_function: Optional[Callable[[], np.ndarray]] = None):
+                 orientation_function: Optional[Callable[[], np.ndarray]] = None,
+                 debug: bool = False):
         self.car_id = car_id
         self.position_function = position_function
         self.orientation_function = orientation_function
-
+        self.debug = debug
+    
     def apply(self, state: GameState, shared_info: Dict[str, Any]) -> None:
         car_id_str = str(self.car_id)
         if car_id_str not in state.cars:
@@ -99,11 +101,13 @@ class CarPositionMutator(StateMutator):
         position = None # Initialize position
         try:
             position = self.position_function()
-            print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Generated Position: {position}") # Debug print
+            if self.debug:
+                print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Generated Position: {position}")
             if position is None or not isinstance(position, (np.ndarray, list, tuple)):
                 raise ValueError("Position function returned invalid position")
         except Exception as e:
-            print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Error in position_function: {e}, using default position")
+            if self.debug:
+                print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Error in position_function: {e}, using default position")
             position = np.array([0.0, -2000.0, 17.0]) # Default position
         
         if not isinstance(position, np.ndarray):
@@ -112,31 +116,33 @@ class CarPositionMutator(StateMutator):
         # Ensure physics object exists using the correct type
         if not hasattr(car, 'physics') or car.physics is None:
              car.physics = PhysicsObject() # Use the imported PhysicsObject
-             print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Created PhysicsObject instance")
+             if self.debug:
+                 print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Created PhysicsObject instance")
              # Initialize rotation attribute if it doesn't exist after creation
              if not hasattr(car.physics, 'rotation'):
                  car.physics.rotation = np.zeros(3)
-                 print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Initialized physics.rotation")
-
+                 if self.debug:
+                     print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Initialized physics.rotation")
         # Apply position
         try:
             car.physics.position = position
-            print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Applied position: {car.physics.position}") # Debug print
+            if self.debug:
+                print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Applied position: {car.physics.position}")
         except Exception as e:
-             print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Error applying position: {e}")
-
+             if self.debug:
+                 print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Error applying position: {e}")
         # Ensure velocities exist (often needed by physics engine)
         if not hasattr(car.physics, 'linear_velocity') or car.physics.linear_velocity is None:
             car.physics.linear_velocity = np.zeros(3)
         if not hasattr(car.physics, 'angular_velocity') or car.physics.angular_velocity is None:
             car.physics.angular_velocity = np.zeros(3)
         # --- End Position Setting ---
-
         # --- Orientation Setting (Attach Euler Angles to Car Object) ---
         if self.orientation_function:
             try:
                 rotation_euler = self.orientation_function()
-                print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Generated Euler Rotation: {rotation_euler}")
+                if self.debug:
+                    print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Generated Euler Rotation: {rotation_euler}")
                 if rotation_euler is None or not isinstance(rotation_euler, (np.ndarray, list, tuple)):
                      raise ValueError("Orientation function returned invalid rotation")
                 if not isinstance(rotation_euler, np.ndarray):
@@ -145,20 +151,25 @@ class CarPositionMutator(StateMutator):
                 # Attach Euler angles directly to the car object being modified
                 try:
                     car._temp_euler_rotation = rotation_euler
-                    print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Attached _temp_euler_rotation = {car._temp_euler_rotation}")
+                    if self.debug:
+                        print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Attached _temp_euler_rotation = {car._temp_euler_rotation}")
                 except Exception as e_set_temp:
-                     print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Error attaching _temp_euler_rotation: {repr(e_set_temp)}")
-
+                     if self.debug:
+                         print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Error attaching _temp_euler_rotation: {repr(e_set_temp)}")
             except Exception as e:
-                print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Error processing orientation function: {repr(e)}")
+                if self.debug:
+                    print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Error processing orientation function: {repr(e)}")
                 # Attempt to set default neutral orientation if error occurs
                 try:
                     car._temp_euler_rotation = np.zeros(3)
-                    print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Attached default Euler rotation due to error.")
+                    if self.debug:
+                        print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Attached default Euler rotation due to error.")
                 except Exception as fallback_e:
-                     print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Error attaching default Euler rotation: {repr(fallback_e)}")
+                     if self.debug:
+                         print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Error attaching default Euler rotation: {repr(fallback_e)}")
         else:
-             print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, No orientation_function provided.")
+             if self.debug:
+                 print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, No orientation_function provided.")
              # Ensure default rotation exists if no function provided
              try:
                  if not hasattr(car, '_temp_euler_rotation'):

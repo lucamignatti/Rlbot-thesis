@@ -632,6 +632,15 @@ class SafePositionWrapper:
         except:
             return f"Position function (error evaluating)"
 
+def create_car_position_mutator(car_id, position_function, orientation_function=None, debug=False):
+    """Helper function to create CarPositionMutator instances with debug flag"""
+    return CarPositionMutator(
+        car_id=car_id,
+        position_function=position_function,
+        orientation_function=orientation_function,
+        debug=debug
+    )
+
 def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
     # Basic constants
     SHORT_TIMEOUT = 8
@@ -701,7 +710,12 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
             min_success_rate=0.0, min_avg_reward=0.0, min_episodes=100,
             max_std_dev=10.0, required_consecutive_successes=1
         ),
-        is_pretraining=True
+        is_pretraining=True,
+        hyperparameter_adjustments={
+            "lr_actor": 0.0003,
+            "lr_critic": 0.0007,
+            "entropy_coef": 0.01
+        }
     )
 
     # ======== STAGE 1: MOVEMENT FOUNDATIONS ========
@@ -769,6 +783,11 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
             min_success_rate=0.85, min_avg_reward=0.5, min_episodes=50,
             max_std_dev=1.0, required_consecutive_successes=3
         ),
+        hyperparameter_adjustments={
+            "lr_actor": 0.00025,
+            "lr_critic": 0.0006,
+            "entropy_coef": 0.008
+        },
         debug=debug
     )
 
@@ -827,6 +846,11 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
             min_success_rate=0.8, min_avg_reward=0.6, min_episodes=75,
             max_std_dev=1.5, required_consecutive_successes=3
         ),
+        hyperparameter_adjustments={
+            "lr_actor": 0.00022,
+            "lr_critic": 0.0005,
+            "entropy_coef": 0.007
+        },
         debug=debug
     )
 
@@ -895,6 +919,11 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
             min_success_rate=0.65, min_avg_reward=0.4, min_episodes=100,
             max_std_dev=1.8, required_consecutive_successes=2
         ),
+        hyperparameter_adjustments={
+            "lr_actor": 0.0002,
+            "lr_critic": 0.0005,
+            "entropy_coef": 0.006
+        },
         debug=debug
     )
 
@@ -925,7 +954,12 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
         progression_requirements=ProgressionRequirements(
             min_success_rate=0.6, min_avg_reward=0.5, min_episodes=125,
             max_std_dev=1.8, required_consecutive_successes=2
-        )
+        ),
+        hyperparameter_adjustments={
+            "lr_actor": 0.00018,
+            "lr_critic": 0.00045,
+            "entropy_coef": 0.005
+        }
         # Skill modules could be added here later (e.g., Angled Shots)
     )
 
@@ -994,6 +1028,11 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
             min_success_rate=0.55, min_avg_reward=0.4, min_episodes=150,
             max_std_dev=2.0, required_consecutive_successes=2
         ),
+        hyperparameter_adjustments={
+            "lr_actor": 0.00015,
+            "lr_critic": 0.0004,
+            "entropy_coef": 0.004
+        },
         debug=debug
     )
 
@@ -1069,6 +1108,11 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
             min_success_rate=0.55, min_avg_reward=0.4, min_episodes=125,
             max_std_dev=2.0, required_consecutive_successes=2
         ),
+        hyperparameter_adjustments={
+            "lr_actor": 0.00012,
+            "lr_critic": 0.00035,
+            "entropy_coef": 0.004
+        },
         debug=debug
     )
 
@@ -1099,7 +1143,12 @@ def create_curriculum(debug=False, use_wandb=True): # Added use_wandb parameter
         progression_requirements=ProgressionRequirements(
             min_success_rate=0.6, min_avg_reward=0.4, min_episodes=150, # Success = save
             max_std_dev=2.0, required_consecutive_successes=2
-        )
+        ),
+        hyperparameter_adjustments={
+            "lr_actor": 0.0001,
+            "lr_critic": 0.0003,
+            "entropy_coef": 0.003
+        }
         # Skill modules could be added (Shadow Defense, Recovery)
     )
 
