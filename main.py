@@ -189,7 +189,8 @@ def run_training(
                 debug=debug,
                 use_wandb=use_wandb,
                 lr_actor=lr_actor,  # Pass CLI learning rate for actor
-                lr_critic=lr_critic  # Pass CLI learning rate for critic
+                lr_critic=lr_critic,  # Pass CLI learning rate for critic
+                use_pretraining=use_pretraining  # Pass the pretraining flag
             )
             # Register trainer with curriculum manager
             curriculum_manager.register_trainer(trainer)
@@ -364,6 +365,14 @@ def run_training(
                 with torch.no_grad():
                     # Get actions and values from the networks in a single forward pass
                     action_batch, log_prob_batch, value_batch, features_batch = trainer.get_action(obs_batch, return_features=True)
+                    
+                    # Ensure all returned values are properly batched for zip() iteration
+                    if not isinstance(action_batch, (list, tuple, np.ndarray)) or np.isscalar(action_batch):
+                        action_batch = [action_batch]
+                    if not isinstance(log_prob_batch, (list, tuple, np.ndarray)) or np.isscalar(log_prob_batch):
+                        log_prob_batch = [log_prob_batch]
+                    if not isinstance(value_batch, (list, tuple, np.ndarray)) or np.isscalar(value_batch):
+                        value_batch = [value_batch]
 
                 # Organize actions into a list of dictionaries, one for each environment.
                 for i, (action, log_prob, value) in enumerate(zip(action_batch, log_prob_batch, value_batch)):
@@ -938,7 +947,7 @@ if __name__ == "__main__":
     # Pre-training parameters
     parser.add_argument('--pretraining', action='store_true', help='Enable unsupervised pre-training phase at the start')
     parser.add_argument('--no-pretraining', action='store_false', dest='pretraining', help='Disable unsupervised pre-training')
-    parser.set_defaults(pretraining=False)
+    parser.set_defaults(pretraining=True)  # Changed default to True so --no-pretraining has an effect
     parser.add_argument('--pretraining-fraction', type=float, default=0.1, help='Fraction of total training time/episodes to use for pre-training (default: 0.1)')
     parser.add_argument('--pretraining-sr-weight', type=float, default=10.0, help='Weight for State Representation task during pre-training (default: 10.0)')
     parser.add_argument('--pretraining-rp-weight', type=float, default=5.0, help='Weight for Reward Prediction task during pre-training (default: 5.0)')

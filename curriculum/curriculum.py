@@ -639,7 +639,7 @@ def create_car_position_mutator(car_id, position_function, orientation_function=
         debug=debug
     )
 
-def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None): # Added lr_actor and lr_critic parameters
+def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None, use_pretraining=True): # Added use_pretraining parameter
     """
     Create a curriculum for training.
     
@@ -648,6 +648,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         use_wandb: Whether to use Weights & Biases for logging
         lr_actor: Learning rate for the actor network (overrides default values)
         lr_critic: Learning rate for the critic network (overrides default values)
+        use_pretraining: Whether to include the pretraining stage
         
     Returns:
         CurriculumManager: The created curriculum manager
@@ -662,6 +663,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
     
     if debug:
         print(f"[DEBUG] Creating curriculum with learning rates - Actor: {lr_actor}, Critic: {lr_critic}")
+        print(f"[DEBUG] Pretraining enabled: {use_pretraining}")
 
     # Basic constants
     SHORT_TIMEOUT = 8
@@ -1422,8 +1424,14 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
     )
 
     # Create the full curriculum list
-    stages = [
-        pretraining,
+    stages = []
+    
+    # Only include pretraining stage if use_pretraining is True
+    if use_pretraining:
+        stages.append(pretraining)
+    
+    # Add all other stages
+    stages.extend([
         movement_foundations,
         ball_engagement,
         ball_control,
@@ -1436,7 +1444,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         offensive_coordination,
         intermediate_aerials,
         full_2v2_integration
-    ]
+    ])
 
     curriculum_manager = CurriculumManager(
         stages=stages,
