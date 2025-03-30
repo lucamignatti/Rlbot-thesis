@@ -568,8 +568,18 @@ def run_training(
             enough_experiences = False
 
             if algorithm == "ppo":
-                # For PPO, we use a batch update approach
-                enough_experiences = collected_experiences >= update_interval
+                # For PPO, check if we've collected enough experiences based on update_interval
+                # or if the buffer is close to being full
+                buffer_capacity = trainer.algorithm.memory.buffer_size if hasattr(trainer.algorithm.memory, 'buffer_size') else update_interval
+                buffer_position = trainer.algorithm.memory.pos if hasattr(trainer.algorithm.memory, 'pos') else collected_experiences
+                
+                # Trigger update if we've collected enough experiences OR if buffer is 90% full
+                enough_experiences = (collected_experiences >= update_interval or 
+                                    buffer_position >= buffer_capacity * 0.9)
+                
+                if args.debug and enough_experiences:
+                    print(f"[DEBUG] PPO update triggered - collected: {collected_experiences}/{update_interval}, " +
+                          f"buffer: {buffer_position}/{buffer_capacity}")
             else:
                 # For StreamAC, updates happen online with immediate wandb logging
                 # We still want to update progress bar and UI periodically

@@ -15,422 +15,6 @@ import torch.optim as optim
 import numpy as np
 from tqdm import tqdm
 
-class PPOMemory:
-    """
-    Buffer to store trajectories experienced by a PPO agent.
-    Handles storage and retrieval of data, taking into account whether
-    we're using the GPU (tensors) or CPU (numpy arrays).
-    """
-    def __init__(self, batch_size, buffer_size=10000, device="cuda"):
-        self.batch_size = batch_size
-        self.buffer_size = buffer_size
-        self.device = device
-
-        # Use different storage depending on whether we have a GPU or not.
-        self.use_device_tensors = device != "cpu"
-
-        if self.use_device_tensors:
-            # We're on a GPU, pre-allocate tensors.
-            self.states = torch.zeros((buffer_size, 1), dtype=torch.float32, device=device)
-            self.actions = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
-            self.logprobs = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
-            self.rewards = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
-            self.values = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
-            self.dones = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
-        else:
-            # We're on a CPU, use numpy arrays which are more efficient on CPU.
-            self.states = None  # Will be initialized when we get our first state
-            self.actions = None  # Will be initialized when we get our first action
-            self.logprobs = np.zeros((buffer_size,), dtype=np.float32)
-            self.rewards = np.zeros((buffer_size,), dtype=np.float32)
-            self.values = np.zeros((buffer_size,), dtype=np.float32)
-            self.dones = np.zeros((buffer_size,), dtype=np.float32)
-
-        self.state_initialized = False
-        self.action_initialized = False
-        self.pos = 0
-        self.size = 0
-
-    def store(self, state, action, logprob, reward, value, done):
-        """Store an experience tuple in the buffer."""
-
-        # Initialize state storage, if needed, and determine its dimensions.
-        if not self.state_initialized and state is not None:
-            if self.use_device_tensors:
-                # If it's a tensor, create a tensor of the right shape.
-                if isinstance(state, torch.Tensor):
-                    state_shape = state.shape
-                    # Check dimensions to handle both batched (2D) and unbatched (1D) inputs
-                    if len(state_shape) == 1:
-                        # Unbatched input, create a 2D states tensor [buffer_size, state_dim]
-                        self.states = torch.zeros((self.buffer_size, state_shape[0]), 
-                                                  device=self.device, dtype=torch.float32)
-                    else:
-                        # Batched input, match the dimensions [buffer_size, batch_dim, state_dim]
-                        self.states = torch.zeros((self.buffer_size, *state_shape[1:]), 
-                                                  device=self.device, dtype=torch.float32)
-                else:
-                    # If it's a numpy array or list, determine shape and create tensor.
-                    state_array = np.array(state)
-                    state_shape = state_array.shape
-                    # Check dimensions
-                    if len(state_shape) == 1:
-                        # Unbatched input
-                        self.states = torch.zeros((self.buffer_size, state_shape[0]),
-                                                  device=self.device, dtype=torch.float32)
-                    else:
-                        # Batched input
-                        self.states = torch.zeros((self.buffer_size, *state_shape[1:]),
-                                                  device=self.device, dtype=torch.float32)
-            else:
-                # We're on CPU, use numpy arrays.
-                if isinstance(state, torch.Tensor):
-                    state_array = state.cpu().numpy()
-                else:
-                    state_array = np.array(state)
-                    
-                state_shape = state_array.shape
-                # Check dimensions
-                if len(state_shape) == 1:
-                    # Unbatched input
-                    self.states = np.zeros((self.buffer_size, state_shape[0]), dtype=np.float32)
-                else:
-                    # Batched input
-                    self.states = np.zeros((self.buffer_size, *state_shape[1:]), dtype=np.float32)
-            
-            self.state_initialized = True
-
-        # Initialize action storage, if needed, and figure out if actions are discrete or continuous.
-        if not self.action_initialized and action is not None:
-            if self.use_device_tensors:
-                # If it's a tensor, create a tensor of the right shape.
-                if isinstance(action, torch.Tensor):
-                    action_shape = action.shape
-                    # Check if we have scalar actions (discrete) or vector actions (continuous)
-                    if action_shape == () or (len(action_shape) == 1 and action_shape[0] == 1):
-                        # Scalar/discrete actions
-                        self.actions = torch.zeros((self.buffer_size,), 
-                                                   device=self.device, dtype=torch.long)
-                    elif len(action_shape) == 1:
-                        # Vector actions with a single dimension (e.g., [batch])
-                        self.actions = torch.zeros((self.buffer_size, 1), 
-                                                   device=self.device, dtype=torch.float32)
-                    else:
-                        # Vector actions with multiple dimensions (e.g., [batch, action_dim])
-                        self.actions = torch.zeros((self.buffer_size, *action_shape[1:]), 
-                                                   device=self.device, dtype=torch.float32)
-                else:
-                    # If it's a numpy array, list, or scalar, determine shape and create tensor.
-                    if isinstance(action, (int, float)):
-                        # Scalar action (discrete)
-                        self.actions = torch.zeros((self.buffer_size,), 
-                                                   device=self.device, dtype=torch.long)
-                    else:
-                        # Vector action (continuous)
-                        action_array = np.array(action)
-                        action_shape = action_array.shape
-                        if not action_shape:  # Scalar numpy array
-                            self.actions = torch.zeros((self.buffer_size,), 
-                                                       device=self.device, dtype=torch.long)
-                        elif len(action_shape) == 1:
-                            # Vector with a single dimension
-                            self.actions = torch.zeros((self.buffer_size, action_shape[0]),
-                                                       device=self.device, dtype=torch.float32)
-                        else:
-                            # Vector with multiple dimensions
-                            self.actions = torch.zeros((self.buffer_size, *action_shape[1:]),
-                                                       device=self.device, dtype=torch.float32)
-            else:
-                # We're on CPU, use numpy arrays.
-                if isinstance(action, torch.Tensor):
-                    action_array = action.cpu().numpy()
-                elif isinstance(action, (int, float)):
-                    # Scalar action (discrete)
-                    self.actions = np.zeros((self.buffer_size,), dtype=np.int64)
-                    action_array = np.array(action, dtype=np.int64)
-                else:
-                    # Vector action (continuous)
-                    action_array = np.array(action)
-                    
-                action_shape = action_array.shape
-                if not action_shape:  # Scalar numpy array
-                    self.actions = np.zeros((self.buffer_size,), dtype=np.int64)
-                elif len(action_shape) == 1:
-                    # Vector with a single dimension
-                    self.actions = np.zeros((self.buffer_size, action_shape[0]), dtype=np.float32)
-                else:
-                    # Vector with multiple dimensions
-                    self.actions = np.zeros((self.buffer_size, *action_shape[1:]), dtype=np.float32)
-            
-            self.action_initialized = True
-
-        # Actually store the provided values.
-        if self.use_device_tensors:
-            # Convert all inputs to tensors if they're not already, and ensure on correct device.
-            if state is not None and self.state_initialized:
-                if isinstance(state, torch.Tensor):
-                    self.states[self.pos] = state.to(self.device)
-                else:
-                    self.states[self.pos] = torch.tensor(state, device=self.device, dtype=torch.float32)
-                    
-            if action is not None and self.action_initialized:
-                if isinstance(action, torch.Tensor):
-                    self.actions[self.pos] = action.to(self.device)
-                else:
-                    # Handle both discrete and continuous cases
-                    if isinstance(self.actions, torch.Tensor) and self.actions.dtype == torch.long:
-                        # Discrete action
-                        self.actions[self.pos] = torch.tensor(action, device=self.device, dtype=torch.long)
-                    else:
-                        # Continuous action
-                        self.actions[self.pos] = torch.tensor(action, device=self.device, dtype=torch.float32)
-                
-            if logprob is not None:
-                if isinstance(logprob, torch.Tensor):
-                    self.logprobs[self.pos] = logprob.to(self.device)
-                else:
-                    self.logprobs[self.pos] = torch.tensor(logprob, device=self.device, dtype=torch.float32)
-                    
-            if reward is not None:
-                if isinstance(reward, torch.Tensor):
-                    self.rewards[self.pos] = reward.to(self.device)
-                else:
-                    self.rewards[self.pos] = torch.tensor(reward, device=self.device, dtype=torch.float32)
-                    
-            if value is not None:
-                if isinstance(value, torch.Tensor):
-                    self.values[self.pos] = value.to(self.device)
-                else:
-                    self.values[self.pos] = torch.tensor(value, device=self.device, dtype=torch.float32)
-                    
-            if done is not None:
-                if isinstance(done, torch.Tensor):
-                    self.dones[self.pos] = done.to(self.device)
-                else:
-                    self.dones[self.pos] = torch.tensor(float(done), dtype=torch.float32, device=self.device)
-        else:
-            # Store using numpy arrays for CPU.
-            if state is not None and self.state_initialized:
-                if isinstance(state, torch.Tensor):
-                    self.states[self.pos] = state.cpu().numpy()
-                else:
-                    self.states[self.pos] = np.array(state, dtype=np.float32)
-                    
-            if action is not None and self.action_initialized:
-                if isinstance(action, torch.Tensor):
-                    # Convert tensor to numpy, handling both discrete and continuous
-                    if isinstance(self.actions, np.ndarray) and self.actions.dtype == np.int64:
-                        # Discrete action
-                        self.actions[self.pos] = action.cpu().numpy().astype(np.int64)
-                    else:
-                        # Continuous action
-                        self.actions[self.pos] = action.cpu().numpy().astype(np.float32)
-                else:
-                    # Handle both discrete and continuous cases
-                    if isinstance(self.actions, np.ndarray) and self.actions.dtype == np.int64:
-                        # Discrete action
-                        self.actions[self.pos] = np.array(action, dtype=np.int64)
-                    else:
-                        # Continuous action
-                        self.actions[self.pos] = np.array(action, dtype=np.float32)
-                        
-            if logprob is not None:
-                if isinstance(logprob, torch.Tensor):
-                    self.logprobs[self.pos] = logprob.cpu().numpy()
-                else:
-                    self.logprobs[self.pos] = np.array(logprob, dtype=np.float32)
-                    
-            if reward is not None:
-                if isinstance(reward, torch.Tensor):
-                    self.rewards[self.pos] = reward.cpu().numpy()
-                else:
-                    self.rewards[self.pos] = np.array(reward, dtype=np.float32)
-                    
-            if value is not None:
-                if isinstance(value, torch.Tensor):
-                    self.values[self.pos] = value.cpu().numpy()
-                else:
-                    self.values[self.pos] = np.array(value, dtype=np.float32)
-                    
-            if done is not None:
-                if isinstance(done, torch.Tensor):
-                    self.dones[self.pos] = done.cpu().numpy()
-                else:
-                    self.dones[self.pos] = np.array(float(done), dtype=np.float32)
-
-        # Update the current position and size of the buffer (circular buffer).
-        self.pos = (self.pos + 1) % self.buffer_size
-        self.size = min(self.size + 1, self.buffer_size)
-
-    def clear(self):
-        """
-        Reset the buffer after we've used it for an update.
-        We keep the allocated memory, just reset the counters.
-        """
-        self.pos = 0
-        self.size = 0
-        
-        # Force CUDA memory cleanup if using device tensors on CUDA
-        if self.use_device_tensors and self.device.startswith('cuda'):
-            torch.cuda.empty_cache()
-
-    def get(self):
-        """Get all data currently stored in the buffer."""
-        if self.size == 0 or not self.state_initialized:
-            return (np.array([]), np.array([]), np.array([]), np.array([]), np.array([]), np.array([]))
-
-        if self.use_device_tensors:
-            # Get the used portion of each tensor, handling circular buffer wraparound.
-            if self.pos < self.size:  # Buffer hasn't wrapped around
-                valid_states = self.states[:self.size]
-                valid_actions = self.actions[:self.size]
-                valid_logprobs = self.logprobs[:self.size]
-                valid_rewards = self.rewards[:self.size]
-                valid_values = self.values[:self.size]
-                valid_dones = self.dones[:self.size]
-            else:  # Buffer has wrapped around
-                # Concatenate the end of the buffer with the beginning.
-                valid_states = torch.cat([self.states[-(self.size - self.pos):], self.states[:self.pos]])
-                valid_actions = torch.cat([self.actions[-(self.size - self.pos):], self.actions[:self.pos]])
-                valid_logprobs = torch.cat([self.logprobs[-(self.size - self.pos):], self.logprobs[:self.pos]])
-                valid_rewards = torch.cat([self.rewards[-(self.size - self.pos):], self.rewards[:self.pos]])
-                valid_values = torch.cat([self.values[-(self.size - self.pos):], self.values[:self.pos]])
-                valid_dones = torch.cat([self.dones[-(self.size - self.pos):], self.dones[:self.pos]])
-        else:
-            # Same logic but with numpy arrays.
-            if self.pos < self.size:  # Buffer hasn't wrapped around
-                valid_states = self.states[:self.size]
-                valid_actions = self.actions[:self.size]
-                valid_logprobs = self.logprobs[:self.size]
-                valid_rewards = self.rewards[:self.size]
-                valid_values = self.values[:self.size]
-                valid_dones = self.dones[:self.size]
-            else:  # Buffer has wrapped around
-                # Concatenate the end of the buffer with the beginning.
-                valid_states = np.concatenate([self.states[-(self.size - self.pos):], self.states[:self.pos]])
-                valid_actions = np.concatenate([self.actions[-(self.size - self.pos):], self.actions[:self.pos]])
-                valid_logprobs = np.concatenate([self.logprobs[-(self.size - self.pos):], self.logprobs[:self.pos]])
-                valid_rewards = np.concatenate([self.rewards[-(self.size - self.pos):], self.rewards[:self.pos]])
-                valid_values = np.concatenate([self.values[-(self.size - self.pos):], self.values[:self.pos]])
-                valid_dones = np.concatenate([self.dones[-(self.size - self.pos):], self.dones[:self.pos]])
-
-        return (valid_states, valid_actions, valid_logprobs, valid_rewards, valid_values, valid_dones)
-
-    def generate_batches(self):
-        """
-        Generates batches of indices, using prioritized sampling.
-        """
-        if self.size == 0:
-            return []
-
-        # Calculate normalized probabilities for prioritized sampling.
-        if self.use_device_tensors:
-            indices = torch.randperm(self.size).to(self.device)
-            batches = [indices[i:i + self.batch_size] for i in range(0, self.size, self.batch_size)]
-        else:
-            indices = np.random.permutation(self.size)
-            batches = [indices[i:i + self.batch_size] for i in range(0, self.size, self.batch_size)]
-
-        return batches
-    
-    def store_experience_at_idx(self, idx, state=None, action=None, log_prob=None, reward=None, value=None, done=None):
-        """Update only specific values at an index, rather than a complete experience."""
-        if idx >= self.buffer_size:
-            return  # Index out of range
-
-        # Update only the provided values (non-None values).
-        if self.use_device_tensors:
-            if state is not None and self.state_initialized:
-                if isinstance(state, torch.Tensor):
-                    self.states[idx] = state.to(self.device)
-                else:
-                    self.states[idx] = torch.tensor(state, device=self.device, dtype=torch.float32)
-                    
-            if action is not None and self.action_initialized:
-                if isinstance(action, torch.Tensor):
-                    self.actions[idx] = action.to(self.device)
-                else:
-                    # Handle both discrete and continuous cases
-                    if isinstance(self.actions, torch.Tensor) and self.actions.dtype == torch.long:
-                        # Discrete action
-                        self.actions[idx] = torch.tensor(action, device=self.device, dtype=torch.long)
-                    else:
-                        # Continuous action
-                        self.actions[idx] = torch.tensor(action, device=self.device, dtype=torch.float32)
-                        
-            if log_prob is not None:
-                if isinstance(log_prob, torch.Tensor):
-                    self.logprobs[idx] = log_prob.to(self.device)
-                else:
-                    self.logprobs[idx] = torch.tensor(log_prob, device=self.device, dtype=torch.float32)
-                    
-            if reward is not None:
-                if isinstance(reward, torch.Tensor):
-                    self.rewards[idx] = reward.to(self.device)
-                else:
-                    self.rewards[idx] = torch.tensor(reward, device=self.device, dtype=torch.float32)
-                    
-            if value is not None:
-                if isinstance(value, torch.Tensor):
-                    self.values[idx] = value.to(self.device)
-                else:
-                    self.values[idx] = torch.tensor(value, device=self.device, dtype=torch.float32)
-                    
-            if done is not None:
-                if isinstance(done, torch.Tensor):
-                    self.dones[idx] = done.to(self.device)
-                else:
-                    self.dones[idx] = torch.tensor(float(done), dtype=torch.float32, device=self.device)
-        else:
-            # Do the same with numpy arrays for CPU.
-            if state is not None and self.state_initialized:
-                if isinstance(state, torch.Tensor):
-                    self.states[idx] = state.cpu().numpy()
-                else:
-                    self.states[idx] = np.array(state, dtype=np.float32)
-                    
-            if action is not None and self.action_initialized:
-                if isinstance(action, torch.Tensor):
-                    # Convert tensor to numpy, handling both discrete and continuous
-                    if isinstance(self.actions, np.ndarray) and self.actions.dtype == np.int64:
-                        # Discrete action
-                        self.actions[idx] = action.cpu().numpy().astype(np.int64)
-                    else:
-                        # Continuous action
-                        self.actions[idx] = action.cpu().numpy().astype(np.float32)
-                else:
-                    # Handle both discrete and continuous cases
-                    if isinstance(self.actions, np.ndarray) and self.actions.dtype == np.int64:
-                        # Discrete action
-                        self.actions[idx] = np.array(action, dtype=np.int64)
-                    else:
-                        # Continuous action
-                        self.actions[idx] = np.array(action, dtype=np.float32)
-                        
-            if log_prob is not None:
-                if isinstance(log_prob, torch.Tensor):
-                    self.logprobs[idx] = log_prob.cpu().numpy()
-                else:
-                    self.logprobs[idx] = np.array(log_prob, dtype=np.float32)
-                    
-            if reward is not None:
-                if isinstance(reward, torch.Tensor):
-                    self.rewards[idx] = reward.cpu().numpy()
-                else:
-                    self.rewards[idx] = np.array(reward, dtype=np.float32)
-                    
-            if value is not None:
-                if isinstance(value, torch.Tensor):
-                    self.values[idx] = value.cpu().numpy()
-                else:
-                    self.values[idx] = np.array(value, dtype=np.float32)
-                    
-            if done is not None:
-                if isinstance(done, torch.Tensor):
-                    self.dones[idx] = done.cpu().numpy()
-                else:
-                    self.dones[idx] = np.array(float(done), dtype=np.float32)
-
 
 class RunningMeanStd:
     def __init__(self, epsilon=1e-4, shape=()):
@@ -830,7 +414,7 @@ class Trainer:
             
             # Get weights directly from aux_task_manager if available
             sr_weight = getattr(self.aux_task_manager, "sr_weight", 0) if hasattr(self, 'aux_task_manager') else 0
-            rp_weight = getattr(self.aux_task_manager, "rp_weight", 0) if hasattr(self.aux_task_manager) else 0
+            rp_weight = getattr(self.aux_task_manager, "rp_weight", 0) if hasattr(self, 'aux_task_manager') else 0
             
             # Log the unweighted losses (more meaningful values for trends)
             auxiliary_metrics["AUX/state_representation_loss"] = sr_loss
@@ -842,7 +426,7 @@ class Trainer:
             auxiliary_metrics["AUX/rp_weight"] = rp_weight
             
             # Log actual last values from auxiliary manager if available
-            if hasattr(self.aux_task_manager):
+            if hasattr(self, 'aux_task_manager'): # Check existence on self
                 if hasattr(self.aux_task_manager, 'last_sr_loss') and self.aux_task_manager.last_sr_loss > 0:
                     sr_value = self.aux_task_manager.last_sr_loss
                     auxiliary_metrics["AUX/state_representation_loss"] = sr_value
@@ -1163,23 +747,42 @@ class Trainer:
         # Ensure explained_variance is correctly calculated and reported for PPO
         if self.algorithm_type == "ppo" and metrics.get('explained_variance', 0.0) == 0.0:
             # If we need to recalculate it, we can look at the metrics data
-            if hasattr(self.algorithm, 'memory') and hasattr(self.algorithm.memory, 'values') and hasattr(self.algorithm.memory, 'rewards'):
+            if hasattr(self.algorithm, 'memory') and \
+               hasattr(self.algorithm.memory, 'values') and \
+               hasattr(self.algorithm.memory, 'rewards') and \
+               self.algorithm.memory.values is not None and \
+               self.algorithm.memory.rewards is not None and \
+               self.algorithm.memory.size > 1: 
                 try:
-                    values = self.algorithm.memory.values[:self.algorithm.memory.pos].detach().cpu().numpy()
-                    returns = self.algorithm.memory.rewards[:self.algorithm.memory.pos].detach().cpu().numpy()
+                    # Access tensors only after validation
+                    values = self.algorithm.memory.values[:self.algorithm.memory.size].detach().cpu().numpy()
+                    returns = self.algorithm.memory.rewards[:self.algorithm.memory.size].detach().cpu().numpy()
                     
-                    if len(values) > 1 and len(returns) > 1:
-                        # Calculate explained variance
-                        var_y = np.var(returns)
-                        explained_var = 1 - np.var(returns - values) / (var_y + 1e-8)
-                        metrics['explained_variance'] = float(explained_var)
-                        
-                        if self.debug:
-                            print(f"[DEBUG] Recalculated explained_variance = {explained_var:.4f}")
+                    # Calculate explained variance: 1 - (var(y - pred) / var(y))
+                    var_y = np.var(returns)
+                    # Add small epsilon to denominator to prevent division by zero
+                    explained_var = 1 - np.var(returns - values) / (var_y + 1e-8) 
+                    metrics['explained_variance'] = explained_var
+                    
+                    if self.debug:
+                        print(f"[DEBUG] Recalculated explained_variance: {explained_var:.4f}")
+                            
                 except Exception as e:
                     if self.debug:
-                        print(f"[DEBUG] Error recalculating explained_variance: {e}")
-        
+                        print(f"[DEBUG] Error recalculating explained_variance: {str(e)}")
+                        import traceback
+                        traceback.print_exc()
+            elif self.debug:
+                 # Log why calculation was skipped
+                 if not hasattr(self.algorithm, 'memory'):
+                     print("[DEBUG] Skipping explained_variance: algorithm has no memory attribute.")
+                 elif self.algorithm.memory.values is None:
+                     print("[DEBUG] Skipping explained_variance: memory.values is None.")
+                 elif self.algorithm.memory.rewards is None:
+                     print("[DEBUG] Skipping explained_variance: memory.rewards is None.")
+                 elif self.algorithm.memory.size <= 1:
+                     print(f"[DEBUG] Skipping explained_variance: memory size ({self.algorithm.memory.size}) <= 1.")
+
         # Update training step counter
         if self.algorithm_type != "streamac":  # For StreamAC, steps are tracked in store_experience
             self.training_steps += 1
@@ -1225,7 +828,9 @@ class Trainer:
                 self._log_to_wandb(metrics)
             except Exception as e:
                 if self.debug:
-                    print(f"[DEBUG] Error logging to wandb: {e}")
+                    print(f"[DEBUG] Error logging to wandb: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
         
         return metrics
 
