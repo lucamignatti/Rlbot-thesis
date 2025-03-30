@@ -11,7 +11,7 @@ from auxiliary import AuxiliaryTaskManager, StateRepresentationTask, RewardPredi
 from rewards import BallProximityReward, BallToGoalDistanceReward, TouchBallReward, BallVelocityToGoalReward
 from pathlib import Path
 import configparser
-from rlbot.integration import RLBotStage, is_bot_compatible, get_bot_skill, get_compatible_bots
+from rlbot.integration import RLBotSkillStage, is_bot_compatible, get_bot_skill, get_compatible_bots
 from rlbot.registry import RLBotPackRegistry
 
 class MockStateMutator(StateMutator):
@@ -805,7 +805,7 @@ class TestRLBotIntegration(unittest.TestCase):
             base_task_reward_function=self.reward_fn,
             base_task_termination_condition=self.term_cond,
             base_task_truncation_condition=self.trunc_cond,
-            progression_requirements=self.prog_req,  # Add progression requirements
+            progression_requirements=self.prog_req,
             bot_skill_ranges={(0.3, 0.7): 0.6, (0.7, 1.0): 0.4},
             bot_tags=["defensive", "aerial"],
             allowed_bots=["HiveBot", "Necto"]
