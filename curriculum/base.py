@@ -229,45 +229,45 @@ class CurriculumManager:
         rehearsal_decay_factor: float = 0.5,
         evaluation_window: int = 100,
         debug: bool = False,
-        testing = False,
+        testing: bool = False,
         use_wandb: bool = True
     ):
         if not stages:
             raise ValueError("At least one curriculum stage must be provided")
-
-        self.debug = debug
-        self.use_wandb = use_wandb
+        
         self.stages = stages
         self.current_stage_index = 0
-        self.evaluation_window = evaluation_window
-        self.progress_thresholds = progress_thresholds or {
-            "success_rate": 0.7,
-            "avg_reward": 0.8
-        }
-
-        # Initialize tracking variables
-        self.trainer = None
-        self.stage_transitions = []
-        self.total_episodes = 0
-        self.current_difficulty = 0.0
-        self.difficulty_increase_rate = 0.01
-        # Initialize step counter
-        self._last_wandb_step = 0
-
-        # Initialize rehearsal variables
-        self.current_rehearsal = None
-        self.rehearsal_difficulty = 0.0
-        self.difficulty_threshold = 0.95  # Threshold for stage progression
-
-        if max_rehearsal_stages < 0:
-            raise ValueError("max_rehearsal_stages must be non-negative")
-
-        if rehearsal_decay_factor <= 0 or rehearsal_decay_factor > 1:
-            raise ValueError("rehearsal_decay_factor must be in range (0, 1]")
-
+        self.current_stage = stages[0]  # Initialize current stage to first stage
+        self.progress_thresholds = progress_thresholds or {}
         self.max_rehearsal_stages = max_rehearsal_stages
         self.rehearsal_decay_factor = rehearsal_decay_factor
-        self._testing = testing
+        self.evaluation_window = evaluation_window
+        self.debug = debug
+        self.testing = testing
+        self.use_wandb = use_wandb
+
+        # Tracking variables
+        self.completed_stages = []
+        self.current_difficulty = 0.0  # Initialize difficulty level to 0
+        self.current_rehearsal = None  # Track current rehearsal stage
+        self.difficulty_threshold = 0.95  # Threshold to progress to next stage
+        self.difficulty_increase_rate = 0.1  # Rate of difficulty increase
+        self.difficulty_level = 0.0
+        self.episodes_in_current_stage = 0
+        self.success_count = 0
+        self.failure_count = 0
+        self.consecutive_successes = 0
+        self.trainer = None  # Will be set via register_trainer
+        self._last_wandb_step = 0
+        self.total_episodes = 0  # Total episodes across all stages
+
+        if debug:
+            print(f"[DEBUG] Initialized curriculum with {len(stages)} stages")
+            print(f"[DEBUG] Starting at stage: {self.current_stage.name}")
+        
+        # Initialize any stage-specific variables
+        if hasattr(self.current_stage, 'initialize') and callable(self.current_stage.initialize):
+            self.current_stage.initialize()
 
     def register_trainer(self, trainer):
         """Register a trainer object for hyperparameter adjustments"""
@@ -337,7 +337,7 @@ class CurriculumManager:
             return
             
         # Never log to a step that's less than our last step
-        if not self._testing and hasattr(self, '_last_wandb_step') and current_step <= self._last_wandb_step:
+        if not self.testing and hasattr(self, '_last_wandb_step') and current_step <= self._last_wandb_step:
             if self.debug:
                 print(f"Skipping wandb log for step {current_step} (≤ {self._last_wandb_step})")
             return
@@ -394,7 +394,7 @@ class CurriculumManager:
         """Update statistics based on completed episode metrics."""
         current_stage = self.stages[self.current_stage_index]
         current_stage.update_statistics(episode_metrics)
-        self.total_episodes += 1
+        self.episodes_in_current_stage += 1
 
         if self.use_wandb:
             self._log_to_wandb({
@@ -403,14 +403,14 @@ class CurriculumManager:
                 "curriculum/current_difficulty": self.current_difficulty,
                 "curriculum/success_rate": current_stage.moving_success_rate,
                 "curriculum/avg_reward": current_stage.moving_avg_reward,
-                "curriculum/total_episodes": self.total_episodes,
+                "curriculum/total_episodes": self.episodes_in_current_stage,
                 "curriculum/stage_progress": self.get_stage_progress(),
                 "curriculum/overall_progress": self.get_overall_progress()["total_progress"],
                 "curriculum/episodes_in_stage": current_stage.episode_count,
                 "curriculum/consecutive_successes": current_stage.get_consecutive_successes()
             })
 
-        if self.total_episodes % self.evaluation_window == 0:
+        if self.episodes_in_current_stage % self.evaluation_window == 0:
             self._evaluate_progression()
 
     def _evaluate_progression(self) -> bool:
@@ -555,8 +555,8 @@ class CurriculumManager:
         self.current_difficulty = 0.0
 
         # Record transition
-        self.stage_transitions.append({
-            "episode": self.total_episodes,
+        self.completed_stages.append({
+            "episode": self.episodes_in_current_stage,
             "from_stage": old_stage_name,
             "to_stage": new_stage.name,
             "timestamp": np.datetime64('now'),

@@ -818,7 +818,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
             BallPositionMutator(position_function=SafePositionWrapper(get_varied_ground_ball_position)),
-            CarBallRelativePositionMutator(car_id="blue-0", position_function=SafePositionWrapper(get_varied_approach_car_position))
+            CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(get_varied_approach_car_position))
         ),
         base_task_reward_function=CombinedReward(
             (ball_proximity_reward, 0.8),
