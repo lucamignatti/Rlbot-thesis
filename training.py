@@ -214,8 +214,13 @@ class Trainer:
                 use_sparse_init=use_sparse_init,
                 update_freq=update_freq
             )
-            # For compatibility, create an empty PPOMemory
-            self.memory = PPOMemory(batch_size, buffer_size=1, device=device)
+            # For compatibility, create dummy memory object
+            class DummyMemory:
+                def __init__(self, *args, **kwargs):
+                    pass
+                def store_experience_at_idx(self, *args, **kwargs):
+                    pass
+            self.memory = DummyMemory(batch_size, buffer_size=1, device=device)
         else:
             raise ValueError(f"Unknown algorithm type: {algorithm_type}. Use 'ppo' or 'streamac'.")
 
