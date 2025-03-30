@@ -234,10 +234,17 @@ class CurriculumManager:
     ):
         if not stages:
             raise ValueError("At least one curriculum stage must be provided")
-        
+
+        # Add back validation for rehearsal parameters
+        if max_rehearsal_stages < 0:
+            raise ValueError("max_rehearsal_stages must be non-negative")
+
+        if rehearsal_decay_factor <= 0 or rehearsal_decay_factor > 1:
+            raise ValueError("rehearsal_decay_factor must be in range (0, 1]")
+
         self.stages = stages
         self.current_stage_index = 0
-        self.current_stage = stages[0]  # Initialize current stage to first stage
+        self.current_stage = stages[0]
         self.progress_thresholds = progress_thresholds or {}
         self.max_rehearsal_stages = max_rehearsal_stages
         self.rehearsal_decay_factor = rehearsal_decay_factor
@@ -616,7 +623,7 @@ class CurriculumManager:
             'current_stage_index': self.current_stage_index,
             'current_difficulty': self.current_difficulty,
             'total_episodes': self.total_episodes,
-            'stage_transitions': self.stage_transitions,
+            'completed_stages': self.completed_stages,
             'stages_data': [{
                 'name': stage.name,
                 'episode_count': stage.episode_count,
@@ -639,7 +646,14 @@ class CurriculumManager:
         self.current_stage_index = save_data['current_stage_index']
         self.current_difficulty = save_data['current_difficulty']
         self.total_episodes = save_data['total_episodes']
-        self.stage_transitions = save_data['stage_transitions']
+
+        # Handle either attribute name for backward compatibility
+        if 'stage_transitions' in save_data:
+            self.completed_stages = save_data['stage_transitions']
+        elif 'completed_stages' in save_data:
+            self.completed_stages = save_data['completed_stages']
+        else:
+            self.completed_stages = []
 
         # Restore stage data
         for stage, stage_data in zip(self.stages, save_data['stages_data']):

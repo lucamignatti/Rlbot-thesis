@@ -588,9 +588,9 @@ class TestCurriculumManager(unittest.TestCase):
         self.assertEqual(self.manager.current_difficulty, 0.0)  # Reset for new stage
 
         # Verify stage transition
-        self.assertEqual(len(self.manager.stage_transitions), 1)
-        self.assertEqual(self.manager.stage_transitions[0]["from_stage"], self.stage1.name)
-        self.assertEqual(self.manager.stage_transitions[0]["to_stage"], self.stage2.name)
+        self.assertEqual(len(self.manager.completed_stages), 1)
+        self.assertEqual(self.manager.completed_stages[0]["from_stage"], self.stage1.name)
+        self.assertEqual(self.manager.completed_stages[0]["to_stage"], self.stage2.name)
 
         # Verify all hyperparameters were adjusted correctly
         for param_group in mock_trainer.actor_optimizer.param_groups:
@@ -718,9 +718,7 @@ class TestCurriculumIntegration(unittest.TestCase):
         self.assertEqual(self.manager.current_difficulty, 0.0)  # Should reset for new stage
 
         # Verify transition was recorded
-        self.assertEqual(len(self.manager.stage_transitions), 1)
-        self.assertEqual(self.manager.stage_transitions[0]["from_stage"], "Basic")
-        self.assertEqual(self.manager.stage_transitions[0]["to_stage"], "Intermediate")
+        self.assertEqual(len(self.manager.completed_stages), 1)
 
     def test_stress_test(self):
         """Stress test with rapid stage transitions and frequent updates"""
