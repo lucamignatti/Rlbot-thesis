@@ -533,7 +533,7 @@ class Trainer:
                 print("[DEBUG] Initialized extrinsic reward normalizer for adaptive intrinsic scaling")
         
         # Add intrinsic rewards if enabled (using adaptive scaling throughout training)
-        if self.use_intrinsic_rewards:
+        if self.use_intrinsic_rewards and self.intrinsic_reward_generator is not None:
             # Convert inputs to tensor format for intrinsic reward computation
             if not isinstance(state, torch.Tensor):
                 state_tensor = torch.FloatTensor(state).to(self.device)
@@ -544,6 +544,20 @@ class Trainer:
                 
             if not isinstance(action, torch.Tensor):
                 if self.action_space_type == "discrete":
+                    if isinstance(action, np.ndarray):
+                        # For numpy arrays
+                        if action.size == 1:
+                            # Single value in array
+                            action = int(action.item())
+                        else:
+                            # Convert first element if multiple values
+                            action = int(action[0])
+                    elif isinstance(action, (float, np.floating)):
+                        # Direct float types
+                        action = int(action)
+                    elif hasattr(action, 'item'):
+                        # Tensor-like objects
+                        action = int(action.item())
                     action_tensor = torch.LongTensor([action]).to(self.device)
                 else:
                     action_tensor = torch.FloatTensor(action).to(self.device)
@@ -551,44 +565,66 @@ class Trainer:
                         action_tensor = action_tensor.unsqueeze(0)
             else:
                 action_tensor = action.to(self.device)
-                
-            # Get next state if available in buffer
+            
+            # Get next state based on algorithm type and buffer structure
             next_state = None
-            if hasattr(self.algorithm, 'experience_buffer') and len(self.algorithm.experience_buffer) > 0:
+            if self.algorithm_type == "streamac" and hasattr(self.algorithm, 'experience_buffers') and env_id in self.algorithm.experience_buffers:
+                # For StreamAC, use environment-specific buffer
+                if len(self.algorithm.experience_buffers[env_id]) > 0:
+                    next_state = self.algorithm.experience_buffers[env_id][-1]['obs']
+            elif self.algorithm_type == "ppo":
+                # For PPO, use the memory buffer
+                if hasattr(self.algorithm, 'memory') and hasattr(self.algorithm.memory, 'obs') and self.algorithm.memory.size > 0:
+                    # Get the most recent observation (accounting for circular buffer)
+                    idx = (self.algorithm.memory.pos - 1) % self.algorithm.memory.buffer_size
+                    next_state = self.algorithm.memory.obs[idx]
+            elif hasattr(self.algorithm, 'experience_buffer') and len(self.algorithm.experience_buffer) > 0:
+                # For other algorithms with a flat buffer
                 next_state = self.algorithm.experience_buffer[-1][0]
-                next_state = torch.FloatTensor(next_state).to(self.device).unsqueeze(0)
                 
-                # Compute intrinsic reward if we have a next state
-                if next_state is not None:
-                    intrinsic_reward = self.intrinsic_reward_generator.compute_reward(
-                        state_tensor, action_tensor, next_state
-                    )
+            # If we found a next state, compute and apply intrinsic reward
+            if next_state is not None:
+                # Convert next_state to tensor if needed
+                if not isinstance(next_state, torch.Tensor):
+                    next_state = torch.FloatTensor(next_state).to(self.device)
+                # Ensure batch dimension
+                if next_state.dim() == 1:
+                    next_state = next_state.unsqueeze(0)
+                
+                # Compute intrinsic reward using the correct method name
+                intrinsic_reward = self.intrinsic_reward_generator.compute_intrinsic_reward(
+                    state_tensor, action_tensor, next_state
+                )
+
+                # Extract extrinsic reward value for normalization
+                extrinsic_reward = reward.item() if hasattr(reward, 'item') else reward
+                
+                # Normalize extrinsic reward using running statistics
+                normalized_reward = self.extrinsic_reward_normalizer.normalize(extrinsic_reward)
+                
+                # Calculate adaptive scale using sigmoid function:
+                # - Higher intrinsic reward when extrinsic reward is low
+                # - Lower intrinsic reward when extrinsic reward is high
+                sigmoid_factor = 1.0 / (1.0 + np.exp(2.0 * normalized_reward))
+                adaptive_scale = self.intrinsic_reward_scale * sigmoid_factor
+                
+                # Ensure minimum scale to maintain some exploration
+                adaptive_scale = max(0.1 * self.intrinsic_reward_scale, adaptive_scale)
+                
+                # Add scale to metrics for debugging if in debug mode
+                if self.debug and hasattr(self, 'metrics'):
+                    self.metrics['intrinsic_scale'] = adaptive_scale
+                    self.metrics['normalized_extrinsic_reward'] = normalized_reward
                     
-                    # Extract extrinsic reward value for normalization
-                    extrinsic_reward = reward.item() if hasattr(reward, 'item') else reward
-                    
-                    # Normalize extrinsic reward using running statistics
-                    normalized_reward = self.extrinsic_reward_normalizer.normalize(extrinsic_reward)
-                    
-                    # Calculate adaptive scale using sigmoid function:
-                    # - Higher intrinsic reward when extrinsic reward is low
-                    # - Lower intrinsic reward when extrinsic reward is high
-                    sigmoid_factor = 1.0 / (1.0 + np.exp(2.0 * normalized_reward))
-                    adaptive_scale = self.intrinsic_reward_scale * sigmoid_factor
-                    
-                    # Ensure minimum scale to maintain some exploration
-                    adaptive_scale = max(0.1 * self.intrinsic_reward_scale, adaptive_scale)
-                    
-                    # Add scale to metrics for debugging if in debug mode
-                    if self.debug and hasattr(self, 'metrics'):
-                        self.metrics['intrinsic_scale'] = adaptive_scale
-                        self.metrics['normalized_extrinsic_reward'] = normalized_reward
-                    
-                    # Add scaled intrinsic reward to extrinsic reward
-                    if isinstance(reward, torch.Tensor):
-                        reward = reward + adaptive_scale * intrinsic_reward.to(reward.device)
-                    else:
-                        reward = reward + adaptive_scale * intrinsic_reward.cpu().numpy()
+                # Log that we're applying intrinsic rewards in debug mode
+                if self.debug:
+                    print(f"[DEBUG] Adding intrinsic reward: {adaptive_scale * intrinsic_reward.item():.4f} to extrinsic: {extrinsic_reward:.4f}")
+                
+                # Add scaled intrinsic reward to extrinsic reward
+                if isinstance(reward, torch.Tensor):
+                    reward = reward + adaptive_scale * intrinsic_reward[0].to(reward.device)
+                else:
+                    reward = reward + adaptive_scale * intrinsic_reward[0].cpu().numpy()
 
         # Store the experience using the algorithm - only update if not in test mode
         if not test_mode:

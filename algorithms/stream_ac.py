@@ -286,65 +286,80 @@ class StreamACAlgorithm(BaseAlgorithm):
         # Convert observation to tensor if needed
         if not isinstance(obs, torch.Tensor):
             obs = torch.FloatTensor(obs).to(self.device)
-            
+
         # Ensure observation has batch dimension
         if obs.dim() == 1:
             obs = obs.unsqueeze(0)
-            
+
         # Set models to evaluation mode
         self.actor.eval()
         self.critic.eval()
-        
+
         with torch.no_grad():
             # Get value estimate
             value = self.critic(obs)
-            
+
             # Get action distribution
             if self.action_space_type == "discrete":
                 # For discrete actions
                 action_logits = self.actor(obs)
-                
+
                 # Add this line to ensure valid probabilities:
                 action_probs = F.softmax(action_logits, dim=-1)
-                
+
                 dist = Categorical(action_probs)
-                
+
                 if deterministic:
-                    action = torch.argmax(action_probs, dim=1)
+                    action_indices = torch.argmax(action_probs, dim=1)
                 else:
-                    action = dist.sample()
-                log_prob = dist.log_prob(action)
-                    
+                    action_indices = dist.sample()
+
+                # Return raw action indices for compatibility with lookup table
+                raw_action = action_indices.cpu().numpy()
+                if raw_action.shape[0] == 1:
+                    raw_action = raw_action.item()  # Return scalar if batch size is 1
+
+                # Create one-hot encoding (for internal calculations)
+                action = torch.zeros_like(action_probs)
+                action.scatter_(-1, action_indices.unsqueeze(-1), 1)
+
+                log_prob = dist.log_prob(action_indices)
+
             else:
-                # For continuous actions
+                # For continuous actions (unchanged)
                 mu, log_std = self.actor(obs)
                 std = torch.exp(log_std)
                 dist = Normal(mu, std)
-                
+
                 if deterministic:
                     action = mu  # Use mean for deterministic action
                 else:
                     action = dist.sample()
-                    
+
                     # Apply action bounds if provided
                     if self.action_bounds:
                         action = torch.clamp(action, self.action_bounds[0], self.action_bounds[1])
-                        
+
                 log_prob = dist.log_prob(action)
-                
+
                 # Sum log probs for each action dimension
                 if log_prob.dim() > 1:
                     log_prob = log_prob.sum(dim=1)
-        
+
+                # For continuous actions, raw action is the same as action
+                raw_action = action.cpu().numpy()
+                if raw_action.shape[0] == 1:
+                    raw_action = raw_action[0]  # Return first element if batch size is 1
+
         # Set models back to training mode
         self.actor.train()
         self.critic.train()
-        
+
         # Extract tensors from device if needed
         action_np = action.cpu().numpy()[0] if action.shape[0] == 1 else action.cpu().numpy()
         log_prob_np = log_prob.cpu().numpy()[0] if log_prob.shape[0] == 1 else log_prob.cpu().numpy()
         value_np = value.cpu().numpy()[0] if value.shape[0] == 1 else value.cpu().numpy()
-        
+
         # Return features if requested
         if return_features:
             features = None
@@ -352,17 +367,10 @@ class StreamACAlgorithm(BaseAlgorithm):
                 features = self.actor.extract_features(obs)
             elif hasattr(self.actor, 'features'):
                 features = self.actor.features
-                
-            # Add checks for invalid values in logits
-            if torch.isnan(action_logits).any() or torch.isinf(action_logits).any():
-                print("[ERROR] Invalid values (NaN or Inf) detected in actor logits:")
-                print(action_logits)
-                # Optionally, raise an error or handle it
-                raise ValueError("Actor produced invalid logits (NaN or Inf)")
-            
-            return action_np, log_prob_np, value_np, features
-            
-        return action_np, log_prob_np, value_np
+
+            return raw_action, log_prob_np, value_np, features  # Return raw_action (integer) instead of one-hot
+
+        return raw_action, log_prob_np, value_np  # Return raw_action (integer) instead of one-hot
     
     def update_reward_tracking(self, reward, env_id=0):
         """Update reward tracking for episode return calculation after delay-updating an experience."""
@@ -724,7 +732,7 @@ class StreamACAlgorithm(BaseAlgorithm):
                             std = torch.exp(log_std)
                             dist = Normal(mu, std)
                             log_prob = dist.log_prob(action).sum(-1)
-                            entropy = dist.entropy().sum(-1)
+                            entropy = dist.entropy().sum(-1).mean()
                         
                         # Compute critic output
                         current_value = self.critic(obs)
@@ -734,7 +742,7 @@ class StreamACAlgorithm(BaseAlgorithm):
                         td_target_flat = td_target.reshape(-1)
                         value_loss = F.mse_loss(current_value_flat, td_target_flat.detach())
                         policy_loss = -log_prob.mean()
-                        entropy_loss = -entropy.mean() * self.entropy_coef * torch.sign(delta.detach()) if self.entropy_coef != 0 else torch.tensor(0.0, device=self.device)
+                        entropy_loss = -entropy * self.entropy_coef
                         
                         # Zero gradients
                         self.actor_optimizer.zero_grad()

@@ -89,6 +89,9 @@ class CuriosityReward:
         else:
             action_dim = np.prod(action_shape)
             
+        # Store action_dim as an instance variable
+        self.action_dim = action_dim
+
         self.forward_model = nn.Sequential(
             nn.Linear(feature_dim + action_dim, hidden_dim),
             nn.ReLU(),
@@ -111,7 +114,7 @@ class CuriosityReward:
         # Switch to evaluation mode
         self.feature_encoder.eval()
         self.forward_model.eval()
-        
+
         with torch.no_grad():
             # Ensure state is a torch tensor
             if not isinstance(state, torch.Tensor):
@@ -120,7 +123,7 @@ class CuriosityReward:
                 next_state = torch.tensor(next_state, dtype=torch.float32, device=self.device)
             if not isinstance(action, torch.Tensor):
                 action = torch.tensor(action, dtype=torch.float32, device=self.device)
-                
+
             # Add batch dimension if needed
             if state.dim() == 1:
                 state = state.unsqueeze(0)
@@ -128,18 +131,24 @@ class CuriosityReward:
                 next_state = next_state.unsqueeze(0)
             if action.dim() == 1:
                 action = action.unsqueeze(0)
-                
+
+            # Handle discrete actions by converting to one-hot encoding
+            if action.shape[1] == 1 and isinstance(self.action_dim, int):
+                one_hot_action = torch.zeros((action.size(0), self.action_dim), device=self.device)
+                one_hot_action.scatter_(1, action.long(), 1.0)
+                action = one_hot_action
+
             # Compute features
             current_features = self.compute_features(state)
             next_features = self.compute_features(next_state)
-                
+
             # Forward model prediction
             forward_input = torch.cat([current_features, action], dim=1)
             predicted_next_features = self.forward_model(forward_input)
-                
+
             # Calculate prediction error (MSE)
             prediction_error = F.mse_loss(predicted_next_features, next_features, reduction='none').sum(dim=1)
-            
+
             # Normalize reward
             raw_reward = prediction_error.cpu().numpy()
             if self.normalize_rewards:
@@ -148,11 +157,11 @@ class CuriosityReward:
                 clipped_reward = np.clip(normalized_reward, 0, 5) * self.reward_scale
             else:
                 clipped_reward = np.clip(raw_reward, 0, 5) * self.reward_scale
-        
+
         # Switch back to training mode
         self.feature_encoder.train()
         self.forward_model.train()
-        
+
         return torch.tensor(clipped_reward, device=self.device)
         
     def update(self, state, action, next_state, done=False):

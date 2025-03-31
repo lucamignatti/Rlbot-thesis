@@ -365,16 +365,9 @@ def run_training(
                 with torch.no_grad():
                     # Get actions and values from the networks in a single forward pass
                     action_batch, log_prob_batch, value_batch, features_batch = trainer.get_action(obs_batch, return_features=True)
-                    
-                    # Ensure all returned values are properly batched for zip() iteration
-                    if not isinstance(action_batch, (list, tuple, np.ndarray)) or np.isscalar(action_batch):
-                        action_batch = [action_batch]
-                    if not isinstance(log_prob_batch, (list, tuple, np.ndarray)) or np.isscalar(log_prob_batch):
-                        log_prob_batch = [log_prob_batch]
-                    if not isinstance(value_batch, (list, tuple, np.ndarray)) or np.isscalar(value_batch):
-                        value_batch = [value_batch]
+                
                 # Organize actions into a list of dictionaries, one for each environment.
-                for i, (action, log_prob, value) in enumerate(zip(action_batch[0], log_prob_batch[0], value_batch[0])):
+                for i, (action, log_prob, value) in enumerate(zip(action_batch, log_prob_batch, value_batch)):
                     env_idx = all_env_indices[i]
                     agent_id = all_agent_ids[i]
                     
