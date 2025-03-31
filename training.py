@@ -186,23 +186,20 @@ class Trainer:
             # For compatibility with existing code, keep a reference to the memory
             self.memory = self.algorithm.memory
         elif self.algorithm_type == "streamac":
-            self.algorithm = StreamACAlgorithm(
-                actor=self.actor,
+            # Create StreamAC algorithm
+            algorithm = StreamACAlgorithm(
+                actor=self.actor, 
                 critic=self.critic,
                 action_space_type=action_space_type,
                 action_dim=action_dim,
                 action_bounds=action_bounds,
-                device=device,
+                device=self.device,
                 lr_actor=lr_actor,
                 lr_critic=lr_critic,
                 gamma=gamma,
                 critic_coef=critic_coef,
-                entropy_coef=entropy_coef,
+                entropy_coef=self.entropy_coef,
                 max_grad_norm=max_grad_norm,
-                use_amp=use_amp,
-                debug=debug,
-                use_wandb=use_wandb,
-                # StreamAC specific parameters
                 adaptive_learning_rate=adaptive_learning_rate,
                 target_step_size=target_step_size,
                 backtracking_patience=backtracking_patience,
@@ -212,15 +209,12 @@ class Trainer:
                 use_obgd=use_obgd,
                 buffer_size=stream_buffer_size,
                 use_sparse_init=use_sparse_init,
-                update_freq=update_freq
+                update_freq=update_freq,
+                debug=self.debug
             )
-            # For compatibility, create dummy memory object
-            class DummyMemory:
-                def __init__(self, *args, **kwargs):
-                    pass
-                def store_experience_at_idx(self, *args, **kwargs):
-                    pass
-            self.memory = DummyMemory(batch_size, buffer_size=1, device=device)
+            # Set reference to trainer so StreamAC can update auxiliary tasks
+            algorithm.trainer = self
+            self.algorithm = algorithm
         else:
             raise ValueError(f"Unknown algorithm type: {algorithm_type}. Use 'ppo' or 'streamac'.")
 

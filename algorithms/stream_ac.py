@@ -556,7 +556,9 @@ class StreamACAlgorithm(BaseAlgorithm):
             'entropy_loss': 0.0,
             'total_loss': 0.0,
             'effective_step_size': 0.0,
-            'backtracking_count': self.backtracking_count
+            'backtracking_count': self.backtracking_count,
+            'sr_loss': 0.0,
+            'rp_loss': 0.0
         }
         
         # Nothing to update if buffer is empty
@@ -905,6 +907,19 @@ class StreamACAlgorithm(BaseAlgorithm):
         
         # Update the main metrics dictionary
         self.metrics.update(metrics)
+        
+        # Update auxiliary tasks if available
+        if hasattr(self, 'trainer') and hasattr(self.trainer, 'use_auxiliary_tasks') and self.trainer.use_auxiliary_tasks:
+            if hasattr(self.trainer, 'aux_task_manager'):
+                # Compute auxiliary losses and update models
+                aux_losses = self.trainer.aux_task_manager.compute_losses()
+                if aux_losses:
+                    metrics.update(aux_losses)
+                    # Also update in main metrics
+                    self.metrics.update(aux_losses)
+                    
+                    if self.debug:
+                        print(f"[DEBUG StreamAC] Auxiliary task losses - SR: {aux_losses.get('sr_loss', 0):.6f}, RP: {aux_losses.get('rp_loss', 0):.6f}")
         
         # Clear buffer if requested
         if end_of_episode:

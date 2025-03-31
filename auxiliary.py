@@ -63,22 +63,27 @@ class RewardPredictionTask(nn.Module):
     LSTM-based network for Reward Prediction (RP) auxiliary task.
     Predicts immediate rewards based on a sequence of observations.
     """
-    def __init__(self, input_dim, hidden_dim=64, sequence_length=20, device="cpu", debug=False):  # Add debug parameter
+    def __init__(self, input_dim, hidden_dim=64, sequence_length=20, device="cpu", debug=False):
         super(RewardPredictionTask, self).__init__()
         self.device = device
         self.hidden_dim = hidden_dim
         self.sequence_length = sequence_length
-        self.debug = debug  # Store debug flag
+        self.debug = debug
+        self.input_dim = input_dim  # Store the expected input dimension
 
+        # Add projection layer to handle varying input dimensions
+        # The projection will be created or recreated in the forward pass if needed
+        self.projection = nn.Linear(input_dim, hidden_dim)
+        
         # LSTM layer to process observation sequences
-        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.lstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True)
 
         # Output layer for 3-class classification (negative, near-zero, positive reward)
         self.output_layer = nn.Linear(hidden_dim, 3)
 
         # Lower thresholds for classifying rewards - adjusted for typical reward scales
-        self.pos_threshold = 0.001  # Reduced from 0.009
-        self.neg_threshold = -0.001  # Reduced from -0.009
+        self.pos_threshold = 0.001
+        self.neg_threshold = -0.001
         
         # Debug counters for reward distribution
         self.debug_reward_counts = {"negative": 0, "zero": 0, "positive": 0}
@@ -90,7 +95,30 @@ class RewardPredictionTask(nn.Module):
 
     def forward(self, x_seq):
         # x_seq shape: [batch_size, sequence_length, input_dim]
-        lstm_out, _ = self.lstm(x_seq)
+        batch_size, seq_len, actual_dim = x_seq.shape
+        
+        # Check if input dimensions match the expected dimensions
+        # If not, recreate the projection layer with the correct dimensions
+        if actual_dim != self.input_dim:
+            if self.debug:
+                print(f"[RP DEBUG] Input dimension mismatch. Expected: {self.input_dim}, Got: {actual_dim}. Recreating projection layer.")
+            
+            # Create a new projection layer with correct input dimensions
+            self.projection = nn.Linear(actual_dim, self.hidden_dim).to(self.device)
+            # Update stored input dimension
+            self.input_dim = actual_dim
+        
+        # Reshape to process all sequence elements at once
+        x_reshaped = x_seq.reshape(batch_size * seq_len, -1)
+        
+        # Now apply the projection
+        projected = self.projection(x_reshaped)
+        
+        # Reshape back to sequence format
+        projected = projected.reshape(batch_size, seq_len, self.hidden_dim)
+        
+        # Now pass through LSTM
+        lstm_out, _ = self.lstm(projected)
 
         # Take only the last timestep's output
         last_output = lstm_out[:, -1, :]
@@ -294,7 +322,7 @@ class AuxiliaryTaskManager:
 
         # History buffers - Use deques for efficient appending/popping
         # Size needs to be large enough for batch sampling + sequence length
-        history_maxlen = 5  # Fixed buffer size to match tests
+        history_maxlen = 10000 if learning_mode == "batch" else 1000  # Much larger buffer for batch mode, reasonable for stream
         self.obs_history = deque(maxlen=history_maxlen)
         self.feature_history = deque(maxlen=history_maxlen)
         self.reward_history = deque(maxlen=history_maxlen)

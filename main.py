@@ -680,9 +680,9 @@ def run_training(
                 # Update StreamAC specific metrics if using that algorithm
                 if algorithm == "streamac":
                     stats_dict.update({
-                        "StepSize": f"{stats.get('effective_step_size', 0)::.4f}",
-                        "ActorLR": f"{getattr(trainer.algorithm, 'lr_actor', lr_actor)::.6f}",
-                        "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic)::.6f}",
+                        "StepSize": f"{stats.get('effective_step_size', 0):.4f}",
+                        "ActorLR": f"{getattr(trainer.algorithm, 'lr_actor', lr_actor):.6f}",
+                        "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic):.6f}",
                         "Updates": getattr(trainer.algorithm, "successful_steps", 0)
                     })
 
