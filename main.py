@@ -431,6 +431,9 @@ def run_training(
                     reward = reward_dict[agent_id]
                     done = terminated_dict[agent_id] or truncated_dict[agent_id]
 
+                    # Get the next observation for this agent
+                    next_obs = next_obs_dict.get(agent_id, None)
+
                     # Reset action history if episode is done
                     if done:
                         action_stacker.reset_agent(agent_id)
@@ -447,6 +450,19 @@ def run_training(
                         if debug and exp_idx == 0:  # Only log for the first agent to avoid too much output
                             print(f"[DEBUG] Updating experience at idx {mem_idx} with reward={reward:.4f}, done={done}")
                         
+                        # Get original observation and action from memory
+                        orig_obs = all_obs[exp_idx]
+                        
+                        # Calculate combined reward (extrinsic + intrinsic) if next observation is available
+                        if next_obs is not None and trainer.use_intrinsic_rewards:
+                            reward = trainer.update_experience_with_intrinsic_reward(
+                                state=orig_obs,
+                                action=actions_dict_list[env_idx][agent_id],
+                                next_state=next_obs,
+                                reward=reward,
+                                env_id=env_idx
+                            )
+                        
                         trainer.store_experience_at_idx(mem_idx, None, None, None, reward, None, done)
                     else:
                         # For StreamAC, we directly update the latest experience with env_idx
@@ -456,31 +472,22 @@ def run_training(
                                 # Update the most recent experience with actual reward and done flag
                                 try:
                                     latest_exp = trainer.algorithm.experience_buffers[env_idx][-1]
+                                    
+                                    # Calculate combined reward (extrinsic + intrinsic) if next observation is available
+                                    if next_obs is not None and trainer.use_intrinsic_rewards:
+                                        reward = trainer.update_experience_with_intrinsic_reward(
+                                            state=latest_exp['obs'],
+                                            action=latest_exp['action'],
+                                            next_state=next_obs,
+                                            reward=reward,
+                                            env_id=env_idx
+                                        )
+                                    
                                     if 'reward' in latest_exp:  # Safety check
                                         latest_exp['reward'] = torch.tensor([reward], dtype=torch.float32, device=trainer.device)
                                         # Update reward tracking for return calculation
                                         if hasattr(trainer.algorithm, 'update_reward_tracking'):
                                             trainer.algorithm.update_reward_tracking(reward, env_id=env_idx)
-                                    if 'done' in latest_exp:  # Safety check
-                                        latest_exp['done'] = torch.tensor([float(done)], dtype=torch.float32, device=trainer.device)
-                                        
-                                        # When episode is done, explicitly track the return
-                                        if done and debug:
-                                            print(f"[DEBUG] Episode done detected for agent {agent_id} in environment {env_idx} with reward {reward}")
-                                        
-                                        # If the episode is done, force calculation of the return for this episode
-                                        if done and hasattr(trainer.algorithm, 'current_episode_rewards_per_env'):
-                                            if env_idx in trainer.algorithm.current_episode_rewards_per_env and len(trainer.algorithm.current_episode_rewards_per_env[env_idx]) > 0:
-                                                episode_return = sum(trainer.algorithm.current_episode_rewards_per_env[env_idx])
-                                                if hasattr(trainer.algorithm, 'episode_returns'):
-                                                    trainer.algorithm.episode_returns.append(episode_return)
-                                                    # Force update of mean_return metric
-                                                    mean_return = sum(trainer.algorithm.episode_returns) / len(trainer.algorithm.episode_returns)
-                                                    trainer.algorithm.metrics['mean_return'] = mean_return
-                                                    if debug:
-                                                        print(f"[DEBUG] Env {env_idx}: Calculated episode return: {episode_return:.2f}, mean: {mean_return:.2f}")
-                                                # Reset episode tracking
-                                                trainer.algorithm.current_episode_rewards_per_env[env_idx] = []
                                 except Exception as e:
                                     if debug:
                                         print(f"[DEBUG] Error updating StreamAC experience for env {env_idx}: {e}")
@@ -512,8 +519,8 @@ def run_training(
                                                 trainer.algorithm.metrics['mean_return'] = mean_return
                                                 if debug:
                                                     print(f"[DEBUG] Calculated episode return: {episode_return:.2f}, mean: {mean_return:.2f}")
-                                            # Reset episode tracking
-                                            trainer.algorithm.current_episode_rewards = []
+                                                # Reset episode tracking
+                                                trainer.algorithm.current_episode_rewards_per_env[env_idx] = []
                                 except Exception as e:
                                     if debug:
                                         print(f"[DEBUG] Error updating StreamAC experience: {e}")

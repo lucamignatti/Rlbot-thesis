@@ -532,8 +532,14 @@ class Trainer:
             if self.debug:
                 print("[DEBUG] Initialized extrinsic reward normalizer for adaptive intrinsic scaling")
         
-        # Add intrinsic rewards if enabled (using adaptive scaling throughout training)
-        if self.use_intrinsic_rewards and self.intrinsic_reward_generator is not None:
+        # Skip intrinsic reward calculation when reward is 0 (placeholder value)
+        # This is to avoid calculating intrinsic rewards before we have the actual reward from the environment
+        # Instead, we'll use the update_experience_with_intrinsic_reward method after we have the real reward
+        add_intrinsic = self.use_intrinsic_rewards and self.intrinsic_reward_generator is not None
+        is_placeholder_reward = isinstance(reward, (int, float)) and reward == 0 or \
+                              hasattr(reward, 'item') and reward.item() == 0
+        
+        if add_intrinsic and not is_placeholder_reward:
             # Convert inputs to tensor format for intrinsic reward computation
             if not isinstance(state, torch.Tensor):
                 state_tensor = torch.FloatTensor(state).to(self.device)
@@ -596,7 +602,9 @@ class Trainer:
                     state_tensor, action_tensor, next_state
                 )
 
-                print(reward)
+                if self.debug:
+                    print(f"[DEBUG] Processing reward: {reward}")
+                    
                 # Extract extrinsic reward value for normalization
                 extrinsic_reward = reward.item() if hasattr(reward, 'item') else reward
                 
@@ -1102,12 +1110,25 @@ class Trainer:
         
         return self._get_pretraining_end_step()
 
-    def update_intrinsic_models(self, state, action, next_state, done=False):
-        """Update intrinsic reward models with new experience"""
-        if not self.use_intrinsic_rewards or self.intrinsic_reward_generator is None:
-            return {}
+    def update_experience_with_intrinsic_reward(self, state, action, next_state, reward, env_id=0):
+        """
+        Update experience with both extrinsic (environment) reward and calculated intrinsic reward.
+        
+        Args:
+            state: Current state
+            action: Action taken
+            next_state: Resulting state
+            reward: Extrinsic reward from environment
+            env_id: Environment ID for multi-environment training
             
-        # Convert inputs to tensor format for intrinsic reward update
+        Returns:
+            Combined reward (extrinsic + intrinsic)
+        """
+        # Skip if intrinsic rewards disabled or no generator
+        if not self.use_intrinsic_rewards or self.intrinsic_reward_generator is None:
+            return reward
+            
+        # Convert inputs to tensor format if needed
         if not isinstance(state, torch.Tensor):
             state_tensor = torch.FloatTensor(state).to(self.device)
             if state_tensor.dim() == 1:
@@ -1117,6 +1138,15 @@ class Trainer:
             
         if not isinstance(action, torch.Tensor):
             if self.action_space_type == "discrete":
+                if isinstance(action, np.ndarray):
+                    if action.size == 1:
+                        action = int(action.item())
+                    else:
+                        action = int(action[0])
+                elif isinstance(action, (float, np.floating)):
+                    action = int(action)
+                elif hasattr(action, 'item'):
+                    action = int(action.item())
                 action_tensor = torch.LongTensor([action]).to(self.device)
             else:
                 action_tensor = torch.FloatTensor(action).to(self.device)
@@ -1131,6 +1161,40 @@ class Trainer:
                 next_state_tensor = next_state_tensor.unsqueeze(0)
         else:
             next_state_tensor = next_state.to(self.device)
-            
-        # Update intrinsic reward models
-        return self.intrinsic_reward_generator.update(state_tensor, action_tensor, next_state_tensor, done)
+        
+        # Compute intrinsic reward
+        intrinsic_reward = self.intrinsic_reward_generator.compute_intrinsic_reward(
+            state_tensor, action_tensor, next_state_tensor
+        )
+        
+        # Extract extrinsic reward value for normalization
+        extrinsic_reward = reward.item() if hasattr(reward, 'item') else reward
+        
+        # Initialize extrinsic reward normalizer if it doesn't exist
+        if not hasattr(self, 'extrinsic_reward_normalizer'):
+            from intrinsic_rewards import ExtrinsicRewardNormalizer
+            self.extrinsic_reward_normalizer = ExtrinsicRewardNormalizer()
+            if self.debug:
+                print("[DEBUG] Initialized extrinsic reward normalizer for adaptive intrinsic scaling")
+        
+        # Normalize extrinsic reward
+        normalized_reward = self.extrinsic_reward_normalizer.normalize(extrinsic_reward)
+        
+        # Calculate adaptive scale using sigmoid function
+        sigmoid_factor = 1.0 / (1.0 + np.exp(2.0 * normalized_reward))
+        adaptive_scale = self.intrinsic_reward_scale * sigmoid_factor
+        
+        # Ensure minimum scale to maintain some exploration
+        adaptive_scale = max(0.1 * self.intrinsic_reward_scale, adaptive_scale)
+        
+        # Add scaled intrinsic reward to extrinsic reward
+        combined_reward = None
+        if isinstance(reward, torch.Tensor):
+            combined_reward = reward + adaptive_scale * intrinsic_reward[0].to(reward.device)
+        else:
+            combined_reward = reward + adaptive_scale * intrinsic_reward[0].cpu().numpy()
+        
+        if self.debug:
+            print(f"[DEBUG] Added intrinsic reward: {adaptive_scale * intrinsic_reward[0].item():.4f} to extrinsic: {extrinsic_reward:.4f}")
+        
+        return combined_reward
