@@ -484,7 +484,18 @@ def run_training(
                                         )
                                     
                                     if 'reward' in latest_exp:  # Safety check
-                                        latest_exp['reward'] = torch.tensor([reward], dtype=torch.float32, device=trainer.device)
+                                        if isinstance(reward, (int, float, np.number)):
+                                            latest_exp['reward'] = torch.tensor(reward, dtype=torch.float32, device=trainer.device)
+                                        elif isinstance(reward, np.ndarray):
+                                            if reward.size == 1:  # If it's a scalar array
+                                                latest_exp['reward'] = torch.tensor(reward.item(), dtype=torch.float32, device=trainer.device)
+                                            else:
+                                                latest_exp['reward'] = torch.tensor(reward[0], dtype=torch.float32, device=trainer.device)
+                                        elif isinstance(reward, torch.Tensor):
+                                            latest_exp['reward'] = reward.to(device=trainer.device, dtype=torch.float32)
+                                        else:
+                                            latest_exp['reward'] = torch.tensor(float(reward), dtype=torch.float32, device=trainer.device)
+                                        
                                         # Update reward tracking for return calculation
                                         if hasattr(trainer.algorithm, 'update_reward_tracking'):
                                             trainer.algorithm.update_reward_tracking(reward, env_id=env_idx)
