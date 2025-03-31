@@ -365,6 +365,12 @@ def run_training(
                 with torch.no_grad():
                     # Get actions and values from the networks in a single forward pass
                     action_batch, log_prob_batch, value_batch, features_batch = trainer.get_action(obs_batch, return_features=True)
+                if type(action_batch) in [int, float, np.float64, np.float32]:
+                    action_batch = [action_batch]
+                if type(log_prob_batch) in [int, float, np.float64, np.float32]:
+                    log_prob_batch = [log_prob_batch]
+                if type(value_batch) in [int, float, np.float64, np.float32]:
+                    value_batch = [value_batch]
                 
                 # Organize actions into a list of dictionaries, one for each environment.
                 for i, (action, log_prob, value) in enumerate(zip(action_batch, log_prob_batch, value_batch)):

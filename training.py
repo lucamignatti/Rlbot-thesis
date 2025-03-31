@@ -596,6 +596,7 @@ class Trainer:
                     state_tensor, action_tensor, next_state
                 )
 
+                print(reward)
                 # Extract extrinsic reward value for normalization
                 extrinsic_reward = reward.item() if hasattr(reward, 'item') else reward
                 
@@ -618,7 +619,7 @@ class Trainer:
                     
                 # Log that we're applying intrinsic rewards in debug mode
                 if self.debug:
-                    print(f"[DEBUG] Adding intrinsic reward: {adaptive_scale * intrinsic_reward.item():.4f} to extrinsic: {extrinsic_reward:.4f}")
+                    print(f"[DEBUG] Adding intrinsic reward: {adaptive_scale * intrinsic_reward[0]} to extrinsic: {extrinsic_reward}")
                 
                 # Add scaled intrinsic reward to extrinsic reward
                 if isinstance(reward, torch.Tensor):
