@@ -373,9 +373,8 @@ def run_training(
                         log_prob_batch = [log_prob_batch]
                     if not isinstance(value_batch, (list, tuple, np.ndarray)) or np.isscalar(value_batch):
                         value_batch = [value_batch]
-
                 # Organize actions into a list of dictionaries, one for each environment.
-                for i, (action, log_prob, value) in enumerate(zip(action_batch, log_prob_batch, value_batch)):
+                for i, (action, log_prob, value) in enumerate(zip(action_batch[0], log_prob_batch[0], value_batch[0])):
                     env_idx = all_env_indices[i]
                     agent_id = all_agent_ids[i]
                     

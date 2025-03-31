@@ -190,7 +190,29 @@ class CuriosityReward:
         self.optimizer.step()
         
         return forward_loss.item()
-
+    
+    def reset_models(self):
+        """Reset the models used for computing intrinsic rewards"""
+        # Reset feature encoder weights
+        for layer in self.feature_encoder.modules():
+            if isinstance(layer, nn.Linear):
+                if hasattr(layer, 'reset_parameters'):
+                    layer.reset_parameters()
+        
+        # Reset forward model weights
+        for layer in self.forward_model.modules():
+            if isinstance(layer, nn.Linear):
+                if hasattr(layer, 'reset_parameters'):
+                    layer.reset_parameters()
+                    
+        # Reset optimizer
+        self.optimizer = torch.optim.Adam(
+            list(self.feature_encoder.parameters()) + list(self.forward_model.parameters()),
+            lr=self.optimizer.param_groups[0]['lr']
+        )
+        
+        # Reset reward normalization
+        self.reward_normalizer = RunningMeanStd(shape=())
 
 class RNDReward(IntrinsicRewardGenerator):
     """Implementation of Random Network Distillation (RND)"""

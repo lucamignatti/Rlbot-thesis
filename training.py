@@ -325,7 +325,7 @@ class Trainer:
         if self.use_intrinsic_rewards:
             obs_dim = getattr(actor, 'obs_shape', action_dim * 2)  # Use action_dim * 2 as fallback
             self.intrinsic_reward_generator = create_intrinsic_reward_generator(
-                input_dim=obs_dim,
+                obs_dim=obs_dim,
                 action_dim=action_dim,
                 device=device,
                 curiosity_weight=curiosity_weight,
@@ -413,7 +413,7 @@ class Trainer:
             
             # Get weights directly from aux_task_manager if available
             sr_weight = getattr(self.aux_task_manager, "sr_weight", 0) if hasattr(self, 'aux_task_manager') else 0
-            rp_weight = getattr(self.aux_task_manager, "rp_weight", 0) if hasattr(self, 'aux_task_manager') else 0
+            rp_weight = getattr(self.aux_task_manager, "rp_weight", 0) if hasattr(self.aux_task_manager, 'rp_weight') else 0
             
             # Log the unweighted losses (more meaningful values for trends)
             auxiliary_metrics["AUX/state_representation_loss"] = sr_loss
