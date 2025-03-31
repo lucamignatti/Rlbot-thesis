@@ -298,21 +298,46 @@ class StreamACAlgorithm(BaseAlgorithm):
         with torch.no_grad():
             # Get value estimate
             value = self.critic(obs)
+            
+            # Check for NaN in value
+            if torch.isnan(value).any():
+                if self.debug:
+                    print("[DEBUG] NaN detected in value, replacing with zeros")
+                value = torch.zeros_like(value)
 
             # Get action distribution
             if self.action_space_type == "discrete":
                 # For discrete actions
                 action_logits = self.actor(obs)
-
-                # Add this line to ensure valid probabilities:
+                
+                # Check for NaNs in action logits
+                if torch.isnan(action_logits).any() or torch.isinf(action_logits).any():
+                    if self.debug:
+                        print("[DEBUG] NaN/Inf in action_logits, replacing with uniform distribution")
+                    action_logits = torch.zeros_like(action_logits)
+                
+                # Add this line to ensure valid probabilities with numerical safety:
                 action_probs = F.softmax(action_logits, dim=-1)
+                
+                # Extra safety check to ensure proper probability distribution
+                invalid_probs = torch.isnan(action_probs).any() or (action_probs.sum(dim=-1) < 0.99).any()
+                if invalid_probs:
+                    if self.debug:
+                        print("[DEBUG] Invalid probability distribution detected, using uniform")
+                    action_probs = torch.ones_like(action_probs) / action_probs.shape[-1]
 
                 dist = Categorical(action_probs)
 
                 if deterministic:
                     action_indices = torch.argmax(action_probs, dim=1)
                 else:
-                    action_indices = dist.sample()
+                    # Sample with protection against rare numerical issues
+                    try:
+                        action_indices = dist.sample()
+                    except RuntimeError:
+                        if self.debug:
+                            print("[DEBUG] Error sampling from distribution, using argmax")
+                        action_indices = torch.argmax(action_probs, dim=1)
 
                 # Return raw action indices for compatibility with lookup table
                 raw_action = action_indices.cpu().numpy()
@@ -322,13 +347,42 @@ class StreamACAlgorithm(BaseAlgorithm):
                 # Create one-hot encoding (for internal calculations)
                 action = torch.zeros_like(action_probs)
                 action.scatter_(-1, action_indices.unsqueeze(-1), 1)
-
-                log_prob = dist.log_prob(action_indices)
+                
+                # Safely calculate log probability
+                try:
+                    log_prob = dist.log_prob(action_indices)
+                    # Check for NaNs
+                    if torch.isnan(log_prob).any():
+                        if self.debug:
+                            print("[DEBUG] NaN in log_prob, using safe computation")
+                        # Fall back to manual calculation with safety
+                        selected_probs = torch.gather(action_probs, 1, action_indices.unsqueeze(-1)).squeeze(-1)
+                        # Add small epsilon to prevent log(0)
+                        log_prob = torch.log(selected_probs + 1e-10)
+                except RuntimeError:
+                    if self.debug:
+                        print("[DEBUG] Error computing log_prob, using fallback")
+                    log_prob = torch.zeros_like(action_indices, dtype=torch.float32)
 
             else:
                 # For continuous actions (unchanged)
                 mu, log_std = self.actor(obs)
+                
+                # Check for NaNs
+                if torch.isnan(mu).any() or torch.isinf(mu).any():
+                    if self.debug:
+                        print("[DEBUG] NaN/Inf in action mean, replacing with zeros")
+                    mu = torch.zeros_like(mu)
+                
+                if torch.isnan(log_std).any() or torch.isinf(log_std).any():
+                    if self.debug:
+                        print("[DEBUG] NaN/Inf in log_std, using default value")
+                    log_std = torch.ones_like(log_std) * -1.0  # Default log_std = -1
+                
+                # Clamp log_std for numerical stability
+                log_std = torch.clamp(log_std, -5.0, 2.0)
                 std = torch.exp(log_std)
+                
                 dist = Normal(mu, std)
 
                 if deterministic:
@@ -340,7 +394,17 @@ class StreamACAlgorithm(BaseAlgorithm):
                     if self.action_bounds:
                         action = torch.clamp(action, self.action_bounds[0], self.action_bounds[1])
 
-                log_prob = dist.log_prob(action)
+                # Safely calculate log probability
+                try:
+                    log_prob = dist.log_prob(action)
+                    if torch.isnan(log_prob).any():
+                        if self.debug:
+                            print("[DEBUG] NaN in continuous log_prob, using safe computation")
+                        log_prob = torch.zeros_like(log_prob)
+                except RuntimeError:
+                    if self.debug:
+                        print("[DEBUG] Error computing continuous log_prob, using fallback")
+                    log_prob = torch.zeros_like(action)
 
                 # Sum log probs for each action dimension
                 if log_prob.dim() > 1:
@@ -532,6 +596,22 @@ class StreamACAlgorithm(BaseAlgorithm):
             done = done.unsqueeze(0)
         if value.dim() == 0:
             value = value.unsqueeze(0)
+            
+        # Check for NaNs in inputs and replace them with zeros
+        if torch.isnan(reward).any() or torch.isinf(reward).any():
+            if self.debug:
+                print("[DEBUG] NaN/Inf detected in reward, replacing with zeros")
+            reward = torch.nan_to_num(reward, nan=0.0, posinf=10.0, neginf=-10.0)
+            
+        if torch.isnan(next_value).any() or torch.isinf(next_value).any():
+            if self.debug:
+                print("[DEBUG] NaN/Inf detected in next_value, replacing with zeros")
+            next_value = torch.nan_to_num(next_value, nan=0.0, posinf=10.0, neginf=-10.0)
+            
+        if torch.isnan(value).any() or torch.isinf(value).any():
+            if self.debug:
+                print("[DEBUG] NaN/Inf detected in value, replacing with zeros")
+            value = torch.nan_to_num(value, nan=0.0, posinf=10.0, neginf=-10.0)
         
         # done mask: 0 if done, 1 otherwise
         done_mask = 1.0 - done
@@ -539,13 +619,19 @@ class StreamACAlgorithm(BaseAlgorithm):
         # TD target: r + γV(s') if not done, otherwise just r
         td_target = reward + self.gamma * next_value * done_mask
         
+        # Clip td_target to reasonable values
+        td_target = torch.clamp(td_target, -100.0, 100.0)
+        
         # TD error
         delta = td_target - value
+        
+        # Clip delta to reasonable values to prevent extreme updates
+        delta = torch.clamp(delta, -10.0, 10.0)
         
         # Store TD errors for metrics
         if not delta.requires_grad:
             # Convert to numpy and add to buffer for metrics
-            delta_np = delta.cpu().numpy()
+            delta_np = delta.detach().cpu().numpy()
             for d in delta_np:
                 self.td_error_buffer.append(float(d))
             
@@ -660,11 +746,54 @@ class StreamACAlgorithm(BaseAlgorithm):
                         done = batch_dones[j]
                         
                         # Compute individual losses
+                        if torch.isnan(current_value).any() or torch.isinf(current_value).any():
+                            if self.debug:
+                                print("[DEBUG] NaN/Inf detected in current_value, using fallback")
+                            current_value = torch.nan_to_num(current_value, nan=0.0, posinf=1.0, neginf=-1.0)
+                        
+                        if torch.isnan(td_target).any() or torch.isinf(td_target).any():
+                            if self.debug:
+                                print("[DEBUG] NaN/Inf detected in td_target, using fallback")
+                            td_target = torch.nan_to_num(td_target, nan=0.0, posinf=1.0, neginf=-1.0)
+                        
                         current_value_flat = current_value.reshape(-1)
                         td_target_flat = td_target.reshape(-1)
-                        value_loss = F.mse_loss(current_value_flat, td_target_flat.detach())
-                        policy_loss = -log_prob.mean()
-                        entropy_loss = -entropy.mean() * self.entropy_coef * torch.sign(delta.detach()) if self.entropy_coef != 0 else torch.tensor(0.0, device=self.device)
+                        
+                        # Safety check for value loss calculation
+                        try:
+                            value_loss = F.mse_loss(current_value_flat, td_target_flat.detach())
+                            if torch.isnan(value_loss).any() or torch.isinf(value_loss).any():
+                                if self.debug:
+                                    print("[DEBUG] NaN/Inf detected in value_loss, using dummy loss")
+                                value_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
+                        except RuntimeError:
+                            if self.debug:
+                                print("[DEBUG] RuntimeError in value_loss calculation, using dummy loss")
+                            value_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
+                        
+                        # Safety check for policy loss calculation
+                        try:
+                            policy_loss = -log_prob.mean()
+                            if torch.isnan(policy_loss).any() or torch.isinf(policy_loss).any():
+                                if self.debug:
+                                    print("[DEBUG] NaN/Inf detected in policy_loss, using dummy loss")
+                                policy_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
+                        except RuntimeError:
+                            if self.debug:
+                                print("[DEBUG] RuntimeError in policy_loss calculation, using dummy loss")
+                            policy_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
+                        
+                        # Safety check for entropy loss
+                        try:
+                            entropy_loss = -entropy.mean() * self.entropy_coef
+                            if torch.isnan(entropy_loss).any() or torch.isinf(entropy_loss).any():
+                                if self.debug:
+                                    print("[DEBUG] NaN/Inf detected in entropy_loss, using zero")
+                                entropy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+                        except RuntimeError:
+                            if self.debug:
+                                print("[DEBUG] RuntimeError in entropy_loss calculation, using zero")
+                            entropy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
                         
                         # Zero gradients
                         self.actor_optimizer.zero_grad()
@@ -738,11 +867,54 @@ class StreamACAlgorithm(BaseAlgorithm):
                         current_value = self.critic(obs)
                         
                         # Compute losses
+                        if torch.isnan(current_value).any() or torch.isinf(current_value).any():
+                            if self.debug:
+                                print("[DEBUG] NaN/Inf detected in current_value, using fallback")
+                            current_value = torch.nan_to_num(current_value, nan=0.0, posinf=1.0, neginf=-1.0)
+                        
+                        if torch.isnan(td_target).any() or torch.isinf(td_target).any():
+                            if self.debug:
+                                print("[DEBUG] NaN/Inf detected in td_target, using fallback")
+                            td_target = torch.nan_to_num(td_target, nan=0.0, posinf=1.0, neginf=-1.0)
+                        
                         current_value_flat = current_value.reshape(-1)
                         td_target_flat = td_target.reshape(-1)
-                        value_loss = F.mse_loss(current_value_flat, td_target_flat.detach())
-                        policy_loss = -log_prob.mean()
-                        entropy_loss = -entropy * self.entropy_coef
+                        
+                        # Safety check for value loss calculation
+                        try:
+                            value_loss = F.mse_loss(current_value_flat, td_target_flat.detach())
+                            if torch.isnan(value_loss).any() or torch.isinf(value_loss).any():
+                                if self.debug:
+                                    print("[DEBUG] NaN/Inf detected in value_loss, using dummy loss")
+                                value_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
+                        except RuntimeError:
+                            if self.debug:
+                                print("[DEBUG] RuntimeError in value_loss calculation, using dummy loss")
+                            value_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
+                        
+                        # Safety check for policy loss calculation
+                        try:
+                            policy_loss = -log_prob.mean()
+                            if torch.isnan(policy_loss).any() or torch.isinf(policy_loss).any():
+                                if self.debug:
+                                    print("[DEBUG] NaN/Inf detected in policy_loss, using dummy loss")
+                                policy_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
+                        except RuntimeError:
+                            if self.debug:
+                                print("[DEBUG] RuntimeError in policy_loss calculation, using dummy loss")
+                            policy_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
+                        
+                        # Safety check for entropy loss
+                        try:
+                            entropy_loss = -entropy.mean() * self.entropy_coef
+                            if torch.isnan(entropy_loss).any() or torch.isinf(entropy_loss).any():
+                                if self.debug:
+                                    print("[DEBUG] NaN/Inf detected in entropy_loss, using zero")
+                                entropy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+                        except RuntimeError:
+                            if self.debug:
+                                print("[DEBUG] RuntimeError in entropy_loss calculation, using zero")
+                            entropy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
                         
                         # Zero gradients
                         self.actor_optimizer.zero_grad()
@@ -829,18 +1001,59 @@ class StreamACAlgorithm(BaseAlgorithm):
             current_values = self.critic(batch_obs)
             
             # Compute losses (batched)
+            if torch.isnan(current_values).any() or torch.isinf(current_values).any():
+                if self.debug:
+                    print("[DEBUG] NaN/Inf detected in current_values, using fallback")
+                current_values = torch.nan_to_num(current_values, nan=0.0, posinf=1.0, neginf=-1.0)
+            
+            if torch.isnan(batch_td_targets).any() or torch.isinf(batch_td_targets).any():
+                if self.debug:
+                    print("[DEBUG] NaN/Inf detected in batch_td_targets, using fallback")
+                batch_td_targets = torch.nan_to_num(batch_td_targets, nan=0.0, posinf=1.0, neginf=-1.0)
+            
             current_value_flat = current_values.reshape(-1)
             td_target_flat = batch_td_targets.reshape(-1)
-            value_loss = F.mse_loss(current_value_flat, td_target_flat.detach())
-            policy_loss = -log_probs.mean()
-            entropy_loss = -entropy * self.entropy_coef
             
-            # Compute total loss
-            loss = policy_loss + self.critic_coef * value_loss + entropy_loss
+            # Safety check for value loss calculation
+            try:
+                value_loss = F.mse_loss(current_value_flat, td_target_flat.detach())
+                if torch.isnan(value_loss).any() or torch.isinf(value_loss).any():
+                    if self.debug:
+                        print("[DEBUG] NaN/Inf detected in value_loss, using dummy loss")
+                    value_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
+            except RuntimeError:
+                if self.debug:
+                    print("[DEBUG] RuntimeError in value_loss calculation, using dummy loss")
+                value_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
+            
+            # Safety check for policy loss calculation
+            try:
+                policy_loss = -log_probs.mean()
+                if torch.isnan(policy_loss).any() or torch.isinf(policy_loss).any():
+                    if self.debug:
+                        print("[DEBUG] NaN/Inf detected in policy_loss, using dummy loss")
+                    policy_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
+            except RuntimeError:
+                if self.debug:
+                    print("[DEBUG] RuntimeError in policy_loss calculation, using dummy loss")
+                policy_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
+            
+            # Safety check for entropy loss
+            try:
+                entropy_loss = -entropy * self.entropy_coef
+                if torch.isnan(entropy_loss).any() or torch.isinf(entropy_loss).any():
+                    if self.debug:
+                        print("[DEBUG] NaN/Inf detected in entropy_loss, using zero")
+                    entropy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+            except RuntimeError:
+                if self.debug:
+                    print("[DEBUG] RuntimeError in entropy_loss calculation, using zero")
+                entropy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
             
             # Zero gradients and update
             self.actor_optimizer.zero_grad()
             self.critic_optimizer.zero_grad()
+            loss = policy_loss + self.critic_coef * value_loss + entropy_loss
             loss.backward()
             
             # Gradient clipping if enabled

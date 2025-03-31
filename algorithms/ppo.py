@@ -312,18 +312,18 @@ class PPOAlgorithm(BaseAlgorithm):
         """Store experience in the buffer"""
         if self.debug:
             print(f"[DEBUG PPO] Storing experience - reward: {reward}")
-
+        
         # Forward to memory buffer
         self.memory.store(obs, action, log_prob, reward, value, done)
-
+        
         # Track episode rewards for calculating returns
         if isinstance(reward, torch.Tensor):
             reward_val = reward.item()
         else:
             reward_val = float(reward)
-
+            
         self.current_episode_rewards.append(reward_val)
-
+        
         # When episode is done, calculate return
         if done:
             if self.current_episode_rewards:
@@ -332,20 +332,14 @@ class PPOAlgorithm(BaseAlgorithm):
                 if self.debug:
                     print(f"[DEBUG PPO] Episode done with return: {episode_return}")
                 self.current_episode_rewards = []  # Reset for next episode
-
+                
     def store_experience_at_idx(self, idx, obs=None, action=None, log_prob=None, reward=None, value=None, done=None):
         """Update specific values of an experience at a given index"""
         if self.debug and reward is not None:
             print(f"[DEBUG PPO] Updating reward at idx {idx}: {reward}")
-
+            
         # Forward to memory buffer
         self.memory.store_experience_at_idx(idx, obs, action, log_prob, reward, value, done)
-
-        # If reward is updated, recalculate intrinsic rewards if applicable
-        if reward is not None and hasattr(self, 'intrinsic_reward_generator'):
-            intrinsic_reward = self.intrinsic_reward_generator.compute_intrinsic_reward(obs, action, obs)
-            combined_reward = reward + intrinsic_reward
-            self.memory.store_experience_at_idx(idx, reward=combined_reward)
 
     def get_action(self, obs, deterministic=False, return_features=False):
         """Get action for a given observation"""
