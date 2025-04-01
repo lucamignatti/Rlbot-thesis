@@ -116,13 +116,22 @@ class CuriosityReward:
         self.forward_model.eval()
 
         with torch.no_grad():
-            # Ensure state is a torch tensor
+            # Ensure state is a torch tensor on the correct device
             if not isinstance(state, torch.Tensor):
                 state = torch.tensor(state, dtype=torch.float32, device=self.device)
+            elif state.device != self.device:
+                state = state.to(self.device)
+
             if not isinstance(next_state, torch.Tensor):
                 next_state = torch.tensor(next_state, dtype=torch.float32, device=self.device)
+            elif next_state.device != self.device:
+                next_state = next_state.to(self.device)
+
+            # Ensure action is a torch tensor on the correct device
             if not isinstance(action, torch.Tensor):
                 action = torch.tensor(action, dtype=torch.float32, device=self.device)
+            elif action.device != self.device:
+                action = action.to(self.device) # Explicitly move action to the correct device
 
             # Add batch dimension if needed
             if state.dim() == 1:
@@ -135,7 +144,8 @@ class CuriosityReward:
             # Handle discrete actions by converting to one-hot encoding
             if action.shape[1] == 1 and isinstance(self.action_dim, int):
                 one_hot_action = torch.zeros((action.size(0), self.action_dim), device=self.device)
-                one_hot_action.scatter_(1, action.long(), 1.0)
+                # Ensure action is long type for scatter_
+                one_hot_action.scatter_(1, action.long(), 1.0) 
                 action = one_hot_action
 
             # Compute features
@@ -143,7 +153,8 @@ class CuriosityReward:
             next_features = self.compute_features(next_state)
 
             # Forward model prediction
-            forward_input = torch.cat([current_features, action], dim=1)
+            # Ensure both tensors are on the same device before concatenating
+            forward_input = torch.cat([current_features.to(self.device), action.to(self.device)], dim=1) # Ensure both tensors are on the correct device
             predicted_next_features = self.forward_model(forward_input)
 
             # Calculate prediction error (MSE)
@@ -162,17 +173,27 @@ class CuriosityReward:
         self.feature_encoder.train()
         self.forward_model.train()
 
-        return torch.tensor(clipped_reward, device=self.device)
+        # Ensure a scalar tensor is returned by taking the mean
+        scalar_reward = np.mean(clipped_reward) 
+        return torch.tensor(scalar_reward, device=self.device, dtype=torch.float32)
         
     def update(self, state, action, next_state, done=False):
         """Update forward model to improve prediction accuracy"""
-        # Convert inputs to tensors if they aren't already
+        # Convert inputs to tensors if they aren't already and move to device
         if not isinstance(state, torch.Tensor):
             state = torch.tensor(state, dtype=torch.float32, device=self.device)
+        elif state.device != self.device:
+            state = state.to(self.device)
+
         if not isinstance(next_state, torch.Tensor):
             next_state = torch.tensor(next_state, dtype=torch.float32, device=self.device)
+        elif next_state.device != self.device:
+            next_state = next_state.to(self.device)
+
         if not isinstance(action, torch.Tensor):
             action = torch.tensor(action, dtype=torch.float32, device=self.device)
+        elif action.device != self.device:
+            action = action.to(self.device) # Explicitly move action to the correct device
             
         # Add batch dimension if needed
         if state.dim() == 1:
@@ -181,13 +202,21 @@ class CuriosityReward:
             next_state = next_state.unsqueeze(0)
         if action.dim() == 1:
             action = action.unsqueeze(0)
+
+        # Handle discrete actions by converting to one-hot encoding
+        if action.shape[1] == 1 and isinstance(self.action_dim, int):
+            one_hot_action = torch.zeros((action.size(0), self.action_dim), device=self.device)
+            # Ensure action is long type for scatter_
+            one_hot_action.scatter_(1, action.long(), 1.0) 
+            action = one_hot_action
             
         # Extract features
         current_features = self.compute_features(state)
         next_features = self.compute_features(next_state)
         
         # Predict next features
-        forward_input = torch.cat([current_features, action], dim=1)
+        # Ensure both tensors are on the same device before concatenating
+        forward_input = torch.cat([current_features.to(self.device), action.to(self.device)], dim=1) # Ensure both tensors are on the correct device
         predicted_next_features = self.forward_model(forward_input)
         
         # Calculate loss
@@ -283,9 +312,11 @@ class RNDReward(IntrinsicRewardGenerator):
         self.predictor_network.eval()
         
         with torch.no_grad():
-            # Ensure next_state is a torch tensor
+            # Ensure next_state is a torch tensor on the correct device
             if not isinstance(next_state, torch.Tensor):
                 next_state = torch.tensor(next_state, dtype=torch.float32, device=self.device)
+            elif next_state.device != self.device:
+                next_state = next_state.to(self.device)
                 
             # Add batch dimension if needed
             if next_state.dim() == 1:
@@ -315,7 +346,9 @@ class RNDReward(IntrinsicRewardGenerator):
         # Switch back to training mode
         self.predictor_network.train()
         
-        return torch.tensor(clipped_reward, device=self.device)
+        # Ensure a scalar tensor is returned by taking the mean
+        scalar_reward = np.mean(clipped_reward)
+        return torch.tensor(scalar_reward, device=self.device, dtype=torch.float32)
     
     def update(self, state, action, next_state, done=False):
         """Update the RND model based on the transition
@@ -329,9 +362,11 @@ class RNDReward(IntrinsicRewardGenerator):
         Returns:
             loss: Loss value from the update
         """
-        # Ensure next_state is a torch tensor
+        # Ensure next_state is a torch tensor on the correct device
         if not isinstance(next_state, torch.Tensor):
             next_state = torch.tensor(next_state, dtype=torch.float32, device=self.device)
+        elif next_state.device != self.device:
+            next_state = next_state.to(self.device)
             
         # Add batch dimension if needed
         if next_state.dim() == 1:
@@ -459,17 +494,52 @@ class IntrinsicRewardEnsemble:
             next_state: Next state
             
         Returns:
-            intrinsic_reward: Combined intrinsic reward value
+            intrinsic_reward: Combined intrinsic reward value (scalar float)
         """
+        # Ensure inputs are tensors on the correct device
+        device = next(iter(self.reward_generators.values())).device # Get device from first generator
+        if not isinstance(state, torch.Tensor):
+            state = torch.tensor(state, dtype=torch.float32, device=device)
+        elif state.device != device:
+            state = state.to(device)
+            
+        if not isinstance(action, torch.Tensor):
+            action = torch.tensor(action, dtype=torch.float32, device=device)
+        elif action.device != device:
+            action = action.to(device)
+            
+        if not isinstance(next_state, torch.Tensor):
+            next_state = torch.tensor(next_state, dtype=torch.float32, device=device)
+        elif next_state.device != device:
+            next_state = next_state.to(device)
+
+        # Add batch dimension if needed
+        if state.dim() == 1: state = state.unsqueeze(0)
+        if action.dim() == 1: action = action.unsqueeze(0)
+        if next_state.dim() == 1: next_state = next_state.unsqueeze(0)
+
         # Compute rewards from each generator
         rewards = {}
         for name, generator in self.reward_generators.items():
-            rewards[name] = generator.compute_intrinsic_reward(state, action, next_state)
+            # Generator should return tensor on correct device
+            rewards[name] = generator.compute_intrinsic_reward(state, action, next_state) 
             
-        # Combine rewards using weights
-        combined_reward = sum(self.weights[name] * reward for name, reward in rewards.items())
-        
-        return combined_reward, rewards
+        # Combine rewards using weights - Use .item() to ensure scalar multiplication
+        combined_reward_val = 0.0
+        for name, reward in rewards.items():
+            weight = self.weights.get(name, 0.0)
+            try:
+                reward_item = reward.item()
+                term = weight * reward_item
+                combined_reward_val += term
+            except Exception as e:
+                # Handle potential errors during item extraction or multiplication
+                print(f"Error processing reward for {name}: {e}")
+                # Optionally add a default value or skip if error occurs
+                # combined_reward_val += 0.0
+
+        # Return ONLY the combined scalar reward value
+        return combined_reward_val
     
     def update(self, state, action, next_state, done=False):
         """Update all reward generators
@@ -483,6 +553,28 @@ class IntrinsicRewardEnsemble:
         Returns:
             losses: Dictionary of losses from each generator
         """
+        # Ensure inputs are tensors on the correct device
+        device = next(iter(self.reward_generators.values())).device # Get device from first generator
+        if not isinstance(state, torch.Tensor):
+            state = torch.tensor(state, dtype=torch.float32, device=device)
+        elif state.device != device:
+            state = state.to(device)
+            
+        if not isinstance(action, torch.Tensor):
+            action = torch.tensor(action, dtype=torch.float32, device=device)
+        elif action.device != device:
+            action = action.to(device)
+            
+        if not isinstance(next_state, torch.Tensor):
+            next_state = torch.tensor(next_state, dtype=torch.float32, device=device)
+        elif next_state.device != device:
+            next_state = next_state.to(device)
+
+        # Add batch dimension if needed
+        if state.dim() == 1: state = state.unsqueeze(0)
+        if action.dim() == 1: action = action.unsqueeze(0)
+        if next_state.dim() == 1: next_state = next_state.unsqueeze(0)
+
         losses = {}
         for name, generator in self.reward_generators.items():
             generator_losses = generator.update(state, action, next_state, done)

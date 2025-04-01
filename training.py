@@ -1,6 +1,7 @@
+from collections import deque
 from torch.distributions import Categorical, Normal
 from torch.amp import autocast, GradScaler
-from models import fix_compiled_state_dict, print_model_info
+from models import fix_compiled_state_dict, load_partial_state_dict, print_model_info
 from typing import Union, Tuple, Optional, Dict, Any
 from auxiliary import AuxiliaryTaskManager
 from intrinsic_rewards import create_intrinsic_reward_generator, IntrinsicRewardEnsemble
@@ -14,6 +15,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 from tqdm import tqdm
+import random
 
 
 class RunningMeanStd:
@@ -304,6 +306,7 @@ class Trainer:
         self.total_episodes_offset = 0
         self.pretraining_completed = False
         self.in_transition_phase = False
+        self.transition_start_step = 0  # Initialize transition_start_step to avoid the attribute error
         self.base_sr_weight = sr_weight
         self.base_rp_weight = rp_weight
 
@@ -884,317 +887,595 @@ class Trainer:
             self.aux_task_manager.reset()
 
     def save_models(self, model_path=None, metadata=None):
-        """
-        Save both actor and critic models to a single file.
-
-        Args:
-            model_path: Optional custom path. If None, creates a timestamped file.
-                    If a directory is provided, a timestamped file will be created inside it.
-            metadata: Optional dictionary containing additional metadata to save with the model
-
-        Returns:
-            The complete path where the model was saved
-        """
-        # Generate timestamp for unique filenames.
-        timestamp = time.strftime("%Y%m%d-%H%M%S")
-
+        """Save actor and critic models, including curriculum state if available."""
         if model_path is None:
-            model_path = f"checkpoints/model_{timestamp}.pt"
-        elif os.path.isdir(model_path) or model_path.endswith('/') or model_path.endswith('\\'):
-            model_path = os.path.join(model_path, f"model_{timestamp}.pt")
+            model_path = f"models/model_{int(time.time())}.pt"
+            
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
         
-        # Make sure parent directory exists
-        parent_dir = os.path.dirname(model_path)
-        if parent_dir:
-            os.makedirs(parent_dir, exist_ok=True)
-
-        # Get the original models if using compiled versions
-        actor_state = self.actor._orig_mod.state_dict() if hasattr(self.actor, '_orig_mod') else self.actor.state_dict()
-        critic_state = self.critic._orig_mod.state_dict() if hasattr(self.critic, '_orig_mod') else self.critic.state_dict()
-
-        # Get auxiliary task models if enabled
-        aux_state = {}
-        if self.use_auxiliary_tasks:
-            # Save SR model
-            aux_state['sr_task'] = self.aux_task_manager.sr_task.state_dict()
-            # Save RP model
-            aux_state['rp_task'] = self.aux_task_manager.rp_task.state_dict()
-
-        # Get the WandB run ID if available
-        wandb_run_id = None
-        if self.use_wandb:
-            try:
-                wandb_run_id = wandb.run.id
-            except:
-                pass
-
-        # Save all models to a single file
-        try:
-            # Prepare metadata
-            if metadata is None:
-                metadata = {}
-                
-            # Add training info to metadata
-            metadata.update({
-                'algorithm': self.algorithm_type,
-                'training_step': self.training_steps + self.training_step_offset,
-                'total_episodes': self.total_episodes + self.total_episodes_offset,
-                'wandb_run_id': wandb_run_id,
-                'timestamp': timestamp
-            })
+        current_timestamp = time.strftime("%Y%m%d-%H%M%S")
+        
+        # Initialize metadata if None
+        if metadata is None:
+            metadata = {}
             
-            # Save everything to a single file
-            torch.save({
-                'actor': actor_state,
-                'critic': critic_state,
-                'aux': aux_state,
-                'metadata': metadata
-            }, model_path)
+        # Update metadata with training info
+        metadata.update({
+            'algorithm': self.algorithm_type,
+            'training_step': self.training_steps + self.training_step_offset,
+            'total_episodes': self.total_episodes + self.total_episodes_offset,
+            'timestamp': current_timestamp,
+            'version': '2.0'  # Checkpoint format version
+        })
+        
+        # Save pretraining state if enabled
+        if self.use_pretraining:
+            metadata['pretraining'] = {
+                'completed': self.pretraining_completed,
+                'in_transition': self.in_transition_phase,
+                'transition_start_step': getattr(self, 'transition_start_step', 0),
+                'pretraining_fraction': self.pretraining_fraction,
+                'pretraining_transition_steps': self.pretraining_transition_steps,
+                'base_sr_weight': self.base_sr_weight,
+                'base_rp_weight': self.base_rp_weight,
+                'pretraining_sr_weight': self.pretraining_sr_weight,
+                'pretraining_rp_weight': self.pretraining_rp_weight
+            }
             
+        # Prepare the main checkpoint dictionary
+        checkpoint = {
+            'actor': self.actor.state_dict(),
+            'critic': self.critic.state_dict(),
+            'metadata': metadata # Include updated metadata
+        }
+        
+        # Include algorithm state if available
+        if hasattr(self, 'algorithm') and hasattr(self.algorithm, 'get_state_dict'):
+            checkpoint['algorithm_state'] = self.algorithm.get_state_dict()
             if self.debug:
-                print(f"[DEBUG] Model saved to {model_path}")
-            return model_path
-        except Exception as e:
-            print(f"Error saving models: {e}")
-            return None
+                print(f"[DEBUG Trainer Save] Included algorithm state in checkpoint.")
+        
+        # Include curriculum state if manager is registered
+        if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None:
+             if hasattr(self.curriculum_manager, 'get_state'):
+                 checkpoint['curriculum'] = self.curriculum_manager.get_state() # Use 'curriculum' key
+                 if self.debug:
+                     print(f"[DEBUG Trainer Save] Included curriculum state in checkpoint.")
+
+        # Include auxiliary task state if manager exists
+        if hasattr(self, 'aux_task_manager') and self.aux_task_manager is not None:
+             if hasattr(self.aux_task_manager, 'get_state_dict'):
+                 checkpoint['aux'] = self.aux_task_manager.get_state_dict() # Use 'aux' key
+                 if self.debug:
+                     print(f"[DEBUG Trainer Save] Included auxiliary task state in checkpoint.")
+
+        # Include intrinsic reward state if generator exists
+        if hasattr(self, 'intrinsic_reward_generator') and self.intrinsic_reward_generator is not None:
+             if hasattr(self.intrinsic_reward_generator, 'get_state_dict'):
+                 checkpoint['intrinsic'] = self.intrinsic_reward_generator.get_state_dict() # Use 'intrinsic' key
+                 if self.debug:
+                     print(f"[DEBUG Trainer Save] Included intrinsic reward state in checkpoint.")
+                     
+        # Include random states for reproducibility
+        checkpoint['random_states'] = {
+            'torch': torch.get_rng_state(),
+            'numpy': np.random.get_state(),
+            'random': random.getstate()
+        }
+        
+        # Include entropy settings
+        checkpoint['entropy'] = {
+            'entropy_coef': self.entropy_coef,
+            'entropy_coef_decay': self.entropy_coef_decay,
+            'min_entropy_coef': self.min_entropy_coef,
+            'base_entropy_coef': self.base_entropy_coef
+        }
+        
+        # Include wandb info if enabled
+        if self.use_wandb and wandb.run:
+            checkpoint['wandb'] = {
+                'run_id': wandb.run.id,
+                'project': wandb.run.project,
+                'entity': wandb.run.entity,
+                'name': wandb.run.name
+            }
+
+        # Save to a single file with all components
+        torch.save(checkpoint, model_path)
+        
+        if self.debug:
+            print(f"[DEBUG Trainer Save] Saved checkpoint to {model_path}")
+            
+        return model_path # Return the path where it was saved
 
     def load_models(self, model_path):
         """
-        Load both actor and critic models from a single file.
-
+        Load a comprehensive checkpoint to resume training from the exact state.
+        
         Args:
-            model_path: Path to the saved model file
+            model_path: Path to the saved checkpoint file
+            
+        Returns:
+            bool: Whether loading was successful
         """
         if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Model file not found: {model_path}")
+            print(f"Error: Checkpoint file not found: {model_path}")
+            return False
 
-        # Load the saved state
-        checkpoint = torch.load(model_path, map_location=self.device)
-
-        # Handle both new single-file format and legacy format
-        if isinstance(checkpoint, dict) and 'actor' in checkpoint and 'critic' in checkpoint:
-            # Load actor and critic models
-            # Fix compiled state dicts if necessary
-            actor_state = fix_compiled_state_dict(checkpoint['actor'])
-            critic_state = fix_compiled_state_dict(checkpoint['critic'])
+        try:
+            # Load the saved state with CPU mapping to allow loading on any device
+            checkpoint = torch.load(model_path, map_location='cpu')
             
-            # Load models
-            self.actor.load_state_dict(actor_state)
-            self.critic.load_state_dict(critic_state)
+            # Check for checkpoint version to handle different formats
+            metadata = checkpoint.get('metadata', {})
+            version = metadata.get('version', '1.0')
             
-            # Load auxiliary tasks if available and enabled
+            # Log loading info
+            if self.debug:
+                print(f"[DEBUG] Loading checkpoint version {version} from {model_path}")
+            
+            # ===== Restore Model Parameters =====
+            if 'actor' in checkpoint and 'critic' in checkpoint:
+                # Fix state dicts for compiled models
+                actor_state = fix_compiled_state_dict(checkpoint['actor'])
+                critic_state = fix_compiled_state_dict(checkpoint['critic'])
+                
+                # Load models with error handling for architecture mismatches
+                actor_mismatches = load_partial_state_dict(self.actor, actor_state)
+                critic_mismatches = load_partial_state_dict(self.critic, critic_state)
+                
+                if self.debug:
+                    print(f"[DEBUG] Loaded actor and critic models")
+                    if actor_mismatches > 0:
+                        print(f"[DEBUG] {actor_mismatches} actor parameters could not be loaded")
+                    if critic_mismatches > 0:
+                        print(f"[DEBUG] {critic_mismatches} critic parameters could not be loaded")
+            else:
+                print(f"Warning: Checkpoint does not contain expected model parameters")
+                return False
+            
+            # ===== Restore Algorithm State =====
+            if 'algorithm_state' in checkpoint and checkpoint['algorithm_state']:
+                algorithm_state = checkpoint['algorithm_state']
+                
+                # Restore the algorithm's internal state with type-specific handling
+                if self.algorithm_type == "ppo":
+                    # Restore PPO optimizers
+                    if 'actor_optimizer' in algorithm_state:
+                        try:
+                            self.algorithm.actor_optimizer.load_state_dict(algorithm_state['actor_optimizer'])
+                        except Exception as e:
+                            print(f"Warning: Could not load actor optimizer state: {e}")
+                            
+                    if 'critic_optimizer' in algorithm_state:
+                        try:
+                            self.algorithm.critic_optimizer.load_state_dict(algorithm_state['critic_optimizer'])
+                        except Exception as e:
+                            print(f"Warning: Could not load critic optimizer state: {e}")
+                    
+                    # Restore PPO memory state if possible
+                    if hasattr(self.algorithm, 'memory'):
+                        self.algorithm.memory.pos = algorithm_state.get('memory_pos', 0)
+                        self.algorithm.memory.size = algorithm_state.get('memory_size', 0)
+                        self.algorithm.memory.full = algorithm_state.get('memory_full', False)
+                        
+                        if self.debug:
+                            print(f"[DEBUG] Restored PPO memory state: pos={self.algorithm.memory.pos}, size={self.algorithm.memory.size}")
+                    
+                    # Restore episode returns tracking
+                    if hasattr(self.algorithm, 'episode_returns') and 'episode_returns' in algorithm_state:
+                        self.algorithm.episode_returns = deque(algorithm_state['episode_returns'], maxlen=self.algorithm.episode_returns.maxlen)
+                        
+                    if hasattr(self.algorithm, 'current_episode_rewards') and 'current_episode_rewards' in algorithm_state:
+                        self.algorithm.current_episode_rewards = algorithm_state['current_episode_rewards']
+                        
+                elif self.algorithm_type == "streamac":
+                    # Restore StreamAC optimizers
+                    if 'actor_optimizer' in algorithm_state:
+                        try:
+                            self.algorithm.actor_optimizer.load_state_dict(algorithm_state['actor_optimizer'])
+                        except Exception as e:
+                            print(f"Warning: Could not load StreamAC actor optimizer state: {e}")
+                            
+                    if 'critic_optimizer' in algorithm_state:
+                        try:
+                            self.algorithm.critic_optimizer.load_state_dict(algorithm_state['critic_optimizer'])
+                        except Exception as e:
+                            print(f"Warning: Could not load StreamAC critic optimizer state: {e}")
+                    
+                    # Restore learning rates
+                    if 'learning_rates' in algorithm_state:
+                        lr_dict = algorithm_state['learning_rates']
+                        self.algorithm.lr_actor = lr_dict.get('actor', self.lr_actor)
+                        self.algorithm.lr_critic = lr_dict.get('critic', self.lr_critic)
+                    
+                    # Restore TD error buffer if it exists
+                    if hasattr(self.algorithm, 'td_error_buffer') and 'td_error_buffer' in algorithm_state:
+                        self.algorithm.td_error_buffer = deque(algorithm_state['td_error_buffer'], 
+                                                            maxlen=self.algorithm.td_error_buffer.maxlen)
+                    
+                    # Restore update counters
+                    if hasattr(self.algorithm, 'backtracking_count'):
+                        self.algorithm.backtracking_count = algorithm_state.get('backtracking_count', 0)
+                    if hasattr(self.algorithm, 'update_count'):
+                        self.algorithm.update_count = algorithm_state.get('update_count', 0)
+                        
+                    if self.debug:
+                        print(f"[DEBUG] Restored StreamAC state with learning rates - actor: {self.algorithm.lr_actor}, critic: {self.algorithm.lr_critic}")
+            
+            # ===== Restore Auxiliary Task State =====
             if self.use_auxiliary_tasks and 'aux' in checkpoint and checkpoint['aux']:
                 aux_state = checkpoint['aux']
-                if 'sr_head' in aux_state:
-                    self.aux_task_manager.sr_head.load_state_dict(aux_state['sr_head'])
-                if 'rp_lstm' in aux_state and 'rp_head' in aux_state:
-                    self.aux_task_manager.rp_lstm.load_state_dict(aux_state['rp_lstm'])
-                    self.aux_task_manager.rp_head.load_state_dict(aux_state['rp_head'])
+                
+                # Only try to restore if we have an auxiliary task manager
+                if hasattr(self, 'aux_task_manager'):
+                    try:
+                        # Restore model parameters and optimizer states
+                        self.aux_task_manager.load_state_dict(aux_state)
+                        
+                        # Restore configuration values
+                        if 'sr_weight' in aux_state:
+                            self.aux_task_manager.sr_weight = aux_state['sr_weight']
+                        if 'rp_weight' in aux_state:
+                            self.aux_task_manager.rp_weight = aux_state['rp_weight']
+                        if 'update_frequency' in aux_state:
+                            self.aux_task_manager.update_frequency = aux_state['update_frequency']
+                        if 'history_size' in aux_state:
+                            self.aux_task_manager.history_size = aux_state['history_size']
+                        if 'update_count' in aux_state:
+                            self.aux_task_manager.update_count = aux_state['update_count']
+                        if 'last_sr_loss' in aux_state:
+                            self.aux_task_manager.last_sr_loss = aux_state['last_sr_loss']
+                        if 'last_rp_loss' in aux_state:
+                            self.aux_task_manager.last_rp_loss = aux_state['last_rp_loss']
+                        if 'learning_mode' in aux_state:
+                            self.aux_task_manager.learning_mode = aux_state['learning_mode']
+                            
+                        if self.debug:
+                            print(f"[DEBUG] Restored auxiliary task state with weights - SR: {self.aux_task_manager.sr_weight}, RP: {self.aux_task_manager.rp_weight}")
+                    except Exception as e:
+                        print(f"Warning: Could not restore auxiliary task state: {e}")
+                        if self.debug:
+                            import traceback
+                            traceback.print_exc()
+            
+            # ===== Restore Intrinsic Reward State =====
+            if self.use_intrinsic_rewards and 'intrinsic' in checkpoint and checkpoint['intrinsic']:
+                intrinsic_state = checkpoint['intrinsic']
+                
+                # Only try to restore if we have an intrinsic reward generator
+                if self.intrinsic_reward_generator is not None:
+                    # Load model parameters
+                    if hasattr(self.intrinsic_reward_generator, 'load_state_dict'):
+                        try:
+                            # Filter out configuration items and only pass the model state
+                            model_state = {k: v for k, v in intrinsic_state.items() 
+                                        if k not in ['intrinsic_reward_scale', 'curiosity_weight', 'rnd_weight', 'extrinsic_normalizer']}
+                            if model_state:
+                                self.intrinsic_reward_generator.load_state_dict(model_state)
+                        except Exception as e:
+                            print(f"Warning: Could not load intrinsic reward generator state: {e}")
                     
-            # Extract metadata if available
+                    # Restore configuration values
+                    if 'intrinsic_reward_scale' in intrinsic_state:
+                        self.intrinsic_reward_scale = intrinsic_state['intrinsic_reward_scale']
+                    
+                    # Set component weights if the generator has those attributes
+                    if hasattr(self.intrinsic_reward_generator, 'curiosity_weight') and 'curiosity_weight' in intrinsic_state:
+                        self.intrinsic_reward_generator.curiosity_weight = intrinsic_state['curiosity_weight']
+                    if hasattr(self.intrinsic_reward_generator, 'rnd_weight') and 'rnd_weight' in intrinsic_state:
+                        self.intrinsic_reward_generator.rnd_weight = intrinsic_state['rnd_weight']
+                    
+                    # Restore extrinsic reward normalizer if it exists in the checkpoint
+                    if 'extrinsic_normalizer' in intrinsic_state:
+                        normalizer_state = intrinsic_state['extrinsic_normalizer']
+                        if not hasattr(self, 'extrinsic_reward_normalizer'):
+                            from intrinsic_rewards import ExtrinsicRewardNormalizer
+                            self.extrinsic_reward_normalizer = ExtrinsicRewardNormalizer()
+                        
+                        try:
+                            if 'mean' in normalizer_state:
+                                self.extrinsic_reward_normalizer.mean = np.array(normalizer_state['mean'])
+                            if 'var' in normalizer_state:
+                                self.extrinsic_reward_normalizer.var = np.array(normalizer_state['var'])
+                            if 'count' in normalizer_state:
+                                self.extrinsic_reward_normalizer.count = normalizer_state['count']
+                        except Exception as e:
+                            print(f"Warning: Could not restore extrinsic reward normalizer: {e}")
+                    
+                    if self.debug:
+                        print(f"[DEBUG] Restored intrinsic reward generator with scale {self.intrinsic_reward_scale}")
+            
+            # ===== Restore Curriculum State =====
+            if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None and 'curriculum' in checkpoint:
+                curriculum_state = checkpoint['curriculum']
+                
+                try:
+                    # Restore curriculum stage and difficulty
+                    if 'current_stage_index' in curriculum_state:
+                        stage_index = curriculum_state['current_stage_index']
+                        # Ensure index is within bounds
+                        if 0 <= stage_index < len(self.curriculum_manager.stages):
+                            self.curriculum_manager.current_stage_index = stage_index
+                            self.curriculum_manager.current_stage = self.curriculum_manager.stages[stage_index]
+                    
+                    # Restore current difficulty level
+                    if 'current_difficulty' in curriculum_state:
+                        self.curriculum_manager.current_difficulty = curriculum_state['current_difficulty']
+                    
+                    # Restore total episodes
+                    if 'total_episodes' in curriculum_state:
+                        self.curriculum_manager.total_episodes = curriculum_state['total_episodes']
+                    
+                    # Restore completed stages tracking
+                    if 'completed_stages' in curriculum_state:
+                        self.curriculum_manager.completed_stages = curriculum_state['completed_stages']
+                    
+                    # Restore stage-specific statistics if available
+                    if 'stages_data' in curriculum_state:
+                        stages_data = curriculum_state['stages_data']
+                        if len(stages_data) == len(self.curriculum_manager.stages):
+                            for i, stage_data in enumerate(stages_data):
+                                stage = self.curriculum_manager.stages[i]
+                                if stage.name == stage_data.get('name'):
+                                    # Restore stage statistics
+                                    stage.episode_count = stage_data.get('episode_count', 0)
+                                    stage.success_count = stage_data.get('success_count', 0)
+                                    stage.failure_count = stage_data.get('failure_count', 0)
+                                    stage.rewards_history = stage_data.get('rewards_history', [])
+                                    stage.moving_success_rate = stage_data.get('moving_success_rate', 0.0)
+                                    stage.moving_avg_reward = stage_data.get('moving_avg_reward', 0.0)
+                    
+                    if self.debug:
+                        print(f"[DEBUG] Restored curriculum state: stage={self.curriculum_manager.current_stage_index}, difficulty={self.curriculum_manager.current_difficulty:.2f}")
+                except Exception as e:
+                    print(f"Warning: Could not fully restore curriculum state: {e}")
+                    if self.debug:
+                        import traceback
+                        traceback.print_exc()
+            
+            # ===== Restore Random States =====
+            if 'random_states' in checkpoint:
+                try:
+                    random_states = checkpoint['random_states']
+                    # Restore torch random state
+                    if 'torch' in random_states:
+                        torch.set_rng_state(random_states['torch'])
+                    # Restore numpy random state
+                    if 'numpy' in random_states:
+                        np.random.set_state(random_states['numpy'])
+                    # Restore Python random state
+                    if 'random' in random_states:
+                        random.setstate(random_states['random'])
+                        
+                    if self.debug:
+                        print("[DEBUG] Restored random states for reproducibility")
+                except Exception as e:
+                    print(f"Warning: Could not restore random states: {e}")
+            
+            # ===== Restore Entropy Settings =====
+            if 'entropy' in checkpoint:
+                entropy_settings = checkpoint['entropy']
+                self.entropy_coef = entropy_settings.get('entropy_coef', self.entropy_coef)
+                self.entropy_coef_decay = entropy_settings.get('entropy_coef_decay', self.entropy_coef_decay)
+                self.min_entropy_coef = entropy_settings.get('min_entropy_coef', self.min_entropy_coef)
+                self.base_entropy_coef = entropy_settings.get('base_entropy_coef', self.base_entropy_coef)
+                
+                if self.debug:
+                    print(f"[DEBUG] Restored entropy settings: coef={self.entropy_coef:.6f}, decay={self.entropy_coef_decay:.6f}")
+            
+            # ===== Restore Training Counters =====
             if 'metadata' in checkpoint:
                 metadata = checkpoint['metadata']
                 if 'training_step' in metadata:
                     self.training_step_offset = metadata['training_step']
                 if 'total_episodes' in metadata:
                     self.total_episodes_offset = metadata['total_episodes']
-                if self.debug:
-                    print(f"[DEBUG] Loaded metadata: {metadata}")
                     
-            if self.debug:
-                print(f"[DEBUG] Successfully loaded model from {model_path}")
-        else:
-            # Handle legacy format - just load actor
-            self.actor.load_state_dict(checkpoint)
-            if self.debug:
-                print(f"[DEBUG] Loaded legacy model format from {model_path}")
-
-    def register_curriculum_manager(self, curriculum_manager):
-        """Register a curriculum manager to synchronize wandb logging"""
-        self.curriculum_manager = curriculum_manager
-        if curriculum_manager is not None and self.debug:
-            print(f"[DEBUG] Registered curriculum manager with {len(curriculum_manager.stages)} stages")
-
-    def _get_pretraining_end_step(self):
-        """Calculate the step at which pretraining should end based on available targets"""
-        # Check if total_episode_target attribute exists before accessing
-        if hasattr(self, 'total_episode_target') and self.total_episode_target:
-            return int(self.total_episode_target * self.pretraining_fraction)
+                if self.debug:
+                    print(f"[DEBUG] Restored training counters: steps={self.training_step_offset}, episodes={self.total_episodes_offset}")
             
-        # Check if training_time_target attribute exists before accessing
-        if hasattr(self, 'training_time_target') and self.training_time_target:
-            return int(self.training_time_target * self.pretraining_fraction)
+            # ===== Restore Pretraining State =====
+            if self.use_pretraining and 'metadata' in checkpoint and 'pretraining' in metadata:
+                pretraining_state = metadata['pretraining']
+                self.pretraining_completed = pretraining_state.get('completed', self.pretraining_completed)
+                self.in_transition_phase = pretraining_state.get('in_transition', self.in_transition_phase)
+                
+                if 'transition_start_step' in pretraining_state:
+                    self.transition_start_step = pretraining_state['transition_start_step']
+                
+                # Restore weight configurations
+                self.pretraining_fraction = pretraining_state.get('pretraining_fraction', self.pretraining_fraction)
+                self.pretraining_transition_steps = pretraining_state.get('pretraining_transition_steps', self.pretraining_transition_steps)
+                self.base_sr_weight = pretraining_state.get('base_sr_weight', self.base_sr_weight)
+                self.base_rp_weight = pretraining_state.get('base_rp_weight', self.base_rp_weight)
+                self.pretraining_sr_weight = pretraining_state.get('pretraining_sr_weight', self.pretraining_sr_weight)
+                self.pretraining_rp_weight = pretraining_state.get('pretraining_rp_weight', self.pretraining_rp_weight)
+                
+                if self.debug:
+                    pretraining_status = "completed" if self.pretraining_completed else ("transitioning" if self.in_transition_phase else "active")
+                    print(f"[DEBUG] Restored pretraining state: {pretraining_status}")
             
-        # Default fallback - use a fixed number of steps
-        return int(5000 * self.pretraining_fraction)
+            # ===== Resume WandB Run =====
+            if self.use_wandb and 'wandb' in checkpoint and checkpoint['wandb']:
+                wandb_info = checkpoint['wandb']
+                
+                try:
+                    # Check if we need to resume a wandb run
+                    if 'run_id' in wandb_info and wandb.run is None or (wandb.run and wandb.run.id != wandb_info['run_id']):
+                        run_id = wandb_info['run_id']
+                        project = wandb_info.get('project', 'rlbot-training')
+                        entity = wandb_info.get('entity', None)
+                        name = wandb_info.get('name', None)
+                        
+                        print(f"Resuming wandb run: {run_id}")
+                        wandb.init(
+                            project=project,
+                            entity=entity,
+                            id=run_id,
+                            resume="must",
+                            name=name
+                        )
+                        
+                        if self.debug:
+                            print(f"[DEBUG] Successfully resumed wandb run: {run_id}")
+                except Exception as e:
+                    print(f"Warning: Could not resume wandb run: {e}")
+            
+            print(f"Successfully loaded checkpoint from {model_path}")
+            print(f"Resumed training at step {self.training_steps + self.training_step_offset}")
+            return True
+            
+        except Exception as e:
+            print(f"Error loading checkpoint: {e}")
+            if self.debug:
+                import traceback
+                traceback.print_exc()
+            return False
 
     def _update_pretraining_state(self):
-        """Update pretraining state based on current step"""
-        # Check if we should exit pretraining
-        pretraining_end_step = self._get_pretraining_end_step()
-        current_step = self.total_episodes + self.total_episodes_offset
-        
-        # If we've reached the end of pretraining and not in transition phase yet
-        if current_step >= pretraining_end_step and not self.pretraining_completed and not self.in_transition_phase:
-            if self.debug:
-                print(f"[DEBUG] Starting pretraining transition phase at episode {current_step}/{pretraining_end_step}")
-            self.in_transition_phase = True
-            self.transition_start_step = current_step
-            
-        # If we're in the transition phase and have completed it
-        elif self.in_transition_phase:
-            transition_progress = current_step - self.transition_start_step
-            if transition_progress >= self.pretraining_transition_steps:
-                if self.debug:
-                    print(f"[DEBUG] Completed pretraining transition phase at episode {current_step}")
-                self.pretraining_completed = True
-                self.in_transition_phase = False
-
-    def _update_auxiliary_weights(self):
-        """Update auxiliary task weights based on pretraining phase"""
-        if not self.use_auxiliary_tasks or not self.use_pretraining:
+        """Update pretraining state based on current progress"""
+        if not self.use_pretraining or self.pretraining_completed:
             return
-            
-        current_sr_weight = self.base_sr_weight
-        current_rp_weight = self.base_rp_weight
         
-        if not self.pretraining_completed:
-            # In pretraining phase, use higher weights
-            current_sr_weight = self.pretraining_sr_weight
-            current_rp_weight = self.pretraining_rp_weight
-        elif self.in_transition_phase:
-            # In transition phase, gradually reduce weights
-            progress = min(1.0, (self.training_steps - self.transition_start_step) / 
-                          self.pretraining_transition_steps)
-            current_sr_weight = self.pretraining_sr_weight + progress * (self.base_sr_weight - self.pretraining_sr_weight)
-            current_rp_weight = self.pretraining_rp_weight + progress * (self.base_rp_weight - self.pretraining_rp_weight)
-            
-        # Update the weights in the manager
-        self.aux_task_manager.sr_weight = current_sr_weight
-        self.aux_task_manager.rp_weight = current_rp_weight
-
-        # Also update entropy coefficient based on pretraining status
-        if not self.pretraining_completed:
-            # Higher entropy during pretraining to encourage exploration
-            self.entropy_coef = self.base_entropy_coef * self.pretraining_entropy_scale
-        elif self.in_transition_phase:
-            progress = min(1.0, (self.training_steps - self.transition_start_step) / 
-                          self.pretraining_transition_steps)
-            self.entropy_coef = self.base_entropy_coef * self.pretraining_entropy_scale + \
-                               progress * (self.base_entropy_coef - self.base_entropy_coef * self.pretraining_entropy_scale)
+        # Calculate total progress
+        if self.total_episode_target:
+            # Use episode count for tracking
+            progress_ratio = (self.total_episodes + self.total_episodes_offset) / self.total_episode_target
         else:
-            # Use base entropy with normal decay during regular training
-            self.entropy_coef = max(self.min_entropy_coef, 
-                                   self.base_entropy_coef * (self.entropy_coef_decay ** self.training_steps))
-
-        # Log to wandb
-        if self.use_wandb and self.training_steps % 10 == 0:
-            wandb.log({
-                "sr_weight": current_sr_weight,
-                "rp_weight": current_rp_weight,
-                "entropy_coef": self.entropy_coef
-            }, step=self._get_wandb_step())
-
-    def _get_wandb_step(self):
-        """Get the correct step for wandb logging"""
-        return self.training_steps + self.training_step_offset
-
-    def set_total_episode_target(self, total_episodes):
-        """Set the target for total training episodes, used for pretraining calculations."""
-        self.total_episode_target = total_episodes
+            # Default to using training steps
+            total_steps = max(1, self._true_training_steps())
+            progress_ratio = min(1.0, total_steps / 1000)  # Default to 1000 steps if no target
         
-        if self.use_pretraining and self.total_episode_target and self.debug:
-            pretraining_end = self._get_pretraining_end_step()
-            print(f"[DEBUG] Set total episode target to {total_episodes}")
-            print(f"[DEBUG] Pretraining will end at episode {pretraining_end}")
+        # Check if pretraining phase is complete
+        if progress_ratio >= self.pretraining_fraction and not self.pretraining_completed:
+            if not self.in_transition_phase:
+                print(f"Transitioning from pretraining to regular training over next {self.pretraining_transition_steps} steps.")
+                self.in_transition_phase = True
+                self.transition_start_step = self._true_training_steps()
+            
+        # Check if transition is complete
+        current_step = self._true_training_steps()
+        transition_progress = min(1.0, (current_step - self.transition_start_step) / self.pretraining_transition_steps)
         
-        return self._get_pretraining_end_step()
+        if transition_progress >= 1.0:
+            # Mark pretraining as fully completed
+            self.pretraining_completed = True
+            self.in_transition_phase = False
+            print("Pretraining phase completed. Switching to regular training.")
+            
+            # Reset auxiliary task weights to regular values
+            if self.use_auxiliary_tasks:
+                self.aux_task_manager.sr_weight = self.base_sr_weight
+                self.aux_task_manager.rp_weight = self.base_rp_weight
+                
+            # Reset entropy coefficient to base value
+            self.entropy_coef = self.base_entropy_coef
+            
+        else:
+            # Gradually transition auxiliary task weights
+            if self.use_auxiliary_tasks:
+                sr_weight = self.pretraining_sr_weight + transition_progress * (self.base_sr_weight - self.pretraining_sr_weight)
+                rp_weight = self.pretraining_rp_weight + transition_progress * (self.base_rp_weight - self.pretraining_rp_weight)
+                self.aux_task_manager.sr_weight = sr_weight
+                self.aux_task_manager.rp_weight = rp_weight
+                
+                # Gradually transition entropy coefficient
+                pretraining_entropy = self.base_entropy_coef * self.pretraining_entropy_scale
+                entropy_coef = pretraining_entropy + transition_progress * (self.base_entropy_coef - pretraining_entropy)
+                self.entropy_coef = max(self.min_entropy_coef, entropy_coef)
+    
+            # During early pretraining, use higher values for auxiliary tasks and entropy
+            elif not self.in_transition_phase and not self.pretraining_completed:
+                if self.use_auxiliary_tasks:
+                    self.aux_task_manager.sr_weight = self.pretraining_sr_weight
+                    self.aux_task_manager.rp_weight = self.pretraining_rp_weight
+            
+                # Higher entropy during pretraining
+                self.entropy_coef = max(self.min_entropy_coef, self.base_entropy_coef * self.pretraining_entropy_scale)
 
-    def update_experience_with_intrinsic_reward(self, state, action, next_state, reward, env_id=0):
+    def update_experience_with_intrinsic_reward(self, state=None, action=None, next_state=None, done=None, reward=None, store_idx=None, env_id=None):
         """
-        Update experience with both extrinsic (environment) reward and calculated intrinsic reward.
+        Calculate intrinsic reward and update stored experience
         
         Args:
-            state: Current state
+            state: Current observation (renamed from obs to match main.py calls)
             action: Action taken
-            next_state: Resulting state
-            reward: Extrinsic reward from environment
-            env_id: Environment ID for multi-environment training
-            
+            next_state: Next observation (renamed from next_obs to match main.py calls)
+            done: Done flag (now optional with default None)
+            reward: Original extrinsic reward
+            store_idx: Index in memory to update (for PPO)
+            env_id: Environment ID for vectorized environments
+        
         Returns:
-            Combined reward (extrinsic + intrinsic)
+            Total reward (extrinsic + intrinsic)
         """
-        # Skip if intrinsic rewards disabled or no generator
+        # If intrinsic rewards are disabled or generator is not initialized, return original reward
         if not self.use_intrinsic_rewards or self.intrinsic_reward_generator is None:
             return reward
-            
-        # Convert inputs to tensor format if needed
-        if not isinstance(state, torch.Tensor):
-            state_tensor = torch.FloatTensor(state).to(self.device)
-            if state_tensor.dim() == 1:
-                state_tensor = state_tensor.unsqueeze(0)
-        else:
-            state_tensor = state.to(self.device)
-            
-        if not isinstance(action, torch.Tensor):
-            if self.action_space_type == "discrete":
-                if isinstance(action, np.ndarray):
-                    if action.size == 1:
-                        action = int(action.item())
-                    else:
-                        action = int(action[0])
-                elif isinstance(action, (float, np.floating)):
-                    action = int(action)
-                elif hasattr(action, 'item'):
-                    action = int(action.item())
-                action_tensor = torch.LongTensor([action]).to(self.device)
+        
+        # Calculate intrinsic reward
+        intrinsic_reward = 0.0
+        
+        try:
+            # Convert inputs to tensors if needed
+            if not isinstance(state, torch.Tensor):
+                obs_tensor = torch.tensor(state, dtype=torch.float32, device=self.device)
             else:
-                action_tensor = torch.FloatTensor(action).to(self.device)
-                if action_tensor.dim() == 1:
-                    action_tensor = action_tensor.unsqueeze(0)
-        else:
-            action_tensor = action.to(self.device)
+                obs_tensor = state
             
-        if not isinstance(next_state, torch.Tensor):
-            next_state_tensor = torch.FloatTensor(next_state).to(self.device)
-            if next_state_tensor.dim() == 1:
-                next_state_tensor = next_state_tensor.unsqueeze(0)
-        else:
-            next_state_tensor = next_state.to(self.device)
+            if not isinstance(action, torch.Tensor):
+                action_tensor = torch.tensor(action, dtype=torch.float32, device=self.device)
+            else:
+                action_tensor = action
+            
+            if not isinstance(next_state, torch.Tensor):
+                next_obs_tensor = torch.tensor(next_state, dtype=torch.float32, device=self.device)
+            else:
+                next_obs_tensor = next_state
+    
+            # Add batch dimension if needed
+            if obs_tensor.dim() == 1:
+                obs_tensor = obs_tensor.unsqueeze(0)
+            if action_tensor.dim() == 1:
+                action_tensor = action_tensor.unsqueeze(0)
+            if next_obs_tensor.dim() == 1:
+                next_obs_tensor = next_obs_tensor.unsqueeze(0)
+            
+            # Compute intrinsic reward
+            intrinsic_reward = self.intrinsic_reward_generator.compute_intrinsic_reward(
+                obs_tensor, action_tensor, next_obs_tensor
+            )
+
+            # Update intrinsic reward model
+            if done is not None:  # Only update if done flag is provided
+                self.intrinsic_reward_generator.update(obs_tensor, action_tensor, next_obs_tensor, done)
         
-        # Compute intrinsic reward
-        intrinsic_reward = self.intrinsic_reward_generator.compute_intrinsic_reward(
-            state_tensor, action_tensor, next_state_tensor
-        )
-        
-        # Extract extrinsic reward value for normalization
-        extrinsic_reward = reward.item() if hasattr(reward, 'item') else reward
-        
-        # Initialize extrinsic reward normalizer if it doesn't exist
-        if not hasattr(self, 'extrinsic_reward_normalizer'):
-            from intrinsic_rewards import ExtrinsicRewardNormalizer
-            self.extrinsic_reward_normalizer = ExtrinsicRewardNormalizer()
+            # Convert to scalar if tensor
+            if isinstance(intrinsic_reward, torch.Tensor):
+                intrinsic_reward = intrinsic_reward.item()
+                
+            # Scale intrinsic reward
+            intrinsic_reward *= self.intrinsic_reward_scale
+            
+        except Exception as e:
             if self.debug:
-                print("[DEBUG] Initialized extrinsic reward normalizer for adaptive intrinsic scaling")
+                print(f"Error computing intrinsic reward: {e}")
+            intrinsic_reward = 0.0
+            
+        # Calculate total reward
+        total_reward = reward + intrinsic_reward
         
-        # Normalize extrinsic reward
-        normalized_reward = self.extrinsic_reward_normalizer.normalize(extrinsic_reward)
+        # Update stored experience if index is provided (for PPO)
+        if store_idx is not None and self.algorithm_type == "ppo":
+            # Convert to tensor if needed
+            if not isinstance(total_reward, torch.Tensor):
+                total_reward_tensor = torch.tensor(total_reward, dtype=torch.float32, device=self.device)
+            else:
+                total_reward_tensor = total_reward
         
-        # Calculate adaptive scale using sigmoid function
-        sigmoid_factor = 1.0 / (1.0 + np.exp(2.0 * normalized_reward))
-        adaptive_scale = self.intrinsic_reward_scale * sigmoid_factor
-        
-        # Ensure minimum scale to maintain some exploration
-        adaptive_scale = max(0.1 * self.intrinsic_reward_scale, adaptive_scale)
-        
-        # Add scaled intrinsic reward to extrinsic reward
-        combined_reward = None
-        if isinstance(reward, torch.Tensor):
-            combined_reward = reward + adaptive_scale * intrinsic_reward[0].to(reward.device)
-        else:
-            combined_reward = reward + adaptive_scale * intrinsic_reward[0].cpu().numpy()
-        
-        if self.debug:
-            print(f"[DEBUG] Added intrinsic reward: {adaptive_scale * intrinsic_reward[0].item():.4f} to extrinsic: {extrinsic_reward:.4f}")
-        
-        return combined_reward
+            # Update the experience in memory
+            self.algorithm.store_experience_at_idx(store_idx, reward=total_reward_tensor)
+    
+        return total_reward

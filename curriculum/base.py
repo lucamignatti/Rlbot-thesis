@@ -1,10 +1,10 @@
 """Core curriculum learning functionality."""
 import numpy as np
 from typing import List, Dict, Any, Optional, Tuple
+import pickle
 from rlgym.api import StateMutator, RewardFunction, DoneCondition
 from dataclasses import dataclass
 import wandb
-import pickle
 
 @dataclass
 class ProgressionRequirements:
@@ -617,63 +617,77 @@ class CurriculumManager:
         """Check if any stage requires RLBot opponents."""
         return any(stage.__class__.__name__ == "RLBotSkillStage" for stage in self.stages)
 
-    def save_curriculum(self, path: str):
-        """Save curriculum state"""
-        save_data = {
+    def get_state(self) -> Dict[str, Any]:
+        """Get the current state of the curriculum manager as a dictionary."""
+        # Ensure stage data is serializable (e.g., convert numpy arrays if needed)
+        stages_data = []
+        for stage in self.stages:
+            stage_state = stage.get_statistics() # Use existing method to get stats
+            # Convert numpy types if necessary for broader compatibility
+            for key, value in stage_state.items():
+                if isinstance(value, np.ndarray):
+                    stage_state[key] = value.tolist()
+                elif isinstance(value, (np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, np.int64, np.uint8, np.uint16, np.uint32, np.uint64)):
+                     stage_state[key] = int(value)
+                elif isinstance(value, (np.float_, np.float16, np.float32, np.float64)):
+                     stage_state[key] = float(value)
+                elif isinstance(value, list):
+                     # Ensure lists don't contain numpy types
+                     stage_state[key] = [float(v) if isinstance(v, (np.float_, np.float16, np.float32, np.float64)) else v for v in value]
+
+            # Add rewards history separately if needed (can be large)
+            # stage_state['rewards_history'] = stage.rewards_history # Consider if this is too large
+            stages_data.append(stage_state)
+
+        return {
             'current_stage_index': self.current_stage_index,
             'current_difficulty': self.current_difficulty,
             'total_episodes': self.total_episodes,
             'completed_stages': self.completed_stages,
-            'stages_data': [{
-                'name': stage.name,
-                'episode_count': stage.episode_count,
-                'success_count': stage.success_count,
-                'failure_count': stage.failure_count,
-                'rewards_history': stage.rewards_history,
-                'moving_success_rate': stage.moving_success_rate,
-                'moving_avg_reward': stage.moving_avg_reward
-            } for stage in self.stages]
+            'stages_data': stages_data # Store stats, not full objects
         }
 
+    def load_state(self, state_dict: Dict[str, Any]):
+        """Load the curriculum manager's state from a dictionary."""
+        self.current_stage_index = state_dict.get('current_stage_index', 0)
+        self.current_difficulty = state_dict.get('current_difficulty', 0.0)
+        self.total_episodes = state_dict.get('total_episodes', 0)
+        self.completed_stages = state_dict.get('completed_stages', [])
+
+        # Restore stage statistics from the loaded data
+        loaded_stages_data = state_dict.get('stages_data', [])
+        for i, stage_data in enumerate(loaded_stages_data):
+            if i < len(self.stages):
+                stage = self.stages[i]
+                stage.episode_count = stage_data.get('episode_count', 0)
+                stage.success_count = stage_data.get('success_count', 0)
+                stage.failure_count = stage_data.get('failure_count', 0)
+                # stage.rewards_history = stage_data.get('rewards_history', []) # Avoid loading large history for now
+                stage.moving_success_rate = stage_data.get('moving_success_rate', 0.0)
+                stage.moving_avg_reward = stage_data.get('moving_avg_reward', 0.0)
+
+        # Update current_stage reference
+        if 0 <= self.current_stage_index < len(self.stages):
+            self.current_stage = self.stages[self.current_stage_index]
+        else:
+            print(f"Warning: Loaded invalid stage index {self.current_stage_index}, resetting to 0.")
+            self.current_stage_index = 0
+            self.current_stage = self.stages[0]
+
+        if self.debug:
+            print(f"[DEBUG] Loaded curriculum state: Stage {self.current_stage_index} ({self.current_stage.name}), Difficulty {self.current_difficulty:.2f}")
+
+    def save_curriculum(self, path: str):
+        """Save curriculum state to a file using get_state."""
+        state = self.get_state()
         with open(path, 'wb') as f:
-            pickle.dump(save_data, f)
+            pickle.dump(state, f)
 
     def load_curriculum(self, path: str):
-        """Load curriculum state"""
+        """Load curriculum state from a file using load_state."""
         with open(path, 'rb') as f:
-            save_data = pickle.load(f)
-
-        self.current_stage_index = save_data['current_stage_index']
-        self.current_difficulty = save_data['current_difficulty']
-        self.total_episodes = save_data['total_episodes']
-
-        # Handle either attribute name for backward compatibility
-        if 'stage_transitions' in save_data:
-            self.completed_stages = save_data['stage_transitions']
-        elif 'completed_stages' in save_data:
-            self.completed_stages = save_data['completed_stages']
-        else:
-            self.completed_stages = []
-
-        # Restore stage data
-        for stage, stage_data in zip(self.stages, save_data['stages_data']):
-            stage.episode_count = stage_data['episode_count']
-            stage.success_count = stage_data['success_count']
-            stage.failure_count = stage_data['failure_count']
-            stage.rewards_history = stage_data['rewards_history']
-            stage.moving_success_rate = stage_data['moving_success_rate']
-            stage.moving_avg_reward = stage_data['moving_avg_reward']
-
-        # Log the loaded curriculum state
-        if self.use_wandb:
-            current_stage = self.stages[self.current_stage_index]
-            self._log_to_wandb({
-                "curriculum/loaded_state/current_stage": self.current_stage_index,
-                "curriculum/loaded_state/stage_name": current_stage.name,
-                "curriculum/loaded_state/difficulty": self.current_difficulty,
-                "curriculum/loaded_state/total_episodes": self.total_episodes,
-                "curriculum/loaded_state/success_rate": current_stage.moving_success_rate
-            })
+            state_dict = pickle.load(f)
+        self.load_state(state_dict)
 
     def get_curriculum_stats(self) -> Dict[str, Any]:
         """
