@@ -36,8 +36,10 @@ def run_training(
     actor,
     critic,
     device,
-    num_envs: int,  # Required parameter first
-    training_step_offset: int = 0,  # Optional parameter with default value after
+    num_envs: int,
+    # Remove training_step_offset from signature, it's loaded by trainer.load_models
+    # Add model_path_to_load parameter
+    model_path_to_load: str = None, 
     total_episodes: int = None,
     training_time: float = None,
     render: bool = False,
@@ -93,9 +95,7 @@ def run_training(
     update_freq: int = 1,
 ):
     """
-    Main training loop.  This sets up the agent, environment, and training process,
-    then runs the training loop until either a specified number of episodes have
-    been completed, or a specified amount of time has passed.
+    Main training loop.
     """
     # Performance optimizations
     os.environ['OMP_NUM_THREADS'] = str(max(1, os.cpu_count() // 4))
@@ -113,10 +113,12 @@ def run_training(
     # Initialize action stacker for keeping track of previous actions
     action_stacker = ActionStacker(stack_size=5, action_size=actor.action_shape)
 
-    # Initialize the Trainer with the appropriate algorithm
+    # Initialize the Trainer
     trainer = Trainer(
         actor,
         critic,
+        # Pass training_step_offset=0 initially, load_models will update it
+        training_step_offset=0, 
         algorithm_type=algorithm,  # Use the specified algorithm
         action_space_type="discrete",  # For RLBot, we use discrete actions
         action_dim=actor.action_shape,
@@ -131,7 +133,6 @@ def run_training(
         max_grad_norm=max_grad_norm,
         ppo_epochs=ppo_epochs,
         batch_size=batch_size,
-        training_step_offset=training_step_offset,
         use_wandb=use_wandb,
         debug=debug,
         use_compile=use_compile,
@@ -162,7 +163,21 @@ def run_training(
         use_sparse_init=use_sparse_init,
         update_freq=update_freq,
     )
-    
+
+    # --- MODEL LOADING LOGIC ---
+    if model_path_to_load:
+        print(f"Attempting to load model from: {model_path_to_load}")
+        if trainer.load_models(model_path_to_load):
+             print(f"Successfully loaded model and state from {model_path_to_load}")
+             # Add a debug print to confirm the trainer's state AFTER loading
+             if debug:
+                 print(f"[DEBUG] Trainer state after load: pretraining_completed={trainer.pretraining_completed}")
+             print(f"Continuing from training step {trainer.training_step_offset}")
+        else:
+             print(f"Failed to load model from {model_path_to_load}. Starting fresh.")
+             trainer.training_step_offset = 0
+    # --- END MODEL LOADING LOGIC ---
+
     # Set total_episodes and training_time attributes for pretraining calculation
     if total_episodes is not None:
         trainer.total_episode_target = total_episodes
@@ -181,26 +196,48 @@ def run_training(
     if test:
         trainer.test_mode = True
 
-    # Initialize curriculum if enabled
+    # Initialize curriculum manager AFTER trainer is created and potentially loaded
     curriculum_manager = None
-    if use_curriculum:
+    # Use the trainer's potentially updated pretraining status
+    effective_use_pretraining = trainer.use_pretraining and not trainer.pretraining_completed 
+    if use_curriculum: # Check the original arg flag first
         try:
             curriculum_manager = create_curriculum(
                 debug=debug,
                 use_wandb=use_wandb,
-                lr_actor=lr_actor,  # Pass CLI learning rate for actor
-                lr_critic=lr_critic,  # Pass CLI learning rate for critic
-                use_pretraining=use_pretraining  # Pass the pretraining flag
+                lr_actor=trainer.lr_actor, # Use potentially loaded LR
+                lr_critic=trainer.lr_critic, # Use potentially loaded LR
+                # IMPORTANT: Use the trainer's state to decide if pretraining is active
+                use_pretraining=effective_use_pretraining 
             )
             # Register trainer with curriculum manager
             curriculum_manager.register_trainer(trainer)
+            # Assign curriculum manager back to trainer
+            trainer.curriculum_manager = curriculum_manager 
+            
+            # If loading occurred, ensure curriculum state matches loaded state
+            if model_path_to_load and hasattr(trainer, '_loaded_curriculum_state'):
+                 # If load_models stored the state, re-apply it AFTER manager creation
+                 print("[DEBUG] Re-applying loaded curriculum state to manager...")
+                 curriculum_manager.load_state(trainer._loaded_curriculum_state)
+                 # Re-register again just in case load_state overwrites something
+                 curriculum_manager.register_trainer(trainer) 
+                 del trainer._loaded_curriculum_state # Clean up temporary state
+
             if debug:
-                print(f"[DEBUG] Initialized curriculum with {len(curriculum_manager.stages)} stages")
+                print(f"[DEBUG] Initialized curriculum with {len(curriculum_manager.stages)} stages.")
+                print(f"[DEBUG] Effective pretraining for curriculum: {effective_use_pretraining}")
                 print(f"[DEBUG] Starting at stage: {curriculum_manager.current_stage.name}")
+
         except Exception as e:
             print(f"Failed to initialize curriculum: {e}")
+            import traceback
+            traceback.print_exc()
             print("Continuing without curriculum")
             use_curriculum = False
+            trainer.curriculum_manager = None # Ensure trainer doesn't have stale reference
+    else:
+         trainer.curriculum_manager = None # Ensure it's None if not used
 
     # Use a vectorized environment for parallel data collection.
     env_class = VectorizedEnv  # Default
@@ -809,7 +846,7 @@ def run_training(
                 import traceback
                 traceback.print_exc()
 
-        # Return the trainer regardless of potential errors
+        # Return the trainer instance
         return trainer
 
 def parse_time(time_str):
@@ -1192,90 +1229,16 @@ if __name__ == "__main__":
             print(f"[DEBUG] Training for {args.episodes} episodes")
 
 
-    if args.model:
-        try:
-            # Load a pre-trained model.
-            # Load checkpoint and handle wandb run ID if present
-            checkpoint = torch.load(args.model, map_location=device)
-            wandb_run_id = checkpoint.get('wandb_run_id')
+    # Get the training step offset (initialize to 0)
+    # This will be updated inside run_training if a model is loaded
+    trainer_offset = 0 
 
-            if args.debug:
-                print(f"[DEBUG] Loaded checkpoint from {args.model}")
-                if wandb_run_id:
-                    print(f"[DEBUG] Found wandb run ID: {wandb_run_id}")
-
-            # If using wandb and checkpoint has a run ID, try to resume that run
-            if args.wandb and wandb_run_id:
-                try:
-                    wandb.init(id=wandb_run_id, resume="must")
-                    print(f"Resuming wandb run {wandb_run_id}")
-                except Exception as e:
-                    print(f"Could not resume wandb run {wandb_run_id}: {e}")
-                    # Fall back to new run
-                    wandb.init()
-
-            # If the checkpoint contains both actor and critic, extract their parameters.
-            if isinstance(checkpoint, dict) and 'actor' in checkpoint and 'critic' in checkpoint:
-                actor_obs_shape, actor_hidden_dim, actor_action_shape, actor_num_blocks = extract_model_dimensions(checkpoint['actor'])
-                critic_obs_shape, critic_hidden_dim, critic_action_shape, critic_num_blocks = extract_model_dimensions(checkpoint['critic'])
-
-                # Validate and fix observation shape if needed
-                if actor_obs_shape != obs_space_dims:
-                    print(f"Warning: Model expects observation shape {actor_obs_shape}, but environment has {obs_space_dims}.")
-                    print("Using environment's observation shape for model.")
-                    actor_obs_shape = obs_space_dims
-                    critic_obs_shape = obs_space_dims
-
-                if args.debug:
-                    print("[DEBUG] Extracted model dimensions from checkpoint:")
-                    print(f"[DEBUG] Actor: obs_shape={actor_obs_shape}, hidden_dim={actor_hidden_dim}, action_shape={actor_action_shape}, num_blocks={actor_num_blocks}")
-                    print(f"[DEBUG] Critic: obs_shape={critic_obs_shape}, hidden_dim={critic_hidden_dim}, action_shape={critic_action_shape}, num_blocks={critic_num_blocks}")
-
-                # Recreate the models with the correct dimensions
-                actor = SimBa(
-                    obs_shape=actor_obs_shape,
-                    action_shape=actor_action_shape,
-                    hidden_dim=int(actor_hidden_dim) if actor_hidden_dim is not None else 1024,
-                    num_blocks=actor_num_blocks if actor_num_blocks is not None else 4
-                )
-
-                critic = SimBa(
-                    obs_shape=critic_obs_shape,
-                    action_shape=critic_action_shape,
-                    hidden_dim=int(critic_hidden_dim) if critic_hidden_dim is not None else 1024,
-                    num_blocks=critic_num_blocks if critic_num_blocks is not None else 4
-                )
-
-                # Load the model weights, skipping mismatched layers
-                load_partial_state_dict(actor, checkpoint['actor'])
-                load_partial_state_dict(critic, checkpoint['critic'])
-                # Get training step count from checkpoint if available
-                if 'training_step' in checkpoint:
-                    trainer_offset = checkpoint.get('training_step', 0)
-                    if args.debug:
-                        print(f"[DEBUG] Loaded training step offset: {trainer_offset}")
-                else:
-                    trainer_offset = 0
-
-                print(f"Successfully loaded model from {args.model} with adjusted dimensions")
-                print(f"Continuing from training step {trainer_offset}")
-
-            else:
-                print(f"Error: Unsupported model format in {args.model}")
-        except Exception as e:
-            print(f"Error loading model: {e}")
-            if args.debug:
-                import traceback
-                traceback.print_exc()
-
-    # Get the training step offset if we loaded a checkpoint
-    trainer_offset = trainer_offset if 'trainer_offset' in locals() else 0
-
-    # Start the main training process with proper step counting
+    # Start the main training process
+    # Pass args.model path to run_training
     trainer = run_training(
         actor=actor,
         critic=critic,
-        training_step_offset=trainer_offset,  # Pass the offset to maintain step counting
+        # training_step_offset is now handled inside run_training via load_models
         device=device,
         num_envs=args.num_envs,
         total_episodes=args.episodes if args.time is None else None,
@@ -1289,9 +1252,10 @@ if __name__ == "__main__":
         save_interval=args.save_interval,
         output_path=args.out,
         use_curriculum=args.curriculum,
-        # Algorithm selection
+        # Pass model path to run_training
+        model_path_to_load=args.model, 
+        # ... rest of the arguments ...
         algorithm=args.algorithm,
-        # Hyperparameters
         lr_actor=args.lra,
         lr_critic=args.lrc,
         gamma=args.gamma,
@@ -1313,12 +1277,10 @@ if __name__ == "__main__":
         pretraining_sr_weight=args.pretraining_sr_weight,
         pretraining_rp_weight=args.pretraining_rp_weight,
         pretraining_transition_steps=args.pretraining_transition_steps,
-        # Intrinsic reward parameters
         use_intrinsic_rewards=args.use_intrinsic,
         intrinsic_reward_scale=args.intrinsic_scale,
         curiosity_weight=args.curiosity_weight,
         rnd_weight=args.rnd_weight,
-        # StreamAC specific parameters
         adaptive_learning_rate=args.adaptive_learning_rate,
         target_step_size=args.target_step_size,
         backtracking_patience=args.backtracking_patience,

@@ -341,6 +341,63 @@ class Trainer:
         """Get the true training step count (including offset)"""
         return self.training_steps + self.training_step_offset
     
+    def _get_pretraining_end_step(self) -> int:
+        """Calculate the step/episode number when pretraining should end."""
+        if not self.use_pretraining:
+            return 0
+        
+        if hasattr(self, 'total_episode_target') and self.total_episode_target:
+            # Use episode count if available
+            return int(self.total_episode_target * self.pretraining_fraction)
+        else:
+            # Fallback to a default step count if no episode target is set
+            # This might need adjustment based on typical training lengths
+            default_total_steps = 1_000_000 # Example default total steps
+            return int(default_total_steps * self.pretraining_fraction)
+
+    def _update_auxiliary_weights(self):
+        """Update auxiliary task weights based on pretraining state."""
+        if not self.use_auxiliary_tasks or not hasattr(self, 'aux_task_manager'):
+            return
+
+        if not self.use_pretraining or self.pretraining_completed:
+            # Use base weights if pretraining is disabled or completed
+            self.aux_task_manager.sr_weight = self.base_sr_weight
+            self.aux_task_manager.rp_weight = self.base_rp_weight
+            self.entropy_coef = self.base_entropy_coef # Also reset entropy
+        elif self.in_transition_phase:
+            # Calculate transition progress (0 to 1)
+            current_step = self._true_training_steps()
+            if self.pretraining_transition_steps > 0:
+                 transition_progress = min(1.0, (current_step - self.transition_start_step) / self.pretraining_transition_steps)
+            else:
+                 transition_progress = 1.0 # Avoid division by zero
+
+            # Interpolate weights during transition
+            sr_weight = self.pretraining_sr_weight + transition_progress * (self.base_sr_weight - self.pretraining_sr_weight)
+            rp_weight = self.pretraining_rp_weight + transition_progress * (self.base_rp_weight - self.pretraining_rp_weight)
+            self.aux_task_manager.sr_weight = sr_weight
+            self.aux_task_manager.rp_weight = rp_weight
+
+            # Interpolate entropy coefficient
+            pretraining_entropy = self.base_entropy_coef * self.pretraining_entropy_scale
+            entropy_coef = pretraining_entropy + transition_progress * (self.base_entropy_coef - pretraining_entropy)
+            self.entropy_coef = max(self.min_entropy_coef, entropy_coef)
+        else:
+            # Use pretraining weights if pretraining is active but not transitioning
+            self.aux_task_manager.sr_weight = self.pretraining_sr_weight
+            self.aux_task_manager.rp_weight = self.pretraining_rp_weight
+            # Use higher entropy during active pretraining
+            self.entropy_coef = max(self.min_entropy_coef, self.base_entropy_coef * self.pretraining_entropy_scale)
+
+        # Decay entropy coefficient over time (independent of pretraining state after transition)
+        if self.pretraining_completed:
+             self.entropy_coef = max(self.min_entropy_coef, self.entropy_coef * self.entropy_coef_decay)
+
+        # Log weight changes if debugging
+        if self.debug:
+            print(f"[DEBUG Aux Weights] SR: {self.aux_task_manager.sr_weight:.4f}, RP: {self.aux_task_manager.rp_weight:.4f}, Entropy: {self.entropy_coef:.6f}")
+    
     def _log_to_wandb(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
         """Centralized wandb logging with step validation and metric organization"""
         if not self.use_wandb or wandb.run is None:
@@ -1186,49 +1243,22 @@ class Trainer:
                     
                     if self.debug:
                         print(f"[DEBUG] Restored intrinsic reward generator with scale {self.intrinsic_reward_scale}")
-            
+        
             # ===== Restore Curriculum State =====
             if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None and 'curriculum' in checkpoint:
                 curriculum_state = checkpoint['curriculum']
                 
                 try:
-                    # Restore curriculum stage and difficulty
-                    if 'current_stage_index' in curriculum_state:
-                        stage_index = curriculum_state['current_stage_index']
-                        # Ensure index is within bounds
-                        if 0 <= stage_index < len(self.curriculum_manager.stages):
-                            self.curriculum_manager.current_stage_index = stage_index
-                            self.curriculum_manager.current_stage = self.curriculum_manager.stages[stage_index]
+                    # Load the entire curriculum state
+                    self.curriculum_manager.load_state(curriculum_state)
                     
-                    # Restore current difficulty level
-                    if 'current_difficulty' in curriculum_state:
-                        self.curriculum_manager.current_difficulty = curriculum_state['current_difficulty']
-                    
-                    # Restore total episodes
-                    if 'total_episodes' in curriculum_state:
-                        self.curriculum_manager.total_episodes = curriculum_state['total_episodes']
-                    
-                    # Restore completed stages tracking
-                    if 'completed_stages' in curriculum_state:
-                        self.curriculum_manager.completed_stages = curriculum_state['completed_stages']
-                    
-                    # Restore stage-specific statistics if available
-                    if 'stages_data' in curriculum_state:
-                        stages_data = curriculum_state['stages_data']
-                        if len(stages_data) == len(self.curriculum_manager.stages):
-                            for i, stage_data in enumerate(stages_data):
-                                stage = self.curriculum_manager.stages[i]
-                                if stage.name == stage_data.get('name'):
-                                    # Restore stage statistics
-                                    stage.episode_count = stage_data.get('episode_count', 0)
-                                    stage.success_count = stage_data.get('success_count', 0)
-                                    stage.failure_count = stage_data.get('failure_count', 0)
-                                    stage.rewards_history = stage_data.get('rewards_history', [])
-                                    stage.moving_success_rate = stage_data.get('moving_success_rate', 0.0)
-                                    stage.moving_avg_reward = stage_data.get('moving_avg_reward', 0.0)
+                    # Critical fix: Re-register the trainer with the curriculum
+                    # This ensures the curriculum stages can access trainer attributes like pretraining_completed
+                    self.curriculum_manager.register_trainer(self)
                     
                     if self.debug:
-                        print(f"[DEBUG] Restored curriculum state: stage={self.curriculum_manager.current_stage_index}, difficulty={self.curriculum_manager.current_difficulty:.2f}")
+                        print(f"[DEBUG] Restored curriculum state and re-registered trainer")
+                        print(f"[DEBUG] Current stage: {self.curriculum_manager.current_stage.name}, index: {self.curriculum_manager.current_stage_index}")
                 except Exception as e:
                     print(f"Warning: Could not fully restore curriculum state: {e}")
                     if self.debug:
@@ -1276,8 +1306,25 @@ class Trainer:
                 if self.debug:
                     print(f"[DEBUG] Restored training counters: steps={self.training_step_offset}, episodes={self.total_episodes_offset}")
             
+            
+            # ===== Auto-detect models trained without pretraining =====
+            if 'pretraining_completed' not in checkpoint:
+                if 'metadata' in checkpoint:
+                    metadata = checkpoint['metadata']
+                    # Check if this model was created with --no-pretraining flag
+                    if 'use_pretraining' in metadata and metadata['use_pretraining'] is False:
+                        print(f"Detected model trained with --no-pretraining - setting pretraining_completed = True")
+                        self.pretraining_completed = True
+                    elif 'pretraining' not in metadata:
+                        print(f"No pretraining configuration found - assuming pretraining was disabled")
+                        self.pretraining_completed = True
+                else:
+                    # Older model format without metadata - assume pretraining was completed
+                    print(f"Legacy model format detected - assuming pretraining was completed")
+                    self.pretraining_completed = True
+
             # ===== Restore Pretraining State =====
-            if self.use_pretraining and 'metadata' in checkpoint and 'pretraining' in metadata:
+            if 'metadata' in checkpoint and 'pretraining' in metadata.get('pretraining', {}):
                 pretraining_state = metadata['pretraining']
                 self.pretraining_completed = pretraining_state.get('completed', self.pretraining_completed)
                 self.in_transition_phase = pretraining_state.get('in_transition', self.in_transition_phase)
@@ -1293,9 +1340,16 @@ class Trainer:
                 self.pretraining_sr_weight = pretraining_state.get('pretraining_sr_weight', self.pretraining_sr_weight)
                 self.pretraining_rp_weight = pretraining_state.get('pretraining_rp_weight', self.pretraining_rp_weight)
                 
+                # Explicitly check and print the pretraining_completed flag
                 if self.debug:
                     pretraining_status = "completed" if self.pretraining_completed else ("transitioning" if self.in_transition_phase else "active")
                     print(f"[DEBUG] Restored pretraining state: {pretraining_status}")
+                    print(f"[DEBUG] pretraining_completed = {self.pretraining_completed}")
+            # If we explicitly find the 'pretraining_completed' at the top level, use it
+            elif 'pretraining_completed' in checkpoint:
+                self.pretraining_completed = checkpoint['pretraining_completed']
+                if self.debug:
+                    print(f"[DEBUG] Found top-level pretraining_completed = {self.pretraining_completed}")
             
             # ===== Resume WandB Run =====
             if self.use_wandb and 'wandb' in checkpoint and checkpoint['wandb']:
@@ -1326,7 +1380,7 @@ class Trainer:
             print(f"Successfully loaded checkpoint from {model_path}")
             print(f"Resumed training at step {self.training_steps + self.training_step_offset}")
             return True
-            
+        
         except Exception as e:
             print(f"Error loading checkpoint: {e}")
             if self.debug:

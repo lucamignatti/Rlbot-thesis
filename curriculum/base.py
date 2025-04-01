@@ -648,34 +648,114 @@ class CurriculumManager:
         }
 
     def load_state(self, state_dict: Dict[str, Any]):
-        """Load the curriculum manager's state from a dictionary."""
-        self.current_stage_index = state_dict.get('current_stage_index', 0)
-        self.current_difficulty = state_dict.get('current_difficulty', 0.0)
-        self.total_episodes = state_dict.get('total_episodes', 0)
-        self.completed_stages = state_dict.get('completed_stages', [])
-
-        # Restore stage statistics from the loaded data
-        loaded_stages_data = state_dict.get('stages_data', [])
-        for i, stage_data in enumerate(loaded_stages_data):
-            if i < len(self.stages):
-                stage = self.stages[i]
-                stage.episode_count = stage_data.get('episode_count', 0)
-                stage.success_count = stage_data.get('success_count', 0)
-                stage.failure_count = stage_data.get('failure_count', 0)
-                # stage.rewards_history = stage_data.get('rewards_history', []) # Avoid loading large history for now
-                stage.moving_success_rate = stage_data.get('moving_success_rate', 0.0)
-                stage.moving_avg_reward = stage_data.get('moving_avg_reward', 0.0)
-
-        # Update current_stage reference
-        if 0 <= self.current_stage_index < len(self.stages):
-            self.current_stage = self.stages[self.current_stage_index]
-        else:
-            print(f"Warning: Loaded invalid stage index {self.current_stage_index}, resetting to 0.")
-            self.current_stage_index = 0
-            self.current_stage = self.stages[0]
-
+        """Load curriculum state from a dictionary."""
+        if not isinstance(state_dict, dict):
+            raise ValueError("State must be a dictionary")
+            
+        # Load basic properties
+        if 'current_stage_index' in state_dict:
+            self.current_stage_index = state_dict['current_stage_index']
+            if 0 <= self.current_stage_index < len(self.stages):
+                self.current_stage = self.stages[self.current_stage_index]
+            else:
+                print(f"Warning: Loaded invalid stage index {self.current_stage_index}, resetting to 0.")
+                self.current_stage_index = 0
+                self.current_stage = self.stages[0]
+            
+        if 'current_difficulty' in state_dict:
+            self.current_difficulty = state_dict['current_difficulty']
+            
+        if 'completed_stages' in state_dict:
+            self.completed_stages = state_dict['completed_stages']
+            
+        if 'total_episodes' in state_dict:
+            self.total_episodes = state_dict['total_episodes']
+            
+        # Load stage-specific states if available
+        if 'stages_data' in state_dict and isinstance(state_dict['stages_data'], list):
+            stages_data = state_dict['stages_data']
+            for i, stage_data in enumerate(stages_data):
+                if i < len(self.stages):
+                    stage = self.stages[i]
+                    # Reset and update stage statistics
+                    if isinstance(stage_data, dict):
+                        # Basic attributes we need to restore
+                        if 'episodes' in stage_data:
+                            stage.episode_count = stage_data['episodes']
+                        elif 'episode_count' in stage_data:
+                            stage.episode_count = stage_data['episode_count']
+                            
+                        if 'successes' in stage_data:
+                            stage.success_count = stage_data['successes']
+                        elif 'success_count' in stage_data:
+                            stage.success_count = stage_data['success_count']
+                            
+                        if 'failures' in stage_data:
+                            stage.failure_count = stage_data['failures']
+                        elif 'failure_count' in stage_data:
+                            stage.failure_count = stage_data['failure_count']
+                            
+                        if 'success_rate' in stage_data:
+                            stage.moving_success_rate = stage_data['success_rate']
+                        elif 'moving_success_rate' in stage_data:
+                            stage.moving_success_rate = stage_data['moving_success_rate']
+                            
+                        if 'avg_reward' in stage_data:
+                            stage.moving_avg_reward = stage_data['avg_reward']
+                        elif 'moving_avg_reward' in stage_data:
+                            stage.moving_avg_reward = stage_data['moving_avg_reward']
+                            
+                        # Conditionally restore rewards history (may be large) if available
+                        if 'rewards_history' in stage_data and isinstance(stage_data['rewards_history'], list):
+                            rewards = stage_data['rewards_history']
+                            # Convert numpy types to native Python types if needed
+                            stage.rewards_history = []
+                            for reward in rewards:
+                                if hasattr(reward, 'item'):  # Handle numpy scalars
+                                    stage.rewards_history.append(reward.item())
+                                else:
+                                    stage.rewards_history.append(float(reward))
+                                    
+        # Check if pretraining flag exists in the state, and handle it appropriately
+        # First, check if we have a pretraining stage
+        is_pretraining_stage_exists = False
+        for stage in self.stages:
+            if hasattr(stage, 'is_pretraining') and stage.is_pretraining:
+                is_pretraining_stage_exists = True
+                break
+                
+        # If we have a pretraining stage, check if we need to synchronize with trainer
+        if is_pretraining_stage_exists and 'pretraining_completed' in state_dict:
+            # If trainer is available, synchronize pretraining state
+            if self.trainer is not None:
+                # Update trainer's pretraining state
+                if hasattr(self.trainer, 'pretraining_completed'):
+                    self.trainer.pretraining_completed = state_dict['pretraining_completed']
+                    if self.debug:
+                        print(f"[DEBUG] Updated trainer.pretraining_completed to {state_dict['pretraining_completed']}")
+                        
+        # Ensure each stage that has the is_pretraining flag reflects the correct state
+        for stage in self.stages:
+            if hasattr(stage, 'is_pretraining') and stage.is_pretraining:
+                # Make sure trainer is connected to this stage
+                if hasattr(stage, 'register_trainer') and self.trainer is not None:
+                    stage.register_trainer(self.trainer)
+                    if self.debug:
+                        print(f"[DEBUG] Re-registered trainer with pretraining stage: {stage.name}")
+                        
+                # If this stage is marked as a pretraining stage, make sure it has the right state based on
+                # pretraining_completed in the state_dict
+                if 'pretraining_completed' in state_dict:
+                    if self.debug:
+                        print(f"[DEBUG] Setting pretraining state for stage {stage.name}: {state_dict['pretraining_completed']}")
+                        
+        # Debug info
         if self.debug:
-            print(f"[DEBUG] Loaded curriculum state: Stage {self.current_stage_index} ({self.current_stage.name}), Difficulty {self.current_difficulty:.2f}")
+            print(f"[DEBUG] Loaded curriculum state: Stage {self.current_stage_index} ({self.current_stage.name}), "
+                  f"Difficulty {self.current_difficulty:.2f}")
+            if is_pretraining_stage_exists:
+                print(f"[DEBUG] Pretraining stage exists, pretraining completed: "
+                      f"{getattr(self.trainer, 'pretraining_completed', None) if self.trainer else 'No trainer'}")
 
     def save_curriculum(self, path: str):
         """Save curriculum state to a file using get_state."""
