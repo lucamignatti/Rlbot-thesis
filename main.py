@@ -904,7 +904,7 @@ if __name__ == "__main__":
     training_duration.add_argument('-t', '--time', type=str, default=None,
                                   help='Training duration in format: 5m (minutes), 5h (hours), 5d (days)')
 
-    parser.add_argument('-n', '--num_envs', type=int, default=30 if sys.platform != "darwin" else 12,
+    parser.add_argument('-n', '--num_envs', type=int, default=4,
                         help='Number of parallel environments to run for faster data collection')
     parser.add_argument('--update_interval', type=int, default=3072,
                         help='Number of experiences to collect before updating the policy')
@@ -1058,8 +1058,8 @@ if __name__ == "__main__":
                                 help='Use default PyTorch initialization instead of SparseInit')
     parser.set_defaults(use_sparse_init=True)
     
-    streamac_group.add_argument('--update-freq', type=int, default=1,
-                               help='Frequency of updates for StreamAC (default: 1, update every step)')
+    streamac_group.add_argument('--update-freq', type=int, default=4,
+                               help='Frequency of updates for StreamAC (default: 4, update every 4th step)')
     
     # Backwards compatibility.
     parser.add_argument('-p', '--processes', type=int, default=None,
@@ -1254,7 +1254,6 @@ if __name__ == "__main__":
         use_curriculum=args.curriculum,
         # Pass model path to run_training
         model_path_to_load=args.model, 
-        # ... rest of the arguments ...
         algorithm=args.algorithm,
         lr_actor=args.lra,
         lr_critic=args.lrc,

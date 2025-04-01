@@ -11,7 +11,8 @@ from collections import deque
 
 class ObGD(torch.optim.Optimizer):
     """
-    overshooting-Bounded Gradient Descent optimizer with eligibility traces.
+    Optimized overshooting-Bounded Gradient Descent optimizer with eligibility traces.
+    This implementation includes vectorized operations for better performance.
     """
     def __init__(self, params, lr=1.0, gamma=0.99, lamda=0.8, kappa=2.0):
         defaults = dict(lr=lr, gamma=gamma, lamda=lamda, kappa=kappa)
@@ -28,56 +29,47 @@ class ObGD(torch.optim.Optimizer):
         return self.env_traces[env_id]
         
     def step(self, delta, env_id=0, reset=False):
-        """
-        Perform a parameter update step using TD error and eligibility traces.
-        Combines trace update and parameter update loops for efficiency.
-        """
+        """Optimized ObGD step with vectorized operations"""
+        # First pass: update traces and calculate z_sum
+        param_groups = []
         z_sum = 0.0
         env_traces = self.get_traces(env_id)
-        param_trace_list = [] # To store parameters and traces for the second pass
-
-        # First pass: Update traces, calculate z_sum, and store refs
-        for group in self.param_groups:
-            # Store group hyperparams locally for efficiency if needed later
+        
+        # Extract hyperparameters early (only once for all parameters)
+        # Assumes all parameter groups have the same hyperparameters
+        if self.param_groups:
+            group = self.param_groups[0]
             lr = group["lr"]
-            gamma = group["gamma"]
-            lamda = group["lamda"]
+            gamma_lambda = group["gamma"] * group["lamda"]
             kappa = group["kappa"]
-
+        
+        # Update all traces and gather parameters in one pass
+        for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None:
                     continue
-
-                # Get trace for this param
+                
+                # Update trace with vectorized operation
                 e = env_traces[p]
-
-                # Update eligibility trace: e = λγe + ∇θ
-                e.mul_(gamma * lamda).add_(p.grad, alpha=1.0)
+                e.mul_(gamma_lambda).add_(p.grad)  # Vectorized trace update
+                
                 z_sum += e.abs().sum().item()
-
-                # Store param, trace, and group info for the update step
-                param_trace_list.append({'param': p, 'trace': e, 'group': group})
-
-        # Calculate adaptive step size (using hyperparams from the last group, assumes they are the same)
-        # If hyperparams can differ per group, this calculation needs adjustment.
+                param_groups.append((p, e))
+        
+        # Calculate step size once
         delta_bar = max(abs(delta), 1.0)
-        # Using lr and kappa from the last processed group. Ensure this is intended behavior.
-        # If groups can have different lr/kappa, the step_size calculation might need refinement.
         dot_product = delta_bar * z_sum * lr * kappa
-        if dot_product > 1:
-            step_size = lr / dot_product
-        else:
-            step_size = lr
-
-        # Second pass: Apply updates to parameters
-        for item in param_trace_list:
-            p = item['param']
-            e = item['trace']
-            # Update parameter: θ = θ - α·δ·e
+        step_size = lr / dot_product if dot_product > 1 else lr
+        
+        # Second pass: Apply updates in batch
+        for p, e in param_groups:
+            # Use a single vectorized operation to update parameter
             p.data.add_(delta * e, alpha=-step_size)
+            
+            # Reset trace if needed
             if reset:
                 e.zero_()
-
+                
         return step_size
 
     def reset_traces(self, env_id=None):
@@ -664,22 +656,24 @@ class StreamACAlgorithm(BaseAlgorithm):
         total_policy_loss = 0.0
         total_entropy_loss = 0.0
         
-        # For OBGD, we can use mini-batches to speed up forward passes
+        # For OBGD, use mini-batches with improved batch processing
         if self.use_obgd:
-            # Define mini-batch size - too large might harm sample efficiency, too small is inefficient
-            mini_batch_size = min(8, len(self.experience_buffers[env_id]) - 1)
+            # Increase mini-batch size for better GPU utilization
+            mini_batch_size = min(32, len(self.experience_buffers[env_id]) - 1)
             
             for i in range(0, len(self.experience_buffers[env_id]) - 1, mini_batch_size):
-                # Get batch of experiences
+                # Get batch indices
                 batch_indices = range(i, min(i + mini_batch_size, len(self.experience_buffers[env_id]) - 1))
                 
-                # Pre-allocate arrays for batch data
+                # --- BATCH PROCESSING: FORWARD PASS ---
+                # Pre-fetch all data needed for the forward pass
                 batch_obs = []
                 batch_actions = []
                 batch_rewards = []
                 batch_values = []
                 batch_dones = []
                 batch_next_values = []
+                batch_exp_indices = []  # Store original indices for mapping back
                 
                 # Collect batch data
                 for idx in batch_indices:
@@ -692,120 +686,93 @@ class StreamACAlgorithm(BaseAlgorithm):
                     batch_values.append(current_exp['value'])
                     batch_dones.append(current_exp['done'])
                     batch_next_values.append(next_exp['value'])
+                    batch_exp_indices.append(idx)
                 
-                # Stack tensors if all are same shape, otherwise process individually
                 try:
-                    # Try to stack tensors for batch processing
+                    # Stack tensors for efficient batch processing
                     batch_obs = torch.cat(batch_obs, dim=0)
-                    
-                    # Handle discrete vs continuous actions differently
-                    if self.action_space_type == "discrete":
-                        batch_actions = torch.cat(batch_actions, dim=0).long()
-                    else:
-                        batch_actions = torch.cat(batch_actions, dim=0).float()
-                        
                     batch_rewards = torch.cat(batch_rewards, dim=0)
                     batch_values = torch.cat(batch_values, dim=0)
                     batch_dones = torch.cat(batch_dones, dim=0)
                     batch_next_values = torch.cat(batch_next_values, dim=0)
                     
-                    # Calculate TD errors for batch
+                    if self.action_space_type == "discrete":
+                        batch_actions = torch.cat(batch_actions, dim=0).long()
+                    else:
+                        batch_actions = torch.cat(batch_actions, dim=0).float()
+                    
+                    # Calculate TD errors for the entire batch at once
                     batch_deltas, batch_td_targets = self._calculate_td_error(
                         batch_rewards, batch_next_values, batch_dones, batch_values)
                     
-                    # Forward pass (batched)
+                    # Perform forward passes in batch for efficiency
                     self.actor.train()
                     self.critic.train()
                     
+                    # Get policy distributions and log probs in a single forward pass
                     if self.action_space_type == "discrete":
-                        # Discrete actions
                         action_probs = self.actor(batch_obs)
                         dist = Categorical(action_probs)
                         log_probs = dist.log_prob(batch_actions.squeeze())
                         entropies = dist.entropy()
                     else:
-                        # Continuous actions
                         mu, log_std = self.actor(batch_obs)
                         std = torch.exp(log_std)
                         dist = Normal(mu, std)
                         log_probs = dist.log_prob(batch_actions).sum(-1)
                         entropies = dist.entropy().sum(-1)
                     
-                    # Compute critic outputs (batched)
+                    # Get critic values in a single forward pass
                     current_values = self.critic(batch_obs)
                     
-                    # Now we need to process each experience individually for OBGD
-                    for j in range(len(batch_indices)):
-                        # Get individual components from the batch
-                        idx = batch_indices[j]
+                    # --- INDIVIDUAL PROCESSING: TRACE UPDATES ---
+                    # Now process each experience individually for trace updates
+                    for j, orig_idx in enumerate(batch_exp_indices):
+                        # Extract individual components from batch results
                         delta = batch_deltas[j]
                         td_target = batch_td_targets[j]
                         log_prob = log_probs[j]
-                        entropy = entropies[j]
+                        entropy = entropies[j] if self.action_space_type == "discrete" else entropies[j].mean()
                         current_value = current_values[j]
                         done = batch_dones[j]
                         
-                        # Compute individual losses
+                        # Ensure values are properly formatted and handle NaNs
                         if torch.isnan(current_value).any() or torch.isinf(current_value).any():
-                            if self.debug:
-                                print("[DEBUG] NaN/Inf detected in current_value, using fallback")
                             current_value = torch.nan_to_num(current_value, nan=0.0, posinf=1.0, neginf=-1.0)
                         
                         if torch.isnan(td_target).any() or torch.isinf(td_target).any():
-                            if self.debug:
-                                print("[DEBUG] NaN/Inf detected in td_target, using fallback")
                             td_target = torch.nan_to_num(td_target, nan=0.0, posinf=1.0, neginf=-1.0)
                         
+                        # Reshape tensors for loss calculation
                         current_value_flat = current_value.reshape(-1)
                         td_target_flat = td_target.reshape(-1)
                         
-                        # Safety check for value loss calculation
+                        # Calculate losses with safety checks
                         try:
                             value_loss = F.mse_loss(current_value_flat, td_target_flat.detach())
-                            if torch.isnan(value_loss).any() or torch.isinf(value_loss).any():
-                                if self.debug:
-                                    print("[DEBUG] NaN/Inf detected in value_loss, using dummy loss")
-                                value_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
                         except RuntimeError:
-                            if self.debug:
-                                print("[DEBUG] RuntimeError in value_loss calculation, using dummy loss")
                             value_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
                         
-                        # Safety check for policy loss calculation
                         try:
                             policy_loss = -log_prob.mean()
-                            if torch.isnan(policy_loss).any() or torch.isinf(policy_loss).any():
-                                if self.debug:
-                                    print("[DEBUG] NaN/Inf detected in policy_loss, using dummy loss")
-                                policy_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
                         except RuntimeError:
-                            if self.debug:
-                                print("[DEBUG] RuntimeError in policy_loss calculation, using dummy loss")
                             policy_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
                         
-                        # Safety check for entropy loss
                         try:
-                            entropy_loss = -entropy.mean() * self.entropy_coef
-                            if torch.isnan(entropy_loss).any() or torch.isinf(entropy_loss).any():
-                                if self.debug:
-                                    print("[DEBUG] NaN/Inf detected in entropy_loss, using zero")
-                                entropy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+                            entropy_loss = -entropy.mean() * self.entropy_coef if isinstance(entropy, torch.Tensor) else -entropy * self.entropy_coef
                         except RuntimeError:
-                            if self.debug:
-                                print("[DEBUG] RuntimeError in entropy_loss calculation, using zero")
                             entropy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
                         
-                        # Zero gradients
+                        # Zero gradients before backpropagation
                         self.actor_optimizer.zero_grad()
                         self.critic_optimizer.zero_grad()
                         
                         # Backpropagate losses
                         actor_loss = policy_loss + entropy_loss
-                        if actor_loss.requires_grad:
-                            actor_loss.backward(retain_graph=True)  # Need retain_graph for batch processing
-                        value_loss.backward(retain_graph=(j < len(batch_indices) - 1))  # No retain on last item
+                        actor_loss.backward(retain_graph=True)
+                        value_loss.backward(retain_graph=(j < len(batch_exp_indices) - 1))
                         
-                        # Apply OBGD updates
+                        # Apply OBGD updates with trace management
                         delta_value = delta.item()
                         actor_step_size = self.actor_optimizer.step(delta_value, env_id=env_id, reset=done.item() > 0.5)
                         critic_step_size = self.critic_optimizer.step(delta_value, env_id=env_id, reset=done.item() > 0.5)
@@ -817,44 +784,41 @@ class StreamACAlgorithm(BaseAlgorithm):
                             self.last_step_sizes.pop(0)
                         self.successful_steps += 1
                         
-                        # Track losses
+                        # Track losses for metrics
                         total_value_loss += value_loss.item()
                         total_policy_loss += policy_loss.item()
-                        total_entropy_loss += entropy_loss.item() if hasattr(entropy_loss, 'item') else 0.0
-                    
+                        if hasattr(entropy_loss, 'item'):
+                            total_entropy_loss += entropy_loss.item()
+                        
                 except (RuntimeError, ValueError) as e:
-                    # Fallback to original individual processing if stacking fails
+                    # Fallback to individual processing if batching fails
+                    if self.debug:
+                        print(f"[DEBUG] Batch processing failed: {str(e)}. Using individual processing.")
+                    
                     for idx in batch_indices:
-                        # Get current and next experience
                         current_exp = self.experience_buffers[env_id][idx]
                         next_exp = self.experience_buffers[env_id][idx + 1]
                         
-                        # Get experience components and ensure they're all float32
-                        obs = current_exp['obs'].float() if hasattr(current_exp['obs'], 'float') else current_exp['obs']
+                        # Extract values from experiences
+                        obs = current_exp['obs']
                         action = current_exp['action']
-                        reward = current_exp['reward'].float() if hasattr(current_exp['reward'], 'float') else current_exp['reward']
-                        value = current_exp['value'].float() if hasattr(current_exp['value'], 'float') else current_exp['value']
-                        done = current_exp['done'].float() if hasattr(current_exp['done'], 'float') else current_exp['done']
-                        next_value = next_exp['value'].float() if hasattr(next_exp['value'], 'float') else next_exp['value']
+                        reward = current_exp['reward']
+                        value = current_exp['value']
+                        done = current_exp['done']
+                        next_value = next_exp['value']
                         
-                        # For discrete action spaces, ensure action is the right type
-                        if self.action_space_type == "discrete" and hasattr(action, 'long'):
-                            action = action.long()
-                        elif hasattr(action, 'float'):
-                            action = action.float()
-                            
-                        # Calculate TD error
+                        # Calculate TD error individually
                         delta, td_target = self._calculate_td_error(reward, next_value, done, value)
                         
-                        # Train networks
+                        # Forward passes
                         self.actor.train()
                         self.critic.train()
                         
-                        # Forward pass
+                        # Get action distribution and entropy
                         if self.action_space_type == "discrete":
                             action_probs = self.actor(obs)
                             dist = Categorical(action_probs)
-                            log_prob = dist.log_prob(action)
+                            log_prob = dist.log_prob(action.squeeze())
                             entropy = dist.entropy()
                         else:
                             mu, log_std = self.actor(obs)
@@ -863,70 +827,25 @@ class StreamACAlgorithm(BaseAlgorithm):
                             log_prob = dist.log_prob(action).sum(-1)
                             entropy = dist.entropy().sum(-1).mean()
                         
-                        # Compute critic output
+                        # Get critic value
                         current_value = self.critic(obs)
                         
-                        # Compute losses
-                        if torch.isnan(current_value).any() or torch.isinf(current_value).any():
-                            if self.debug:
-                                print("[DEBUG] NaN/Inf detected in current_value, using fallback")
-                            current_value = torch.nan_to_num(current_value, nan=0.0, posinf=1.0, neginf=-1.0)
+                        # Calculate losses
+                        current_value = torch.nan_to_num(current_value, nan=0.0)
+                        td_target = torch.nan_to_num(td_target, nan=0.0)
                         
-                        if torch.isnan(td_target).any() or torch.isinf(td_target).any():
-                            if self.debug:
-                                print("[DEBUG] NaN/Inf detected in td_target, using fallback")
-                            td_target = torch.nan_to_num(td_target, nan=0.0, posinf=1.0, neginf=-1.0)
+                        value_loss = F.mse_loss(current_value.reshape(-1), td_target.reshape(-1).detach())
+                        policy_loss = -log_prob.mean()
+                        entropy_loss = -entropy * self.entropy_coef
                         
-                        current_value_flat = current_value.reshape(-1)
-                        td_target_flat = td_target.reshape(-1)
-                        
-                        # Safety check for value loss calculation
-                        try:
-                            value_loss = F.mse_loss(current_value_flat, td_target_flat.detach())
-                            if torch.isnan(value_loss).any() or torch.isinf(value_loss).any():
-                                if self.debug:
-                                    print("[DEBUG] NaN/Inf detected in value_loss, using dummy loss")
-                                value_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
-                        except RuntimeError:
-                            if self.debug:
-                                print("[DEBUG] RuntimeError in value_loss calculation, using dummy loss")
-                            value_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
-                        
-                        # Safety check for policy loss calculation
-                        try:
-                            policy_loss = -log_prob.mean()
-                            if torch.isnan(policy_loss).any() or torch.isinf(policy_loss).any():
-                                if self.debug:
-                                    print("[DEBUG] NaN/Inf detected in policy_loss, using dummy loss")
-                                policy_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
-                        except RuntimeError:
-                            if self.debug:
-                                print("[DEBUG] RuntimeError in policy_loss calculation, using dummy loss")
-                            policy_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
-                        
-                        # Safety check for entropy loss
-                        try:
-                            entropy_loss = -entropy.mean() * self.entropy_coef
-                            if torch.isnan(entropy_loss).any() or torch.isinf(entropy_loss).any():
-                                if self.debug:
-                                    print("[DEBUG] NaN/Inf detected in entropy_loss, using zero")
-                                entropy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-                        except RuntimeError:
-                            if self.debug:
-                                print("[DEBUG] RuntimeError in entropy_loss calculation, using zero")
-                            entropy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-                        
-                        # Zero gradients
+                        # Apply updates
                         self.actor_optimizer.zero_grad()
                         self.critic_optimizer.zero_grad()
                         
-                        # Backpropagation - Combined actor loss
                         actor_loss = policy_loss + entropy_loss
-                        if actor_loss.requires_grad:
-                            actor_loss.backward()
+                        actor_loss.backward()
                         value_loss.backward()
                         
-                        # Apply updates with OBGD optimizers
                         delta_value = delta.item()
                         actor_step_size = self.actor_optimizer.step(delta_value, env_id=env_id, reset=done.item() > 0.5)
                         critic_step_size = self.critic_optimizer.step(delta_value, env_id=env_id, reset=done.item() > 0.5)
@@ -936,7 +855,6 @@ class StreamACAlgorithm(BaseAlgorithm):
                         self.last_step_sizes.append(metrics['effective_step_size'])
                         if len(self.last_step_sizes) > 100:
                             self.last_step_sizes.pop(0)
-                        self.successful_steps += 1
                         
                         # Track losses
                         total_value_loss += value_loss.item()
@@ -944,11 +862,11 @@ class StreamACAlgorithm(BaseAlgorithm):
                         total_entropy_loss += entropy_loss.item() if hasattr(entropy_loss, 'item') else 0.0
         
         else:
-            # Batch update with standard optimizers - more efficient implementation
-            batch_size = min(64, len(self.experience_buffers[env_id]) - 1)  # Increased batch size
+            # Standard optimizer batch update (Adam) - already efficient
+            batch_size = min(64, len(self.experience_buffers[env_id]) - 1)
             batch_indices = np.random.choice(len(self.experience_buffers[env_id]) - 1, batch_size, replace=False)
             
-            # Pre-allocate lists for batching
+            # Collect batch data
             batch_obs = []
             batch_actions = []
             batch_rewards = []
@@ -956,7 +874,6 @@ class StreamACAlgorithm(BaseAlgorithm):
             batch_dones = []
             batch_next_values = []
             
-            # Collect batch data
             for i in batch_indices:
                 current_exp = self.experience_buffers[env_id][i]
                 next_exp = self.experience_buffers[env_id][i + 1]
@@ -968,7 +885,7 @@ class StreamACAlgorithm(BaseAlgorithm):
                 batch_dones.append(current_exp['done'])
                 batch_next_values.append(next_exp['value'])
             
-            # Stack tensors for batch processing
+            # Stack tensors
             batch_obs = torch.cat(batch_obs, dim=0)
             batch_rewards = torch.cat(batch_rewards, dim=0)
             batch_values = torch.cat(batch_values, dim=0)
@@ -980,11 +897,11 @@ class StreamACAlgorithm(BaseAlgorithm):
             else:
                 batch_actions = torch.cat(batch_actions, dim=0).float()
             
-            # Calculate TD error for the entire batch
+            # Calculate TD error
             batch_deltas, batch_td_targets = self._calculate_td_error(
                 batch_rewards, batch_next_values, batch_dones, batch_values)
             
-            # Forward pass (batched)
+            # Forward passes
             if self.action_space_type == "discrete":
                 action_probs = self.actor(batch_obs)
                 dist = Categorical(action_probs)
@@ -997,58 +914,16 @@ class StreamACAlgorithm(BaseAlgorithm):
                 log_probs = dist.log_prob(batch_actions).sum(-1)
                 entropy = dist.entropy().sum(-1).mean()
             
-            # Compute critic output (batched)
+            # Get critic values
             current_values = self.critic(batch_obs)
             
-            # Compute losses (batched)
-            if torch.isnan(current_values).any() or torch.isinf(current_values).any():
-                if self.debug:
-                    print("[DEBUG] NaN/Inf detected in current_values, using fallback")
-                current_values = torch.nan_to_num(current_values, nan=0.0, posinf=1.0, neginf=-1.0)
+            # Calculate losses
+            current_values = torch.nan_to_num(current_values, nan=0.0)
+            batch_td_targets = torch.nan_to_num(batch_td_targets, nan=0.0)
             
-            if torch.isnan(batch_td_targets).any() or torch.isinf(batch_td_targets).any():
-                if self.debug:
-                    print("[DEBUG] NaN/Inf detected in batch_td_targets, using fallback")
-                batch_td_targets = torch.nan_to_num(batch_td_targets, nan=0.0, posinf=1.0, neginf=-1.0)
-            
-            current_value_flat = current_values.reshape(-1)
-            td_target_flat = batch_td_targets.reshape(-1)
-            
-            # Safety check for value loss calculation
-            try:
-                value_loss = F.mse_loss(current_value_flat, td_target_flat.detach())
-                if torch.isnan(value_loss).any() or torch.isinf(value_loss).any():
-                    if self.debug:
-                        print("[DEBUG] NaN/Inf detected in value_loss, using dummy loss")
-                    value_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
-            except RuntimeError:
-                if self.debug:
-                    print("[DEBUG] RuntimeError in value_loss calculation, using dummy loss")
-                value_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
-            
-            # Safety check for policy loss calculation
-            try:
-                policy_loss = -log_probs.mean()
-                if torch.isnan(policy_loss).any() or torch.isinf(policy_loss).any():
-                    if self.debug:
-                        print("[DEBUG] NaN/Inf detected in policy_loss, using dummy loss")
-                    policy_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
-            except RuntimeError:
-                if self.debug:
-                    print("[DEBUG] RuntimeError in policy_loss calculation, using dummy loss")
-                policy_loss = torch.tensor(0.01, device=self.device, requires_grad=True)
-            
-            # Safety check for entropy loss
-            try:
-                entropy_loss = -entropy * self.entropy_coef
-                if torch.isnan(entropy_loss).any() or torch.isinf(entropy_loss).any():
-                    if self.debug:
-                        print("[DEBUG] NaN/Inf detected in entropy_loss, using zero")
-                    entropy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-            except RuntimeError:
-                if self.debug:
-                    print("[DEBUG] RuntimeError in entropy_loss calculation, using zero")
-                entropy_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+            value_loss = F.mse_loss(current_values.reshape(-1), batch_td_targets.reshape(-1).detach())
+            policy_loss = -log_probs.mean()
+            entropy_loss = -entropy * self.entropy_coef
             
             # Zero gradients and update
             self.actor_optimizer.zero_grad()
@@ -1065,7 +940,7 @@ class StreamACAlgorithm(BaseAlgorithm):
             self.actor_optimizer.step()
             self.critic_optimizer.step()
             
-            # Track losses for metrics
+            # Track losses
             total_value_loss = value_loss.item() * batch_size
             total_policy_loss = policy_loss.item() * batch_size
             total_entropy_loss = entropy_loss.item() * batch_size

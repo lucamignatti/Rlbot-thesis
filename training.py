@@ -282,6 +282,47 @@ class Trainer:
                     print("[DEBUG] Using torch.compile for models...")
                 self.actor = torch.compile(self.actor)
                 self.critic = torch.compile(self.critic)
+                
+                # Also compile auxiliary task models if they exist
+                if self.use_auxiliary_tasks and hasattr(self, 'aux_task_manager'):
+                    if hasattr(self.aux_task_manager, 'sr_model') and self.aux_task_manager.sr_model is not None:
+                        self.aux_task_manager.sr_model = torch.compile(self.aux_task_manager.sr_model)
+                        if self.debug:
+                            print("[DEBUG] Compiled SR auxiliary model")
+                    
+                    if hasattr(self.aux_task_manager, 'rp_model') and self.aux_task_manager.rp_model is not None:
+                        self.aux_task_manager.rp_model = torch.compile(self.aux_task_manager.rp_model)
+                        if self.debug:
+                            print("[DEBUG] Compiled RP auxiliary model")
+                
+                # Also compile intrinsic reward models if they exist
+                if self.use_intrinsic_rewards and self.intrinsic_reward_generator is not None:
+                    # For ensemble, compile each component
+                    if hasattr(self.intrinsic_reward_generator, 'components'):
+                        for i, component in enumerate(self.intrinsic_reward_generator.components):
+                            if hasattr(component, 'forward_model') and component.forward_model is not None:
+                                component.forward_model = torch.compile(component.forward_model)
+                            if hasattr(component, 'inverse_model') and component.inverse_model is not None:
+                                component.inverse_model = torch.compile(component.inverse_model)
+                            if hasattr(component, 'target_network') and component.target_network is not None:
+                                component.target_network = torch.compile(component.target_network)
+                            if hasattr(component, 'predictor_network') and component.predictor_network is not None:
+                                component.predictor_network = torch.compile(component.predictor_network)
+                        if self.debug:
+                            print("[DEBUG] Compiled intrinsic reward ensemble components")
+                    # For individual models
+                    else:
+                        if hasattr(self.intrinsic_reward_generator, 'forward_model') and self.intrinsic_reward_generator.forward_model is not None:
+                            self.intrinsic_reward_generator.forward_model = torch.compile(self.intrinsic_reward_generator.forward_model)
+                        if hasattr(self.intrinsic_reward_generator, 'inverse_model') and self.intrinsic_reward_generator.inverse_model is not None:
+                            self.intrinsic_reward_generator.inverse_model = torch.compile(self.intrinsic_reward_generator.inverse_model)
+                        if hasattr(self.intrinsic_reward_generator, 'target_network') and self.intrinsic_reward_generator.target_network is not None:
+                            self.intrinsic_reward_generator.target_network = torch.compile(self.intrinsic_reward_generator.target_network)
+                        if hasattr(self.intrinsic_reward_generator, 'predictor_network') and self.intrinsic_reward_generator.predictor_network is not None:
+                            self.intrinsic_reward_generator.predictor_network = torch.compile(self.intrinsic_reward_generator.predictor_network)
+                        if self.debug:
+                            print("[DEBUG] Compiled intrinsic reward models")
+                
                 if self.debug:
                     print("[DEBUG] Models compiled successfully")
             except Exception as e:

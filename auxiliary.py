@@ -316,6 +316,11 @@ class AuxiliaryTaskManager:
             device=device,
             debug=debug
         )
+        
+        # Store references for torch.compile
+        self.sr_model = self.sr_task
+        self.rp_model = self.rp_task
+        
         # Initialize optimizers
         self.sr_optimizer = torch.optim.Adam(self.sr_task.parameters(), lr=3e-4)
         self.rp_optimizer = torch.optim.Adam(self.rp_task.parameters(), lr=3e-4)
