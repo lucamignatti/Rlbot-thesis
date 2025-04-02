@@ -176,17 +176,17 @@ class PPOAlgorithm(BaseAlgorithm):
                 reward = reward.to(self.device)
                 value = value.to(self.device)
                 done = done.to(self.device)
-            
-            # Store the experience
+                
+            # Store the experience, detaching obs and action
             if obs.dim() > 1:  # If obs is batched
-                self.obs[self.pos] = obs.squeeze(0) 
+                self.obs[self.pos] = obs.squeeze(0).detach() 
             else:
-                self.obs[self.pos] = obs
+                self.obs[self.pos] = obs.detach()
                 
             if action.dim() > 1:  # If action is batched
-                self.actions[self.pos] = action.squeeze(0)
+                self.actions[self.pos] = action.squeeze(0).detach()
             else:
-                self.actions[self.pos] = action
+                self.actions[self.pos] = action.detach()
                 
             if log_prob.dim() > 0:  # If log_prob has dimensions
                 self.log_probs[self.pos] = log_prob.item()
@@ -223,18 +223,22 @@ class PPOAlgorithm(BaseAlgorithm):
             if state is not None and self.obs is not None:
                 if not isinstance(state, torch.Tensor):
                     state = torch.tensor(state, dtype=torch.float32, device=self.device if self.use_device_tensors else "cpu")
-                if state.dim() > 1:  # If state is batched
-                    self.obs[idx] = state.squeeze(0).to(self.device) if self.use_device_tensors else state.squeeze(0)
+                # Detach state before storing
+                state_detached = state.detach()
+                if state_detached.dim() > 1:  # If state is batched
+                    self.obs[idx] = state_detached.squeeze(0).to(self.device) if self.use_device_tensors else state_detached.squeeze(0)
                 else:
-                    self.obs[idx] = state.to(self.device) if self.use_device_tensors else state
+                    self.obs[idx] = state_detached.to(self.device) if self.use_device_tensors else state_detached
                     
             if action is not None and self.actions is not None:
                 if not isinstance(action, torch.Tensor):
                     action = torch.tensor(action, dtype=torch.float32, device=self.device if self.use_device_tensors else "cpu")
-                if action.dim() > 1:  # If action is batched
-                    self.actions[idx] = action.squeeze(0).to(self.device) if self.use_device_tensors else action.squeeze(0)
+                # Detach action before storing
+                action_detached = action.detach()
+                if action_detached.dim() > 1:  # If action is batched
+                    self.actions[idx] = action_detached.squeeze(0).to(self.device) if self.use_device_tensors else action_detached.squeeze(0)
                 else:
-                    self.actions[idx] = action.to(self.device) if self.use_device_tensors else action
+                    self.actions[idx] = action_detached.to(self.device) if self.use_device_tensors else action_detached
                     
             if log_prob is not None and self.log_probs is not None:
                 if not isinstance(log_prob, torch.Tensor):

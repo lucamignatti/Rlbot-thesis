@@ -116,10 +116,7 @@ class Trainer:
         self.debug = debug
         self.test_mode = False  # Initialize test_mode attribute to False by default
         
-        # IMPORTANT: Initialize use_pretraining first since use_intrinsic_rewards depends on it
-        self.use_pretraining = use_pretraining
-        
-        # IMPORTANT: Set use_intrinsic_rewards early to avoid attribute access errors during compilation
+        # IMPORTANT: Set use_intrinsic_rewards early to avoid attribute access errors
         self.use_intrinsic_rewards = use_intrinsic_rewards and use_pretraining
         self.intrinsic_reward_scale = intrinsic_reward_scale
         self.intrinsic_reward_generator = None
@@ -1111,7 +1108,7 @@ class Trainer:
 
         try:
             # Load the saved state with CPU mapping to allow loading on any device
-            checkpoint = torch.load(model_path, map_location='cpu')
+            checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
             
             # Check for checkpoint version to handle different formats
             metadata = checkpoint.get('metadata', {})
