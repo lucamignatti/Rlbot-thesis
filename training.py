@@ -115,7 +115,15 @@ class Trainer:
         self.use_wandb = use_wandb
         self.debug = debug
         self.test_mode = False  # Initialize test_mode attribute to False by default
-
+        
+        # IMPORTANT: Initialize use_pretraining first since use_intrinsic_rewards depends on it
+        self.use_pretraining = use_pretraining
+        
+        # IMPORTANT: Set use_intrinsic_rewards early to avoid attribute access errors during compilation
+        self.use_intrinsic_rewards = use_intrinsic_rewards and use_pretraining
+        self.intrinsic_reward_scale = intrinsic_reward_scale
+        self.intrinsic_reward_generator = None
+        
         # Figure out which device (CPU, CUDA, MPS) to use
         if device is None:
             if torch.cuda.is_available():
@@ -388,13 +396,13 @@ class Trainer:
             return 0
         
         if hasattr(self, 'total_episode_target') and self.total_episode_target:
-            # Use episode count if available
-            return int(self.total_episode_target * self.pretraining_fraction)
+            # Calculate based on fraction of total episodes
+            pretraining_episodes = int(self.total_episode_target * self.pretraining_fraction)
+            # Convert episodes to approximate steps (assuming each episode contributes ~200 steps)
+            return pretraining_episodes * 200
         else:
-            # Fallback to a default step count if no episode target is set
-            # This might need adjustment based on typical training lengths
-            default_total_steps = 1_000_000 # Example default total steps
-            return int(default_total_steps * self.pretraining_fraction)
+            # Default to a fixed number of steps if no episode target is set
+            return 100000  # Default to 100k steps for pretraining
 
     def _update_auxiliary_weights(self):
         """Update auxiliary task weights based on pretraining state."""
@@ -1430,65 +1438,76 @@ class Trainer:
             return False
 
     def _update_pretraining_state(self):
-        """Update pretraining state based on current progress"""
-        if not self.use_pretraining or self.pretraining_completed:
+        """Update pretraining state and manage transition to regular training."""
+        # Skip if pretraining is not enabled
+        if not self.use_pretraining:
             return
         
-        # Calculate total progress
-        if self.total_episode_target:
-            # Use episode count for tracking
-            progress_ratio = (self.total_episodes + self.total_episodes_offset) / self.total_episode_target
-        else:
-            # Default to using training steps
-            total_steps = max(1, self._true_training_steps())
-            progress_ratio = min(1.0, total_steps / 1000)  # Default to 1000 steps if no target
-        
-        # Check if pretraining phase is complete
-        if progress_ratio >= self.pretraining_fraction and not self.pretraining_completed:
-            if not self.in_transition_phase:
-                print(f"Transitioning from pretraining to regular training over next {self.pretraining_transition_steps} steps.")
-                self.in_transition_phase = True
-                self.transition_start_step = self._true_training_steps()
+        # If pretraining is already completed, nothing to do
+        if self.pretraining_completed and not self.in_transition_phase:
+            return
             
-        # Check if transition is complete
+        # Calculate when pretraining should end based on episodes or steps
+        pretraining_end_step = self._get_pretraining_end_step()
         current_step = self._true_training_steps()
-        transition_progress = min(1.0, (current_step - self.transition_start_step) / self.pretraining_transition_steps)
         
-        if transition_progress >= 1.0:
-            # Mark pretraining as fully completed
-            self.pretraining_completed = True
-            self.in_transition_phase = False
-            print("Pretraining phase completed. Switching to regular training.")
-            
-            # Reset auxiliary task weights to regular values
-            if self.use_auxiliary_tasks:
-                self.aux_task_manager.sr_weight = self.base_sr_weight
-                self.aux_task_manager.rp_weight = self.base_rp_weight
+        # Determine if we're in regular pretraining mode, transition phase, or fully completed
+        if not self.pretraining_completed:
+            # Check if we've reached the end of the pretraining phase
+            if current_step >= pretraining_end_step:
+                self.pretraining_completed = True
+                self.in_transition_phase = True
+                self.transition_start_step = current_step
                 
-            # Reset entropy coefficient to base value
-            self.entropy_coef = self.base_entropy_coef
-            
-        else:
-            # Gradually transition auxiliary task weights
-            if self.use_auxiliary_tasks:
-                sr_weight = self.pretraining_sr_weight + transition_progress * (self.base_sr_weight - self.pretraining_sr_weight)
-                rp_weight = self.pretraining_rp_weight + transition_progress * (self.base_rp_weight - self.pretraining_rp_weight)
-                self.aux_task_manager.sr_weight = sr_weight
-                self.aux_task_manager.rp_weight = rp_weight
+                # Only print transition message when we just entered transition phase
+                print(f"Transitioning from pretraining to regular training over next {self.pretraining_transition_steps} steps.")
                 
-                # Gradually transition entropy coefficient
-                pretraining_entropy = self.base_entropy_coef * self.pretraining_entropy_scale
-                entropy_coef = pretraining_entropy + transition_progress * (self.base_entropy_coef - pretraining_entropy)
-                self.entropy_coef = max(self.min_entropy_coef, entropy_coef)
-    
-            # During early pretraining, use higher values for auxiliary tasks and entropy
-            elif not self.in_transition_phase and not self.pretraining_completed:
+                if self.use_wandb:
+                    wandb.log({
+                        'training/pretraining_completed': True,
+                        'training/transition_started': True
+                    }, step=current_step)
+
+        # Handle transition phase
+        elif self.in_transition_phase:
+            # Check if transition phase is complete
+            transition_progress = min(1.0, (current_step - self.transition_start_step) / self.pretraining_transition_steps)
+            
+            if transition_progress >= 1.0:
+                # Mark pretraining as fully completed
+                self.pretraining_completed = True
+                self.in_transition_phase = False
+                print("Pretraining phase completed. Switching to regular training.")
+                
+                # Reset auxiliary task weights to regular values
                 if self.use_auxiliary_tasks:
-                    self.aux_task_manager.sr_weight = self.pretraining_sr_weight
-                    self.aux_task_manager.rp_weight = self.pretraining_rp_weight
-            
-                # Higher entropy during pretraining
-                self.entropy_coef = max(self.min_entropy_coef, self.base_entropy_coef * self.pretraining_entropy_scale)
+                    self.aux_task_manager.sr_weight = self.base_sr_weight
+                    self.aux_task_manager.rp_weight = self.base_rp_weight
+                    
+                # Reset entropy coefficient to base value
+                self.entropy_coef = self.base_entropy_coef
+                
+            else:
+                # Gradually transition auxiliary task weights
+                if self.use_auxiliary_tasks:
+                    sr_weight = self.pretraining_sr_weight + transition_progress * (self.base_sr_weight - self.pretraining_sr_weight)
+                    rp_weight = self.pretraining_rp_weight + transition_progress * (self.base_rp_weight - self.pretraining_rp_weight)
+                    self.aux_task_manager.sr_weight = sr_weight
+                    self.aux_task_manager.rp_weight = rp_weight
+                    
+                    # Gradually transition entropy coefficient
+                    pretraining_entropy = self.base_entropy_coef * self.pretraining_entropy_scale
+                    entropy_coef = pretraining_entropy + transition_progress * (self.base_entropy_coef - pretraining_entropy)
+                    self.entropy_coef = max(self.min_entropy_coef, entropy_coef)
+
+                # During early pretraining, use higher values for auxiliary tasks and entropy
+                elif not self.in_transition_phase and not self.pretraining_completed:
+                    if self.use_auxiliary_tasks:
+                        self.aux_task_manager.sr_weight = self.pretraining_sr_weight
+                        self.aux_task_manager.rp_weight = self.pretraining_rp_weight
+                
+                    # Higher entropy during pretraining
+                    self.entropy_coef = max(self.min_entropy_coef, self.base_entropy_coef * self.pretraining_entropy_scale)
 
     def update_experience_with_intrinsic_reward(self, state=None, action=None, next_state=None, done=None, reward=None, store_idx=None, env_id=None):
         """

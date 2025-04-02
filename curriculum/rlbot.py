@@ -82,7 +82,20 @@ class RLBotSkillStage(CurriculumStage):
         if not self.bot_skill_ranges:
             # Default to linear skill progression if no ranges specified
             return (0.0, difficulty)
-            
+        
+        # For low difficulty (< 0.7), prefer lower skill ranges
+        if difficulty < 0.7:
+            # Find ranges with max <= 0.7
+            low_skill_ranges = [r for r in self.bot_skill_ranges.keys() if r[1] <= 0.7]
+            if low_skill_ranges:
+                # Find the range that contains the current difficulty
+                for skill_range in low_skill_ranges:
+                    min_skill, max_skill = skill_range
+                    if min_skill <= difficulty <= max_skill:
+                        return skill_range
+                # If no exact match, pick the closest low skill range
+                return min(low_skill_ranges, key=lambda r: abs((r[0] + r[1])/2 - difficulty))
+                
         # For high difficulty (>= 0.7), prefer higher skill ranges
         if difficulty >= 0.7:
             # Find ranges with min >= 0.7
