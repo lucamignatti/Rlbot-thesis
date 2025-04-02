@@ -904,9 +904,9 @@ if __name__ == "__main__":
     training_duration.add_argument('-t', '--time', type=str, default=None,
                                   help='Training duration in format: 5m (minutes), 5h (hours), 5d (days)')
 
-    parser.add_argument('-n', '--num_envs', type=int, default=4,
+    parser.add_argument('-n', '--num_envs', type=int, default=24,
                         help='Number of parallel environments to run for faster data collection')
-    parser.add_argument('--update_interval', type=int, default=3072,
+    parser.add_argument('--update_interval', type=int, default=8192,
                         help='Number of experiences to collect before updating the policy')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use for training (cuda/mps/cpu).  Autodetects if not specified.')
@@ -942,7 +942,7 @@ if __name__ == "__main__":
 
     # Training loop parameters
     parser.add_argument('--ppo_epochs', type=int, default=10, help='Number of PPO epochs per update')
-    parser.add_argument('--batch_size', type=int, default=2048, help='Batch size for PPO updates')
+    parser.add_argument('--batch_size', type=int, default=8192, help='Batch size for PPO updates')
 
     parser.add_argument('--compile', action='store_true', help='Use torch.compile for model optimization (if available)')
     parser.add_argument('--no-compile', action='store_false', dest='compile', help='Disable torch.compile')
