@@ -79,6 +79,8 @@ class Trainer:
         entropy_coef_decay: float = 0.995,
         max_grad_norm: float = 0.5,
         ppo_epochs: int = 10,
+        use_weight_clipping: bool = False,
+        weight_clip_kappa: float = 1.0,
         batch_size: int = 128,
         use_wandb: bool = False,
         debug: bool = False,
@@ -188,7 +190,9 @@ class Trainer:
                 batch_size=batch_size,
                 use_amp=use_amp,
                 debug=debug,
-                use_wandb=use_wandb
+                use_wandb=use_wandb,
+                use_weight_clipping=use_weight_clipping,
+                weight_clip_kappa=weight_clip_kappa,
             )
             # For compatibility with existing code, keep a reference to the memory
             self.memory = self.algorithm.memory

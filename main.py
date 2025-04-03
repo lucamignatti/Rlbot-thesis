@@ -61,6 +61,8 @@ def run_training(
     entropy_coef: float = 0.01,
     max_grad_norm: float = 0.5,
     ppo_epochs: int = 10,
+    use_weight_clipping: bool = False,
+    weight_clip_kappa: float = 1.0,
     batch_size: int = 64,
     aux_amp: bool = False,
     aux_scale: float = 0.005,
@@ -133,6 +135,8 @@ def run_training(
         max_grad_norm=max_grad_norm,
         ppo_epochs=ppo_epochs,
         batch_size=batch_size,
+        use_weight_clipping=use_weight_clipping,
+        weight_clip_kappa=weight_clip_kappa,
         use_wandb=use_wandb,
         debug=debug,
         use_compile=use_compile,
@@ -616,14 +620,21 @@ def run_training(
                 # Reset episode rewards for the environments that finished an episode.
                 for env_idx, done in enumerate(dones):
                     if done:
-                        avg_reward = sum(episode_rewards[env_idx].values()) / len(episode_rewards[env_idx])
-                        if debug:
-                            print(f"Episode {episode_counts[env_idx]} in env {env_idx} completed with avg reward: {avg_reward:.2f}")
+                        # Add a safe check to prevent division by zero
+                        if len(episode_rewards[env_idx]) > 0:
+                            avg_reward = sum(episode_rewards[env_idx].values()) / max(1, len(episode_rewards[env_idx]))
+                            if debug:
+                                print(f"Episode {episode_counts[env_idx]} in env {env_idx} completed with avg reward: {avg_reward:.2f}")
+                            
+                            # Track average episode reward for PPO updates
+                            if algorithm == "ppo":
+                                completed_episode_rewards_since_last_update.append(avg_reward)
+                        else:
+                            # Handle case where there are no rewards (shouldn't happen in normal usage)
+                            if debug:
+                                print(f"Warning: Episode {episode_counts[env_idx]} in env {env_idx} completed with no rewards recorded")
                         
-                        # Track average episode reward for PPO updates
-                        if algorithm == "ppo":
-                            completed_episode_rewards_since_last_update.append(avg_reward)
-                        
+                        # Reset rewards dictionary for next episode
                         episode_rewards[env_idx] = {agent_id: 0 for agent_id in vec_env.obs_dicts[env_idx]}
 
             # Determine if it's time to update the policy
@@ -942,7 +953,10 @@ if __name__ == "__main__":
 
     # Training loop parameters
     parser.add_argument('--ppo_epochs', type=int, default=10, help='Number of PPO epochs per update')
-    parser.add_argument('--batch_size', type=int, default=8192, help='Batch size for PPO updates')
+    parser.add_argument('--batch_size', type=int, default=8192, help='Batch size for PPO updates')    
+
+    parser.add_argument('--weight_clip_kappa', type=float, default=1.0, help='Weight clipping factor for PPO')
+    parser.add_argument('--weight_clipping', type=bool, default=True, help='Enable weight clipping for PPO')
 
     parser.add_argument('--compile', action='store_true', help='Use torch.compile for model optimization (if available)')
     parser.add_argument('--no-compile', action='store_false', dest='compile', help='Disable torch.compile')
@@ -1264,6 +1278,8 @@ if __name__ == "__main__":
         entropy_coef=args.entropy_coef,
         max_grad_norm=args.max_grad_norm,
         ppo_epochs=args.ppo_epochs,
+        weight_clip_kappa=args.weight_clip_kappa,
+        use_weight_clipping=args.weight_clipping,
         batch_size=args.batch_size,
         aux_amp=args.aux_amp if args.aux_amp is not None else args.amp,
         aux_scale=args.aux_scale,

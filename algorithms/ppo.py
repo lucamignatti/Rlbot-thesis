@@ -31,6 +31,8 @@ class PPOAlgorithm(BaseAlgorithm):
         use_amp=False,
         debug=False,
         use_wandb=False,
+        use_weight_clipping=False,
+        weight_clip_kappa=1.0,
     ):
         super().__init__(
             actor,
@@ -54,6 +56,14 @@ class PPOAlgorithm(BaseAlgorithm):
             use_wandb=use_wandb,
         )
 
+        # Weight clipping parameters
+        self.use_weight_clipping = use_weight_clipping
+        self.weight_clip_kappa = weight_clip_kappa
+        
+        # Store initial weight ranges if weight clipping is enabled
+        if self.use_weight_clipping:
+            self.init_weight_ranges()
+            
         # Initialize memory with correct buffer size and device
         self.memory = self.PPOMemory(batch_size=batch_size, buffer_size=10000, device=device)
 
@@ -506,6 +516,54 @@ class PPOAlgorithm(BaseAlgorithm):
         
         return returns, advantages
     
+    def init_weight_ranges(self):
+        """Store the initialization ranges of all network parameters"""
+        self.actor_init_bounds = {}
+        self.critic_init_bounds = {}
+        
+        # Store bounds for actor network weights
+        for name, param in self.actor.named_parameters():
+            if param.requires_grad:
+                # Use the He initialization range for the parameter
+                # Assuming the weights follow uniform initialization with range [-a, a]
+                # where a = sqrt(6 / fan_in)
+                if 'weight' in name:
+                    fan_in = param.shape[1] * (param.shape[2] if len(param.shape) > 2 else 1)
+                    bound = self.weight_clip_kappa * (6 / fan_in) ** 0.5
+                    self.actor_init_bounds[name] = (-bound, bound)
+                else:
+                    # For biases, use a smaller range
+                    bound = 0.01 * self.weight_clip_kappa
+                    self.actor_init_bounds[name] = (-bound, bound)
+                    
+        # Store bounds for critic network weights
+        for name, param in self.critic.named_parameters():
+            if param.requires_grad:
+                if 'weight' in name:
+                    fan_in = param.shape[1] * (param.shape[2] if len(param.shape) > 2 else 1)
+                    bound = self.weight_clip_kappa * (6 / fan_in) ** 0.5
+                    self.critic_init_bounds[name] = (-bound, bound)
+                else:
+                    bound = 0.01 * self.weight_clip_kappa
+                    self.critic_init_bounds[name] = (-bound, bound)
+
+    def clip_weights(self):
+        """Clip weights to stay within their initialization ranges"""
+        if not self.use_weight_clipping:
+            return
+            
+        # Clip actor network weights
+        for name, param in self.actor.named_parameters():
+            if name in self.actor_init_bounds:
+                lower_bound, upper_bound = self.actor_init_bounds[name]
+                param.data.clamp_(lower_bound, upper_bound)
+                
+        # Clip critic network weights
+        for name, param in self.critic.named_parameters():
+            if name in self.critic_init_bounds:
+                lower_bound, upper_bound = self.critic_init_bounds[name]
+                param.data.clamp_(lower_bound, upper_bound)
+
     def _update_policy(self, states, actions, old_log_probs, returns, advantages):
         """
         Update policy and value networks using PPO algorithm
@@ -544,7 +602,7 @@ class PPOAlgorithm(BaseAlgorithm):
             # Generate random batches
             batch_indices = self.memory.generate_batches()
             
-            # Skip if no batches (should never happen since we check buffer size)
+            # Skip if no batches
             if not batch_indices:
                 continue
             
@@ -605,6 +663,9 @@ class PPOAlgorithm(BaseAlgorithm):
                     nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
                 
                 self.optimizer.step()
+                
+                # Apply weight clipping after optimization step
+                self.clip_weights()
                 
                 # Update metrics
                 metrics['actor_loss'] += actor_loss.item()

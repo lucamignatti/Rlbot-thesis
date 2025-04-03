@@ -206,94 +206,105 @@ class BallVelocityMutator(StateMutator):
         state.ball.angular_velocity = np.zeros(3)
 
 class CarPositionMutator(StateMutator):
-    """Sets a car's position and orientation using callback functions"""
-    def __init__(self, car_id: str, 
-                 position_function: Optional[Callable[[], np.ndarray]] = None,
-                 orientation_function: Optional[Callable[[], np.ndarray]] = None,
-                 debug: bool = False):
+    """Sets a car's position"""
+    def __init__(self, car_id: str, position_function: Optional[Callable[[None], np.ndarray]] = None,
+                 orientation_function: Optional[Callable[[None], np.ndarray]] = None):
+        """
+        Args:
+            car_id: Identifier for the car to position
+            position_function: Function that returns car position
+                               If None, positions the car at [0, 0, 17]
+            orientation_function: Function that returns car orientation (Euler angles)
+                                  If None, car will have default orientation
+        """
         self.car_id = car_id
-        self.position_function = position_function
-        self.orientation_function = orientation_function
-        self.debug = debug
-    
+        self.position_function = position_function or (lambda: np.array([0, 0, 17]))
+        self.orientation_function = orientation_function or (lambda: np.zeros(3))
+        
     def apply(self, state: GameState, shared_info: Dict[str, Any]) -> None:
         car_id_str = str(self.car_id)
+        
+        # Check if the car exists in the state
         if car_id_str not in state.cars:
-            if self.debug:
-                print(f"[DEBUG CarPositionMutator] Car {car_id_str} not found in state")
             return
-        
+            
+        # Get the car from the state
         car = state.cars[car_id_str]
-        
-        # --- Position Setting ---
+            
+        # Generate the car position
         try:
-            position = self.position_function() if self.position_function else np.array([0.0, -2000.0, 17.0])
-            if self.debug:
-                print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Generated Position: {position}")
+            position = self.position_function()
+            if position is None or not isinstance(position, (np.ndarray, list, tuple)):
+                raise ValueError("Position function returned invalid position")
+        except Exception as e:
+            # If there's an error, use a safe default position
+            print(f"Error in position_function: {e}, using default position")
+            position = np.array([0, 0, 17])
+        
+        # Generate the car orientation
+        try:
+            orientation = self.orientation_function()
+            if orientation is None or not isinstance(orientation, (np.ndarray, list, tuple)):
+                raise ValueError("Orientation function returned invalid orientation")
+        except Exception as e:
+            # If there's an error, use a safe default orientation
+            print(f"Error in orientation_function: {e}, using default orientation")
+            orientation = np.zeros(3)
+        
+        # Ensure position and orientation are numpy arrays
+        if not isinstance(position, np.ndarray):
+            position = np.array(position)
+        if not isinstance(orientation, np.ndarray):
+            orientation = np.array(orientation)
             
-            if not isinstance(position, np.ndarray):
-                position = np.array(position)
-            
-            # Ensure physics object exists with proper type
-            if not hasattr(car, 'physics') or car.physics is None:
-                car.physics = PhysicsObject()
+        # Set the car position and orientation
+        if hasattr(car, 'physics'):
+            if car.physics is None:
+                car.physics = type('Physics', (), {})()
                 
-            # Apply position and initialize velocities
+            # Set position
             car.physics.position = position
-            car.physics.linear_velocity = np.zeros(3)
-            car.physics.angular_velocity = np.zeros(3)
             
-        except Exception as e:
-            if self.debug:
-                print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Position error: {str(e)}")
-            # Use safe default position
-            car.physics.position = np.array([0.0, -2000.0, 17.0])
-        
-        # --- Orientation Setting ---
-        try:
-            if self.orientation_function:
-                euler_rotation = self.orientation_function()
-                if self.debug:
-                    print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Euler rotation: {euler_rotation}")
+            # Handle orientation safely without using hasattr for properties
+            # Try different approaches for different RLGym versions
+            try:
+                # Try setting rotation directly (works on some versions)
+                car.physics.rotation = orientation
+            except (AttributeError, ValueError):
+                try:
+                    # Try setting quaternion (works on newer versions)
+                    quat = euler_to_quaternion(orientation)
+                    car.physics.quaternion = quat
+                except (AttributeError, ValueError):
+                    try:
+                        # Try direct rotation matrix (fallback)
+                        rot_matrix = euler_to_rotation_matrix(orientation)
+                        setattr(car.physics, 'rotation_matrix', rot_matrix)
+                    except:
+                        # Last resort: do nothing with orientation
+                        print(f"WARNING: Could not set car orientation for car {car_id_str}")
                 
-                if not isinstance(euler_rotation, np.ndarray):
-                    euler_rotation = np.array(euler_rotation)
+            # Initialize velocity as zeros if it doesn't exist
+            if not hasattr(car.physics, 'linear_velocity') or car.physics.linear_velocity is None:
+                car.physics.linear_velocity = np.zeros(3)
                 
-                # Convert Euler angles to quaternion
-                quaternion = euler_to_quaternion(euler_rotation)
-                if self.debug:
-                    print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Quaternion: {quaternion}")
-                
-                # Convert quaternion to rotation matrix
-                rotation_matrix = quaternion_to_rotation_matrix(quaternion)
-                if self.debug:
-                    print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Rotation matrix: {rotation_matrix}")
-                
-                # Apply rotation matrix to car physics (using rotation_mtx instead of rotation)
-                car.physics.rotation_mtx = rotation_matrix  # Apply rotation matrix
-                # Store quaternion if the physics object supports it
-                if hasattr(car.physics, 'quaternion'):
-                    car.physics.quaternion = quaternion
-                
-                # Verify rotation was applied
-                if self.debug:
-                    if hasattr(car.physics, 'rotation_mtx'):
-                        print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Applied rotation matrix: {car.physics.rotation_mtx}")
-                    else:
-                        print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Warning: rotation_mtx not set")
-            else:
-                # Default to neutral orientation
-                car.physics.rotation_mtx = np.eye(3)
-                if hasattr(car.physics, 'quaternion'):
-                    car.physics.quaternion = np.array([1., 0., 0., 0.])
-                
-        except Exception as e:
-            if self.debug:
-                print(f"[DEBUG CarPositionMutator] Car: {self.car_id}, Orientation error: {str(e)}")
-            # Use safe default orientation
-            car.physics.rotation_mtx = np.eye(3)
-            if hasattr(car.physics, 'quaternion'):
-                car.physics.quaternion = np.array([1., 0., 0., 0.])
+            # Initialize angular velocity as zeros if it doesn't exist
+            if not hasattr(car.physics, 'angular_velocity') or car.physics.angular_velocity is None:
+                car.physics.angular_velocity = np.zeros(3)
+        else:
+            # Direct attributes on car (old API)
+            car.position = position
+            try:
+                car.rotation = orientation
+            except (AttributeError, ValueError):
+                # Fallback options for setting orientation on car
+                try:
+                    car.euler_angles = orientation
+                except (AttributeError, ValueError):
+                    try:
+                        car.quaternion = euler_to_quaternion(orientation)
+                    except:
+                        print(f"WARNING: Could not set car orientation for car {car_id_str}")
 
 class CarBoostMutator(StateMutator):
     """Sets boost amount for specific cars"""
@@ -311,15 +322,17 @@ class CarBoostMutator(StateMutator):
 
 class CarBallRelativePositionMutator(StateMutator):
     """Sets a car's position relative to the ball's position"""
-    def __init__(self, car_id: str, position_function: Optional[Callable[[np.ndarray], np.ndarray]] = None):
+    def __init__(self, car_id: str, position_function: Optional[Callable[[np.ndarray], np.ndarray]] = None, force_orientation: bool = False):
         """
         Args:
             car_id: Identifier for the car to position
             position_function: Function that takes ball position and returns car position
                                If None, positions the car 1000 units behind the ball on y-axis
+            force_orientation: If True, car will always face the ball. If False, existing orientation is preserved.
         """
         self.car_id = car_id
         self.position_function = position_function or (lambda ball_pos: np.array([ball_pos[0], ball_pos[1]-1000, 17]))
+        self.force_orientation = force_orientation
         
     def apply(self, state: GameState, shared_info: Dict[str, Any]) -> None:
         car_id_str = str(self.car_id)
@@ -364,35 +377,28 @@ class CarBallRelativePositionMutator(StateMutator):
         else:
             car.position = position
         
-        # Reset rotation to point car toward ball
-        try:
-            # Calculate direction vector from car to ball
-            direction = ball_position - position
-            
-            # Only set rotation if we're not too close to the ball (avoid division by zero)
-            if np.linalg.norm(direction) > 1.0:
-                # Normalize direction
-                direction = direction / np.linalg.norm(direction)
-                
-                # Simple rotation to face the ball (only yaw)
-                yaw = np.arctan2(direction[1], direction[0])
-                
-                if hasattr(car, 'physics') and car.physics is not None:
-                    car.physics.rotation = np.array([0, 0, yaw])
-                else:
-                    car.rotation = np.array([0, 0, yaw])
-            else:
-                # Default rotation if too close to ball
-                if hasattr(car, 'physics') and car.physics is not None:
-                    car.physics.rotation = np.zeros(3)
-                else:
-                    car.rotation = np.zeros(3)
-        except (AttributeError, TypeError):
-            # Fallback for rotation
+        # Only set orientation if force_orientation is True
+        if self.force_orientation:
             try:
-                if hasattr(car, 'rotation_mtx'):
-                    car.rotation_mtx = np.eye(3)
+                # Calculate direction vector from car to ball
+                direction = ball_position - position
+                
+                # Only set rotation if we're not too close to the ball
+                if np.linalg.norm(direction) > 1.0:
+                    # Normalize direction
+                    direction = direction / np.linalg.norm(direction)
+                    
+                    # Simple rotation to face the ball (only yaw)
+                    yaw = np.arctan2(direction[1], direction[0])
+                    
+                    print(f"DEBUG: Setting car {car_id_str} to face ball with yaw {yaw}")
+                    
+                    if hasattr(car, 'physics') and car.physics is not None:
+                        car.physics.rotation = np.array([0, 0, yaw])
+                    else:
+                        car.rotation = np.array([0, 0, yaw])
             except:
+                # Silently ignore errors in orientation
                 pass
 
 # --- Add a new TouchBallCondition class ---
