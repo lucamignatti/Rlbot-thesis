@@ -957,6 +957,16 @@ if __name__ == "__main__":
 
     parser.add_argument('--weight_clip_kappa', type=float, default=1.0, help='Weight clipping factor for PPO')
     parser.add_argument('--weight_clipping', type=bool, default=True, help='Enable weight clipping for PPO')
+    
+    # Adaptive weight clipping parameters
+    parser.add_argument('--adaptive_kappa', action='store_true', help='Enable adaptive weight clipping kappa')
+    parser.add_argument('--no-adaptive_kappa', action='store_false', dest='adaptive_kappa', help='Disable adaptive weight clipping kappa')
+    parser.set_defaults(adaptive_kappa=True)  # Enable by default
+    parser.add_argument('--kappa_update_freq', type=int, default=10, help='Update frequency for adaptive kappa')
+    parser.add_argument('--kappa_update_rate', type=float, default=0.01, help='Update rate for adaptive kappa (1% by default)')
+    parser.add_argument('--target_clip_fraction', type=float, default=0.05, help='Target fraction of weights to clip (5% by default)')
+    parser.add_argument('--min_kappa', type=float, default=0.1, help='Minimum value for adaptive kappa')
+    parser.add_argument('--max_kappa', type=float, default=10.0, help='Maximum value for adaptive kappa')
 
     parser.add_argument('--compile', action='store_true', help='Use torch.compile for model optimization (if available)')
     parser.add_argument('--no-compile', action='store_false', dest='compile', help='Disable torch.compile')

@@ -33,6 +33,14 @@ class PPOAlgorithm(BaseAlgorithm):
         use_wandb=False,
         use_weight_clipping=False,
         weight_clip_kappa=1.0,
+        # --- Adaptive Kappa Params ---
+        adaptive_kappa=False,
+        kappa_update_freq=10, # Update kappa every 10 policy updates
+        kappa_update_rate=0.01, # Adjust kappa by 1%
+        target_clip_fraction=0.05, # Target 5% of weights being clipped
+        min_kappa=0.1,
+        max_kappa=10.0,
+        # ---------------------------
     ):
         super().__init__(
             actor,
@@ -59,10 +67,17 @@ class PPOAlgorithm(BaseAlgorithm):
         # Weight clipping parameters
         self.use_weight_clipping = use_weight_clipping
         self.weight_clip_kappa = weight_clip_kappa
+        self.adaptive_kappa = adaptive_kappa
+        self.kappa_update_freq = kappa_update_freq
+        self.kappa_update_rate = kappa_update_rate
+        self.target_clip_fraction = target_clip_fraction
+        self.min_kappa = min_kappa
+        self.max_kappa = max_kappa
+        self._update_counter = 0 # Counter for kappa updates
         
         # Store initial weight ranges if weight clipping is enabled
         if self.use_weight_clipping:
-            self.init_weight_ranges()
+            self.init_weight_ranges() # Now stores base bounds (kappa=1)
             
         # Initialize memory with correct buffer size and device
         self.memory = self.PPOMemory(batch_size=batch_size, buffer_size=10000, device=device)
@@ -82,11 +97,13 @@ class PPOAlgorithm(BaseAlgorithm):
             'critic_loss': 0.0,
             'entropy_loss': 0.0,
             'total_loss': 0.0,
-            'clip_fraction': 0.0,
+            'clip_fraction': 0.0, # PPO policy clip fraction
             'explained_variance': 0.0,
             'kl_divergence': 0.0,
             'mean_advantage': 0.0,
-            'mean_return': 0.0
+            'mean_return': 0.0,
+            'weight_clip_fraction': 0.0, # Fraction of weights clipped
+            'current_kappa': self.weight_clip_kappa, # Current kappa value
         }
 
         # Add episode return tracking
@@ -454,6 +471,8 @@ class PPOAlgorithm(BaseAlgorithm):
         if torch.isnan(advantages).any():
             if self.debug:
                 print("[DEBUG] NaN detected in advantages, skipping update")
+            # Clear memory even if update is skipped due to NaNs
+            self.memory.clear()
             return self.metrics
         
         # Update the policy and value networks using PPO
@@ -468,6 +487,9 @@ class PPOAlgorithm(BaseAlgorithm):
         # If we have episode returns, update the mean return metric
         if len(self.episode_returns) > 0:
             self.metrics['mean_return'] = sum(self.episode_returns) / len(self.episode_returns)
+        
+        # Increment update counter for adaptive kappa
+        self._update_counter += 1
         
         return self.metrics
 
@@ -517,88 +539,118 @@ class PPOAlgorithm(BaseAlgorithm):
         return returns, advantages
     
     def init_weight_ranges(self):
-        """Store the initialization ranges of all network parameters"""
-        self.actor_init_bounds = {}
-        self.critic_init_bounds = {}
+        """Store the BASE initialization ranges (kappa=1) of all network parameters"""
+        self.actor_base_bounds = {}
+        self.critic_base_bounds = {}
         
-        # Store bounds for actor network weights
+        # Store base bounds for actor network weights
         for name, param in self.actor.named_parameters():
             if param.requires_grad:
-                # Use the He initialization range for the parameter
-                # Assuming the weights follow uniform initialization with range [-a, a]
-                # where a = sqrt(6 / fan_in)
+                # Use the He initialization range for the parameter (kappa=1)
                 if 'weight' in name:
                     fan_in = param.shape[1] * (param.shape[2] if len(param.shape) > 2 else 1)
-                    bound = self.weight_clip_kappa * (6 / fan_in) ** 0.5
-                    self.actor_init_bounds[name] = (-bound, bound)
+                    bound = (6 / fan_in) ** 0.5 # Base bound (kappa=1)
+                    self.actor_base_bounds[name] = (-bound, bound)
                 else:
-                    # For biases, use a smaller range
-                    bound = 0.01 * self.weight_clip_kappa
-                    self.actor_init_bounds[name] = (-bound, bound)
+                    # For biases, use a smaller base range
+                    bound = 0.01 # Base bound (kappa=1)
+                    self.actor_base_bounds[name] = (-bound, bound)
                     
-        # Store bounds for critic network weights
+        # Store base bounds for critic network weights
         for name, param in self.critic.named_parameters():
             if param.requires_grad:
                 if 'weight' in name:
                     fan_in = param.shape[1] * (param.shape[2] if len(param.shape) > 2 else 1)
-                    bound = self.weight_clip_kappa * (6 / fan_in) ** 0.5
-                    self.critic_init_bounds[name] = (-bound, bound)
+                    bound = (6 / fan_in) ** 0.5 # Base bound (kappa=1)
+                    self.critic_base_bounds[name] = (-bound, bound)
                 else:
-                    bound = 0.01 * self.weight_clip_kappa
-                    self.critic_init_bounds[name] = (-bound, bound)
+                    bound = 0.01 # Base bound (kappa=1)
+                    self.critic_base_bounds[name] = (-bound, bound)
 
     def clip_weights(self):
-        """Clip weights to stay within their initialization ranges"""
+        """Clip weights based on current kappa and return clipped fraction."""
         if not self.use_weight_clipping:
-            return
-            
+            return 0.0
+
+        total_params = 0
+        clipped_params = 0
+        current_kappa = self.weight_clip_kappa # Use the current kappa value
+
         # Clip actor network weights
         for name, param in self.actor.named_parameters():
-            if name in self.actor_init_bounds:
-                lower_bound, upper_bound = self.actor_init_bounds[name]
+            if name in self.actor_base_bounds and param.requires_grad:
+                base_lower, base_upper = self.actor_base_bounds[name]
+                lower_bound = base_lower * current_kappa
+                upper_bound = base_upper * current_kappa
+                
+                # Store original values to check for clipping
+                original_param = param.data.clone()
                 param.data.clamp_(lower_bound, upper_bound)
+                
+                # Count clipped parameters
+                num_params = param.numel()
+                total_params += num_params
+                clipped_params += torch.sum(param.data != original_param).item()
                 
         # Clip critic network weights
         for name, param in self.critic.named_parameters():
-            if name in self.critic_init_bounds:
-                lower_bound, upper_bound = self.critic_init_bounds[name]
+            if name in self.critic_base_bounds and param.requires_grad:
+                base_lower, base_upper = self.critic_base_bounds[name]
+                lower_bound = base_lower * current_kappa
+                upper_bound = base_upper * current_kappa
+
+                # Store original values to check for clipping
+                original_param = param.data.clone()
                 param.data.clamp_(lower_bound, upper_bound)
+
+                # Count clipped parameters
+                num_params = param.numel()
+                total_params += num_params
+                clipped_params += torch.sum(param.data != original_param).item()
+
+        # Return the fraction of clipped parameters
+        return float(clipped_params) / total_params if total_params > 0 else 0.0
+
 
     def _update_policy(self, states, actions, old_log_probs, returns, advantages):
         """
         Update policy and value networks using PPO algorithm
         
         Args:
-            states: batch of states [batch_size, state_dim]
-            actions: batch of actions [batch_size, action_dim]
-            old_log_probs: batch of log probabilities from old policy [batch_size]
-            returns: batch of returns [batch_size]
-            advantages: batch of advantages [batch_size]
+            states: batch of states [buffer_size, state_dim]
+            actions: batch of actions [buffer_size, action_dim]
+            old_log_probs: batch of log probabilities from old policy [buffer_size]
+            returns: batch of returns [buffer_size]
+            advantages: batch of advantages [buffer_size]
             
         Returns:
             dict: metrics from the update
         """
-        # Track metrics
-        metrics = {
+        # Track metrics for this update cycle
+        update_metrics = {
             'actor_loss': 0.0,
             'critic_loss': 0.0,
             'entropy_loss': 0.0,
             'total_loss': 0.0,
-            'clip_fraction': 0.0,
-            'explained_variance': 0.0,
-            'kl_divergence': 0.0,
-            'mean_advantage': advantages.mean().item()
+            'clip_fraction': 0.0, # PPO policy clip fraction
+            'weight_clip_fraction': 0.0, # Fraction of weights clipped this update
         }
         
-        # Calculate explained variance
-        y_pred = values = self.critic(states).squeeze()
+        # Calculate explained variance (once before updates)
+        with torch.no_grad():
+            y_pred = self.critic(states).squeeze()
         y_true = returns
         var_y = torch.var(y_true)
         explained_var = 1 - torch.var(y_true - y_pred) / (var_y + 1e-8)
-        metrics['explained_variance'] = explained_var.item()
+        update_metrics['explained_variance'] = explained_var.item()
+        update_metrics['mean_advantage'] = advantages.mean().item()
+        update_metrics['kl_divergence'] = 0.0 # Will be averaged later
+        
+        total_weight_clipped_fraction_epoch = 0.0
+        num_batches_processed = 0
         
         # Multiple epochs of PPO update
-        for _ in range(self.ppo_epochs):
+        for epoch in range(self.ppo_epochs):
             # Generate random batches
             batch_indices = self.memory.generate_batches()
             
@@ -608,6 +660,7 @@ class PPOAlgorithm(BaseAlgorithm):
             
             # Process each batch
             for batch_idx in batch_indices:
+                num_batches_processed += 1
                 # Get batch data
                 batch_states = states[batch_idx]
                 batch_actions = actions[batch_idx]
@@ -620,11 +673,17 @@ class PPOAlgorithm(BaseAlgorithm):
                     # For discrete actions
                     action_probs = self.actor(batch_states)
                     action_probs = torch.clamp(action_probs, 1e-10, 1.0)
+                    # Ensure probabilities sum to 1
                     action_probs = action_probs / action_probs.sum(dim=-1, keepdim=True)
                     dist = torch.distributions.Categorical(probs=action_probs)
                     
                     # Calculate log probabilities and entropy
-                    actions_indices = torch.argmax(batch_actions, dim=-1)
+                    # Ensure batch_actions are indices if they are one-hot
+                    if batch_actions.shape[-1] > 1 and batch_actions.dtype == torch.float32:
+                         actions_indices = torch.argmax(batch_actions, dim=-1)
+                    else: # Assume actions are already indices
+                         actions_indices = batch_actions.long()
+                         
                     curr_log_probs = dist.log_prob(actions_indices)
                     entropy = dist.entropy().mean()
                 else:
@@ -664,32 +723,51 @@ class PPOAlgorithm(BaseAlgorithm):
                 
                 self.optimizer.step()
                 
-                # Apply weight clipping after optimization step
-                self.clip_weights()
+                # Apply weight clipping after optimization step and get clipped fraction
+                current_weight_clip_fraction = self.clip_weights()
+                total_weight_clipped_fraction_epoch += current_weight_clip_fraction
                 
-                # Update metrics
-                metrics['actor_loss'] += actor_loss.item()
-                metrics['critic_loss'] += critic_loss.item()
-                metrics['entropy_loss'] += entropy_loss.item()
-                metrics['total_loss'] += total_loss.item()
+                # Update metrics (accumulate)
+                update_metrics['actor_loss'] += actor_loss.item()
+                update_metrics['critic_loss'] += critic_loss.item()
+                update_metrics['entropy_loss'] += entropy_loss.item()
+                update_metrics['total_loss'] += total_loss.item()
                 
-                # Calculate clipping fraction
-                clip_fraction = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean().item()
-                metrics['clip_fraction'] += clip_fraction
+                # Calculate PPO policy clipping fraction
+                policy_clip_fraction = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean().item()
+                update_metrics['clip_fraction'] += policy_clip_fraction
                 
                 # Calculate KL divergence (approximate)
                 with torch.no_grad():
-                    kl_div = (batch_old_log_probs - curr_log_probs).mean().item()
-                    metrics['kl_divergence'] += kl_div
+                    # Detach curr_log_probs before calculation
+                    kl_div = (batch_old_log_probs - curr_log_probs.detach()).mean().item()
+                    update_metrics['kl_divergence'] += kl_div
         
-        # Calculate averages
-        num_batches = len(batch_indices) * self.ppo_epochs
-        if num_batches > 0:
-            metrics['actor_loss'] /= num_batches
-            metrics['critic_loss'] /= num_batches
-            metrics['entropy_loss'] /= num_batches
-            metrics['total_loss'] /= num_batches
-            metrics['clip_fraction'] /= num_batches
-            metrics['kl_divergence'] /= num_batches
+        # Calculate averages over all batches and epochs
+        if num_batches_processed > 0:
+            update_metrics['actor_loss'] /= num_batches_processed
+            update_metrics['critic_loss'] /= num_batches_processed
+            update_metrics['entropy_loss'] /= num_batches_processed
+            update_metrics['total_loss'] /= num_batches_processed
+            update_metrics['clip_fraction'] /= num_batches_processed # Avg PPO clip fraction
+            update_metrics['kl_divergence'] /= num_batches_processed
+            update_metrics['weight_clip_fraction'] = total_weight_clipped_fraction_epoch / num_batches_processed # Avg weight clip fraction
         
-        return metrics
+        # --- Adaptive Kappa Update Logic ---
+        if self.use_weight_clipping and self.adaptive_kappa and (self._update_counter % self.kappa_update_freq == 0):
+            actual_clip_fraction = update_metrics['weight_clip_fraction']
+            if actual_clip_fraction > self.target_clip_fraction:
+                self.weight_clip_kappa *= (1 + self.kappa_update_rate)
+            elif actual_clip_fraction < self.target_clip_fraction:
+                self.weight_clip_kappa *= (1 - self.kappa_update_rate)
+                
+            # Clamp kappa within bounds
+            self.weight_clip_kappa = max(self.min_kappa, min(self.max_kappa, self.weight_clip_kappa))
+            
+            if self.debug:
+                print(f"[DEBUG PPO] Kappa updated. New kappa: {self.weight_clip_kappa:.4f} (Clip fraction: {actual_clip_fraction:.4f})")
+
+        # Store current kappa value in metrics
+        update_metrics['current_kappa'] = self.weight_clip_kappa
+        
+        return update_metrics
