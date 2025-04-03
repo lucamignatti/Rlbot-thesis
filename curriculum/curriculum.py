@@ -753,9 +753,13 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             BallPositionMutator(position_function=SafePositionWrapper(safe_ball_position)) # Ball present but not focus
         ),
         base_task_reward_function=CombinedReward(
+            (GoalReward(), 5.0),
+            (goal_accel_reward, 3.0),
+            (touch_ball_reward, 1.2),
             (ball_proximity_reward, 1.0), # Reward moving towards general area
             (velocity_to_ball_reward, 0.5),
-            (save_boost_reward, 0.3)
+            (save_boost_reward, 0.3),
+            (alignment_reward, 0.1),
         ),
         base_task_termination_condition=goal_condition, # Unlikely, acts as fallback
         base_task_truncation_condition=short_timeout,
@@ -771,6 +775,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                     BallPositionMutator(position_function=SafePositionWrapper(get_ball_ground_position)) # Target ball
                 ),
                 reward_function=CombinedReward(
+                    (touch_ball_reward, 1.5),
                     (ball_proximity_reward, 1.0),
                     (velocity_to_ball_reward, 0.5)
                 ),
@@ -823,9 +828,11 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(get_varied_approach_car_position))
         ),
         base_task_reward_function=CombinedReward(
+            (goal_velocity_reward, 1.0),
             (ball_proximity_reward, 0.8),
             (touch_ball_reward, 0.3),
-            (goal_accel_reward, 0.5) # Reward touching towards goal
+            (goal_accel_reward, 0.5), # Reward touching towards goal
+            (GoalReward(), 5.0),
         ),
         base_task_termination_condition=goal_condition,
         base_task_truncation_condition=no_touch_timeout_short,
@@ -891,7 +898,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         base_task_reward_function=CombinedReward(
             (touch_ball_reward, 0.2),
             (goal_velocity_reward, 0.6),
-            (goal_accel_reward, 0.3)
+            (goal_accel_reward, 0.3),
+            (GoalReward(), 1.0),
         ),
         base_task_termination_condition=goal_condition,
         base_task_truncation_condition=TimeoutCondition(10),
@@ -908,6 +916,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                 ),
                 # Reward structure needs to encourage multiple touches
                 reward_function=CombinedReward(
+                    (GoalReward(), 1.5),
                     (TouchBallReward(weight=1.0), 1.0), # High reward per touch
                     (BallProximityReward(dispersion=0.6), 0.5) # Keep it close between touches
                 ),
@@ -967,6 +976,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                                orientation_function=get_face_own_goal_orientation)
         ),
         base_task_reward_function=CombinedReward(
+            (GoalReward(), 1.0),
             (goal_velocity_reward, 0.7),
             (goal_accel_reward, 0.3),
             (alignment_reward, 1.0)
@@ -983,7 +993,6 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             "lr_critic": lr_critic * 0.9,
             "entropy_coef": 0.005
         }
-        # Skill modules could be added here later (e.g., Angled Shots)
     )
 
     # ======== STAGE 5: WALL & AIR MECHANICS ========
@@ -1001,7 +1010,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         base_task_reward_function=CombinedReward(
             (touch_ball_reward, 0.2),
             (save_boost_reward, 0.3),
-            (goal_velocity_reward, 0.5) # Reward hitting towards goal even from air
+            (goal_velocity_reward, 0.5), # Reward hitting towards goal even from air
+            (GoalReward(), 1.0),
         ),
         base_task_termination_condition=goal_condition,
         base_task_truncation_condition=short_timeout,
@@ -1073,11 +1083,14 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                                position_function=SafePositionWrapper(get_blue_attacker_position),
                                orientation_function=get_random_yaw_orientation)
         ),
-        base_task_reward_function=KRCReward([
-            (offensive_potential_reward, 0.7),
-            (touch_ball_reward, 0.5),
-            (goal_velocity_reward, 0.5)
-        ], team_spirit=0.7),
+        base_task_reward_function=CombinedReward(
+            KRCReward([
+                (offensive_potential_reward, 0.7),
+                (touch_ball_reward, 0.5),
+                (goal_velocity_reward, 0.5)
+            ], team_spirit=0.7),
+            (GoalReward(), 2.0),
+        ),
         base_task_termination_condition=goal_condition,
         base_task_truncation_condition=med_timeout,
         skill_modules=[
@@ -1095,6 +1108,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                                        orientation_function=get_random_yaw_orientation)
                 ),
                 reward_function=CombinedReward(
+                    (GoalReward(), 1.5),
                     (TeamSpacingReward(), 1.0), # Focus solely on spacing
                     (TeamPossessionReward(), 0.3) # Encourage keeping ball
                 ),
@@ -1118,7 +1132,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                 ),
                 reward_function=CombinedReward(
                     (PassCompletionReward(), 1.0), # Focus on completing pass
-                    (ScoringOpportunityCreationReward(), 0.5)
+                    (ScoringOpportunityCreationReward(), 0.5),
+                    (GoalReward(), 1.5),
                 ),
                 termination_condition=goal_condition,
                 truncation_condition=med_timeout,
@@ -1158,7 +1173,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         base_task_reward_function=CombinedReward(
             (BlockSuccessReward(), 0.7),
             (DefensivePositioningReward(), 0.5),
-            (BallClearanceReward(), 0.4)
+            (BallClearanceReward(), 0.4),
+            (GoalReward(), 1.5)
         ),
         base_task_termination_condition=goal_condition, # Success is NOT conceding
         base_task_truncation_condition=TimeoutCondition(10),
@@ -1172,7 +1188,6 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             "lr_critic": 0.0003,
             "entropy_coef": 0.003
         }
-        # Skill modules could be added (Shadow Defense, Recovery)
     )
 
     # ======== STAGE 8: INTERMEDIATE BALL CONTROL ========
@@ -1195,7 +1210,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         base_task_reward_function=CombinedReward(
             (ball_proximity_reward, 0.6),
             (velocity_to_ball_reward, 0.4), # Keep moving with ball
-            (goal_velocity_reward, 0.4)
+            (goal_velocity_reward, 0.4),
+            (GoalReward(), 1.5)
         ),
         base_task_termination_condition=goal_condition,
         base_task_truncation_condition=TimeoutCondition(12),
@@ -1219,7 +1235,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                 ),
                 reward_function=CombinedReward(
                     (ball_proximity_reward, 0.8),
-                    (velocity_to_ball_reward, 0.5) # Reward moving with ball
+                    (velocity_to_ball_reward, 0.5), # Reward moving with ball
+                    (GoalReward(), 1.5)
                 ),
                 termination_condition=goal_condition,
                 truncation_condition=TimeoutCondition(15),
@@ -1247,7 +1264,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                     (ball_proximity_reward, 0.8),
                     # Reward for changing direction while maintaining proximity
                     (touch_ball_reward, 0.3),
-                    (goal_velocity_reward, 0.3)
+                    (goal_velocity_reward, 0.3),
+                    (GoalReward(), 1.5)
                 ),
                 termination_condition=goal_condition,
                 truncation_condition=TimeoutCondition(15),
@@ -1284,11 +1302,14 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                                position_function=SafePositionWrapper(get_orange_support_position),
                                orientation_function=get_face_own_goal_orientation)
         ),
-        base_task_reward_function=KRCReward([
-            (BlockSuccessReward(), 0.7), # Renamed from GoalPrevention
-            (DefensivePositioningReward(), 0.5),
-            (BallClearanceReward(), 0.6)
-        ], team_spirit=0.7),
+        base_task_reward_function=CombinedReward(
+            KRCReward([
+                (BlockSuccessReward(), 0.7), # Renamed from GoalPrevention
+                (DefensivePositioningReward(), 0.5),
+                (BallClearanceReward(), 0.6)
+            ], team_spirit=0.7),
+            (GoalReward(), 1.5),
+        ),
         base_task_termination_condition=goal_condition,
         base_task_truncation_condition=long_timeout,
         bot_skill_ranges={(0.3, 0.5): 1.0}, # Mid-skill bots
@@ -1296,7 +1317,6 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             min_success_rate=0.55, min_avg_reward=0.4, min_episodes=175, # Success = save/clear
             max_std_dev=2.0, required_consecutive_successes=2
         )
-        # Skill modules could be added (First Man, Last Man, Recovery Rotation)
     )
 
     # ======== STAGE 10: 2v2 OFFENSIVE COORDINATION ========
@@ -1321,6 +1341,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                                orientation_function=get_face_own_goal_orientation)
         ),
         base_task_reward_function=KRCReward([
+            (GoalReward(), 2.0),
             (goal_velocity_reward, 0.7),
             (offensive_potential_reward, 0.6),
             (PassCompletionReward(), 0.5), # Added pass reward
@@ -1333,7 +1354,6 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             min_success_rate=0.5, min_avg_reward=0.4, min_episodes=200,
             max_std_dev=2.0, required_consecutive_successes=2
         )
-        # Skill modules could be added (Pass Execution, Receiving, Decision)
     )
 
     # ======== STAGE 11: INTERMEDIATE AERIALS & WALL PLAY ========
@@ -1352,7 +1372,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         base_task_reward_function=CombinedReward(
             (touch_ball_reward, 0.2),
             (AerialControlReward(), 0.4), # More emphasis on control
-            (AerialDirectionalTouchReward(), 0.6) # Reward controlled aerial hits
+            (AerialDirectionalTouchReward(), 0.6), # Reward controlled aerial hits
+            (GoalReward(), 2.0),
         ),
         base_task_termination_condition=goal_condition,
         base_task_truncation_condition=TimeoutCondition(10),
@@ -1412,7 +1433,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             FixedTeamSizeMutator(blue_size=2, orange_size=2),
             KickoffMutator()
         ),
-        base_task_reward_function=lucy_reward, # Use comprehensive team reward
+        base_task_reward_function=lucy_reward,
         base_task_termination_condition=goal_condition,
         base_task_truncation_condition=match_timeout,
         bot_skill_ranges={(0.4, 0.6): 0.7, (0.6, 0.7): 0.3}, # Higher skill bots
@@ -1420,7 +1441,6 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             min_success_rate=0.55, min_avg_reward=0.3, min_episodes=250, # Success = win (implicitly via reward)
             max_std_dev=2.5, required_consecutive_successes=2
         )
-        # Skill modules could be added (Kickoffs, Rotation, Adaptation)
     )
 
     # Create the full curriculum list

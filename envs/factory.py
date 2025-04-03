@@ -7,7 +7,7 @@ from rlgym.rocket_league.sim import RocketSimEngine
 import RocketSim as rsim
 from rlgym.rocket_league.rlviser import RLViserRenderer
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
-from rewards import BallProximityReward, BallToGoalDistanceReward, BallVelocityToGoalReward, TouchBallReward, TouchBallToGoalAccelerationReward, AlignBallToGoalReward, PlayerVelocityTowardBallReward, KRCReward
+from rewards import BallProximityReward, BallToGoalDistanceReward, BallVelocityToGoalReward, TouchBallReward, TouchBallToGoalAccelerationReward, AlignBallToGoalReward, PlayerVelocityTowardBallReward, KRCReward, create_lucy_skg_reward
 from observation import StackedActionsObs
 import numpy as np
 
@@ -326,41 +326,7 @@ def get_env(renderer=None, action_stacker=None, curriculum_config=None, debug=Fa
         ),
         obs_builder=StackedActionsObs(action_stacker, zero_padding=2),
         action_parser=RepeatAction(LookupTableAction(), repeats=8),
-        reward_fn=CombinedReward(
-            # Primary objective rewards - slightly increased to emphasize scoring
-            (GoalReward(), 15.0),
-
-            # Offensive Potential KRC group
-            (KRCReward([
-                (AlignBallToGoalReward(dispersion=1.1, density=1.0), 1.0),
-                (BallProximityReward(dispersion=0.8, density=1.2), 0.8),
-                (PlayerVelocityTowardBallReward(), 0.6)
-            ], team_spirit=0.3), 8.0),
-
-            # Ball Control KRC group
-            (KRCReward([
-                (TouchBallToGoalAccelerationReward(), 1.0),
-                (TouchBallReward(), 0.8),
-                (BallVelocityToGoalReward(), 0.6)
-            ], team_spirit=0.3), 6.0),
-
-            # Distance-weighted Alignment KRC group
-            (KRCReward([
-                (AlignBallToGoalReward(dispersion=1.1, density=1.0), 1.0),
-                (BallProximityReward(dispersion=0.8, density=1.2), 0.8)
-            ], team_spirit=0.3), 4.0),
-
-            # Strategic Ball Positioning
-            (KRCReward([
-                (BallToGoalDistanceReward(
-                    offensive_dispersion=0.6,
-                    defensive_dispersion=0.4,
-                    offensive_density=1.0,
-                    defensive_density=1.0
-                ), 1.0),
-                (BallProximityReward(dispersion=0.7, density=1.0), 0.4)
-            ], team_spirit=0.3), 2.0),
-        ),
+        reward_fn=create_lucy_skg_reward(),
         termination_cond=GoalCondition(),
         truncation_cond=AnyCondition(
             TimeoutCondition(300.),
