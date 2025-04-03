@@ -16,6 +16,7 @@ import torch.optim as optim
 import numpy as np
 from tqdm import tqdm
 import random
+import collections
 
 
 class RunningMeanStd:
@@ -246,11 +247,14 @@ class Trainer:
         if self.use_amp:
             self.scaler = GradScaler()
 
-        # Track metrics
-        self.actor_losses = []
-        self.critic_losses = []
-        self.entropy_losses = []
-        self.total_losses = []
+        # Track metrics using deques with a max length (e.g., 1000)
+        history_len = 1000
+        self.actor_losses = collections.deque(maxlen=history_len)
+        self.critic_losses = collections.deque(maxlen=history_len)
+        self.entropy_losses = collections.deque(maxlen=history_len)
+        self.total_losses = collections.deque(maxlen=history_len)
+        self.aux_sr_losses = collections.deque(maxlen=history_len) # Add deque for aux losses
+        self.aux_rp_losses = collections.deque(maxlen=history_len) # Add deque for aux losses
 
         # Initialize auxiliary tasks if enabled
         self.use_auxiliary_tasks = use_auxiliary_tasks
@@ -998,6 +1002,20 @@ class Trainer:
                     import traceback
                     traceback.print_exc()
         
+        # Append losses to deques
+        if 'actor_loss' in metrics:
+            self.actor_losses.append(metrics['actor_loss'])
+        if 'critic_loss' in metrics:
+            self.critic_losses.append(metrics['critic_loss'])
+        if 'entropy_loss' in metrics:
+            self.entropy_losses.append(metrics['entropy_loss'])
+        if 'total_loss' in metrics:
+            self.total_losses.append(metrics['total_loss'])
+        if 'sr_loss' in metrics: # Add aux loss tracking
+            self.aux_sr_losses.append(metrics['sr_loss'])
+        if 'rp_loss' in metrics: # Add aux loss tracking
+            self.aux_rp_losses.append(metrics['rp_loss'])
+
         return metrics
 
     def reset_auxiliary_tasks(self):

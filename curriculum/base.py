@@ -5,6 +5,7 @@ import pickle
 from rlgym.api import StateMutator, RewardFunction, DoneCondition
 from dataclasses import dataclass
 import wandb
+import collections # Ensure collections is imported
 
 @dataclass
 class ProgressionRequirements:
@@ -69,7 +70,7 @@ class CurriculumStage:
         self.episode_count = 0
         self.success_count = 0
         self.failure_count = 0
-        self.rewards_history = []
+        self.rewards_history = collections.deque(maxlen=500)
         self.moving_success_rate = 0.0
         self.moving_avg_reward = 0.0
 
@@ -78,7 +79,9 @@ class CurriculumStage:
         if not self.progression_requirements or self.episode_count < self.progression_requirements.min_episodes:
             return False
 
-        recent_rewards = self.rewards_history[-100:]
+        # Convert deque to list before slicing
+        rewards_list = list(self.rewards_history)
+        recent_rewards = rewards_list[-100:]
         if not recent_rewards:
             return False
 
@@ -189,7 +192,7 @@ class CurriculumStage:
         self.episode_count = 0
         self.success_count = 0
         self.failure_count = 0
-        self.rewards_history = []
+        self.rewards_history.clear()
         self.moving_success_rate = 0.0
         self.moving_avg_reward = 0.0
 
@@ -199,7 +202,8 @@ class CurriculumStage:
         if self.episode_count > 0:
             self.moving_success_rate = self.success_count / self.episode_count
         if self.rewards_history:
-            self.moving_avg_reward = np.mean(self.rewards_history)
+             rewards_list = list(self.rewards_history)
+             self.moving_avg_reward = np.mean(rewards_list) if rewards_list else 0.0
 
         return {
             "name": self.name,
@@ -230,7 +234,8 @@ class CurriculumManager:
         evaluation_window: int = 100,
         debug: bool = False,
         testing: bool = False,
-        use_wandb: bool = True
+        use_wandb: bool = True,
+        max_completed_stages_history: int = 50 # Add max history size
     ):
         if not stages:
             raise ValueError("At least one curriculum stage must be provided")
@@ -254,19 +259,20 @@ class CurriculumManager:
         self.use_wandb = use_wandb
 
         # Tracking variables
-        self.completed_stages = []
-        self.current_difficulty = 0.0  # Initialize difficulty level to 0
-        self.current_rehearsal = None  # Track current rehearsal stage
-        self.difficulty_threshold = 0.95  # Threshold to progress to next stage
-        self.difficulty_increase_rate = 0.1  # Rate of difficulty increase
+        # Use deque for completed stages history with a maximum length
+        self.completed_stages = collections.deque(maxlen=max_completed_stages_history)
+        self.current_difficulty = 0.0
+        self.current_rehearsal = None
+        self.difficulty_threshold = 0.95
+        self.difficulty_increase_rate = 0.1
         self.difficulty_level = 0.0
         self.episodes_in_current_stage = 0
         self.success_count = 0
         self.failure_count = 0
         self.consecutive_successes = 0
-        self.trainer = None  # Will be set via register_trainer
+        self.trainer = None
         self._last_wandb_step = 0
-        self.total_episodes = 0  # Total episodes across all stages
+        self.total_episodes = 0
 
         if debug:
             print(f"[DEBUG] Initialized curriculum with {len(stages)} stages")
@@ -556,16 +562,17 @@ class CurriculumManager:
 
         # Progress to next stage
         self.current_stage_index += 1
-        new_stage = self.stages[self.current_stage_index]
+        self.current_stage = self.stages[self.current_stage_index] # Update current_stage reference
 
-        # Reset difficulty for new stage
+        # Reset difficulty and episode counter for the new stage
         self.current_difficulty = 0.0
+        self.episodes_in_current_stage = 0
 
-        # Record transition
+        # Record transition (append to deque, automatically handles maxlen)
         self.completed_stages.append({
-            "episode": self.episodes_in_current_stage,
+            "episode": self.total_episodes, # Use total episodes for tracking transition point
             "from_stage": old_stage_name,
-            "to_stage": new_stage.name,
+            "to_stage": self.current_stage.name,
             "timestamp": np.datetime64('now'),
             "final_stats": old_stats
         })
@@ -578,13 +585,19 @@ class CurriculumManager:
             self._log_to_wandb({
                 "curriculum/stage_transition": 1.0,
                 "curriculum/from_stage": old_stage_name,
-                "curriculum/to_stage": new_stage.name,
+                "curriculum/to_stage": self.current_stage.name,
                 "curriculum/from_stage_index": self.current_stage_index - 1,
                 "curriculum/to_stage_index": self.current_stage_index,
                 "curriculum/completed_stage/success_rate": old_stats["success_rate"],
                 "curriculum/completed_stage/avg_reward": old_stats["avg_reward"],
                 "curriculum/completed_stage/episodes": old_stats["episodes"]
             })
+
+        # Reset statistics for the new stage to ensure clean tracking
+        self.current_stage.reset_statistics()
+
+        if self.debug:
+            print(f"Progressed to stage {self.current_stage_index}: {self.current_stage.name}")
 
     def _adjust_hyperparameters(self) -> None:
         """Adjust training hyperparameters based on the current stage."""
