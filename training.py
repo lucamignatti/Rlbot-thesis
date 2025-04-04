@@ -1016,6 +1016,9 @@ class Trainer:
         if 'rp_loss' in metrics: # Add aux loss tracking
             self.aux_rp_losses.append(metrics['rp_loss'])
 
+        # Clean up tensors to reduce memory usage
+        self._cleanup_tensors()
+
         return metrics
 
     def reset_auxiliary_tasks(self):
@@ -1624,3 +1627,9 @@ class Trainer:
             self.algorithm.store_experience_at_idx(store_idx, reward=total_reward_tensor)
     
         return total_reward
+
+    def _cleanup_tensors(self):
+        """Clean up any cached tensors to reduce memory usage"""
+        # Clear PyTorch cache occasionally
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

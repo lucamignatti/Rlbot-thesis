@@ -27,3 +27,5 @@ runnable_bots.txt
 .venv/
 .vscode/
 .aider*
+
+.DS_Store

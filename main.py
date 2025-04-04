@@ -1,4 +1,7 @@
+import psutil
 import os
+import gc
+from collections import Counter
 import numpy as np
 import torch
 from rlgym.api import RLGym
@@ -30,7 +33,17 @@ from envs.factory import get_env
 from envs.vectorized import VectorizedEnv
 from envs.rlbot_vectorized import RLBotVectorizedEnv
 from curriculum import create_curriculum
-import gc
+
+def log_memory_usage(step=0, location=""):
+    """Log memory usage at a specific point in the code"""
+    process = psutil.Process(os.getpid())
+    memory_info = process.memory_info()
+    print(f"[MEMORY] Step {step}, {location}: {memory_info.rss / 1024 / 1024:.2f} MB")
+    
+    # Get counts of common types
+    counts = Counter(type(obj).__name__ for obj in gc.get_objects())
+    top_types = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    print(f"[MEMORY] Top object types: {top_types}")
 
 def run_training(
     actor,

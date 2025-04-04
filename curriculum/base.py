@@ -192,7 +192,14 @@ class CurriculumStage:
         self.episode_count = 0
         self.success_count = 0
         self.failure_count = 0
-        self.rewards_history.clear()
+        
+        # Clear rewards history with explicit deletion
+        if hasattr(self, 'rewards_history') and self.rewards_history:
+            self.rewards_history.clear()
+        else:
+            # Initialize with maxlen to ensure it doesn't grow unbounded
+            self.rewards_history = collections.deque(maxlen=500)
+            
         self.moving_success_rate = 0.0
         self.moving_avg_reward = 0.0
 
