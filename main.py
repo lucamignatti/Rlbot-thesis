@@ -33,17 +33,64 @@ from envs.factory import get_env
 from envs.vectorized import VectorizedEnv
 from envs.rlbot_vectorized import RLBotVectorizedEnv
 from curriculum import create_curriculum
+# Added import for sys and Sized/Iterable
+import sys
+from collections.abc import Sized, Iterable
+# Added import for heapq
+import heapq
 
 def log_memory_usage(step=0, location=""):
     """Log memory usage at a specific point in the code"""
     process = psutil.Process(os.getpid())
     memory_info = process.memory_info()
     print(f"[MEMORY] Step {step}, {location}: {memory_info.rss / 1024 / 1024:.2f} MB")
-    
+
     # Get counts of common types
     counts = Counter(type(obj).__name__ for obj in gc.get_objects())
     top_types = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:10]
     print(f"[MEMORY] Top object types: {top_types}")
+
+# Added memory inspection function
+def print_memory_objects(top_n=5):
+    """
+    Collects all objects tracked by the GC, finds the largest ones using heapq,
+    and prints details for them.
+    """
+    print("\n--- Memory Object Report (End of Training) ---") # Modified title
+    # Force garbage collection to get a cleaner state
+    gc.collect()
+
+    # Use heapq.nlargest to find the top_n largest objects directly
+    # This avoids sorting the entire list of potentially millions of objects
+    try:
+        largest_objects = heapq.nlargest(top_n, (
+            (sys.getsizeof(obj), obj) for obj in gc.get_objects()
+        ), key=lambda x: x[0])
+    except Exception as e:
+        print(f"Error collecting or finding largest objects: {e}")
+        largest_objects = [] # Ensure largest_objects is defined
+
+    print(f"\n--- Top {top_n} Largest Objects (Found via heapq) ---")
+
+    for i, (size, obj) in enumerate(largest_objects):
+        obj_type = type(obj)
+        # --- Added try-except block for repr() ---
+        try:
+            obj_repr = repr(obj)[:100] # Limit representation length
+        except Exception as e:
+            obj_repr = f"<repr error: {e}>"
+        # --- End added block ---
+        obj_len = len(obj) if isinstance(obj, Sized) else 'N/A'
+        obj_iterable = isinstance(obj, Iterable)
+
+        print(f"\n#{i+1}: Size={size} bytes")
+        print(f"  Type: {obj_type}")
+        print(f"  Iterable: {obj_iterable}")
+        print(f"  Length: {obj_len}")
+        print(f"  Repr: {obj_repr}...")
+
+    print("--- End Memory Object Report ---\n")
+
 
 def run_training(
     actor,
@@ -357,7 +404,7 @@ def run_training(
     last_update_time = time.time()
     last_save_episode = 0
     last_progress_update_step = 0  # Track last step count when progress was updated
-    
+
     # Add defensive initialization for episode_rewards
     episode_rewards = {}
     for i in range(num_envs):
@@ -657,7 +704,7 @@ def run_training(
                 # For PPO, check if we've collected enough experiences based on update_interval
                 # or if the buffer is close to being full
                 buffer_capacity = trainer.algorithm.memory.buffer_size if hasattr(trainer.algorithm.memory, 'buffer_size') else update_interval
-                buffer_position = trainer.algorithm.memory.pos if hasattr(trainer.algorithm.memory, 'pos') else collected_experiences
+                buffer_position = trainer.algorithm.memory.pos if hasattr(trainer.algorithm, 'pos') else collected_experiences
                 
                 # Trigger update if we've collected enough experiences OR if buffer is 90% full
                 enough_experiences = (collected_experiences >= update_interval or 
@@ -696,7 +743,7 @@ def run_training(
                             stats_dict.update({
                                 "Reward": f"{metrics.get('mean_return', 0):.2f}",
                                 "PLoss": f"{metrics.get('actor_loss', 0):.4f}",
-                                "VLoss": f"{metrics.get('critic_loss', 0):.4f}",
+                                "VLoss": f"{metrics.get('critic_loss', 0)::.4f}",
                                 "Entropy": f"{metrics.get('entropy_loss', 0):.4f}"
                             })
                             
@@ -757,7 +804,7 @@ def run_training(
                 # Update StreamAC specific metrics if using that algorithm
                 if algorithm == "streamac":
                     stats_dict.update({
-                        "StepSize": f"{stats.get('effective_step_size', 0):.4f}",
+                        "StepSize": f"{stats.get('effective_step_size', 0)::.4f}",
                         "ActorLR": f"{getattr(trainer.algorithm, 'lr_actor', lr_actor):.6f}",
                         "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic):.6f}",
                         "Updates": getattr(trainer.algorithm, "successful_steps", 0)
@@ -847,6 +894,12 @@ def run_training(
                         stats_dict.pop("PT_Progress", None)
             
             progress_bar.set_postfix(stats_dict)
+
+        # --- Added Memory Print at the end of the try block ---
+        # if debug:
+        #     print("\n[DEBUG] Training loop finished. Printing final memory objects...")
+        #     print_memory_objects(top_n=20) # Print top 20 objects at the end
+        # --- End Added Memory Print ---
 
     except KeyboardInterrupt:
         print("\nTraining interrupted. Cleaning up...")
