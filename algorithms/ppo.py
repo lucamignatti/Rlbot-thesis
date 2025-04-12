@@ -728,19 +728,19 @@ class PPOAlgorithm(BaseAlgorithm):
                 total_weight_clipped_fraction_epoch += current_weight_clip_fraction
                 
                 # Update metrics (accumulate)
-                update_metrics['actor_loss'] += actor_loss.item()
-                update_metrics['critic_loss'] += critic_loss.item()
-                update_metrics['entropy_loss'] += entropy_loss.item()
-                update_metrics['total_loss'] += total_loss.item()
+                update_metrics['actor_loss'] += actor_loss.detach().item()
+                update_metrics['critic_loss'] += critic_loss.detach().item()
+                update_metrics['entropy_loss'] += entropy_loss.detach().item()
+                update_metrics['total_loss'] += total_loss.detach().item()
                 
                 # Calculate PPO policy clipping fraction
-                policy_clip_fraction = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean().item()
+                policy_clip_fraction = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean().detach().item()
                 update_metrics['clip_fraction'] += policy_clip_fraction
                 
                 # Calculate KL divergence (approximate)
                 with torch.no_grad():
                     # Detach curr_log_probs before calculation
-                    kl_div = (batch_old_log_probs - curr_log_probs.detach()).mean().item()
+                    kl_div = (batch_old_log_probs - curr_log_probs.detach()).mean().detach().item()
                     update_metrics['kl_divergence'] += kl_div
         
         # Calculate averages over all batches and epochs

@@ -768,7 +768,7 @@ def run_training(
                         print(f"[DEBUG] PPO has collected {collected_experiences}/{update_interval} experiences")
 
             # Reset intrinsic models periodically
-            if args.pretraining and total_episodes_so_far % 50 == 0 and hasattr(trainer, 'intrinsic_reward_generator'):
+            if args.pretraining and total_episodes_so_far % 50 == 0 and hasattr(trainer, 'intrinsic_reward_generator') and trainer.intrinsic_reward_generator is not None:
                 trainer.intrinsic_reward_generator.reset_models()
 
             # Update only if we've collected enough experiences and not in test mode

@@ -132,9 +132,9 @@ class CurriculumStage:
         if "episode_reward" not in episode_data:
             raise ValueError("episode_data must contain 'episode_reward'")
 
-        # Initialize rewards_history as empty list if it doesn't exist
+        # Initialize rewards_history as bounded deque if it doesn't exist
         if not hasattr(self, 'rewards_history') or self.rewards_history is None:
-            self.rewards_history = []
+            self.rewards_history = collections.deque(maxlen=500)
 
         # Initialize counters if they don't exist
         if not hasattr(self, 'episode_count') or self.episode_count is None:
@@ -293,7 +293,9 @@ class CurriculumManager:
         """Register a trainer object for hyperparameter adjustments"""
         # Only register if not already registered to prevent infinite recursion
         if self.trainer != trainer:
-            self.trainer = trainer
+            # Use weakref to avoid circular reference memory leaks
+            import weakref
+            self.trainer = weakref.proxy(trainer) if trainer is not None else None
             # Only register back with trainer if not already registered
             if hasattr(trainer, 'register_curriculum_manager'):
                 if not hasattr(trainer, '_curriculum_manager') or trainer._curriculum_manager != self:
@@ -364,17 +366,35 @@ class CurriculumManager:
             
         # Use trainer's centralized logging if available
         if self.trainer is not None and hasattr(self.trainer, '_log_to_wandb'):
-            # Create curriculum-specific metrics with CURR prefix
-            curriculum_metrics = {}
-            for key, value in metrics.items():
-                # Add CURR/ prefix to match our trainer's structure
-                curriculum_metrics[f"CURR/{key}"] = value
-            
-            # Let the trainer handle logging with proper step syncing
-            self.trainer._log_to_wandb(curriculum_metrics, current_step)
+            try:
+                # Create curriculum-specific metrics with CURR prefix
+                curriculum_metrics = {}
+                # Make shallow copies of values to avoid reference issues
+                for key, value in metrics.items():
+                    # Add CURR/ prefix to match our trainer's structure
+                    if isinstance(value, (int, float, bool, str)):
+                        curriculum_metrics[f"CURR/{key}"] = value
+                    elif isinstance(value, np.ndarray):
+                        curriculum_metrics[f"CURR/{key}"] = value.copy()
+                    else:
+                        # For other types, use simple assignment
+                        curriculum_metrics[f"CURR/{key}"] = value
+                
+                # Let the trainer handle logging with proper step syncing
+                self.trainer._log_to_wandb(curriculum_metrics, current_step)
+            except Exception as e:
+                if self.debug:
+                    print(f"Error in wandb logging: {e}")
+                # Don't let wandb errors crash the training
+                pass
         else:
             # Fall back to direct wandb logging if trainer unavailable
-            wandb.log(metrics, step=current_step)
+            try:
+                wandb.log(metrics, step=current_step)
+            except Exception as e:
+                if self.debug:
+                    print(f"Error in direct wandb logging: {e}")
+                pass
         
         # Remember this step for next time
         self._last_wandb_step = current_step
@@ -567,6 +587,12 @@ class CurriculumManager:
         old_stage_name = old_stage.name
         old_stats = old_stage.get_statistics()
 
+        # Clean up resources for the completed stage
+        if hasattr(old_stage, 'cleanup') and callable(old_stage.cleanup):
+            old_stage.cleanup()
+            if self.debug:
+                print(f"Cleaned up resources for stage {old_stage_name}")
+
         # Progress to next stage
         self.current_stage_index += 1
         self.current_stage = self.stages[self.current_stage_index] # Update current_stage reference
@@ -642,7 +668,17 @@ class CurriculumManager:
         # Ensure stage data is serializable (e.g., convert numpy arrays if needed)
         stages_data = []
         for stage in self.stages:
-            stage_state = stage.get_statistics() # Use existing method to get stats
+            # Only include essential statistics (not full history)
+            stage_state = {
+                'name': stage.name,
+                'episodes': stage.episode_count,
+                'successes': stage.success_count,
+                'failures': stage.failure_count,
+                'success_rate': stage.moving_success_rate,
+                'avg_reward': stage.moving_avg_reward,
+                'consecutive_successes': stage.get_consecutive_successes()
+            }
+            
             # Convert numpy types if necessary for broader compatibility
             for key, value in stage_state.items():
                 if isinstance(value, np.ndarray):
@@ -655,15 +691,23 @@ class CurriculumManager:
                      # Ensure lists don't contain numpy types
                      stage_state[key] = [float(v) if isinstance(v, (np.float_, np.float16, np.float32, np.float64)) else v for v in value]
 
-            # Add rewards history separately if needed (can be large)
-            # stage_state['rewards_history'] = stage.rewards_history # Consider if this is too large
+            # Don't include rewards_history in serialization to reduce memory usage
             stages_data.append(stage_state)
 
         return {
             'current_stage_index': self.current_stage_index,
-            'current_difficulty': self.current_difficulty,
+            'current_difficulty': self.current_difficulty, 
             'total_episodes': self.total_episodes,
-            'completed_stages': self.completed_stages,
+            # Store completed_stages data efficiently (without full state copies)
+            'completed_stages': [
+                {
+                    'episode': cs.get('episode', 0),
+                    'from_stage': cs.get('from_stage', ''),
+                    'to_stage': cs.get('to_stage', ''),
+                    'timestamp': cs.get('timestamp', None)
+                }
+                for cs in self.completed_stages
+            ],
             'stages_data': stages_data # Store stats, not full objects
         }
 
@@ -686,7 +730,17 @@ class CurriculumManager:
             self.current_difficulty = state_dict['current_difficulty']
             
         if 'completed_stages' in state_dict:
-            self.completed_stages = state_dict['completed_stages']
+            # Create a fresh deque with maxlen and copy only essential data
+            self.completed_stages.clear()
+            for cs in state_dict['completed_stages']:
+                if isinstance(cs, dict):
+                    # Only copy basic data, not full stage objects
+                    self.completed_stages.append({
+                        'episode': cs.get('episode', 0),
+                        'from_stage': cs.get('from_stage', ''),
+                        'to_stage': cs.get('to_stage', ''),
+                        'timestamp': cs.get('timestamp', None),
+                    })
             
         if 'total_episodes' in state_dict:
             self.total_episodes = state_dict['total_episodes']
@@ -729,8 +783,9 @@ class CurriculumManager:
                         if 'rewards_history' in stage_data and isinstance(stage_data['rewards_history'], list):
                             rewards = stage_data['rewards_history']
                             # Convert numpy types to native Python types if needed
-                            stage.rewards_history = []
-                            for reward in rewards:
+                            # Properly reset the deque first to ensure it has correct maxlen
+                            stage.rewards_history.clear()
+                            for reward in rewards[-500:]: # Only take last 500 rewards (deque maxlen)
                                 if hasattr(reward, 'item'):  # Handle numpy scalars
                                     stage.rewards_history.append(reward.item())
                                 else:

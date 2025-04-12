@@ -442,11 +442,11 @@ class AuxiliaryTaskManager:
             if not torch.isnan(sr_loss_val) and not torch.isinf(sr_loss_val):
                 sr_loss_val.backward()
                 self.sr_optimizer.step()
-                sr_loss = sr_loss_val.item()
+                sr_loss = sr_loss_val.detach().item()
                 self.last_sr_loss = sr_loss
             else:
                 if self.debug:
-                    print(f"[AUX DEBUG] Invalid SR loss detected: {sr_loss_val.item()}")
+                    print(f"[AUX DEBUG] Invalid SR loss detected: {sr_loss_val.detach().item()}")
                 self.last_sr_loss = 0.0
         else:
              if self.debug and self.sr_weight > 0:
@@ -496,11 +496,11 @@ class AuxiliaryTaskManager:
             if not torch.isnan(rp_loss_val) and not torch.isinf(rp_loss_val):
                 rp_loss_val.backward()
                 self.rp_optimizer.step()
-                rp_loss = rp_loss_val.item()
+                rp_loss = rp_loss_val.detach().item()
                 self.last_rp_loss = rp_loss
             else:
                 if self.debug:
-                    print(f"[AUX DEBUG] Invalid RP loss detected: {rp_loss_val.item()}")
+                    print(f"[AUX DEBUG] Invalid RP loss detected: {rp_loss_val.detach().item()}")
                 self.last_rp_loss = 0.0
         else:
             if self.debug and self.rp_weight > 0:

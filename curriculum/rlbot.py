@@ -29,7 +29,8 @@ class RLBotSkillStage(CurriculumStage):
                  bot_tags: List[str] = None,
                  allowed_bots: List[str] = None,
                  hyperparameter_adjustments: Dict[str, Any] = None,
-                 is_pretraining: bool = False):
+                 is_pretraining: bool = False,
+                 max_bots_to_track: int = 50):  # Maximum number of bots to track
         """
         Initialize a new RLBotSkillStage.
         
@@ -46,6 +47,7 @@ class RLBotSkillStage(CurriculumStage):
             allowed_bots: List of specific bot names to use. If None, all compatible bots may be selected.
             hyperparameter_adjustments: Dictionary of hyperparameters to adjust when this stage is reached
             is_pretraining: Whether this stage represents the pre-training phase
+            max_bots_to_track: Maximum number of bots to track in performance stats
         """
         super().__init__(
             name=name,
@@ -63,8 +65,11 @@ class RLBotSkillStage(CurriculumStage):
         self.bot_tags = set(bot_tags) if bot_tags else set()
         self.allowed_bots = set(allowed_bots) if allowed_bots else None
         
-        # Track performance against specific bots
+        # Track performance against specific bots with size limit
         self.bot_performance = {}  # Maps bot name -> stats dict
+        self.max_bots_to_track = max_bots_to_track
+        self.bot_last_used = {}  # Maps bot name -> last time used (episode counter)
+        self.total_episodes = 0   # Counter for tracking recency
         
         # Pre-training flag
         self.is_pretraining = is_pretraining
@@ -131,6 +136,21 @@ class RLBotSkillStage(CurriculumStage):
             reward: Episode reward value
             difficulty: Current difficulty level
         """
+        # Increment episode counter for recency tracking
+        self.total_episodes += 1
+        
+        # Update the last used timestamp for this bot
+        self.bot_last_used[bot_name] = self.total_episodes
+        
+        # Check if we need to remove least recently used bots
+        if len(self.bot_performance) >= self.max_bots_to_track and bot_name not in self.bot_performance:
+            # Remove the least recently used bot
+            lru_bot = min(self.bot_last_used.items(), key=lambda x: x[1])[0]
+            if lru_bot != bot_name:  # Don't remove the bot we're about to update
+                del self.bot_performance[lru_bot]
+                # Keep the timestamp in case we see this bot again
+        
+        # Create stats dictionary if this is a new bot (or was removed due to LRU)
         if bot_name not in self.bot_performance:
             self.bot_performance[bot_name] = {
                 "games_played": 0,
@@ -266,4 +286,15 @@ class RLBotSkillStage(CurriculumStage):
         
     def register_trainer(self, trainer) -> None:
         """Register a trainer object to enable pretraining stage communication"""
-        self._trainer = trainer
+        # Use weakref to avoid circular reference memory leaks
+        import weakref
+        self._trainer = weakref.proxy(trainer) if trainer is not None else None
+        
+    def cleanup(self) -> None:
+        """
+        Clean up resources to prevent memory leaks.
+        This should be called when the stage is completed or no longer needed.
+        """
+        # Clear large data structures
+        self.bot_performance.clear()
+        self.bot_last_used.clear()
