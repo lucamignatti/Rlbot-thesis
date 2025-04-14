@@ -99,7 +99,7 @@ def run_training(
     num_envs: int,
     # Remove training_step_offset from signature, it's loaded by trainer.load_models
     # Add model_path_to_load parameter
-    model_path_to_load: str = None, 
+    model_path_to_load: str = None,
     total_episodes: int = None,
     training_time: float = None,
     render: bool = False,
@@ -180,7 +180,7 @@ def run_training(
         actor,
         critic,
         # Pass training_step_offset=0 initially, load_models will update it
-        training_step_offset=0, 
+        training_step_offset=0,
         algorithm_type=algorithm,  # Use the specified algorithm
         action_space_type="discrete",  # For RLBot, we use discrete actions
         action_dim=actor.action_shape,
@@ -263,7 +263,7 @@ def run_training(
     # Initialize curriculum manager AFTER trainer is created and potentially loaded
     curriculum_manager = None
     # Use the trainer's potentially updated pretraining status
-    effective_use_pretraining = trainer.use_pretraining and not trainer.pretraining_completed 
+    effective_use_pretraining = trainer.use_pretraining and not trainer.pretraining_completed
     if use_curriculum: # Check the original arg flag first
         try:
             curriculum_manager = create_curriculum(
@@ -272,20 +272,20 @@ def run_training(
                 lr_actor=trainer.lr_actor, # Use potentially loaded LR
                 lr_critic=trainer.lr_critic, # Use potentially loaded LR
                 # IMPORTANT: Use the trainer's state to decide if pretraining is active
-                use_pretraining=effective_use_pretraining 
+                use_pretraining=effective_use_pretraining
             )
             # Register trainer with curriculum manager
             curriculum_manager.register_trainer(trainer)
             # Assign curriculum manager back to trainer
-            trainer.curriculum_manager = curriculum_manager 
-            
+            trainer.curriculum_manager = curriculum_manager
+
             # If loading occurred, ensure curriculum state matches loaded state
             if model_path_to_load and hasattr(trainer, '_loaded_curriculum_state'):
                  # If load_models stored the state, re-apply it AFTER manager creation
                  print("[DEBUG] Re-applying loaded curriculum state to manager...")
                  curriculum_manager.load_state(trainer._loaded_curriculum_state)
                  # Re-register again just in case load_state overwrites something
-                 curriculum_manager.register_trainer(trainer) 
+                 curriculum_manager.register_trainer(trainer)
                  del trainer._loaded_curriculum_state # Clean up temporary state
 
             if debug:
@@ -307,7 +307,7 @@ def run_training(
     env_class = VectorizedEnv  # Default
     if curriculum_manager and curriculum_manager.requires_bots():
         env_class = RLBotVectorizedEnv
-        
+
     # Create environment constructor arguments based on the class
     env_args = {
         'num_envs': num_envs,
@@ -316,11 +316,11 @@ def run_training(
         'curriculum_manager': curriculum_manager,
         'debug': debug
     }
-    
+
     # Only add rlbotpack_path if using RLBotVectorizedEnv
     if env_class == RLBotVectorizedEnv:
         env_args['rlbotpack_path'] = os.path.join(os.path.dirname(__file__), "RLBotPack")
-        
+
     vec_env = env_class(**env_args)
 
     # For time-based training, we'll need to know when we started.
@@ -349,14 +349,14 @@ def run_training(
         "Episodes": 0,  # Total episodes completed
         "Algorithm": algorithm  # Display which algorithm is being used
     }
-    
+
     # Add algorithm-specific progress metrics
     if algorithm == "ppo":
         stats_dict["Exp"] = f"0/{update_interval}"  # Experience counter for PPO
     else:  # StreamAC
         stats_dict["Steps"] = 0  # Step counter for StreamAC
         stats_dict["Updates"] = 0  # Update counter for StreamAC
-        
+
     # Add common metrics
     stats_dict.update({
         "Reward": "0.0",  # Average reward per episode
@@ -364,7 +364,7 @@ def run_training(
         "VLoss": "0.0",  # Critic loss
         "Entropy": "0.0"  # Entropy loss
     })
-    
+
     # Add auxiliary task metrics if enabled
     if auxiliary:
         stats_dict.update({
@@ -419,7 +419,7 @@ def run_training(
         except Exception as e:
             if debug:
                 print(f"[DEBUG] Error initializing rewards for env {i}: {e}")
-    
+
     # Add a list to track rewards of completed episodes between PPO updates
     completed_episode_rewards_since_last_update = []
 
@@ -472,12 +472,12 @@ def run_training(
                     log_prob_batch = [log_prob_batch]
                 if type(value_batch) in [int, float, np.float64, np.float32]:
                     value_batch = [value_batch]
-                
+
                 # Organize actions into a list of dictionaries, one for each environment.
                 for i, (action, log_prob, value) in enumerate(zip(action_batch, log_prob_batch, value_batch)):
                     env_idx = all_env_indices[i]
                     agent_id = all_agent_ids[i]
-                    
+
                     # Make sure actions sent to environments are CPU tensors or numpy arrays
                     # This prevents CUDA/HIP errors when sending tensors between processes
                     if isinstance(action, torch.Tensor) and action.is_cuda:
@@ -497,7 +497,7 @@ def run_training(
                         env_id=env_idx  # Pass the environment index to support vectorized StreamAC
                     )
                     collected_experiences += 1
-                    
+
                     # Add periodic debug log to verify experience collection
                     if debug and collected_experiences % 1000 == 0:
                         if algorithm == "ppo" and hasattr(trainer.algorithm, 'memory'):
@@ -526,7 +526,7 @@ def run_training(
                     if debug:
                         print(f"[DEBUG] Unexpected result type: {type(result)}")
                     continue
-                    
+
                 for agent_id in reward_dict.keys():  # Use reward_dict to ensure we get the correct agent ID.
                     # Get the actual reward and done flag for this agent in this environment.
                     reward = reward_dict[agent_id]
@@ -550,10 +550,10 @@ def run_training(
                         # Debug the reward update process
                         if debug and exp_idx == 0:  # Only log for the first agent to avoid too much output
                             print(f"[DEBUG] Updating experience at idx {mem_idx} with reward={reward:.4f}, done={done}")
-                        
+
                         # Get original observation and action from memory
                         orig_obs = all_obs[exp_idx]
-                        
+
                         # Calculate combined reward (extrinsic + intrinsic) if next observation is available
                         if next_obs is not None and trainer.use_intrinsic_rewards:
                             reward = trainer.update_experience_with_intrinsic_reward(
@@ -563,7 +563,7 @@ def run_training(
                                 reward=reward,
                                 env_id=env_idx
                             )
-                        
+
                         trainer.store_experience_at_idx(mem_idx, None, None, None, reward, None, done)
                     else:
                         # For StreamAC, we directly update the latest experience with env_idx
@@ -573,7 +573,7 @@ def run_training(
                                 # Update the most recent experience with actual reward and done flag
                                 try:
                                     latest_exp = trainer.algorithm.experience_buffers[env_idx][-1]
-                                    
+
                                     # Calculate combined reward (extrinsic + intrinsic) if next observation is available
                                     if next_obs is not None and trainer.use_intrinsic_rewards:
                                         reward = trainer.update_experience_with_intrinsic_reward(
@@ -583,7 +583,7 @@ def run_training(
                                             reward=reward,
                                             env_id=env_idx
                                         )
-                                    
+
                                     if 'reward' in latest_exp:  # Safety check
                                         if isinstance(reward, (int, float, np.number)):
                                             latest_exp['reward'] = torch.tensor(reward, dtype=torch.float32, device=trainer.device)
@@ -596,7 +596,7 @@ def run_training(
                                             latest_exp['reward'] = reward.to(device=trainer.device, dtype=torch.float32)
                                         else:
                                             latest_exp['reward'] = torch.tensor(float(reward), dtype=torch.float32, device=trainer.device)
-                                        
+
                                         # Update reward tracking for return calculation
                                         if hasattr(trainer.algorithm, 'update_reward_tracking'):
                                             trainer.algorithm.update_reward_tracking(reward, env_id=env_idx)
@@ -616,11 +616,11 @@ def run_training(
                                             trainer.algorithm.update_reward_tracking(reward)
                                     if 'done' in latest_exp:  # Safety check
                                         latest_exp['done'] = torch.tensor([float(done)], dtype=torch.float32, device=trainer.device)
-                                        
+
                                         # When episode is done, explicitly track the return
                                         if done and debug:
                                             print(f"[DEBUG] Episode done detected for agent {agent_id} with reward {reward}")
-                                        
+
                                         # If the episode is done, force calculation of the return for this episode
                                         if done and hasattr(trainer.algorithm, 'current_episode_rewards') and len(trainer.algorithm.current_episode_rewards) > 0:
                                             episode_return = sum(trainer.algorithm.current_episode_rewards)
@@ -685,7 +685,7 @@ def run_training(
                             avg_reward = sum(episode_rewards[env_idx].values()) / max(1, len(episode_rewards[env_idx]))
                             if debug:
                                 print(f"Episode {episode_counts[env_idx]} in env {env_idx} completed with avg reward: {avg_reward:.2f}")
-                            
+
                             # Track average episode reward for PPO updates
                             if algorithm == "ppo":
                                 completed_episode_rewards_since_last_update.append(avg_reward)
@@ -693,7 +693,7 @@ def run_training(
                             # Handle case where there are no rewards (shouldn't happen in normal usage)
                             if debug:
                                 print(f"Warning: Episode {episode_counts[env_idx]} in env {env_idx} completed with no rewards recorded")
-                        
+
                         # Reset rewards dictionary for next episode
                         episode_rewards[env_idx] = {agent_id: 0 for agent_id in vec_env.obs_dicts[env_idx]}
 
@@ -705,11 +705,11 @@ def run_training(
                 # or if the buffer is close to being full
                 buffer_capacity = trainer.algorithm.memory.buffer_size if hasattr(trainer.algorithm.memory, 'buffer_size') else update_interval
                 buffer_position = trainer.algorithm.memory.pos if hasattr(trainer.algorithm, 'pos') else collected_experiences
-                
+
                 # Trigger update if we've collected enough experiences OR if buffer is 90% full
-                enough_experiences = (collected_experiences >= update_interval or 
+                enough_experiences = (collected_experiences >= update_interval or
                                     buffer_position >= buffer_capacity * 0.9)
-                
+
                 if args.debug and enough_experiences:
                     print(f"[DEBUG] PPO update triggered - collected: {collected_experiences}/{update_interval}, " +
                           f"buffer: {buffer_position}/{buffer_capacity}")
@@ -717,7 +717,7 @@ def run_training(
                 # For StreamAC, updates happen online with immediate wandb logging
                 # We still want to update progress bar and UI periodically
                 enough_experiences = collected_experiences % update_interval == 0
-                
+
                 # Add more frequent update status for StreamAC UI (check if >= 50 steps passed since last update)
                 if algorithm == "streamac" and (collected_experiences - last_progress_update_step >= 50) and collected_experiences > 0:
                     # Update step count and success rate metrics for StreamAC
@@ -725,7 +725,7 @@ def run_training(
                         successful_steps = getattr(trainer.algorithm, "successful_steps", 0)
                         step_sizes = getattr(trainer.algorithm, "last_step_sizes", [0])
                         last_step = step_sizes[-1] if len(step_sizes) > 0 else 0
-                        
+
                         # Update stats specifically for StreamAC progress display
                         stats_dict.update({
                             "Steps": collected_experiences,
@@ -734,10 +734,10 @@ def run_training(
                             "ActorLR": f"{getattr(trainer.algorithm, 'lr_actor', lr_actor):.6f}",
                             "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic):.6f}"
                         })
-                        
+
                         # Initialize metrics with latest algorithm metrics to avoid NameError
                         metrics = trainer.algorithm.get_metrics() if hasattr(trainer.algorithm, 'get_metrics') else {}
-                        
+
                         # Update statistics from the algorithm's metrics
                         if metrics:
                             stats_dict.update({
@@ -746,19 +746,19 @@ def run_training(
                                 "VLoss": f"{metrics.get('critic_loss', 0)::.4f}",
                                 "Entropy": f"{metrics.get('entropy_loss', 0):.4f}"
                             })
-                            
+
                             if 'sr_loss' in metrics or 'rp_loss' in metrics:
                                 stats_dict.update({
                                     "SR_Loss": f"{metrics.get('sr_loss', 0):.4f}",
                                     "RP_Loss": f"{metrics.get('rp_loss', 0):.4f}"
                                 })
-                        
+
                         # Update progress bar immediately
                         progress_bar.set_postfix(stats_dict)
-                        
+
                         # Record the step count at which this update happened
                         last_progress_update_step = collected_experiences
-                
+
                 # Debug mode can show more details
                 if debug and collected_experiences % 100 == 0 and collected_experiences > 0:
                     if algorithm == "streamac":
@@ -817,29 +817,29 @@ def run_training(
                         "Stage": curriculum_stats["current_stage_name"],
                         "Diff": f"{curriculum_stats['difficulty_level']:.2f}"
                     })
-                    
+
                     if use_wandb:
                         # Get current stage stats
                         current_stage_stats = curriculum_stats["current_stage_stats"]
-                        
+
                         # Use trainer's _true_training_steps as source of truth for step counting
                         # This ensures we're using EXACTLY the same step as the trainer just used
                         current_step = trainer.training_steps + trainer.training_step_offset
-                        
+
                         # Synchronize curriculum manager step counter to match trainer exactly
                         curriculum_manager._last_wandb_step = current_step
-                        
-                        # Don't log curriculum metrics separately - the PPOTrainer.update() method 
+
+                        # Don't log curriculum metrics separately - the PPOTrainer.update() method
                         # already logs these through the synchronized step counter
                         # This prevents duplicate/competing logging attempts
-                        
+
                         # Instead, we'll update the trainer's curriculum manager reference
                         # to ensure that it has the most up-to-date curriculum statistics
                         # for its own logging in the next update
                         if hasattr(trainer, 'curriculum_manager'):
                             # Just make sure the trainer's reference is up to date
                             trainer.curriculum_manager = curriculum_manager
-                
+
                 progress_bar.set_postfix(stats_dict)
 
                 collected_experiences = 0
@@ -861,29 +861,29 @@ def run_training(
                     # Force progress bar update for better visual feedback during debugging
                     progress_bar.set_postfix(stats_dict)
                     progress_bar.refresh()
-                
+
             # Regular update for non-debug mode or other algorithms
             progress_bar.set_postfix(stats_dict)
-            
+
             # Update pretraining progress if enabled
             if use_pretraining:
-                pretraining_end_step = trainer._get_pretraining_end_step() 
+                pretraining_end_step = trainer._get_pretraining_end_step()
                 in_pretraining = not trainer.pretraining_completed
                 in_transition = trainer.in_transition_phase
-                
+
                 # Force check of pretraining completion status based on current episode count
                 current_step = total_episodes_so_far + trainer.total_episodes_offset
                 if current_step >= pretraining_end_step and not trainer.pretraining_completed and not trainer.in_transition_phase:
                     print(f"Triggering pretraining transition at episode {current_step}/{pretraining_end_step}")
                     trainer.in_transition_phase = True
                     trainer.transition_start_step = current_step
-                
+
                 if in_pretraining:
                     stats_dict["Mode"] = "PreTraining"
                     stats_dict["PT_Progress"] = f"{current_step}/{pretraining_end_step}"
                 elif in_transition:
                     stats_dict["Mode"] = "PT_Transition"
-                    transition_progress = min(100, int(100 * (current_step - trainer.transition_start_step) / 
+                    transition_progress = min(100, int(100 * (current_step - trainer.transition_start_step) /
                                               trainer.pretraining_transition_steps))
                     stats_dict["PT_Progress"] = f"{transition_progress}%"
                 else:
@@ -892,7 +892,7 @@ def run_training(
                         stats_dict.pop("Mode", None)
                     if "PT_Progress" in stats_dict:
                         stats_dict.pop("PT_Progress", None)
-            
+
             progress_bar.set_postfix(stats_dict)
 
         # --- Added Memory Print at the end of the try block ---
@@ -1019,15 +1019,15 @@ if __name__ == "__main__":
 
     # Training loop parameters
     parser.add_argument('--ppo_epochs', type=int, default=10, help='Number of PPO epochs per update')
-    parser.add_argument('--batch_size', type=int, default=8192, help='Batch size for PPO updates')    
+    parser.add_argument('--batch_size', type=int, default=8192, help='Batch size for PPO updates')
 
     parser.add_argument('--weight_clip_kappa', type=float, default=1.0, help='Weight clipping factor for PPO')
     parser.add_argument('--weight_clipping', type=bool, default=True, help='Enable weight clipping for PPO')
-    
+
     # Adaptive weight clipping parameters
-    parser.add_argument('--adaptive_kappa', action='store_true', help='Enable adaptive weight clipping kappa')
-    parser.add_argument('--no-adaptive_kappa', action='store_false', dest='adaptive_kappa', help='Disable adaptive weight clipping kappa')
-    parser.set_defaults(adaptive_kappa=True)  # Enable by default
+    parser.add_argument('--adaptive_kappa', action='store_false', help='Enable adaptive weight clipping kappa')
+    parser.add_argument('--no-adaptive_kappa', action='store_true', dest='adaptive_kappa', help='Disable adaptive weight clipping kappa')
+    parser.set_defaults(adaptive_kappa=False)  # Disable by default
     parser.add_argument('--kappa_update_freq', type=int, default=10, help='Update frequency for adaptive kappa')
     parser.add_argument('--kappa_update_rate', type=float, default=0.01, help='Update rate for adaptive kappa (1% by default)')
     parser.add_argument('--target_clip_fraction', type=float, default=0.05, help='Target fraction of weights to clip (5% by default)')
@@ -1100,13 +1100,13 @@ if __name__ == "__main__":
     parser.add_argument('--use-intrinsic', action='store_true', help='Use intrinsic rewards during pre-training')
     parser.add_argument('--no-intrinsic', action='store_false', dest='use_intrinsic', help='Disable intrinsic rewards during pre-training')
     parser.set_defaults(use_intrinsic=True)
-    
-    parser.add_argument('--intrinsic-scale', type=float, default=0.7, 
+
+    parser.add_argument('--intrinsic-scale', type=float, default=0.7,
                        help='Scaling factor for intrinsic rewards (default: 0.7)')
-    
+
     parser.add_argument('--curiosity-weight', type=float, default=0.5,
                        help='Weight for curiosity-based intrinsic rewards (default: 0.5)')
-    
+
     parser.add_argument('--rnd-weight', type=float, default=0.5,
                        help='Weight for Random Network Distillation rewards (default: 0.5)')
 
@@ -1117,40 +1117,40 @@ if __name__ == "__main__":
     streamac_group.add_argument('--no-adaptive-lr', action='store_false', dest='adaptive_learning_rate',
                                help='Disable adaptive learning rate for StreamAC')
     parser.set_defaults(adaptive_learning_rate=True)
-    
+
     streamac_group.add_argument('--target-step-size', type=float, default=0.025,
                                help='Target effective step size for StreamAC (default: 0.025)')
-    
+
     streamac_group.add_argument('--backtracking-patience', type=int, default=10,
                                 help='Number of steps before backtracking parameters (default: 10)')
-    
+
     streamac_group.add_argument('--backtracking-zeta', type=float, default=0.85,
                                help='Scaling factor for learning rate during backtracking (default: 0.85)')
-    
+
     streamac_group.add_argument('--min-lr-factor', type=float, default=0.1,
                                help='Minimum learning rate factor relative to initial (default: 0.1)')
-    
+
     streamac_group.add_argument('--max-lr-factor', type=float, default=10.0,
                                help='Maximum learning rate factor relative to initial (default: 10.0)')
-    
+
     streamac_group.add_argument('--obgd', action='store_true', dest='use_obgd',
                                help='Enable Online Backpropagation with Decoupled Gradient (default: True)')
     streamac_group.add_argument('--no-obgd', action='store_false', dest='use_obgd',
                                 help='Disable Online Backpropagation with Decoupled Gradient')
     parser.set_defaults(use_obgd=True)
-    
+
     streamac_group.add_argument('--stream-buffer-size', type=int, default=32,
                                help='Size of experience buffer for StreamAC (default: 32)')
-    
+
     streamac_group.add_argument('--sparse-init', action='store_true', dest='use_sparse_init',
                                help='Use SparseInit for network initialization (default: True)')
     streamac_group.add_argument('--no-sparse-init', action='store_false', dest='use_sparse_init',
                                 help='Use default PyTorch initialization instead of SparseInit')
     parser.set_defaults(use_sparse_init=True)
-    
+
     streamac_group.add_argument('--update-freq', type=int, default=4,
                                help='Frequency of updates for StreamAC (default: 4, update every 4th step)')
-    
+
     # Backwards compatibility.
     parser.add_argument('-p', '--processes', type=int, default=None,
                         help='Legacy parameter; use --num_envs instead')
@@ -1257,7 +1257,7 @@ if __name__ == "__main__":
             config={
                 # Algorithm
                 "algorithm": args.algorithm,
-                
+
                 # Hyperparameters
                 "learning_rate_actor": args.lra,
                 "learning_rate_critic": args.lrc,
@@ -1293,7 +1293,7 @@ if __name__ == "__main__":
             name=f"{args.algorithm.upper()}_{time.strftime('%Y%m%d-%H%M%S')}",
             monitor_gym=False,  # Don't use wandb's default gym monitoring
         )
-        
+
         # Add StreamAC specific config if using that algorithm
         if args.algorithm == "streamac":
             wandb.config.update({
@@ -1321,7 +1321,7 @@ if __name__ == "__main__":
 
     # Get the training step offset (initialize to 0)
     # This will be updated inside run_training if a model is loaded
-    trainer_offset = 0 
+    trainer_offset = 0
 
     # Start the main training process
     # Pass args.model path to run_training
@@ -1343,7 +1343,7 @@ if __name__ == "__main__":
         output_path=args.out,
         use_curriculum=args.curriculum,
         # Pass model path to run_training
-        model_path_to_load=args.model, 
+        model_path_to_load=args.model,
         algorithm=args.algorithm,
         lr_actor=args.lra,
         lr_critic=args.lrc,
@@ -1445,7 +1445,7 @@ if __name__ == "__main__":
                         'dropout': args.dropout
                     },
                 }
-                
+
                 # Add StreamAC specific metadata if relevant
                 if args.algorithm == "streamac":
                     metadata.update({
