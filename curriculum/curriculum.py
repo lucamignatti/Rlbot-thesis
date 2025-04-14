@@ -23,14 +23,18 @@ import random
 
 # Try to import mutators from rlgym_tools if available
 try:
-    from rlgym_tools.rocket_league.state_mutators import AugmentMutator, RandomPhysicsMutator, WeightedSampleMutator
+    # Import directly from correct submodules - don't use aliases to avoid type issues
+    from rlgym_tools.rocket_league.state_mutators.augment_mutator import AugmentMutator
+    from rlgym_tools.rocket_league.state_mutators.random_physics_mutator import RandomPhysicsMutator
+    from rlgym_tools.rocket_league.state_mutators.weighted_sample_mutator import WeightedSampleMutator
     from rlgym_tools.rocket_league.state_mutators.random_scoreboard_mutator import RandomScoreboardMutator
+    # Set flag that imports were successful
     RLGYM_TOOLS_AVAILABLE = True
 except ImportError:
     print("Warning: rlgym_tools not available or incompatible version. Using fallback implementations.")
     # Define simplified versions if the real ones aren't available
     from rlgym.api import StateMutator
-    from typing import Dict, Any
+    from typing import Dict, Any, List, Optional, Union, Tuple
     
     class AugmentMutator(StateMutator):
         """Simplified version of AugmentMutator for data augmentation"""
@@ -161,7 +165,8 @@ def get_basic_aerial_car_position():
         17
     ])
 
-def get_aerial_ball_position():
+def get_aerial_ball_position_v2():
+    """Get aerial ball position with different range parameters than the first version"""
     return np.array([
         np.random.uniform(-800, 800),
         np.random.uniform(-2000, -1000),
@@ -1559,12 +1564,15 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=2, orange_size=2),
             # Add the randomized scoreboard for realistic match scenarios
+            # Note: Different params for rlgym_tools vs fallback implementation
             RandomScoreboardMutator(
-                # Use lower max_score to create more varied game scenarios
-                max_score=3,
-                random_reset_odds=0.8, # 80% chance scoreboard persists between resets
-                reset_on_goal=True,
-                initialized_random_odds=0.7 # 70% chance game starts with existing score
+                # Use max_game_length for real implementation, other params for fallback
+                **({'max_game_length': 300.0} if RLGYM_TOOLS_AVAILABLE else {
+                    'max_score': 3,
+                    'random_reset_odds': 0.8,
+                    'reset_on_goal': True,
+                    'initialized_random_odds': 0.7
+                })
             ),
             # Use field augmentation for better generalization
             AugmentMutator(shuffle_within_teams=True, randomize_front_back=True, randomize_left_right=True),
