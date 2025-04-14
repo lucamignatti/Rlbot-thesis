@@ -66,11 +66,8 @@ except ImportError:
                 
     class RandomScoreboardMutator(StateMutator):
         """Simplified placeholder for RandomScoreboardMutator"""
-        def __init__(self, max_score=5, random_reset_odds=0.5, reset_on_goal=True, initialized_random_odds=0.5):
-            self.max_score = max_score
-            self.random_reset_odds = random_reset_odds
-            self.reset_on_goal = reset_on_goal
-            self.initialized_random_odds = initialized_random_odds
+        def __init__(self, max_game_length=300.0):
+            self.max_game_length = max_game_length
             
         def apply(self, state, shared_info: Dict[str, Any]) -> None:
             # Simplified implementation that does nothing
@@ -1564,16 +1561,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=2, orange_size=2),
             # Add the randomized scoreboard for realistic match scenarios
-            # Note: Different params for rlgym_tools vs fallback implementation
-            RandomScoreboardMutator(
-                # Use max_game_length for real implementation, other params for fallback
-                **({'max_game_length': 300.0} if RLGYM_TOOLS_AVAILABLE else {
-                    'max_score': 3,
-                    'random_reset_odds': 0.8,
-                    'reset_on_goal': True,
-                    'initialized_random_odds': 0.7
-                })
-            ),
+            # The correct implementation for RandomScoreboardMutator
+            RandomScoreboardMutator(max_game_length=300.0),
             # Use field augmentation for better generalization
             AugmentMutator(shuffle_within_teams=True, randomize_front_back=True, randomize_left_right=True),
             KickoffMutator()
