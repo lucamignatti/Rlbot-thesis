@@ -41,12 +41,27 @@ class DiscreteAction:
     def __init__(self):
         # Instead of returning a single integer, we need to return a numpy array
         # for the lookup_table_action parser
-        pass
-
+        self.action_counter = 0
+        self.action_cycle = np.array([
+            [0],  # No action
+            [1],  # Throttle
+            [2],  # Boost
+            [3],  # Boost + Throttle
+            [4],  # Jump
+            [5],  # Jump + Direction
+            [8],  # Pitch up/down
+            [9],  # Yaw left/right
+            [10], # Roll left/right
+            [11], # Jump + Boost (for aerials)
+            [12]  # Air roll (for recoveries)
+        ], dtype=np.int32)
+        self.cycle_length = len(self.action_cycle)
+        
     def get_action(self) -> np.ndarray:
-        # Return a numpy array with a single element (0)
-        # This format is expected by lookup_table_action parser
-        return np.array([8], dtype=np.int32)
+        # Cycle through different actions to test a variety of behaviors
+        action = self.action_cycle[self.action_counter % self.cycle_length]
+        self.action_counter += 1
+        return action
 
 
 def import_module_function(module_path: str, function_name: str) -> Tuple[Any, Optional[Exception]]:
@@ -273,11 +288,19 @@ def run_skill_module(stage_index: int, skill_index: int, render: bool = True, nu
                 print(f"Episode complete: done flag is True")
                 break
             
-            # Create action dictionary based on observation
+            # Create action dictionary based on observation with some randomness
             if isinstance(obs, dict):
-                action_dict = {agent_id: zero_action for agent_id in obs.keys()}
+                action_dict = {}
+                for agent_id in obs.keys():
+                    # Get a potentially different action for each agent
+                    action = discrete_action.get_action()
+                    # Add random actions occasionally to explore more behaviors
+                    if np.random.random() < 0.2:  # 20% chance of random action
+                        random_idx = np.random.randint(0, discrete_action.cycle_length)
+                        action = discrete_action.action_cycle[random_idx]
+                    action_dict[agent_id] = action
             else:
-                action_dict = {'blue-0': zero_action}  # Default agent ID if not specified
+                action_dict = {'blue-0': discrete_action.get_action()}  # Default agent ID if not specified
             
             # Add timeout for env.step to catch hangs
             signal.signal(signal.SIGALRM, timeout_handler)

@@ -14,10 +14,65 @@ from rewards import (
     PassCompletionReward, ScoringOpportunityCreationReward, AerialControlReward,
     AerialDirectionalTouchReward, BlockSuccessReward, DefensivePositioningReward, 
     BallClearanceReward, TeamSpacingReward, TeamPossessionReward,
-    create_distance_weighted_alignment_reward, create_offensive_potential_reward, create_lucy_skg_reward
+    create_distance_weighted_alignment_reward, create_offensive_potential_reward, create_lucy_skg_reward,
+    # New reward functions from rlgym-tools
+    AerialDistanceReward, FlipResetReward, WavedashReward
 )
 import numpy as np
 import random
+
+# Try to import mutators from rlgym_tools if available
+try:
+    from rlgym_tools.rocket_league.state_mutators import AugmentMutator, RandomPhysicsMutator, WeightedSampleMutator
+    from rlgym_tools.rocket_league.state_mutators.random_scoreboard_mutator import RandomScoreboardMutator
+    RLGYM_TOOLS_AVAILABLE = True
+except ImportError:
+    print("Warning: rlgym_tools not available or incompatible version. Using fallback implementations.")
+    # Define simplified versions if the real ones aren't available
+    from rlgym.api import StateMutator
+    from typing import Dict, Any
+    
+    class AugmentMutator(StateMutator):
+        """Simplified version of AugmentMutator for data augmentation"""
+        def __init__(self, shuffle_within_teams=True, randomize_front_back=True, randomize_left_right=True):
+            self.shuffle_within_teams = shuffle_within_teams
+            self.randomize_front_back = randomize_front_back
+            self.randomize_left_right = randomize_left_right
+            
+        def apply(self, state, shared_info: Dict[str, Any]) -> None:
+            # Simplified version that doesn't actually modify the state
+            # but allows code to run without the actual implementation
+            pass
+    
+    class RandomPhysicsMutator(StateMutator):
+        """Simplified placeholder for RandomPhysicsMutator"""
+        def apply(self, state, shared_info: Dict[str, Any]) -> None:
+            pass
+            
+    class WeightedSampleMutator(StateMutator):
+        """Simplified placeholder for WeightedSampleMutator"""
+        def __init__(self, mutators, weights):
+            self.mutators = mutators
+            self.weights = weights
+            
+        def apply(self, state, shared_info: Dict[str, Any]) -> None:
+            # Just apply the first mutator as fallback
+            if self.mutators:
+                self.mutators[0].apply(state, shared_info)
+                
+    class RandomScoreboardMutator(StateMutator):
+        """Simplified placeholder for RandomScoreboardMutator"""
+        def __init__(self, max_score=5, random_reset_odds=0.5, reset_on_goal=True, initialized_random_odds=0.5):
+            self.max_score = max_score
+            self.random_reset_odds = random_reset_odds
+            self.reset_on_goal = reset_on_goal
+            self.initialized_random_odds = initialized_random_odds
+            
+        def apply(self, state, shared_info: Dict[str, Any]) -> None:
+            # Simplified implementation that does nothing
+            pass
+    
+    RLGYM_TOOLS_AVAILABLE = False
 from curriculum.rlbot import RLBotSkillStage
 from curriculum.skills import SkillModule, SkillBasedCurriculumStage
 from functools import partial
@@ -1000,6 +1055,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         name="Wall & Air Mechanics",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
+            # Add data augmentation to improve generalization
+            AugmentMutator(shuffle_within_teams=False, randomize_front_back=True, randomize_left_right=True),
             BallPositionMutator(position_function=SafePositionWrapper(get_basic_aerial_ball_position)), # Low aerials
             CarBoostMutator(boost_amount=50),
             # Add face opponent goal orientation
@@ -1010,7 +1067,9 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         base_task_reward_function=CombinedReward(
             (touch_ball_reward, 0.2),
             (save_boost_reward, 0.3),
-            (goal_velocity_reward, 0.5), # Reward hitting towards goal even from air
+            (goal_velocity_reward, 0.3), # Reward hitting towards goal even from air
+            (AerialDistanceReward(touch_height_weight=1.0, car_distance_weight=0.5, ball_distance_weight=0.5), 0.5),
+            (AerialDirectionalTouchReward(), 0.4),
             (GoalReward(), 1.0),
         ),
         base_task_termination_condition=goal_condition,
@@ -1039,6 +1098,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                 name="Jump Aerials",
                 state_mutator=MutatorSequence(
                     FixedTeamSizeMutator(blue_size=1, orange_size=0),
+                    AugmentMutator(shuffle_within_teams=False, randomize_front_back=True, randomize_left_right=True),
                     BallPositionMutator(position_function=SafePositionWrapper(get_basic_aerial_ball_position)), # Low aerials
                     CarBoostMutator(boost_amount=50),
                     # Add face opponent goal orientation
@@ -1047,8 +1107,9 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                                        orientation_function=get_face_opp_goal_orientation)
                 ),
                 reward_function=CombinedReward(
-                    (touch_ball_reward, 1.0),
-                    (AerialControlReward(), 0.3) # Basic stability reward
+                    (touch_ball_reward, 0.7),
+                    (AerialControlReward(), 0.3), # Basic stability reward
+                    (AerialDistanceReward(touch_height_weight=1.0, car_distance_weight=0.5, ball_distance_weight=0.5), 0.5)
                 ),
                 termination_condition=TouchBallCondition(),
                 truncation_condition=short_timeout,
@@ -1195,6 +1256,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         name="Intermediate Ball Control",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
+            # Add data augmentation for better generalization
+            AugmentMutator(shuffle_within_teams=False, randomize_front_back=False, randomize_left_right=True),
             # First position the car with a predictable location
             CarPositionMutator(car_id="blue-0", 
                                position_function=SafePositionWrapper(partial(create_position, 0, -2800, 17)),
@@ -1208,9 +1271,10 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             CarBoostMutator(boost_amount=50)
         ),
         base_task_reward_function=CombinedReward(
-            (ball_proximity_reward, 0.6),
-            (velocity_to_ball_reward, 0.4), # Keep moving with ball
+            (ball_proximity_reward, 0.5),
+            (velocity_to_ball_reward, 0.3), # Keep moving with ball
             (goal_velocity_reward, 0.4),
+            (WavedashReward(scale_by_acceleration=True, weight=0.8), 0.3), # Add wavedash reward
             (GoalReward(), 1.5)
         ),
         base_task_termination_condition=goal_condition,
@@ -1269,6 +1333,34 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                 ),
                 termination_condition=goal_condition,
                 truncation_condition=TimeoutCondition(15),
+                difficulty_params={},
+                success_threshold=0.5
+            ),
+            SkillModule(
+                name="Wavedash Training",
+                state_mutator=MutatorSequence(
+                    FixedTeamSizeMutator(blue_size=1, orange_size=0),
+                    CarPositionMutator(car_id="blue-0", 
+                                    position_function=SafePositionWrapper(
+                                        lambda: np.array([np.random.uniform(-1000, 1000), 
+                                                          np.random.uniform(-4000, -3000), 
+                                                          800])  # Start in the air
+                                    ),
+                                    orientation_function=get_random_yaw_orientation),
+                    BallPositionMutator(position_function=SafePositionWrapper(
+                        lambda: np.array([np.random.uniform(-2000, 2000), 
+                                          np.random.uniform(1000, 3000), 
+                                          93])
+                    )),
+                    CarBoostMutator(boost_amount=30)
+                ),
+                reward_function=CombinedReward(
+                    (WavedashReward(scale_by_acceleration=True, weight=1.0), 1.0),
+                    (velocity_to_ball_reward, 0.5),
+                    (GoalReward(), 2.0)
+                ),
+                termination_condition=TimeoutCondition(8),
+                truncation_condition=TimeoutCondition(8),
                 difficulty_params={},
                 success_threshold=0.5
             ),
@@ -1361,6 +1453,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         name="Intermediate Aerials & Wall Play",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
+            AugmentMutator(shuffle_within_teams=False, randomize_front_back=True, randomize_left_right=True),
             BallPositionMutator(position_function=SafePositionWrapper(get_advanced_aerial_ball_position)), # Higher aerials
             BallVelocityMutator(velocity_function=SafePositionWrapper(get_advanced_aerial_ball_velocity)), # Moving aerials
             # Add face opponent goal orientation
@@ -1371,8 +1464,10 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         ),
         base_task_reward_function=CombinedReward(
             (touch_ball_reward, 0.2),
-            (AerialControlReward(), 0.4), # More emphasis on control
-            (AerialDirectionalTouchReward(), 0.6), # Reward controlled aerial hits
+            (AerialControlReward(), 0.3), # More emphasis on control
+            (AerialDirectionalTouchReward(), 0.5), # Reward controlled aerial hits
+            (AerialDistanceReward(touch_height_weight=1.0, car_distance_weight=0.7, ball_distance_weight=0.7), 0.4),
+            (FlipResetReward(obtain_flip_weight=0.8, hit_ball_weight=1.2), 0.6), # Advanced aerial mechanic
             (GoalReward(), 2.0),
         ),
         base_task_termination_condition=goal_condition,
@@ -1382,6 +1477,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                 name="Fast Aerials",
                  state_mutator=MutatorSequence(
                     FixedTeamSizeMutator(blue_size=1, orange_size=0),
+                    AugmentMutator(shuffle_within_teams=False, randomize_front_back=True, randomize_left_right=True),
                     BallPositionMutator(position_function=SafePositionWrapper(get_fast_aerial_ball_position)), # Higher, faster targets
                     # Add face opponent goal orientation
                     CarPositionMutator(car_id="blue-0", 
@@ -1389,8 +1485,9 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                     CarBoostMutator(boost_amount=100)
                 ),
                 reward_function=CombinedReward(
-                    (touch_ball_reward, 1.0),
-                    (AerialControlReward(), 0.5)
+                    (touch_ball_reward, 0.6),
+                    (AerialControlReward(), 0.5),
+                    (AerialDistanceReward(touch_height_weight=1.0, car_distance_weight=0.7, ball_distance_weight=0.7), 0.6)
                 ),
                 termination_condition=TouchBallCondition(),
                 truncation_condition=short_timeout,
@@ -1401,6 +1498,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                 name="Wall-to-Air",
                  state_mutator=MutatorSequence(
                     FixedTeamSizeMutator(blue_size=1, orange_size=0),
+                    AugmentMutator(shuffle_within_teams=False, randomize_front_back=True, randomize_left_right=True),
                     BallPositionMutator(position_function=SafePositionWrapper(get_ball_wall_position)), # Ball high on wall
                     # Add random yaw orientation
                     CarPositionMutator(car_id="blue-0", 
@@ -1409,13 +1507,42 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                     CarBoostMutator(boost_amount=60)
                 ),
                 reward_function=CombinedReward(
-                    (touch_ball_reward, 1.0),
-                    (AerialDirectionalTouchReward(), 0.6)
+                    (touch_ball_reward, 0.7),
+                    (AerialDirectionalTouchReward(), 0.6),
+                    (AerialDistanceReward(touch_height_weight=0.8, car_distance_weight=0.6, ball_distance_weight=0.6), 0.5)
                 ),
                 termination_condition=TouchBallCondition(),
                 truncation_condition=med_timeout,
                 difficulty_params={},
                 success_threshold=0.55
+            ),
+            # New flip reset training skill module
+            SkillModule(
+                name="Flip Reset Training",
+                state_mutator=MutatorSequence(
+                    FixedTeamSizeMutator(blue_size=1, orange_size=0),
+                    AugmentMutator(shuffle_within_teams=False, randomize_front_back=True, randomize_left_right=True),
+                    RandomPhysicsMutator(), # Add some randomness to make training more robust
+                    BallPositionMutator(position_function=SafePositionWrapper(
+                        lambda: np.array([np.random.uniform(-1000, 1000), np.random.uniform(-1500, 0), np.random.uniform(900, 1500)])
+                    )), # Higher ball position for reset opportunities
+                    CarPositionMutator(car_id="blue-0",
+                                     position_function=SafePositionWrapper(
+                                         lambda: np.array([np.random.uniform(-300, 300), np.random.uniform(-3500, -2500), 17])
+                                     ),
+                                     orientation_function=get_face_opp_goal_orientation),
+                    CarBoostMutator(boost_amount=100) # Full boost for aerial maneuvers
+                ),
+                reward_function=CombinedReward(
+                    (touch_ball_reward, 0.2),
+                    (AerialControlReward(), 0.3),
+                    (FlipResetReward(obtain_flip_weight=1.0, hit_ball_weight=1.5), 1.0),
+                    (GoalReward(), 1.0) # Extra reward for scoring after reset
+                ),
+                termination_condition=goal_condition,
+                truncation_condition=med_timeout,
+                difficulty_params={},
+                success_threshold=0.4 # Lower threshold as this is more difficult
             ),
         ],
         base_task_prob=0.7,
@@ -1431,6 +1558,16 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         name="Full 2v2 Integration",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=2, orange_size=2),
+            # Add the randomized scoreboard for realistic match scenarios
+            RandomScoreboardMutator(
+                # Use lower max_score to create more varied game scenarios
+                max_score=3,
+                random_reset_odds=0.8, # 80% chance scoreboard persists between resets
+                reset_on_goal=True,
+                initialized_random_odds=0.7 # 70% chance game starts with existing score
+            ),
+            # Use field augmentation for better generalization
+            AugmentMutator(shuffle_within_teams=True, randomize_front_back=True, randomize_left_right=True),
             KickoffMutator()
         ),
         base_task_reward_function=lucy_reward,

@@ -1625,3 +1625,250 @@ class AerialDirectionalTouchReward(RewardFunction):
                 None # previous_state is not available here
             )
         return rewards
+
+
+class AerialDistanceReward(RewardFunction):
+    """Reward for aerial play based on height and distance traveled in the air.
+    
+    - First aerial touch is rewarded by height
+    - Consecutive touches based on distance travelled (since last aerial touch)
+    - Resets when grounded or when another player touches the ball
+    """
+
+    def __init__(self, 
+                 touch_height_weight: float = 1.0,
+                 car_distance_weight: float = 1.0,
+                 ball_distance_weight: float = 1.0,
+                 distance_normalization: float = 1.0/5120,
+                 ramp_height: float = 256):
+        self.touch_height_weight = touch_height_weight
+        self.car_distance_weight = car_distance_weight
+        self.ball_distance_weight = ball_distance_weight
+        self.distance_normalization = distance_normalization
+        self.ramp_height = ramp_height
+        self.distances = {}
+        self.last_touch_agent = None
+        self.prev_state = None
+
+    def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
+        """Reset tracked state for all agents"""
+        self.distances = {k: 0 for k in agents}
+        self.last_touch_agent = None
+        self.prev_state = initial_state
+
+    def calculate(self, agent_id: AgentID, state: GameState, previous_state: Optional[GameState] = None) -> float:
+        # If we don't have a previous state, we can't calculate distance reward
+        if previous_state is None and self.prev_state is None:
+            self.prev_state = state
+            return 0.0
+            
+        # Use provided previous_state if available, otherwise use stored prev_state
+        prev_state = previous_state if previous_state is not None else self.prev_state
+        
+        reward = 0.0
+        car = state.cars[agent_id]
+        
+        # Initialize distance tracker if needed
+        if agent_id not in self.distances:
+            self.distances[agent_id] = 0
+            
+        # Check if this agent was the last to touch the ball
+        if self.last_touch_agent == agent_id:
+            # Reset if player has landed
+            if car.physics.position[2] < self.ramp_height:
+                self.distances[agent_id] = 0
+                self.last_touch_agent = None
+            else:
+                # Track distance traveled since last aerial touch
+                dist_car = np.linalg.norm(car.physics.position - prev_state.cars[agent_id].physics.position)
+                dist_ball = np.linalg.norm(state.ball.position - prev_state.ball.position)
+                self.distances[agent_id] += (dist_car * self.car_distance_weight + 
+                                            dist_ball * self.ball_distance_weight)
+        
+        # Check if player touched the ball
+        player_touched_ball = False
+        if hasattr(car, 'ball_touches') and car.ball_touches > 0:
+            player_touched_ball = True
+        elif hasattr(state, 'last_touch') and state.last_touch and state.last_touch.player_index == agent_id:
+            player_touched_ball = True
+            
+        if player_touched_ball:
+            if self.last_touch_agent == agent_id:
+                # Reward distance traveled since last touch
+                norm_dist = self.distances[agent_id] * self.distance_normalization
+                reward = norm_dist
+            else:
+                # First aerial touch - reward based on height
+                touch_height = car.physics.position[2]  
+                touch_height = max(0.0, touch_height - self.ramp_height) # Clamp to 0
+                norm_dist = touch_height * self.distance_normalization
+                reward = norm_dist * self.touch_height_weight
+                
+                # Track this agent for consecutive touches
+                self.last_touch_agent = agent_id
+                self.distances[agent_id] = 0
+                
+        # Update previous state
+        self.prev_state = state
+        return reward
+    
+    def get_rewards(self, agents: List[AgentID], state: GameState,
+                    is_terminated: Dict[AgentID, bool],
+                    is_truncated: Dict[AgentID, bool],
+                    shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
+        rewards = {}
+        for agent_id in agents:
+            rewards[agent_id] = self.calculate(agent_id, state)
+        
+        # Store aerial distance info in shared_info for potential use by other components
+        shared_info["aerial_distance_info"] = {
+            "distances": self.distances, 
+            "last_touch_agent": self.last_touch_agent
+        }
+        return rewards
+
+
+class FlipResetReward(RewardFunction):
+    """Reward for performing flip reset mechanic (touching ball with wheels while airborne to get flip reset)"""
+    
+    def __init__(self, obtain_flip_weight: float = 1.0, hit_ball_weight: float = 1.0):
+        self.obtain_flip_weight = obtain_flip_weight
+        self.hit_ball_weight = hit_ball_weight
+        
+        self.prev_state = None
+        self.has_reset = None
+        self.has_flipped = None
+        
+    def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
+        self.prev_state = initial_state
+        self.has_reset = set()
+        self.has_flipped = set()
+    
+    def calculate(self, agent_id: AgentID, state: GameState, previous_state: Optional[GameState] = None) -> float:
+        # If we don't have a previous state, we can't detect flip reset
+        if previous_state is None and self.prev_state is None:
+            self.prev_state = state
+            return 0.0
+            
+        # Use provided previous_state if available, otherwise use stored prev_state
+        prev_state = previous_state if previous_state is not None else self.prev_state
+        
+        reward = 0.0
+        car = state.cars[agent_id]
+        
+        # Reset tracking if car lands
+        if car.on_ground:
+            if agent_id in self.has_reset:
+                self.has_reset.remove(agent_id)
+            if agent_id in self.has_flipped:
+                self.has_flipped.remove(agent_id)
+        
+        # Detect flip reset (getting dodge while airborne)
+        elif car.can_flip and not prev_state.cars[agent_id].can_flip:
+            # Check if wheels are pointing toward ball (likely a flip reset)
+            down = -car.physics.up
+            car_ball = state.ball.position - car.physics.position
+            car_ball /= np.linalg.norm(car_ball)
+            cossim_down_ball = np.dot(down, car_ball)
+            
+            # If car's down vector is pointing somewhat toward ball, it's a flip reset
+            if cossim_down_ball > 0.5 ** 0.5:  # 45 degrees or less
+                self.has_reset.add(agent_id)
+                reward = self.obtain_flip_weight
+        
+        # Track if player used the flip reset
+        elif car.is_flipping and agent_id in self.has_reset:
+            self.has_reset.remove(agent_id)
+            self.has_flipped.add(agent_id)
+            
+        # Reward hitting ball after using flip reset
+        if player_touched_ball(car, state, agent_id) and agent_id in self.has_flipped:
+            self.has_flipped.remove(agent_id)
+            reward = self.hit_ball_weight
+        
+        # Update previous state
+        self.prev_state = state
+        return reward
+    
+    def get_rewards(self, agents: List[AgentID], state: GameState,
+                    is_terminated: Dict[AgentID, bool],
+                    is_truncated: Dict[AgentID, bool],
+                    shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
+        rewards = {k: 0 for k in agents}
+        for agent_id in agents:
+            rewards[agent_id] = self.calculate(agent_id, state)
+        return rewards
+
+
+# Helper function for detecting ball touches
+def player_touched_ball(car, state, agent_id):
+    """Helper function to detect if a player touched the ball"""
+    if hasattr(car, 'ball_touches') and car.ball_touches > 0:
+        return True
+    elif hasattr(state, 'last_touch') and state.last_touch and state.last_touch.player_index == agent_id:
+        return True
+    return False
+
+
+class WavedashReward(RewardFunction):
+    """Reward for performing wavedash mechanic (landing while flipping for speed boost)"""
+    
+    def __init__(self, scale_by_acceleration: bool = True, weight: float = 1.0):
+        self.scale_by_acceleration = scale_by_acceleration
+        self.weight = weight
+        self.prev_state = None
+        self.prev_acceleration = None
+        
+    def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
+        self.prev_state = initial_state
+        self.prev_acceleration = {agent: 0 for agent in agents}
+    
+    def calculate(self, agent_id: AgentID, state: GameState, previous_state: Optional[GameState] = None) -> float:
+        # If we don't have a previous state, we can't detect wavedash
+        if previous_state is None and self.prev_state is None:
+            self.prev_state = state
+            return 0.0
+            
+        # Use provided previous_state if available, otherwise use stored prev_state
+        prev_state = previous_state if previous_state is not None else self.prev_state
+        
+        reward = 0.0
+        car = state.cars[agent_id]
+        prev_car = prev_state.cars[agent_id]
+        
+        # Initialize acceleration tracking if needed
+        if agent_id not in self.prev_acceleration:
+            self.prev_acceleration[agent_id] = 0
+        
+        # Detect wavedash - landing while flipping
+        wavedash = (car.on_ground and not prev_car.on_ground) and (car.is_flipping or prev_car.is_flipping)
+        
+        if self.scale_by_acceleration:
+            # Track acceleration when flip starts
+            if car.is_flipping and not prev_car.is_flipping:
+                acc = np.linalg.norm(car.physics.linear_velocity - prev_car.physics.linear_velocity)
+                self.prev_acceleration[agent_id] = acc
+                
+            # Reward wavedash based on acceleration
+            if wavedash:
+                acc = self.prev_acceleration[agent_id]
+                reward = (acc / 2300.0) # Normalized by max car speed
+                self.prev_acceleration[agent_id] = 0
+            elif not car.is_flipping:
+                self.prev_acceleration[agent_id] = 0
+        else:
+            # Fixed reward for wavedash
+            reward = 1.0 if wavedash else 0.0
+        
+        # Update previous state
+        self.prev_state = state
+        return reward * self.weight
+    
+    def get_rewards(self, agents: List[AgentID], state: GameState,
+                    is_terminated: Dict[AgentID, bool],
+                    is_truncated: Dict[AgentID, bool],
+                    shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
+        rewards = {}
+        for agent_id in agents:
+            rewards[agent_id] = self.calculate(agent_id, state)
+        return rewards
