@@ -192,7 +192,7 @@ class SACAlgorithm(BaseAlgorithm):
             self.log_alpha = torch.zeros(1, requires_grad=True, device=self.device)
             self.alpha_optimizer = optim.Adam([self.log_alpha], lr=lr_actor)
         
-        # Create replay buffer
+        # Create replay buffer with correct shapes
         obs_shape = self._get_observation_shape()
         action_shape = self._get_action_shape()
         self.memory = ReplayBuffer(buffer_size, obs_shape, action_shape, device)
@@ -298,7 +298,7 @@ class SACAlgorithm(BaseAlgorithm):
         """Get an action for a given observation."""
         # Convert observation to tensor if needed
         if not isinstance(obs, torch.Tensor):
-            obs = torch.FloatTensor(obs).to(self.device)
+            obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
             
         # Ensure observation has batch dimension
         if obs.dim() == 1:
@@ -311,85 +311,72 @@ class SACAlgorithm(BaseAlgorithm):
         
         with torch.no_grad():
             if self.action_space_type == "discrete":
-                # Get raw action probabilities from the actor
                 action_logits = self.actor(obs)
-                
-                # Apply softmax to get proper probabilities
                 action_probs = F.softmax(action_logits, dim=-1)
                 
-                # Ensure valid probabilities (handle NaN, inf, negative values)
-                # Replace any invalid values with small positive value
-                action_probs = torch.where(
-                    torch.isfinite(action_probs) & (action_probs >= 0),
-                    action_probs,
-                    torch.tensor(1e-8, device=action_probs.device)
-                )
-                
-                # Normalize to ensure sum = 1
-                action_probs = action_probs / action_probs.sum(dim=-1, keepdim=True)
-                
-                # Clamp small values for numerical stability
-                action_probs = torch.clamp(action_probs, min=1e-8)
-                
                 if deterministic:
-                    # Select the action with highest probability
                     action_idx = torch.argmax(action_probs, dim=-1)
-                    # Convert to one-hot encoding
-                    action = F.one_hot(action_idx, num_classes=self.action_dim).float()
-                    log_prob = torch.log(action_probs.gather(-1, action_idx.unsqueeze(-1))).squeeze(-1)
                 else:
-                    try:
-                        # Create proper categorical distribution and sample
-                        dist = Categorical(probs=action_probs)
-                        action_idx = dist.sample()
-                        # Convert to one-hot encoding
-                        action = F.one_hot(action_idx, num_classes=self.action_dim).float()
-                        log_prob = dist.log_prob(action_idx)
-                    except RuntimeError as e:
-                        # Fall back to argmax in case of any sampling errors
-                        print(f"Warning: Sampling error, falling back to argmax: {e}")
-                        action_idx = torch.argmax(action_probs, dim=-1)
-                        action = F.one_hot(action_idx, num_classes=self.action_dim).float()
-                        log_prob = torch.log(action_probs + 1e-8).gather(-1, action_idx.unsqueeze(-1)).squeeze(-1)
+                    dist = Categorical(probs=action_probs)
+                    action_idx = dist.sample()
+                
+                action = F.one_hot(action_idx, num_classes=self.action_dim).float()
+                log_prob = torch.log(action_probs.gather(1, action_idx.unsqueeze(-1)))
+                
+                # Get Q-values
+                q1 = self.critic1(obs)
+                q2 = self.critic2(obs)
+                
+                # Handle both cases: critics output per-action Q-values or a single value
+                if q1.shape[-1] == self.action_dim:
+                    # Critics return Q-values for all actions
+                    value = torch.min(q1, q2).gather(1, action_idx.unsqueeze(-1))
+                else:
+                    # Critics return a single value - use directly
+                    value = torch.min(q1, q2)
+                
+                # Get features if requested
+                if return_features:
+                    features = self.actor(obs, return_features=True)
+                    return action, log_prob, value, features
+                
+                return action.squeeze(0).cpu().numpy()
             else:
-                # Continuous action space handling
-                mean, log_std = self.actor(obs).chunk(2, dim=-1)
+                # For continuous actions
+                mean_and_log_std = self.actor(obs)
+                mean, log_std = mean_and_log_std.chunk(2, dim=-1)
                 std = torch.exp(log_std)
                 
-                # Create normal distribution
-                dist = Normal(mean, std)
-                
+                # Get actions
                 if deterministic:
-                    action = mean
+                    action_raw = mean
                 else:
-                    action = dist.sample()
-                    
-                # Apply tanh squashing for bounded actions
-                action = torch.tanh(action)
+                    dist = Normal(mean, std)
+                    action_raw = dist.rsample()
+                
+                # Apply tanh squashing
+                action = torch.tanh(action_raw)
                 
                 # Scale to action range
                 action_scale = (self.action_bounds[1] - self.action_bounds[0]) / 2.0
                 action_bias = (self.action_bounds[1] + self.action_bounds[0]) / 2.0
                 action = action * action_scale + action_bias
                 
-                # Compute log probability with squashing correction
-                log_prob = dist.log_prob(action)
-                log_prob = log_prob.sum(dim=-1, keepdim=True)
-            
-            # For Q-values, just use observations (don't concat with actions)
-            # This is a workaround to avoid changing the model architecture
-            q1 = self.critic1(obs)
-            q2 = self.critic2(obs)
-            
-            # Take minimum Q-value 
-            value = torch.min(q1, q2)
-        
-        # Return features if requested
-        if return_features:
-            _, features = self.actor(obs, return_features=True)
-            return action, log_prob, value, features
-            
-        return action, log_prob, value
+                # Calculate log probability with squashing correction
+                log_prob = Normal(mean, std).log_prob(action_raw) - torch.log(1 - action.pow(2) + 1e-6)
+                log_prob = log_prob.sum(1, keepdim=True)
+                
+                # Get Q-values
+                q1 = self.critic1(obs)
+                q2 = self.critic2(obs)
+                value = torch.min(q1, q2)
+                
+                # Get features if requested
+                if return_features:
+                    features = self.actor(obs, return_features=True)
+                    return action, log_prob, value, features
+                
+                return action.squeeze(0).cpu().numpy()
     
     def store_experience(self, obs, action, log_prob, reward, value, done, env_id=0):
         """Store experience in the replay buffer."""
@@ -509,7 +496,6 @@ class SACAlgorithm(BaseAlgorithm):
                 next_action_probs = torch.clamp(next_action_probs, min=1e-8)
                 dist = Categorical(probs=next_action_probs)
                 next_action_idx = dist.sample()
-                next_actions = F.one_hot(next_action_idx, num_classes=self.action_dim).float()
                 next_log_probs = dist.log_prob(next_action_idx).unsqueeze(-1)
             else:
                 next_mean, next_log_std = self.actor(next_obs).chunk(2, dim=-1)
@@ -519,19 +505,16 @@ class SACAlgorithm(BaseAlgorithm):
                 next_actions = torch.tanh(next_actions_raw)
                 next_log_probs = dist.log_prob(next_actions_raw) - torch.log(1 - next_actions.pow(2) + 1e-6)
                 next_log_probs = next_log_probs.sum(1, keepdim=True)
-                
-                # Scale to action range
-                action_scale = (self.action_bounds[1] - self.action_bounds[0]) / 2.0
-                action_bias = (self.action_bounds[1] + self.action_bounds[0]) / 2.0
-                next_actions = next_actions * action_scale + action_bias
             
-            # Target Q-values - use next_obs directly instead of concatenating 
+            # Get Q-values with ONLY next states (not concatenated with actions)
             next_q1 = self.critic1_target(next_obs)
             next_q2 = self.critic2_target(next_obs)
+            
+            # Min of two Q-values minus the entropy term
             next_q = torch.min(next_q1, next_q2) - alpha * next_log_probs
             target_q = rewards + (1 - dones) * self.gamma * next_q
         
-        # Current Q-values - use obs directly
+        # Current Q-values with ONLY states (not concatenated with actions)
         current_q1 = self.critic1(obs)
         current_q2 = self.critic2(obs)
         
@@ -541,33 +524,39 @@ class SACAlgorithm(BaseAlgorithm):
         
         # Update critics
         self.critic1_optimizer.zero_grad()
-        critic1_loss.backward()
-        if self.max_grad_norm is not None:
+        critic1_loss.backward(retain_graph=True)
+        if self.max_grad_norm > 0:
             nn.utils.clip_grad_norm_(self.critic1.parameters(), self.max_grad_norm)
         self.critic1_optimizer.step()
         
         self.critic2_optimizer.zero_grad()
         critic2_loss.backward()
-        if self.max_grad_norm is not None:
+        if self.max_grad_norm > 0:
             nn.utils.clip_grad_norm_(self.critic2.parameters(), self.max_grad_norm)
         self.critic2_optimizer.step()
         
+        # Store metrics
+        self.metrics['critic1_loss'] = critic1_loss.item()
+        self.metrics['critic2_loss'] = critic2_loss.item()
+        self.metrics['mean_q_value'] = current_q1.mean().item()
+        
+        # Return critic losses
         return critic1_loss.item(), critic2_loss.item()
     
     def _update_actor_and_alpha(self, obs, alpha):
         """Update the actor network and alpha parameter."""
+        alpha_loss = 0.0  # Default value if not using auto tuning
+        
         if self.action_space_type == "discrete":
             # For discrete actions
             action_probs = F.softmax(self.actor(obs), dim=-1)
             action_probs = torch.clamp(action_probs, min=1e-8)
+            log_probs = torch.log(action_probs)
             
-            # Calculate the Q-values for all actions - use obs directly
+            # Get Q-values for each action
             q1 = self.critic1(obs)
             q2 = self.critic2(obs)
             q = torch.min(q1, q2)
-            
-            # Calculate log probabilities
-            log_probs = torch.log(action_probs)
             
             # Calculate entropy
             entropy = -torch.sum(action_probs * log_probs, dim=1).mean()
@@ -576,7 +565,7 @@ class SACAlgorithm(BaseAlgorithm):
             inside_term = action_probs * (alpha * log_probs - q)
             actor_loss = torch.mean(torch.sum(inside_term, dim=1))
         else:
-            # For continuous actions - implementation details will vary
+            # For continuous actions
             mean, log_std = self.actor(obs).chunk(2, dim=-1)
             std = torch.exp(log_std)
             dist = Normal(mean, std)
@@ -585,16 +574,11 @@ class SACAlgorithm(BaseAlgorithm):
             actions_raw = dist.rsample()
             actions = torch.tanh(actions_raw)
             
-            # Scale to action range
-            action_scale = (self.action_bounds[1] - self.action_bounds[0]) / 2.0
-            action_bias = (self.action_bounds[1] + self.action_bounds[0]) / 2.0
-            actions = actions * action_scale + action_bias
-            
             # Calculate log probabilities with squashing correction
             log_probs = dist.log_prob(actions_raw) - torch.log(1 - actions.pow(2) + 1e-6)
             log_probs = log_probs.sum(1, keepdim=True)
             
-            # Calculate Q-values - use obs directly
+            # Get Q-values with ONLY states
             q1 = self.critic1(obs)
             q2 = self.critic2(obs)
             q = torch.min(q1, q2)
@@ -612,18 +596,22 @@ class SACAlgorithm(BaseAlgorithm):
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         self.actor_optimizer.step()
         
-        # Update alpha if auto-tuning
+        # Update alpha (if auto-tuning)
         if self.auto_alpha_tuning:
-            alpha_loss = -(self.log_alpha * (entropy - self.target_entropy).detach()).mean()
-            
+            alpha_loss = -self.log_alpha * (log_probs + self.target_entropy).detach().mean()
             self.alpha_optimizer.zero_grad()
             alpha_loss.backward()
             self.alpha_optimizer.step()
-            
-            return actor_loss.item(), entropy.item(), alpha_loss.item()
-        else:
-            # If not auto-tuning, just return 0 for alpha loss
-            return actor_loss.item(), entropy.item(), 0.0
+            self.alpha = self.log_alpha.exp().item()
+            self.metrics['alpha_loss'] = alpha_loss.item()
+        
+        # Store metrics
+        self.metrics['actor_loss'] = actor_loss.item()
+        self.metrics['mean_entropy'] = entropy.item()
+        self.metrics['alpha'] = alpha
+        
+        # Return actor loss, entropy, and alpha loss
+        return actor_loss.item(), entropy.item(), alpha_loss.item() if isinstance(alpha_loss, torch.Tensor) else alpha_loss
     
     def reset(self):
         """Reset episode-specific state at the end of an episode."""
