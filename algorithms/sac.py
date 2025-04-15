@@ -32,46 +32,21 @@ class ReplayBuffer:
         
     def add(self, obs, action, reward, next_obs, done):
         """Add a new transition to the buffer."""
-        # Convert numpy arrays to tensors if needed
-        if isinstance(obs, np.ndarray):
-            obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
+        # Convert to tensors and ensure proper shapes in one step
+        def process_tensor(x, expected_dim):
+            if not isinstance(x, torch.Tensor):
+                x = torch.tensor(x, dtype=torch.float32, device=self.device)
+            # Ensure tensor has batch dimension
+            if x.dim() < expected_dim:
+                x = x.unsqueeze(0)
+            return x
         
-        # Fix: Handle both numpy arrays and scalar numpy values
-        if isinstance(action, (int, np.integer)):
-            # Convert scalar integer to tensor with batch dimension
-            action = torch.tensor([float(action)], dtype=torch.float32, device=self.device)
-        elif isinstance(action, np.ndarray):
-            action = torch.tensor(action, dtype=torch.float32, device=self.device)
+        obs = process_tensor(obs, 2)
+        action = process_tensor(action, 2)
+        reward = process_tensor(reward, 2)
+        next_obs = process_tensor(next_obs, 2)
+        done = process_tensor(done, 2)
         
-        if isinstance(reward, (float, int)):
-            reward = torch.tensor([reward], dtype=torch.float32, device=self.device)
-        elif isinstance(reward, np.ndarray):
-            reward = torch.tensor(reward, dtype=torch.float32, device=self.device)
-        
-        if isinstance(next_obs, np.ndarray):
-            next_obs = torch.tensor(next_obs, dtype=torch.float32, device=self.device)
-        
-        if isinstance(done, bool):
-            done = torch.tensor([float(done)], dtype=torch.float32, device=self.device)
-        elif isinstance(done, np.ndarray):
-            done = torch.tensor(done, dtype=torch.float32, device=self.device)
-            
-        # Ensure all tensors have the right shape
-        if obs.dim() == 1:
-            obs = obs.unsqueeze(0)
-        if action.dim() == 1:
-            action = action.unsqueeze(0)
-        if reward.dim() == 0:
-            reward = reward.unsqueeze(0).unsqueeze(0)
-        elif reward.dim() == 1:
-            reward = reward.unsqueeze(0)
-        if next_obs.dim() == 1:
-            next_obs = next_obs.unsqueeze(0)
-        if done.dim() == 0:
-            done = done.unsqueeze(0).unsqueeze(0)
-        elif done.dim() == 1:
-            done = done.unsqueeze(0)
-            
         # Store the transition
         self.observations[self.ptr] = obs
         self.actions[self.ptr] = action
@@ -288,11 +263,16 @@ class SACAlgorithm(BaseAlgorithm):
     
     def _soft_update_target_networks(self):
         """Perform soft update of target network parameters."""
-        for param, target_param in zip(self.critic1.parameters(), self.critic1_target.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
-            
-        for param, target_param in zip(self.critic2.parameters(), self.critic2_target.parameters()):
-            target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
+        with torch.no_grad():
+            # Update both critic networks in a single loop
+            for target_net, source_net in [
+                (self.critic1_target, self.critic1),
+                (self.critic2_target, self.critic2)
+            ]:
+                for target_param, param in zip(target_net.parameters(), source_net.parameters()):
+                    target_param.data.copy_(
+                        self.tau * param.data + (1 - self.tau) * target_param.data
+                    )
     
     def get_action(self, obs, deterministic=False, return_features=False):
         """Get an action for a given observation."""
@@ -506,17 +486,15 @@ class SACAlgorithm(BaseAlgorithm):
                 next_log_probs = dist.log_prob(next_actions_raw) - torch.log(1 - next_actions.pow(2) + 1e-6)
                 next_log_probs = next_log_probs.sum(1, keepdim=True)
             
-            # Get Q-values with ONLY next states (not concatenated with actions)
-            next_q1 = self.critic1_target(next_obs)
-            next_q2 = self.critic2_target(next_obs)
+            # Batch the critic target forward passes
+            next_q1, next_q2 = self.critic1_target(next_obs), self.critic2_target(next_obs)
             
             # Min of two Q-values minus the entropy term
             next_q = torch.min(next_q1, next_q2) - alpha * next_log_probs
             target_q = rewards + (1 - dones) * self.gamma * next_q
-        
-        # Current Q-values with ONLY states (not concatenated with actions)
-        current_q1 = self.critic1(obs)
-        current_q2 = self.critic2(obs)
+    
+        # Batch current critic forward passes
+        current_q1, current_q2 = self.critic1(obs), self.critic2(obs)
         
         # Compute critic losses
         critic1_loss = F.mse_loss(current_q1, target_q)
@@ -589,9 +567,15 @@ class SACAlgorithm(BaseAlgorithm):
             # Actor loss: maximize Q - alpha * log_prob
             actor_loss = (alpha * log_probs - q).mean()
         
-        # Update actor
+        # Compute gradients directly
+        actor_params = list(self.actor.parameters())
+        actor_grads = torch.autograd.grad(actor_loss, actor_params)
+        
+        # Apply gradients
         self.actor_optimizer.zero_grad()
-        actor_loss.backward()
+        for param, grad in zip(actor_params, actor_grads):
+            if grad is not None:
+                param.grad = grad
         if self.max_grad_norm > 0:
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
         self.actor_optimizer.step()
@@ -624,3 +608,7 @@ class SACAlgorithm(BaseAlgorithm):
     def get_metrics(self):
         """Get current metrics."""
         return self.metrics
+    
+    def _batched_critic_forward(self, obs):
+        """Critic forward pass for both critics."""
+        return self.critic1(obs), self.critic2(obs)
