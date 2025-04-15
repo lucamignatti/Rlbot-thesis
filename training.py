@@ -6,10 +6,12 @@ from typing import Union, Tuple, Optional, Dict, Any
 from auxiliary import AuxiliaryTaskManager
 from intrinsic_rewards import create_intrinsic_reward_generator, IntrinsicRewardEnsemble
 from algorithms import BaseAlgorithm, PPOAlgorithm, StreamACAlgorithm
+from algorithms.sac import SACAlgorithm
 import time
 import wandb
 import os
 import torch
+import copy
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
@@ -59,7 +61,7 @@ class RunningMeanStd:
 class Trainer:
     """
     Base trainer class that manages the training of reinforcement learning algorithms.
-    Supports both PPO and StreamAC algorithms.
+    Supports PPO, StreamAC, and SAC algorithms.
     """
     def __init__(
         self,
@@ -120,6 +122,14 @@ class Trainer:
         stream_buffer_size: int = 32,
         use_sparse_init: bool = True,
         update_freq: int = 1,
+        # SAC specific parameters
+        tau: float = 0.005,
+        alpha: float = 0.2,
+        auto_alpha_tuning: bool = True,
+        target_entropy: float = -1.0,
+        buffer_size: int = 1000000,
+        warmup_steps: int = 1000,
+        updates_per_step: int = 1,
     ):
         self.use_wandb = use_wandb
         self.debug = debug
@@ -239,8 +249,39 @@ class Trainer:
             # Set reference to trainer so StreamAC can update auxiliary tasks
             algorithm.trainer = self
             self.algorithm = algorithm
+        elif self.algorithm_type == "sac":
+            # Create a second critic network for SAC's twin Q-function
+            critic2 = copy.deepcopy(critic)
+            
+            # Create SAC algorithm
+            algorithm = SACAlgorithm(
+                actor=self.actor,
+                critic1=self.critic,  # First Q-network
+                critic2=critic2,      # Second Q-network
+                action_space_type=action_space_type,
+                action_dim=action_dim,
+                action_bounds=action_bounds,
+                device=self.device,
+                lr_actor=lr_actor,
+                lr_critic=lr_critic,
+                gamma=gamma,
+                tau=tau,                      # Add this parameter to the Trainer.__init__
+                alpha=alpha,                  # Add this parameter to the Trainer.__init__
+                auto_alpha_tuning=auto_alpha_tuning,  # Add this parameter to the Trainer.__init__
+                target_entropy=target_entropy,        # Add this parameter to the Trainer.__init__
+                buffer_size=buffer_size,              # Add this parameter to the Trainer.__init__
+                batch_size=batch_size,
+                warmup_steps=warmup_steps,            # Add this parameter to the Trainer.__init__
+                update_freq=update_freq,
+                updates_per_step=updates_per_step,    # Add this parameter to the Trainer.__init__
+                max_grad_norm=max_grad_norm,
+                use_amp=use_amp,
+                use_wandb=use_wandb,  # Add this parameter
+                debug=self.debug
+            )
+            self.algorithm = algorithm
         else:
-            raise ValueError(f"Unknown algorithm type: {algorithm_type}. Use 'ppo' or 'streamac'.")
+            raise ValueError(f"Unknown algorithm type: {algorithm_type}. Use 'ppo', 'streamac', or 'sac'.")
 
         # Use Automatic Mixed Precision (AMP) if requested and on CUDA
         self.use_amp = "cuda" in str(device) and use_amp
@@ -612,6 +653,24 @@ class Trainer:
                 # Only create histogram if we have enough data points
                 if len(td_errors) >= 10:
                     grouped_metrics["td_errors"]["TD/distribution"] = wandb.Histogram(np.array(td_errors))
+
+        elif self.algorithm_type == "sac":
+            # SAC metrics organization
+            grouped_metrics = {
+                "training": {
+                    "actor_loss": metrics.get("actor_loss", 0),
+                    "critic1_loss": metrics.get("critic1_loss", 0),
+                    "critic2_loss": metrics.get("critic2_loss", 0),
+                    "alpha_loss": metrics.get("alpha_loss", 0),
+                    "alpha": metrics.get("alpha", 0),
+                    "buffer_size": len(self.algorithm.memory) if hasattr(self.algorithm, 'memory') else 0,
+                },
+                "performance": {
+                    "mean_return": metrics.get("mean_return", 0),
+                    "mean_q_value": metrics.get("mean_q_value", 0),
+                    "mean_entropy": metrics.get("mean_entropy", 0),
+                }
+            }
 
         # Flatten metrics for logging
         flat_metrics = {}

@@ -732,7 +732,7 @@ def run_training(
                             "Updates": successful_steps,
                             "StepSize": f"{last_step:.4f}",
                             "ActorLR": f"{getattr(trainer.algorithm, 'lr_actor', lr_actor):.6f}",
-                            "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic):.6f}"
+                            "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic)::.6f}"
                         })
 
                         # Initialize metrics with latest algorithm metrics to avoid NameError
@@ -743,7 +743,7 @@ def run_training(
                             stats_dict.update({
                                 "Reward": f"{metrics.get('mean_return', 0):.2f}",
                                 "PLoss": f"{metrics.get('actor_loss', 0):.4f}",
-                                "VLoss": f"{metrics.get('critic_loss', 0)::.4f}",
+                                "VLoss": f"{metrics.get('critic_loss', 0):.4f}",
                                 "Entropy": f"{metrics.get('entropy_loss', 0):.4f}"
                             })
 
@@ -809,6 +809,19 @@ def run_training(
                         "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic):.6f}",
                         "Updates": getattr(trainer.algorithm, "successful_steps", 0)
                     })
+
+                # When displaying stats, add SAC-specific metrics
+                if algorithm == "sac":
+                    metrics = trainer.algorithm.get_metrics() if hasattr(trainer.algorithm, 'get_metrics') else {}
+                    if metrics:
+                        stats_dict.update({
+                            "Reward": f"{metrics.get('mean_return', 0):.2f}",
+                            "ActorLoss": f"{metrics.get('actor_loss', 0):.4f}",
+                            "CriticLoss": f"{(metrics.get('critic1_loss', 0) + metrics.get('critic2_loss', 0))/2:.4f}",
+                            "Alpha": f"{metrics.get('alpha', 0):.4f}",
+                            "QValue": f"{metrics.get('mean_q_value', 0):.4f}",
+                            "Buffer": f"{len(trainer.algorithm.memory)}"
+                        })
 
                 # Update curriculum stats if enabled
                 if curriculum_manager:
@@ -1000,7 +1013,7 @@ if __name__ == "__main__":
     parser.set_defaults(curriculum=True)
 
     # Algorithm choice
-    parser.add_argument('--algorithm', type=str, default='ppo', choices=['ppo', 'streamac'],
+    parser.add_argument('--algorithm', type=str, default='ppo', choices=['ppo', 'streamac', 'sac'],
                        help='Learning algorithm to use: ppo (default) or streamac')
 
     # Learning rates
@@ -1150,6 +1163,22 @@ if __name__ == "__main__":
 
     streamac_group.add_argument('--update-freq', type=int, default=4,
                                help='Frequency of updates for StreamAC (default: 4, update every 4th step)')
+
+    # SAC-specific parameters
+    parser.add_argument("--tau", type=float, default=0.005,
+                        help="Target network update rate for SAC")
+    parser.add_argument("--alpha", type=float, default=0.2,
+                        help="Temperature parameter for SAC entropy")
+    parser.add_argument("--auto_alpha_tuning", action="store_true",
+                        help="Enable automatic entropy tuning for SAC")
+    parser.add_argument("--target_entropy", type=float, default=None,
+                        help="Target entropy when auto-tuning (default: -action_dim)")
+    parser.add_argument("--buffer_size", type=int, default=1000000,
+                        help="Replay buffer size for SAC")
+    parser.add_argument("--warmup_steps", type=int, default=1000,
+                        help="Number of steps before starting to train SAC")
+    parser.add_argument("--updates_per_step", type=int, default=1,
+                        help="Number of gradient updates per step for SAC")
 
     # Backwards compatibility.
     parser.add_argument('-p', '--processes', type=int, default=None,
