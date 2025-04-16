@@ -1,24 +1,31 @@
 from collections import deque
 from torch.distributions import Categorical, Normal
 from torch.amp import autocast, GradScaler
-from models import fix_compiled_state_dict, load_partial_state_dict, print_model_info
-from typing import Union, Tuple, Optional, Dict, Any
+from model_architectures import (
+    fix_compiled_state_dict,
+    load_partial_state_dict,
+    print_model_info,
+    fix_rsnorm_cuda_graphs # Import the fix function if needed before compile
+)
+from typing import Union, Tuple, Optional, Dict, Any, Deque # Import Deque
 from auxiliary import AuxiliaryTaskManager
 from intrinsic_rewards import create_intrinsic_reward_generator, IntrinsicRewardEnsemble
 from algorithms import BaseAlgorithm, PPOAlgorithm, StreamACAlgorithm
 from algorithms.sac import SACAlgorithm
 import time
-import wandb
 import os
-import torch
-import copy
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import numpy as np
-from tqdm import tqdm
 import random
 import collections
+import copy
+import wandb
+import math
+import inspect
+import torch
+import torch.nn as nn
+import numpy as np
+import torch.nn.functional as F
+import torch.optim as optim
+from tqdm import tqdm
 
 
 class RunningMeanStd:
@@ -130,6 +137,10 @@ class Trainer:
         buffer_size: int = 1000000,
         warmup_steps: int = 1000,
         updates_per_step: int = 1,
+        # SimbaV2 Reward Scaling parameters
+        use_reward_scaling: bool = True, # Add flag to enable/disable
+        reward_scaling_G_max: float = 10.0, # Max possible return (hyperparameter)
+        reward_scaling_eps: float = 1e-5,
     ):
         self.use_wandb = use_wandb
         self.debug = debug
@@ -344,57 +355,28 @@ class Trainer:
         self.use_compile = use_compile and hasattr(torch, 'compile')
         if self.use_compile:
             try:
-                if self.debug:
-                    print("[DEBUG] Using torch.compile for models...")
+                # Apply RSNorm fix before compiling if necessary
+                # Check if models contain RSNorm before applying fix
+                # This requires RSNorm to be imported or defined
+                try:
+                    from model_architectures.utils import RSNorm # Import RSNorm if needed
+                    if any(isinstance(m, RSNorm) for m in actor.modules()) or \
+                       any(isinstance(m, RSNorm) for m in critic.modules()):
+                        print("Applying RSNorm CUDA graphs fix before compiling...")
+                        self.actor = fix_rsnorm_cuda_graphs(self.actor)
+                        self.critic = fix_rsnorm_cuda_graphs(self.critic)
+                except ImportError:
+                    print("Warning: RSNorm not found, skipping CUDA graphs fix.")
+
+
+                print("Compiling models with torch.compile...")
+                # Compile actor and critic
                 self.actor = torch.compile(self.actor)
                 self.critic = torch.compile(self.critic)
-
-                # Also compile auxiliary task models if they exist
-                if self.use_auxiliary_tasks and hasattr(self, 'aux_task_manager'):
-                    if hasattr(self.aux_task_manager, 'sr_model') and self.aux_task_manager.sr_model is not None:
-                        self.aux_task_manager.sr_model = torch.compile(self.aux_task_manager.sr_model)
-                        if self.debug:
-                            print("[DEBUG] Compiled SR auxiliary model")
-
-                    if hasattr(self.aux_task_manager, 'rp_model') and self.aux_task_manager.rp_model is not None:
-                        self.aux_task_manager.rp_model = torch.compile(self.aux_task_manager.rp_model)
-                        if self.debug:
-                            print("[DEBUG] Compiled RP auxiliary model")
-
-                # Also compile intrinsic reward models if they exist
-                if self.use_intrinsic_rewards and self.intrinsic_reward_generator is not None:
-                    # For ensemble, compile each component
-                    if hasattr(self.intrinsic_reward_generator, 'components'):
-                        for i, component in enumerate(self.intrinsic_reward_generator.components):
-                            if hasattr(component, 'forward_model') and component.forward_model is not None:
-                                component.forward_model = torch.compile(component.forward_model)
-                            if hasattr(component, 'inverse_model') and component.inverse_model is not None:
-                                component.inverse_model = torch.compile(component.inverse_model)
-                            if hasattr(component, 'target_network') and component.target_network is not None:
-                                component.target_network = torch.compile(component.target_network)
-                            if hasattr(component, 'predictor_network') and component.predictor_network is not None:
-                                component.predictor_network = torch.compile(component.predictor_network)
-                        if self.debug:
-                            print("[DEBUG] Compiled intrinsic reward ensemble components")
-                    # For individual models
-                    else:
-                        if hasattr(self.intrinsic_reward_generator, 'forward_model') and self.intrinsic_reward_generator.forward_model is not None:
-                            self.intrinsic_reward_generator.forward_model = torch.compile(self.intrinsic_reward_generator.forward_model)
-                        if hasattr(self.intrinsic_reward_generator, 'inverse_model') and self.intrinsic_reward_generator.inverse_model is not None:
-                            self.intrinsic_reward_generator.inverse_model = torch.compile(self.intrinsic_reward_generator.inverse_model)
-                        if hasattr(self.intrinsic_reward_generator, 'target_network') and self.intrinsic_reward_generator.target_network is not None:
-                            self.intrinsic_reward_generator.target_network = torch.compile(self.intrinsic_reward_generator.target_network)
-                        if hasattr(self.intrinsic_reward_generator, 'predictor_network') and self.intrinsic_reward_generator.predictor_network is not None:
-                            self.intrinsic_reward_generator.predictor_network = torch.compile(self.intrinsic_reward_generator.predictor_network)
-                        if self.debug:
-                            print("[DEBUG] Compiled intrinsic reward models")
-
-                if self.debug:
-                    print("[DEBUG] Models compiled successfully")
+                print("Models compiled successfully.")
             except Exception as e:
-                print(f"Error compiling models: {e}")
-                print("Continuing without compilation")
-                self.use_compile = False
+                print(f"Warning: torch.compile failed: {e}. Proceeding without compilation.")
+                self.use_compile = False # Disable compile if it fails
 
         # Print model info
         print_model_info(self.actor, model_name="Actor", print_amp=self.use_amp, debug=self.debug)
@@ -443,6 +425,16 @@ class Trainer:
             )
             if self.debug:
                 print(f"[DEBUG] Initialized intrinsic reward generator with scale {intrinsic_reward_scale}")
+
+        # SimbaV2 Reward Scaling Initialization
+        self.use_reward_scaling = use_reward_scaling
+        self.reward_scaling_G_max = reward_scaling_G_max
+        self.reward_scaling_eps = reward_scaling_eps
+        # Use dictionaries to store per-environment stats for vectorized envs
+        self.running_G: Dict[int, float] = {} # Tracks G_t per env (Eq 17)
+        self.running_G_var: Dict[int, float] = {} # Tracks variance of G_t per env
+        self.running_G_count: Dict[int, float] = {} # Tracks count for variance calculation per env
+        self.running_G_max: Dict[int, float] = {} # Tracks max(G_t) per env (Eq 18)
 
     def _true_training_steps(self):
         """Get the true training step count (including offset)"""
@@ -710,6 +702,27 @@ class Trainer:
         # Get whether we're in test mode
         test_mode = getattr(self, 'test_mode', False)
 
+        # --- Reward Scaling (SimbaV2) ---
+        original_reward = reward # Keep original for potential intrinsic calculation later
+        if self.use_reward_scaling and not test_mode:
+             # Ensure reward is a float for calculations
+             if isinstance(reward, torch.Tensor):
+                 reward_float = reward.item()
+             elif isinstance(reward, np.ndarray):
+                 reward_float = reward.item() if reward.size == 1 else float(reward[0])
+             else:
+                 reward_float = float(reward)
+
+             # Update running stats for this environment
+             variance_G, max_G = self._update_reward_scaling_stats(env_id, reward_float, done)
+
+             # Scale the reward
+             reward = self._scale_reward(env_id, reward_float, variance_G, max_G)
+
+             if self.debug and self._true_training_steps() % 100 == 0: # Use _true_training_steps
+                 print(f"[DEBUG Reward Scaling env {env_id}] Orig: {reward_float:.4f}, Scaled: {reward:.4f}, VarG: {variance_G:.4f}, MaxG: {max_G:.4f}")
+        # --- End Reward Scaling ---
+
         # Initialize extrinsic reward normalizer if it doesn't exist
         if not hasattr(self, 'extrinsic_reward_normalizer'):
             from intrinsic_rewards import ExtrinsicRewardNormalizer
@@ -721,8 +734,10 @@ class Trainer:
         # This is to avoid calculating intrinsic rewards before we have the actual reward from the environment
         # Instead, we'll use the update_experience_with_intrinsic_reward method after we have the real reward
         add_intrinsic = self.use_intrinsic_rewards and self.intrinsic_reward_generator is not None
-        is_placeholder_reward = isinstance(reward, (int, float)) and reward == 0 or \
-                              hasattr(reward, 'item') and reward.item() == 0
+        is_placeholder_reward = isinstance(original_reward, (int, float)) and original_reward == 0 or \
+                              hasattr(original_reward, 'item') and original_reward.item() == 0
+
+        intrinsic_reward_value = 0.0 # Default value
 
         if add_intrinsic and not is_placeholder_reward:
             # Convert inputs to tensor format for intrinsic reward computation
@@ -783,7 +798,7 @@ class Trainer:
                     next_state = next_state.unsqueeze(0)
 
                 # Compute intrinsic reward using the correct method name
-                intrinsic_reward = self.intrinsic_reward_generator.compute_intrinsic_reward(
+                intrinsic_reward_value = self.intrinsic_reward_generator.compute_intrinsic_reward(
                     state_tensor, action_tensor, next_state
                 )
 
@@ -812,15 +827,32 @@ class Trainer:
 
                 # Log that we're applying intrinsic rewards in debug mode
                 if self.debug:
-                    print(f"[DEBUG] Adding intrinsic reward: {adaptive_scale * intrinsic_reward[0]} to extrinsic: {extrinsic_reward}")
+                    print(f"[DEBUG] Adding intrinsic reward: {adaptive_scale * intrinsic_reward_value[0]} to extrinsic: {extrinsic_reward}")
 
-                # Add scaled intrinsic reward to extrinsic reward
-                if isinstance(reward, torch.Tensor):
-                    reward = reward + adaptive_scale * intrinsic_reward[0].to(reward.device)
-                else:
-                    reward = reward + adaptive_scale * intrinsic_reward[0].cpu().numpy()
+                # Scale the intrinsic reward
+                intrinsic_reward_value = intrinsic_reward_value * adaptive_scale
+
+        # Get the SCALED extrinsic reward
+        if self.use_reward_scaling and not getattr(self, 'test_mode', False):
+            self._initialize_reward_scaling_stats(env_id)
+            variance_G = self.running_G_var[env_id]
+            max_G = self.running_G_max[env_id]
+            # Ensure original reward is float for scaling calculation
+            if isinstance(reward, torch.Tensor): original_reward_float = reward.item()
+            elif isinstance(reward, np.ndarray): original_reward_float = reward.item() if reward.size == 1 else float(reward[0])
+            else: original_reward_float = float(reward)
+            scaled_extrinsic_reward = self._scale_reward(env_id, original_reward_float, variance_G, max_G)
+        else:
+            # If scaling is off or in test mode, use the original reward directly
+            if isinstance(reward, torch.Tensor): scaled_extrinsic_reward = reward.item()
+            elif isinstance(reward, np.ndarray): scaled_extrinsic_reward = reward.item() if reward.size == 1 else float(reward[0])
+            else: scaled_extrinsic_reward = float(reward)
+
+        # Calculate total reward (scaled extrinsic + scaled intrinsic)
+        total_reward = scaled_extrinsic_reward + intrinsic_reward_value
 
         # Store the experience using the algorithm - only update if not in test mode
+        # Use the potentially SCALED 'reward' here
         if not test_mode:
             if self.algorithm_type == "streamac":
                 # For StreamAC, check if an update was performed and pass env_id
@@ -859,7 +891,7 @@ class Trainer:
                     'obs': state,
                     'action': action,
                     'log_prob': log_prob,
-                    'reward': reward,
+                    'reward': original_reward, # Store original reward in test mode
                     'value': value,
                     'done': done,
                     'env_id': env_id  # Add env_id to experience
@@ -873,6 +905,8 @@ class Trainer:
                     self.algorithm.experience_buffers[env_id].append(exp)
 
         # Update auxiliary task models if enabled
+        # Use the SCALED reward for auxiliary tasks? Paper doesn't specify.
+        # Let's use the SCALED reward for consistency with what the agent optimizes.
         if self.use_auxiliary_tasks and hasattr(self, 'aux_task_manager'):
             # Extract features if the actor supports it
             features = None
@@ -883,7 +917,7 @@ class Trainer:
             # Update auxiliary tasks and get metrics
             aux_metrics = self.aux_task_manager.update(
                 observations=state,
-                rewards=reward,
+                rewards=reward, # Pass scaled reward tensor
                 features=features
             )
 
@@ -1602,77 +1636,179 @@ class Trainer:
                     # Higher entropy during pretraining
                     self.entropy_coef = max(self.min_entropy_coef, self.base_entropy_coef * self.pretraining_entropy_scale)
 
+    def _initialize_reward_scaling_stats(self, env_id):
+        """Initialize reward scaling stats for a new environment ID."""
+        if env_id not in self.running_G:
+            self.running_G[env_id] = 0.0
+            self.running_G_var[env_id] = 1.0 # Initialize variance to 1
+            self.running_G_count[env_id] = self.reward_scaling_eps # Avoid div by zero
+            self.running_G_max[env_id] = self.reward_scaling_eps # Avoid issues with max
+
+    def _update_reward_scaling_stats(self, env_id, reward_t, done):
+        """Update running statistics for reward scaling based on paper Eq 17-19."""
+        # Ensure stats are initialized for this env_id
+        self._initialize_reward_scaling_stats(env_id)
+
+        # Get current stats
+        G_prev = self.running_G[env_id]
+        var_prev = self.running_G_var[env_id]
+        count_prev = self.running_G_count[env_id]
+
+        # Update running discounted return G_t (Eq 17)
+        # Note: Paper uses (1-gamma)*G_{t-1} + r_t. This seemslike an error,
+        # typically it's r_t + gamma * V(s_{t+1}) or similar.
+        # Let's try the paper's formula first. If it fails, consider alternatives.
+        # G_t = (1 - self.gamma) * G_prev + reward_t # Paper's formula
+        # Alternative: Simple discounted sum (might be more stable)
+        # G_t = reward_t + self.gamma * G_prev # More standard update? Let's stick to paper for now.
+        G_t = (1 - self.gamma) * G_prev + reward_t # Sticking to paper Eq 17
+
+        # Update running variance of G_t using Welford's online algorithm
+        count_new = count_prev + 1
+        delta = G_t - G_prev # Difference between current G and previous mean G
+        # Mean update isn't needed directly, but delta is used for variance
+        # Update variance: M2 = var * count
+        M2_prev = var_prev * count_prev
+        M2_new = M2_prev + delta * delta * count_prev / count_new # Welford's M2 update
+        var_new = M2_new / count_new
+
+        # Update running max G_t (Eq 18)
+        G_max_new = max(self.running_G_max[env_id], G_t)
+
+        # Store updated stats
+        self.running_G[env_id] = G_t
+        self.running_G_var[env_id] = var_new
+        self.running_G_count[env_id] = count_new
+        self.running_G_max[env_id] = G_max_new
+
+        # Reset G_t at the start of a new episode (when done is True)
+        if done:
+            self.running_G[env_id] = 0.0
+            # Optionally reset variance/max too, or let them persist across episodes?
+            # Paper doesn't specify reset for variance/max. Let's keep them running.
+
+        # Return the current variance and max for scaling calculation
+        return var_new, G_max_new
+
+    def _scale_reward(self, env_id, reward_t, variance_G, max_G):
+        """Scale reward according to paper Eq 19."""
+        # Denominator calculation
+        denom = max(variance_G + self.reward_scaling_eps, max_G / self.reward_scaling_G_max)
+        # Add small epsilon to prevent division by zero if denom is somehow zero
+        denom = max(denom, self.reward_scaling_eps)
+
+        scaled_reward = reward_t / denom
+        return scaled_reward
+
     def update_experience_with_intrinsic_reward(self, state=None, action=None, next_state=None, done=None, reward=None, store_idx=None, env_id=None):
         """
-        Calculate intrinsic reward and update stored experience
+        Calculate intrinsic reward and update stored experience.
+        Uses the ORIGINAL extrinsic reward for normalization context.
+        Combines intrinsic reward with the SCALED extrinsic reward.
 
         Args:
-            state: Current observation (renamed from obs to match main.py calls)
+            state: Current observation
             action: Action taken
-            next_state: Next observation (renamed from next_obs to match main.py calls)
-            done: Done flag (now optional with default None)
-            reward: Original extrinsic reward
+            next_state: Next observation
+            done: Done flag
+            reward: ORIGINAL extrinsic reward (unscaled)
             store_idx: Index in memory to update (for PPO)
-            env_id: Environment ID for vectorized environments
+            env_id: Environment ID
 
         Returns:
-            Total reward (extrinsic + intrinsic)
+            Total reward (scaled extrinsic + scaled intrinsic)
         """
         # If intrinsic rewards are disabled or generator is not initialized, return original reward
         if not self.use_intrinsic_rewards or self.intrinsic_reward_generator is None:
-            return reward
+            # Return the SCALED reward if scaling is enabled, otherwise original
+            if self.use_reward_scaling and not getattr(self, 'test_mode', False):
+                 # Recalculate scaled reward if needed (e.g., for PPO where only original might be available here)
+                 self._initialize_reward_scaling_stats(env_id)
+                 variance_G = self.running_G_var[env_id]
+                 max_G = self.running_G_max[env_id]
+                 # Ensure reward is float
+                 if isinstance(reward, torch.Tensor): reward_float = reward.item()
+                 elif isinstance(reward, np.ndarray): reward_float = reward.item() if reward.size == 1 else float(reward[0])
+                 else: reward_float = float(reward)
+                 return self._scale_reward(env_id, reward_float, variance_G, max_G)
+            else:
+                 # Ensure reward is float before returning
+                 if isinstance(reward, torch.Tensor): return reward.item()
+                 elif isinstance(reward, np.ndarray): return reward.item() if reward.size == 1 else float(reward[0])
+                 else: return float(reward) # Return original reward if scaling disabled or in test mode
 
-        # Calculate intrinsic reward
-        intrinsic_reward = 0.0
-
+        intrinsic_reward_value = 0.0
         try:
             # Convert inputs to tensors if needed
-            if not isinstance(state, torch.Tensor):
-                obs_tensor = torch.tensor(state, dtype=torch.float32, device=self.device)
-            else:
-                obs_tensor = state
+            if not isinstance(state, torch.Tensor): obs_tensor = torch.tensor(state, dtype=torch.float32, device=self.device)
+            else: obs_tensor = state.to(self.device)
+            if not isinstance(action, torch.Tensor): action_tensor = torch.tensor(action, dtype=torch.float32, device=self.device) # Use float32 for actions too
+            else: action_tensor = action.to(self.device)
+            if not isinstance(next_state, torch.Tensor): next_obs_tensor = torch.tensor(next_state, dtype=torch.float32, device=self.device)
+            else: next_obs_tensor = next_state.to(self.device)
+            # Ensure batch dimension
+            if obs_tensor.dim() == 1: obs_tensor = obs_tensor.unsqueeze(0)
+            if action_tensor.dim() == 1: action_tensor = action_tensor.unsqueeze(0)
+            if next_obs_tensor.dim() == 1: next_obs_tensor = next_obs_tensor.unsqueeze(0)
 
-            if not isinstance(action, torch.Tensor):
-                action_tensor = torch.tensor(action, dtype=torch.float32, device=self.device)
-            else:
-                action_tensor = action
-
-            if not isinstance(next_state, torch.Tensor):
-                next_obs_tensor = torch.tensor(next_state, dtype=torch.float32, device=self.device)
-            else:
-                next_obs_tensor = next_state
-
-            # Add batch dimension if needed
-            if obs_tensor.dim() == 1:
-                obs_tensor = obs_tensor.unsqueeze(0)
-            if action_tensor.dim() == 1:
-                action_tensor = action_tensor.unsqueeze(0)
-            if next_obs_tensor.dim() == 1:
-                next_obs_tensor = next_obs_tensor.unsqueeze(0)
 
             # Compute intrinsic reward
-            intrinsic_reward = self.intrinsic_reward_generator.compute_intrinsic_reward(
+            intrinsic_reward_value = self.intrinsic_reward_generator.compute_intrinsic_reward(
                 obs_tensor, action_tensor, next_obs_tensor
             )
 
             # Update intrinsic reward model
-            if done is not None:  # Only update if done flag is provided
+            if done is not None:
                 self.intrinsic_reward_generator.update(obs_tensor, action_tensor, next_obs_tensor, done)
 
             # Convert to scalar if tensor
-            if isinstance(intrinsic_reward, torch.Tensor):
-                intrinsic_reward = intrinsic_reward.item()
+            if isinstance(intrinsic_reward_value, torch.Tensor):
+                intrinsic_reward_value = intrinsic_reward_value.item()
 
-            # Scale intrinsic reward
-            intrinsic_reward *= self.intrinsic_reward_scale
+            # --- Adaptive Scaling based on ORIGINAL reward ---
+            if not hasattr(self, 'extrinsic_reward_normalizer'):
+                 from intrinsic_rewards import ExtrinsicRewardNormalizer
+                 self.extrinsic_reward_normalizer = ExtrinsicRewardNormalizer()
+
+            # Ensure original reward is float
+            if isinstance(reward, torch.Tensor): original_reward_float = reward.item()
+            elif isinstance(reward, np.ndarray): original_reward_float = reward.item() if reward.size == 1 else float(reward[0])
+            else: original_reward_float = float(reward)
+
+            normalized_reward = self.extrinsic_reward_normalizer.normalize(original_reward_float)
+            sigmoid_factor = 1.0 / (1.0 + np.exp(2.0 * normalized_reward))
+            adaptive_scale = self.intrinsic_reward_scale * sigmoid_factor
+            adaptive_scale = max(0.1 * self.intrinsic_reward_scale, adaptive_scale) # Min scale
+
+            # Scale the intrinsic reward
+            scaled_intrinsic_reward = intrinsic_reward_value * adaptive_scale
+            # --- End Adaptive Scaling ---
 
         except Exception as e:
             if self.debug:
                 print(f"Error computing intrinsic reward: {e}")
-            intrinsic_reward = 0.0
+                import traceback
+                traceback.print_exc() # Print stack trace for debugging
+            scaled_intrinsic_reward = 0.0
 
-        # Calculate total reward
-        total_reward = reward + intrinsic_reward
+        # Get the SCALED extrinsic reward
+        if self.use_reward_scaling and not getattr(self, 'test_mode', False):
+            self._initialize_reward_scaling_stats(env_id)
+            variance_G = self.running_G_var[env_id]
+            max_G = self.running_G_max[env_id]
+            # Ensure original reward is float for scaling calculation
+            if isinstance(reward, torch.Tensor): original_reward_float = reward.item()
+            elif isinstance(reward, np.ndarray): original_reward_float = reward.item() if reward.size == 1 else float(reward[0])
+            else: original_reward_float = float(reward)
+            scaled_extrinsic_reward = self._scale_reward(env_id, original_reward_float, variance_G, max_G)
+        else:
+            # If scaling is off or in test mode, use the original reward directly
+            if isinstance(reward, torch.Tensor): scaled_extrinsic_reward = reward.item()
+            elif isinstance(reward, np.ndarray): scaled_extrinsic_reward = reward.item() if reward.size == 1 else float(reward[0])
+            else: scaled_extrinsic_reward = float(reward)
+
+        # Calculate total reward (scaled extrinsic + scaled intrinsic)
+        total_reward = scaled_extrinsic_reward + scaled_intrinsic_reward
 
         # Update stored experience if index is provided (for PPO)
         if store_idx is not None and self.algorithm_type == "ppo":
@@ -1680,10 +1816,17 @@ class Trainer:
             if not isinstance(total_reward, torch.Tensor):
                 total_reward_tensor = torch.tensor(total_reward, dtype=torch.float32, device=self.device)
             else:
-                total_reward_tensor = total_reward
+                total_reward_tensor = total_reward.to(self.device)
 
             # Update the experience in memory
-            self.algorithm.store_experience_at_idx(store_idx, reward=total_reward_tensor)
+            # Ensure we only update the reward field
+            if hasattr(self.algorithm, 'memory') and hasattr(self.algorithm.memory, 'rewards'):
+                 # Check bounds
+                 if 0 <= store_idx < len(self.algorithm.memory.rewards):
+                     self.algorithm.memory.rewards[store_idx] = total_reward_tensor
+                 elif self.debug:
+                     print(f"[DEBUG] Invalid store_idx {store_idx} for memory size {len(self.algorithm.memory.rewards)}")
+
 
         return total_reward
 

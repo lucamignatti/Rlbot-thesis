@@ -1,9 +1,18 @@
-import psutil
-import os
+import sys
 import gc
-from collections import Counter
-import numpy as np
+import psutil
+import heapq
+import os
+import time
+import traceback
+import argparse
+import signal
 import torch
+import wandb
+import multiprocessing as mp
+import numpy as np
+from collections import Counter
+from collections.abc import Sized, Iterable
 from rlgym.api import RLGym
 from rlgym.rocket_league.action_parsers import LookupTableAction, RepeatAction
 from rlgym.rocket_league.done_conditions import GoalCondition, AnyCondition, TimeoutCondition, NoTouchTimeoutCondition
@@ -14,30 +23,21 @@ import RocketSim as rocketsim
 from rlgym.rocket_league.rlviser import RLViserRenderer
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
 from rewards import BallProximityReward, BallToGoalDistanceReward, BallVelocityToGoalReward, TouchBallReward, TouchBallToGoalAccelerationReward, AlignBallToGoalReward, PlayerVelocityTowardBallReward, KRCReward
-from models import BasicModel, SimBa, fix_compiled_state_dict, extract_model_dimensions, load_partial_state_dict
+from model_architectures import (
+    BasicModel, SimBa, SimbaV2,
+    fix_compiled_state_dict, extract_model_dimensions, load_partial_state_dict
+)
 from observation import StackedActionsObs, ActionStacker
 from training import Trainer
 from algorithms import PPOAlgorithm, StreamACAlgorithm  # Import from new algorithms package
 import concurrent.futures
-import time
-import argparse
 from tqdm import tqdm
-import signal
-import sys
-import asyncio
-import multiprocessing as mp
-from multiprocessing import Process, Pipe
 from typing import List, Tuple, Dict
-import numpy as np
 from envs.factory import get_env
 from envs.vectorized import VectorizedEnv
 from envs.rlbot_vectorized import RLBotVectorizedEnv
 from curriculum import create_curriculum
-# Added import for sys and Sized/Iterable
-import sys
-from collections.abc import Sized, Iterable
-# Added import for heapq
-import heapq
+
 
 def log_memory_usage(step=0, location=""):
     """Log memory usage at a specific point in the code"""
@@ -155,6 +155,9 @@ def run_training(
     stream_buffer_size: int = 32,
     use_sparse_init: bool = True,
     update_freq: int = 1,
+    # Add reward scaling parameters
+    use_reward_scaling: bool = True,
+    reward_scaling_G_max: float = 10.0,
 ):
     """
     Main training loop.
@@ -226,6 +229,9 @@ def run_training(
         stream_buffer_size=stream_buffer_size,
         use_sparse_init=use_sparse_init,
         update_freq=update_freq,
+        # Pass reward scaling parameters to Trainer
+        use_reward_scaling=use_reward_scaling,
+        reward_scaling_G_max=reward_scaling_G_max,
     )
 
     # --- MODEL LOADING LOGIC ---
@@ -295,7 +301,6 @@ def run_training(
 
         except Exception as e:
             print(f"Failed to initialize curriculum: {e}")
-            import traceback
             traceback.print_exc()
             print("Continuing without curriculum")
             use_curriculum = False
@@ -918,7 +923,6 @@ def run_training(
         print("\nTraining interrupted. Cleaning up...")
     except Exception as e:
         print(f"Error during training: {str(e)}")
-        import traceback
         traceback.print_exc()
     finally:
         # Always clean up the environments and progress bar.
@@ -933,7 +937,6 @@ def run_training(
                 trainer.update()  # Final update
             except Exception as e:
                 print(f"Error during final update: {str(e)}")
-                import traceback
                 traceback.print_exc()
 
         # Return the trainer instance
@@ -1184,6 +1187,16 @@ if __name__ == "__main__":
     parser.add_argument('-p', '--processes', type=int, default=None,
                         help='Legacy parameter; use --num_envs instead')
 
+    # Model architecture argument
+    parser.add_argument('--model-arch', type=str, default='simbav2', choices=['basic', 'simba', 'simbav2'],
+                       help='Model architecture to use (basic, simba, simbav2)')
+
+    # Add reward scaling args here, before parse_args()
+    parser.add_argument('--use-reward-scaling', action='store_true', dest='use_reward_scaling', help='Enable SimbaV2 reward scaling')
+    parser.add_argument('--no-reward-scaling', action='store_false', dest='use_reward_scaling', help='Disable SimbaV2 reward scaling')
+    parser.set_defaults(use_reward_scaling=True)
+    parser.add_argument('--reward-scaling-gmax', type=float, default=10.0, help='G_max hyperparameter for reward scaling')
+
     args = parser.parse_args()
 
     if args.model is not None:
@@ -1234,12 +1247,33 @@ if __name__ == "__main__":
         else:
             device = "cpu"
 
-    actor = SimBa(obs_shape=obs_space_dims, action_shape=action_space_dims,
-                    hidden_dim=args.hidden_dim, num_blocks=args.num_blocks,
-                    dropout_rate=args.dropout, device=device)
-    critic = SimBa(obs_shape=obs_space_dims, action_shape=1,
-                    hidden_dim=args.hidden_dim, num_blocks=args.num_blocks,
-                    dropout_rate=args.dropout, device=device)
+    ModelClassActor = None
+    ModelClassCritic = None
+    model_kwargs = {
+        'hidden_dim': args.hidden_dim,
+        'num_blocks': args.num_blocks,
+        'device': device
+    }
+    if args.model_arch == 'basic':
+        ModelClassActor = BasicModel
+        ModelClassCritic = BasicModel
+        model_kwargs['dropout_rate'] = args.dropout # BasicModel uses dropout
+    elif args.model_arch == 'simba':
+        ModelClassActor = SimBa
+        ModelClassCritic = SimBa
+        model_kwargs['dropout_rate'] = args.dropout # SimBa uses dropout
+    elif args.model_arch == 'simbav2':
+        ModelClassActor = SimbaV2
+        ModelClassCritic = SimbaV2
+        # SimbaV2 does not use dropout_rate, but might have other specific args
+        # model_kwargs['shift_constant'] = 3.0 # Example if needed
+    else:
+        raise ValueError(f"Unknown model architecture: {args.model_arch}")
+
+
+    actor = ModelClassActor(obs_shape=obs_space_dims, action_shape=action_space_dims, **model_kwargs)
+    # Critic always outputs 1 value
+    critic = ModelClassCritic(obs_shape=obs_space_dims, action_shape=1, **model_kwargs)
 
     torch.set_printoptions(precision=10)
 
@@ -1278,7 +1312,6 @@ if __name__ == "__main__":
 
     # Set up Weights & Biases for experiment tracking, if enabled.
     if args.wandb:
-        import wandb
         # Initialize wandb with proper step counting setup
         run = wandb.init(
             project="rlbot-training",
@@ -1357,6 +1390,9 @@ if __name__ == "__main__":
     trainer = run_training(
         actor=actor,
         critic=critic,
+        # Pass reward scaling args
+        use_reward_scaling=args.use_reward_scaling,
+        reward_scaling_G_max=args.reward_scaling_gmax,
         # training_step_offset is now handled inside run_training via load_models
         device=device,
         num_envs=args.num_envs,
@@ -1432,77 +1468,74 @@ if __name__ == "__main__":
     # Upload the saved model to WandB as an artifact
     if args.wandb and saved_path and os.path.exists(saved_path):
         try:
-            import wandb
-            if wandb.run is not None:
-                # Create a name for the artifact
-                artifact_name = f"{args.algorithm}_{wandb.run.id}"
-                if args.time is not None:
-                    artifact_name += f"_t{int(parse_time(args.time) if args.time else 0)}s"
-                else:
-                    artifact_name += f"_ep{args.episodes}"
+            # Create a name for the artifact
+            artifact_name = f"{args.algorithm}_{wandb.run.id}"
+            if args.time is not None:
+                artifact_name += f"_t{int(parse_time(args.time) if args.time else 0)}s"
+            else:
+                artifact_name += f"_ep{args.episodes}"
 
-                # Log the model as an artifact with metadata
-                artifact = wandb.Artifact(
-                    name=artifact_name,
-                    type="model",
-                    description=f"RL model trained with {args.algorithm.upper()} for {args.episodes if args.time is None else args.time}"
-                )
+            # Log the model as an artifact with metadata
+            artifact = wandb.Artifact(
+                name=artifact_name,
+                type="model",
+                description=f"RL model trained with {args.algorithm.upper()} for {args.episodes if args.time is None else args.time}"
+            )
 
-                # Add the model file
-                artifact.add_file(saved_path)
+            # Add the model file
+            artifact.add_file(saved_path)
 
-                # Add metadata
-                metadata = {
-                    "algorithm": args.algorithm,
-                    "episodes": args.episodes if args.time is None else None,
-                    "training_time": args.time,
-                    "device": str(device),
-                    "lr_actor": args.lra,
-                    "lr_critic": args.lrc,
-                    "gamma": args.gamma,
-                    "gae_lambda": args.gae_lambda,
-                    "clip_epsilon": args.clip_epsilon,
-                    "critic_coef": args.critic_coef,
-                    "entropy_coef": args.entropy_coef,
-                    "model_type": type(actor).__name__,
-                    "num_envs": args.num_envs,
-                    "update_interval": args.update_interval,
-                    "saved_path": saved_path,
-                    'model_config': {
-                        'hidden_dim': args.hidden_dim,
-                        'num_blocks': args.num_blocks,
-                        'dropout': args.dropout
-                    },
-                }
+            # Add metadata
+            metadata = {
+                "algorithm": args.algorithm,
+                "episodes": args.episodes if args.time is None else None,
+                "training_time": args.time,
+                "device": str(device),
+                "lr_actor": args.lra,
+                "lr_critic": args.lrc,
+                "gamma": args.gamma,
+                "gae_lambda": args.gae_lambda,
+                "clip_epsilon": args.clip_epsilon,
+                "critic_coef": args.critic_coef,
+                "entropy_coef": args.entropy_coef,
+                "model_type": type(actor).__name__,
+                "num_envs": args.num_envs,
+                "update_interval": args.update_interval,
+                "saved_path": saved_path,
+                'model_config': {
+                    'hidden_dim': args.hidden_dim,
+                    'num_blocks': args.num_blocks,
+                    'dropout': args.dropout
+                },
+            }
 
-                # Add StreamAC specific metadata if relevant
-                if args.algorithm == "streamac":
-                    metadata.update({
-                        "adaptive_learning_rate": args.adaptive_learning_rate,
-                        "target_step_size": args.target_step_size,
-                        "backtracking_patience": args.backtracking_patience,
-                        "backtracking_zeta": args.backtracking_zeta,
-                        "use_obgd": args.use_obgd,
-                        "stream_buffer_size": args.stream_buffer_size,
-                        "use_sparse_init": args.use_sparse_init
-                    })
+            # Add StreamAC specific metadata if relevant
+            if args.algorithm == "streamac":
+                metadata.update({
+                    "adaptive_learning_rate": args.adaptive_learning_rate,
+                    "target_step_size": args.target_step_size,
+                    "backtracking_patience": args.backtracking_patience,
+                    "backtracking_zeta": args.backtracking_zeta,
+                    "use_obgd": args.use_obgd,
+                    "stream_buffer_size": args.stream_buffer_size,
+                    "use_sparse_init": args.use_sparse_init
+                })
 
-                # Add metadata to the artifact
-                for key, value in metadata.items():
-                    if value is not None:  # Only add non-None values
-                        artifact.metadata[key] = value
+            # Add metadata to the artifact
+            for key, value in metadata.items():
+                if value is not None:  # Only add non-None values
+                    artifact.metadata[key] = value
 
-                # Log the artifact to wandb
-                wandb.log_artifact(artifact)
+            # Log the artifact to wandb
+            wandb.log_artifact(artifact)
 
-                if args.debug:
-                    print(f"[DEBUG] Uploaded model to WandB as artifact '{artifact_name}'")
-                else:
-                    print(f"Uploaded model to WandB as artifact '{artifact_name}'")
+            if args.debug:
+                print(f"[DEBUG] Uploaded model to WandB as artifact '{artifact_name}'")
+            else:
+                print(f"Uploaded model to WandB as artifact '{artifact_name}'")
         except ImportError:
             print("WandB not available, skipping artifact upload")
         except Exception as e:
             print(f"Error uploading model to WandB: {str(e)}")
             if args.debug:
-                import traceback
                 traceback.print_exc()
