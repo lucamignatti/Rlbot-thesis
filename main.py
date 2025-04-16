@@ -752,10 +752,11 @@ def run_training(
                                 "Entropy": f"{metrics.get('entropy_loss', 0):.4f}"
                             })
 
-                            if 'sr_loss' in metrics or 'rp_loss' in metrics:
+                            # Use SCALAR versions for progress bar
+                            if 'sr_loss_scalar' in metrics or 'rp_loss_scalar' in metrics:
                                 stats_dict.update({
-                                    "SR_Loss": f"{metrics.get('sr_loss', 0):.4f}",
-                                    "RP_Loss": f"{metrics.get('rp_loss', 0):.4f}"
+                                    "SR_Loss": f"{metrics.get('sr_loss_scalar', 0):.4f}",
+                                    "RP_Loss": f"{metrics.get('rp_loss_scalar', 0):.4f}"
                                 })
 
                         # Update progress bar immediately
@@ -793,6 +794,7 @@ def run_training(
                     stats = trainer.algorithm.get_metrics()
 
                 # Update the statistics displayed in the progress bar.
+                # Use SCALAR versions for display
                 stats_dict.update({
                     "Device": device,
                     "Envs": num_envs,
@@ -802,8 +804,8 @@ def run_training(
                     "PLoss": f"{stats.get('actor_loss', 0):.4f}",
                     "VLoss": f"{stats.get('critic_loss', 0):.4f}",
                     "Entropy": f"{stats.get('entropy_loss', 0):.4f}",
-                    "SR_Loss": f"{stats.get('sr_loss', 0):.4f}",
-                    "RP_Loss": f"{stats.get('rp_loss', 0):.4f}"
+                    "SR_Loss": f"{stats.get('sr_loss_scalar', 0):.4f}",
+                    "RP_Loss": f"{stats.get('rp_loss_scalar', 0):.4f}"
                 })
 
                 # Update StreamAC specific metrics if using that algorithm

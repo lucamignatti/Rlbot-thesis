@@ -322,7 +322,9 @@ class Trainer:
                 device=self.device,
                 use_amp=aux_amp,
                 update_frequency=1,
-                learning_mode="stream" if algorithm_type == "streamac" else "batch"  # Explicitly set mode
+                learning_mode="stream" if algorithm_type == "streamac" else "batch",
+                debug=self.debug,
+                batch_size=batch_size
             )
 
             # Enable debug mode for auxiliary tasks
@@ -555,35 +557,33 @@ class Trainer:
             auxiliary_metrics = grouped_metrics['auxiliary']
 
             # Always include auxiliary metrics in the log, even if they're 0
-            # This ensures consistent logging and makes debugging easier
-
-            # Check if we have the metrics coming from trainer.update() update or direct aux manager
-            sr_loss = metrics.get("sr_loss", 0)
-            rp_loss = metrics.get("rp_loss", 0)
-            aux_loss = metrics.get("aux_loss", 0)
+            # Use the SCALAR versions for logging
+            sr_loss_scalar = metrics.get("sr_loss_scalar", 0)
+            rp_loss_scalar = metrics.get("rp_loss_scalar", 0)
+            aux_loss_scalar = metrics.get("aux_loss", 0)
 
             # Debug info for auxiliary metrics
-            if self.debug and (sr_loss > 0 or rp_loss > 0):
-                print(f"[WANDB DEBUG] Logging auxiliary metrics - SR: {sr_loss:.6f}, RP: {rp_loss:.6f}")
+            if self.debug and (sr_loss_scalar > 0 or rp_loss_scalar > 0):
+                print(f"[WANDB DEBUG] Logging auxiliary metrics - SR: {sr_loss_scalar:.6f}, RP: {rp_loss_scalar:.6f}")
 
-            # If aux_loss is not provided but sr_loss and rp_loss are, calculate it
-            if aux_loss == 0 and (sr_loss > 0 or rp_loss > 0):
-                aux_loss = sr_loss + rp_loss
+            # If aux_loss is not provided but sr_loss and rp_loss are, calculate it using scalars
+            if aux_loss_scalar == 0 and (sr_loss_scalar > 0 or rp_loss_scalar > 0):
+                aux_loss_scalar = sr_loss_scalar + rp_loss_scalar
 
             # Get weights directly from aux_task_manager if available
             sr_weight = getattr(self.aux_task_manager, "sr_weight", 0) if hasattr(self, 'aux_task_manager') else 0
             rp_weight = getattr(self.aux_task_manager, "rp_weight", 0) if hasattr(self.aux_task_manager, 'rp_weight') else 0
 
-            # Log the unweighted losses (more meaningful values for trends)
-            auxiliary_metrics["AUX/state_representation_loss"] = sr_loss
-            auxiliary_metrics["AUX/reward_prediction_loss"] = rp_loss
-            auxiliary_metrics["AUX/total_loss"] = aux_loss
+            # Log the unweighted SCALAR losses
+            auxiliary_metrics["AUX/state_representation_loss"] = sr_loss_scalar
+            auxiliary_metrics["AUX/reward_prediction_loss"] = rp_loss_scalar
+            auxiliary_metrics["AUX/total_loss"] = aux_loss_scalar
 
             # Also log the weights
             auxiliary_metrics["AUX/sr_weight"] = sr_weight
             auxiliary_metrics["AUX/rp_weight"] = rp_weight
 
-            # Log actual last values from auxiliary manager if available
+            # Log actual last values from auxiliary manager if available (already scalars)
             if hasattr(self, 'aux_task_manager'): # Check existence on self
                 if hasattr(self.aux_task_manager, 'last_sr_loss') and self.aux_task_manager.last_sr_loss > 0:
                     sr_value = self.aux_task_manager.last_sr_loss
@@ -932,7 +932,12 @@ class Trainer:
                         if self.debug:
                             print(f"[STEP DEBUG] Logging auxiliary metrics at step {current_step}")
                         self._last_aux_log_step = current_step
-                        self._log_to_wandb(aux_metrics, step=current_step)
+                        # Pass the SCALAR versions to log_to_wandb
+                        log_data = {
+                            "sr_loss_scalar": self.aux_task_manager.last_sr_loss,
+                            "rp_loss_scalar": self.aux_task_manager.last_rp_loss
+                        }
+                        self._log_to_wandb(log_data, step=current_step)
                 except Exception as e:
                     if self.debug:
                         print(f"[STEP DEBUG] Error logging auxiliary metrics: {e}")
@@ -1073,11 +1078,18 @@ class Trainer:
                     aux_metrics = self.aux_task_manager.compute_losses()
 
                     # Always include auxiliary metrics in the main metrics dictionary
-                    metrics.update(aux_metrics)
-                    # Calculate total aux loss if individual losses are present
-                    metrics['aux_loss'] = aux_metrics.get('sr_loss', 0) + aux_metrics.get('rp_loss', 0)
+                    # Use SCALAR versions for logging/tracking
+                    metrics['sr_loss_scalar'] = aux_metrics.get('sr_loss_scalar', 0)
+                    metrics['rp_loss_scalar'] = aux_metrics.get('rp_loss_scalar', 0)
+                    # Keep tensors for potential backward pass
+                    metrics['sr_loss'] = aux_metrics.get('sr_loss', torch.tensor(0.0, device=self.device))
+                    metrics['rp_loss'] = aux_metrics.get('rp_loss', torch.tensor(0.0, device=self.device))
+
+                    # Calculate total aux loss using SCALARS
+                    metrics['aux_loss'] = metrics['sr_loss_scalar'] + metrics['rp_loss_scalar']
+
                     if self.debug:
-                        print(f"[DEBUG] Auxiliary task update (PPO): SR={aux_metrics.get('sr_loss', 0):.6f}, RP={aux_metrics.get('rp_loss', 0):.6f}")
+                        print(f"[DEBUG] Auxiliary task update (PPO): SR={metrics['sr_loss_scalar']:.6f}, RP={metrics['rp_loss_scalar']:.6f}")
                 except Exception as e:
                     if self.debug:
                         print(f"[DEBUG] Error computing auxiliary losses (PPO): {e}")
@@ -1094,7 +1106,7 @@ class Trainer:
                     import traceback
                     traceback.print_exc()
 
-        # Append losses to deques
+        # Append losses to deques (use SCALARS for tracking)
         if 'actor_loss' in metrics:
             self.actor_losses.append(metrics['actor_loss'])
         if 'critic_loss' in metrics:
@@ -1103,10 +1115,10 @@ class Trainer:
             self.entropy_losses.append(metrics['entropy_loss'])
         if 'total_loss' in metrics:
             self.total_losses.append(metrics['total_loss'])
-        if 'sr_loss' in metrics: # Add aux loss tracking
-            self.aux_sr_losses.append(metrics['sr_loss'])
-        if 'rp_loss' in metrics: # Add aux loss tracking
-            self.aux_rp_losses.append(metrics['rp_loss'])
+        if 'sr_loss_scalar' in metrics: # Add aux loss tracking using scalars
+            self.aux_sr_losses.append(metrics['sr_loss_scalar'])
+        if 'rp_loss_scalar' in metrics: # Add aux loss tracking using scalars
+            self.aux_rp_losses.append(metrics['rp_loss_scalar'])
 
         # Clean up tensors to reduce memory usage
         self._cleanup_tensors()

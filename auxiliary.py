@@ -196,9 +196,9 @@ class RewardPredictionTask(nn.Module):
 
                     # Get confidence scores
                     softmax_probs = F.softmax(logits, dim=1)
-                    avg_confidence = softmax_probs.max(dim=1)[0].mean().item()
+                    avg_confidence = softmax_probs.max(dim=1)[0].mean().detach().item()
                     print(f"[RP DEBUG] Average prediction confidence: {avg_confidence:.4f}")
-                    print(f"[RP DEBUG] Logits sample: {logits[0].cpu().tolist()}")
+                    print(f"[RP DEBUG] Logits sample: {logits[0].detach().cpu().tolist()}")
 
         return loss
 
@@ -237,7 +237,7 @@ def _adjust_reward_thresholds(rewards_history, pos_threshold, neg_threshold, deb
 
     if debug:
         print(f"[RP DEBUG] Adjusted thresholds - Neg: {neg_threshold:.6f}, Pos: {pos_threshold:.6f}")
-    
+
     return pos_threshold, neg_threshold
 
 
@@ -295,7 +295,7 @@ class AuxiliaryTaskManager:
             hidden_dim=sr_hidden_dim,
             device=device
         )
-        
+
         # Reward prediction task
         self.rp_task = RewardPredictionTask(
             input_dim=self.feature_dim,  # Uses actor features
@@ -390,7 +390,7 @@ class AuxiliaryTaskManager:
         """
         Compute auxiliary task losses that flow gradients through the shared
         layers of the actor network.
-        
+
         Returns:
             dict: Dictionary containing SR and RP loss tensors (not detached)
         """
@@ -422,10 +422,10 @@ class AuxiliaryTaskManager:
             # Compute SR loss if we have features
             if features_batch is not None:
                 sr_loss = self.sr_task.get_loss(features_batch, obs_batch) * self.sr_weight
-                
+
                 # Store scalar for logging (don't detach the tensor for gradient flow)
                 if not torch.isnan(sr_loss) and not torch.isinf(sr_loss):
-                    self.last_sr_loss = sr_loss.item()
+                    self.last_sr_loss = sr_loss.detach().item()
                 else:
                     if self.debug:
                         print("[AUX DEBUG] Invalid SR loss detected")
@@ -447,6 +447,7 @@ class AuxiliaryTaskManager:
                 if self.debug:
                     print(f"[AUX DEBUG] RP Task skipped: Not enough valid start indices ({max_start_index+1}/{self.batch_size})")
                 self.last_rp_loss = 0.0
+                # Return early if RP cannot run, SR loss might still be valid
                 return {"sr_loss": sr_loss, "rp_loss": rp_loss}
 
             # Sample valid start indices for sequences
@@ -460,7 +461,7 @@ class AuxiliaryTaskManager:
                 # Extract observation sequence
                 obs_seq = [self.obs_history[i] for i in range(start_idx, start_idx + self.rp_sequence_length)]
                 obs_seq_batch.append(torch.stack(obs_seq))
-                
+
                 # Extract target reward (reward at the end of the sequence)
                 target_reward_idx = start_idx + self.rp_sequence_length - 1
                 reward_target_batch.append(self.reward_history[target_reward_idx])
@@ -473,7 +474,7 @@ class AuxiliaryTaskManager:
             # First reshape to handle batch sequences through the actor
             batch_size, seq_len, obs_dim = obs_seq_tensor.shape
             obs_flat = obs_seq_tensor.reshape(-1, obs_dim)  # [batch_size*seq_len, obs_dim]
-            
+
             with torch.set_grad_enabled(self.training):
                 try:
                     _, features_flat = self.actor(obs_flat, return_features=True)
@@ -494,12 +495,12 @@ class AuxiliaryTaskManager:
                 # Reshape features back to sequence form
                 feature_dim = features_flat.shape[-1]
                 features_seq_tensor = features_flat.reshape(batch_size, seq_len, feature_dim)
-                
+
                 rp_loss = self.rp_task.get_loss(features_seq_tensor, reward_targets_tensor) * self.rp_weight
-                
+
                 # Store scalar for logging (don't detach the tensor for gradient flow)
                 if not torch.isnan(rp_loss) and not torch.isinf(rp_loss):
-                    self.last_rp_loss = rp_loss.item()
+                    self.last_rp_loss = rp_loss.detach().item()
                 else:
                     if self.debug:
                         print("[AUX DEBUG] Invalid RP loss detected")
@@ -539,7 +540,7 @@ class AuxiliaryTaskManager:
             hidden_dim=self.sr_task.hidden_dim,
             device=self.device
         )
-        
+
         # Re-initialize RP task
         self.rp_task = RewardPredictionTask(
             input_dim=self.feature_dim,
@@ -602,7 +603,7 @@ class AuxiliaryTaskManager:
                 self.reward_history.extend(temp_rewards)
 
             self.history_size = len(self.obs_history)  # Update size tracker
-            
+
             if self.debug:
                 print(f"[AUX MODE] Changed learning mode from {prev_mode} to {mode}")
                 print(f"[AUX MODE] New history size: {self.history_size}")
