@@ -993,7 +993,7 @@ if __name__ == "__main__":
 
     parser.add_argument('-n', '--num_envs', type=int, default=24,
                         help='Number of parallel environments to run for faster data collection')
-    parser.add_argument('--update_interval', type=int, default=8192,
+    parser.add_argument('--update_interval', type=int, default=6144,
                         help='Number of experiences to collect before updating the policy')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use for training (cuda/mps/cpu).  Autodetects if not specified.')
@@ -1014,22 +1014,22 @@ if __name__ == "__main__":
                        help='Learning algorithm to use: ppo (default) or streamac')
 
     # Learning rates
-    parser.add_argument('--lra', type=float, default=5e-5, help='Learning rate for actor network')
-    parser.add_argument('--lrc', type=float, default=1e-4, help='Learning rate for critic network')
+    parser.add_argument('--lra', type=float, default=1e-4, help='Learning rate for actor network')
+    parser.add_argument('--lrc', type=float, default=3e-4, help='Learning rate for critic network')
 
     # Discount factors
     parser.add_argument('--gamma', type=float, default=0.997, help='Discount factor for future rewards')
-    parser.add_argument('--gae_lambda', type=float, default=0.95, help='Lambda para,meter for Generalized Advantage Estimation')
+    parser.add_argument('--gae_lambda', type=float, default=0.95, help='Lambda parameter for Generalized Advantage Estimation')
 
     # PPO parameters
-    parser.add_argument('--clip_epsilon', type=float, default=0.15, help='PPO clipping parameter')
-    parser.add_argument('--critic_coef', type=float, default=1.0, help='Weight of the critic loss')
+    parser.add_argument('--clip_epsilon', type=float, default=0.2, help='PPO clipping parameter')
+    parser.add_argument('--critic_coef', type=float, default=0.5, help='Weight of the critic loss')
     parser.add_argument('--entropy_coef', type=float, default=0.005, help='Weight of the entropy bonus (encourages exploration)')
-    parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Maximum gradient norm for clipping')
+    parser.add_argument('--max_grad_norm', type=float, default=0.5, help='Maximum gradient norm for clipping')
 
     # Training loop parameters
     parser.add_argument('--ppo_epochs', type=int, default=10, help='Number of PPO epochs per update')
-    parser.add_argument('--batch_size', type=int, default=8192, help='Batch size for PPO updates')
+    parser.add_argument('--batch_size', type=int, default=1024, help='Batch size for PPO updates')
 
     parser.add_argument('--weight_clip_kappa', type=float, default=1.0, help='Weight clipping factor for PPO')
     parser.add_argument('--weight_clipping', type=bool, default=False, help='Enable weight clipping for PPO')
@@ -1065,8 +1065,8 @@ if __name__ == "__main__":
     parser.add_argument('--save_interval', type=int, default=200,
                        help='Save the model every N episodes')
 
-    parser.add_argument('--hidden_dim', type=int, default=512, help='Hidden dimension for the network')
-    parser.add_argument('--num_blocks', type=int, default=3, help='Number of residual blocks in the network')
+    parser.add_argument('--hidden_dim', type=int, default=1024, help='Hidden dimension for the network')
+    parser.add_argument('--num_blocks', type=int, default=4, help='Number of residual blocks in the network')
     parser.add_argument('--dropout', type=float, default=0.05, help='Dropout rate for regularization')
 
     # Action stacking parameters
@@ -1094,7 +1094,7 @@ if __name__ == "__main__":
     parser.add_argument('--aux_freq', type=int, default=8,
                         help='Auxiliary task update frequency (higher = less frequent updates)')
 
-    parser.add_argument('--aux_scale', type=float, default=0.005,
+    parser.add_argument('--aux_scale', type=float, default=0.1,
                         help='Scaling factor for auxiliary task losses')
 
     # Pre-training parameters
@@ -1104,7 +1104,7 @@ if __name__ == "__main__":
     parser.add_argument('--pretraining-fraction', type=float, default=0.1, help='Fraction of total training time/episodes to use for pre-training (default: 0.1)')
     parser.add_argument('--pretraining-sr-weight', type=float, default=10.0, help='Weight for State Representation task during pre-training (default: 10.0)')
     parser.add_argument('--pretraining-rp-weight', type=float, default=5.0, help='Weight for Reward Prediction task during pre-training (default: 5.0)')
-    parser.add_argument('--pretraining-transition-steps', type=int, default=1000, help='Number of steps for smooth transition from pre-training to RL training (default: 1000)')
+    parser.add_argument('--pretraining-transition-steps', type=int, default=5000, help='Number of steps for smooth transition from pre-training to RL training (default: 1000)')
 
     # Intrinsic reward parameters
     parser.add_argument('--use-intrinsic', action='store_true', help='Use intrinsic rewards during pre-training')
