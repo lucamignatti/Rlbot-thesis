@@ -82,7 +82,6 @@ def extract_model_dimensions(state_dict):
         # Adjust for continuous action spaces (mean + log_std)
         if action_shape % 2 == 0:
              potential_action_dim = action_shape // 2
-             # Add a check, e.g., if potential_action_dim is reasonable
              # This is heuristic, might need refinement based on actual usage
              action_shape = potential_action_dim # Assume it's mean+std
 

@@ -5,7 +5,7 @@ import pickle
 from rlgym.api import StateMutator, RewardFunction, DoneCondition
 from dataclasses import dataclass
 import wandb
-import collections # Ensure collections is imported
+import collections
 
 @dataclass
 class ProgressionRequirements:
@@ -192,14 +192,14 @@ class CurriculumStage:
         self.episode_count = 0
         self.success_count = 0
         self.failure_count = 0
-        
+
         # Clear rewards history with explicit deletion
         if hasattr(self, 'rewards_history') and self.rewards_history:
             self.rewards_history.clear()
         else:
             # Initialize with maxlen to ensure it doesn't grow unbounded
             self.rewards_history = collections.deque(maxlen=500)
-            
+
         self.moving_success_rate = 0.0
         self.moving_avg_reward = 0.0
 
@@ -242,7 +242,7 @@ class CurriculumManager:
         debug: bool = False,
         testing: bool = False,
         use_wandb: bool = True,
-        max_completed_stages_history: int = 50 # Add max history size
+        max_completed_stages_history: int = 50
     ):
         if not stages:
             raise ValueError("At least one curriculum stage must be provided")
@@ -284,7 +284,7 @@ class CurriculumManager:
         if debug:
             print(f"[DEBUG] Initialized curriculum with {len(stages)} stages")
             print(f"[DEBUG] Starting at stage: {self.current_stage.name}")
-        
+
         # Initialize any stage-specific variables
         if hasattr(self.current_stage, 'initialize') and callable(self.current_stage.initialize):
             self.current_stage.initialize()
@@ -300,14 +300,14 @@ class CurriculumManager:
             if hasattr(trainer, 'register_curriculum_manager'):
                 if not hasattr(trainer, '_curriculum_manager') or trainer._curriculum_manager != self:
                     trainer.register_curriculum_manager(self)
-            
+
             # After registering, check if we have a pretraining stage and connect it
             if len(self.stages) > 0:
                 first_stage = self.stages[0]
                 if hasattr(first_stage, 'is_pretraining') and first_stage.is_pretraining:
                     # Register trainer with the pretraining stage
                     first_stage.register_trainer(trainer)
-                    
+
                     if self.debug:
                         print(f"[DEBUG] Registered trainer with pre-training stage: {first_stage.name}")
 
@@ -315,14 +315,14 @@ class CurriculumManager:
         """Get current training step for wandb logging"""
         if self.debug:
             print(f"[STEP DEBUG] _get_current_step called in curriculum")
-            
+
         if self.trainer is None:
             # If no trainer is registered, use internal counter
             self._last_wandb_step += 1
             if self.debug:
                 print(f"[STEP DEBUG] No trainer registered, using internal counter: {self._last_wandb_step}")
             return self._last_wandb_step
-            
+
         # Use trainer's step counter as source of truth when available
         if hasattr(self.trainer, '_true_training_steps'):
             # Use the true training steps counter from the trainer (most accurate)
@@ -347,23 +347,23 @@ class CurriculumManager:
         """Centralized wandb logging with step validation"""
         if not self.use_wandb or wandb.run is None:
             return
-            
+
         # If step is explicitly provided, use it
         # Otherwise get synchronized step from trainer
         current_step = step if step is not None else self._get_current_step()
-        
+
         if current_step is None:
             # Skip logging if we can't get a valid step
             if self.debug:
                 print("Skipping wandb logging - couldn't get valid step")
             return
-            
+
         # Never log to a step that's less than our last step
         if not self.testing and hasattr(self, '_last_wandb_step') and current_step <= self._last_wandb_step:
             if self.debug:
                 print(f"Skipping wandb log for step {current_step} (≤ {self._last_wandb_step})")
             return
-            
+
         # Use trainer's centralized logging if available
         if self.trainer is not None and hasattr(self.trainer, '_log_to_wandb'):
             try:
@@ -379,7 +379,7 @@ class CurriculumManager:
                     else:
                         # For other types, use simple assignment
                         curriculum_metrics[f"CURR/{key}"] = value
-                
+
                 # Let the trainer handle logging with proper step syncing
                 self.trainer._log_to_wandb(curriculum_metrics, current_step)
             except Exception as e:
@@ -395,7 +395,7 @@ class CurriculumManager:
                 if self.debug:
                     print(f"Error in direct wandb logging: {e}")
                 pass
-        
+
         # Remember this step for next time
         self._last_wandb_step = current_step
 
@@ -403,9 +403,9 @@ class CurriculumManager:
         """Get the current environment configuration based on the active stage and difficulty level."""
         # Check if we're in pretraining mode
         current_stage = self.stages[self.current_stage_index]
-        is_pretraining = (hasattr(current_stage, 'is_pretraining') and current_stage.is_pretraining and 
+        is_pretraining = (hasattr(current_stage, 'is_pretraining') and current_stage.is_pretraining and
                          hasattr(self, 'trainer') and not getattr(self.trainer, 'pretraining_completed', True))
-        
+
         # Determine if we should use a rehearsal stage
         if self.current_stage_index > 0 and self.max_rehearsal_stages > 0:
             if np.random.random() < self._get_rehearsal_probability():
@@ -414,20 +414,20 @@ class CurriculumManager:
                 stage = self.stages[rehearsal_index]
                 config = stage.get_config_with_difficulty(0.0)  # Use difficulty 0.0 for rehearsal
                 config["is_rehearsal"] = True
-                
+
                 if self.debug:
                     print(f"[DEBUG] Rehearsing stage {stage.name} at difficulty 0.0")
-                    
+
                 return config
-        
+
         # Normal mode, use the current stage
         config = current_stage.get_config_with_difficulty(self.current_difficulty)
         config["is_rehearsal"] = False
-        
+
         # Add pretraining flag if applicable
         if is_pretraining:
             config["is_pretraining"] = True
-            
+
         return config
 
     def update_progression_stats(self, episode_metrics: Dict[str, Any]) -> None:
@@ -503,7 +503,7 @@ class CurriculumManager:
         Returns True if progression occurred, False otherwise.
         """
         current_stage = self.stages[self.current_stage_index]
-        
+
         # Special handling for pretraining stage
         if hasattr(current_stage, 'is_pretraining') and current_stage.is_pretraining:
             if hasattr(self, 'trainer') and getattr(self.trainer, 'pretraining_completed', False):
@@ -512,7 +512,7 @@ class CurriculumManager:
                 return True
             # Pretraining is still ongoing
             return False
-            
+
         # Regular stage progression logic
         if current_stage.validate_progression():
             if self.current_difficulty >= self.difficulty_threshold or self.current_stage_index == len(self.stages) - 1:
@@ -678,7 +678,7 @@ class CurriculumManager:
                 'avg_reward': stage.moving_avg_reward,
                 'consecutive_successes': stage.get_consecutive_successes()
             }
-            
+
             # Convert numpy types if necessary for broader compatibility
             for key, value in stage_state.items():
                 if isinstance(value, np.ndarray):
@@ -696,7 +696,7 @@ class CurriculumManager:
 
         return {
             'current_stage_index': self.current_stage_index,
-            'current_difficulty': self.current_difficulty, 
+            'current_difficulty': self.current_difficulty,
             'total_episodes': self.total_episodes,
             # Store completed_stages data efficiently (without full state copies)
             'completed_stages': [
@@ -715,7 +715,7 @@ class CurriculumManager:
         """Load curriculum state from a dictionary."""
         if not isinstance(state_dict, dict):
             raise ValueError("State must be a dictionary")
-            
+
         # Load basic properties
         if 'current_stage_index' in state_dict:
             self.current_stage_index = state_dict['current_stage_index']
@@ -725,10 +725,10 @@ class CurriculumManager:
                 print(f"Warning: Loaded invalid stage index {self.current_stage_index}, resetting to 0.")
                 self.current_stage_index = 0
                 self.current_stage = self.stages[0]
-            
+
         if 'current_difficulty' in state_dict:
             self.current_difficulty = state_dict['current_difficulty']
-            
+
         if 'completed_stages' in state_dict:
             # Create a fresh deque with maxlen and copy only essential data
             self.completed_stages.clear()
@@ -741,10 +741,10 @@ class CurriculumManager:
                         'to_stage': cs.get('to_stage', ''),
                         'timestamp': cs.get('timestamp', None),
                     })
-            
+
         if 'total_episodes' in state_dict:
             self.total_episodes = state_dict['total_episodes']
-            
+
         # Load stage-specific states if available
         if 'stages_data' in state_dict and isinstance(state_dict['stages_data'], list):
             stages_data = state_dict['stages_data']
@@ -758,27 +758,27 @@ class CurriculumManager:
                             stage.episode_count = stage_data['episodes']
                         elif 'episode_count' in stage_data:
                             stage.episode_count = stage_data['episode_count']
-                            
+
                         if 'successes' in stage_data:
                             stage.success_count = stage_data['successes']
                         elif 'success_count' in stage_data:
                             stage.success_count = stage_data['success_count']
-                            
+
                         if 'failures' in stage_data:
                             stage.failure_count = stage_data['failures']
                         elif 'failure_count' in stage_data:
                             stage.failure_count = stage_data['failure_count']
-                            
+
                         if 'success_rate' in stage_data:
                             stage.moving_success_rate = stage_data['success_rate']
                         elif 'moving_success_rate' in stage_data:
                             stage.moving_success_rate = stage_data['moving_success_rate']
-                            
+
                         if 'avg_reward' in stage_data:
                             stage.moving_avg_reward = stage_data['avg_reward']
                         elif 'moving_avg_reward' in stage_data:
                             stage.moving_avg_reward = stage_data['moving_avg_reward']
-                            
+
                         # Conditionally restore rewards history (may be large) if available
                         if 'rewards_history' in stage_data and isinstance(stage_data['rewards_history'], list):
                             rewards = stage_data['rewards_history']
@@ -790,7 +790,7 @@ class CurriculumManager:
                                     stage.rewards_history.append(reward.item())
                                 else:
                                     stage.rewards_history.append(float(reward))
-                                    
+
         # Check if pretraining flag exists in the state, and handle it appropriately
         # First, check if we have a pretraining stage
         is_pretraining_stage_exists = False
@@ -798,7 +798,7 @@ class CurriculumManager:
             if hasattr(stage, 'is_pretraining') and stage.is_pretraining:
                 is_pretraining_stage_exists = True
                 break
-                
+
         # If we have a pretraining stage, check if we need to synchronize with trainer
         if is_pretraining_stage_exists and 'pretraining_completed' in state_dict:
             # If trainer is available, synchronize pretraining state
@@ -808,7 +808,7 @@ class CurriculumManager:
                     self.trainer.pretraining_completed = state_dict['pretraining_completed']
                     if self.debug:
                         print(f"[DEBUG] Updated trainer.pretraining_completed to {state_dict['pretraining_completed']}")
-                        
+
         # Ensure each stage that has the is_pretraining flag reflects the correct state
         for stage in self.stages:
             if hasattr(stage, 'is_pretraining') and stage.is_pretraining:
@@ -817,13 +817,13 @@ class CurriculumManager:
                     stage.register_trainer(self.trainer)
                     if self.debug:
                         print(f"[DEBUG] Re-registered trainer with pretraining stage: {stage.name}")
-                        
+
                 # If this stage is marked as a pretraining stage, make sure it has the right state based on
                 # pretraining_completed in the state_dict
                 if 'pretraining_completed' in state_dict:
                     if self.debug:
                         print(f"[DEBUG] Setting pretraining state for stage {stage.name}: {state_dict['pretraining_completed']}")
-                        
+
         # Debug info
         if self.debug:
             print(f"[DEBUG] Loaded curriculum state: Stage {self.current_stage_index} ({self.current_stage.name}), "
@@ -851,33 +851,33 @@ class CurriculumManager:
         """
         # This method is being removed in favor of the more comprehensive implementation below
         return self.get_curriculum_stats()
-        
+
     def get_curriculum_stats(self):
         """Get current curriculum statistics for display and logging."""
         current_stage = self.stages[self.current_stage_index]
-        
+
         # Handle pretraining special case
         is_pretraining = hasattr(current_stage, 'is_pretraining') and current_stage.is_pretraining
         if is_pretraining and hasattr(self, 'trainer'):
             pretraining_completed = getattr(self.trainer, 'pretraining_completed', False)
             pretraining_transition = getattr(self.trainer, 'in_transition_phase', False)
-            
+
             # Get progress info from trainer if available
-            pretraining_step = getattr(self.trainer, 'training_steps', 0) 
+            pretraining_step = getattr(self.trainer, 'training_steps', 0)
             pretraining_end_step = getattr(self.trainer, '_get_pretraining_end_step', lambda: 0)()
-            
+
             if pretraining_end_step > 0:
                 pretraining_progress = min(1.0, pretraining_step / pretraining_end_step)
             else:
                 pretraining_progress = 0
-                
+
         else:
             pretraining_completed = True
             pretraining_transition = False
             pretraining_progress = 1.0
             pretraining_step = 0
             pretraining_end_step = 0
-        
+
         stats = {
             "current_stage": self.current_stage_index,  # Adding this for backward compatibility
             "current_stage_index": self.current_stage_index,
@@ -893,7 +893,7 @@ class CurriculumManager:
             "pretraining_step": pretraining_step if is_pretraining else None,
             "pretraining_end_step": pretraining_end_step if is_pretraining else None
         }
-        
+
         # Add current stage statistics
         try:
             stage_stats = current_stage.get_statistics()
@@ -902,7 +902,7 @@ class CurriculumManager:
             if self.debug:
                 print(f"[DEBUG] Error getting stage statistics: {str(e)}")
             stats["current_stage_stats"] = {}
-            
+
         return stats
 
     def get_stage_progress(self) -> float:
@@ -926,11 +926,11 @@ class CurriculumManager:
         if not self.stages:
             print("ERROR: No stages in curriculum")
             return False
-            
+
         print("Validating stages:")
         for i, stage in enumerate(self.stages):
             print(f"\nStage {i}: {stage.name}")
-            
+
             # Check required components
             if not stage.state_mutator:
                 print(f"ERROR: Stage {stage.name} missing state_mutator")
@@ -944,11 +944,11 @@ class CurriculumManager:
             if not stage.truncation_condition:
                 print(f"ERROR: Stage {stage.name} missing truncation_condition")
                 return False
-                
+
             # Check progression requirements if not final stage
             if i < len(self.stages) - 1 and not stage.progression_requirements:
                 print(f"WARNING: Non-final stage {stage.name} has no progression requirements")
-                
+
             if self.debug:
                 print(f"- State mutator: {stage.state_mutator.__class__.__name__}")
                 print(f"- Reward function: {stage.reward_function.__class__.__name__}")
@@ -956,6 +956,6 @@ class CurriculumManager:
                 print(f"- Truncation condition: {stage.truncation_condition.__class__.__name__}")
                 if stage.progression_requirements:
                     print("- Has progression requirements")
-                    
+
         print("\nAll stages validated successfully!")
         return True

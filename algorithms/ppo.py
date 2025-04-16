@@ -9,7 +9,7 @@ from .base import BaseAlgorithm
 
 class PPOAlgorithm(BaseAlgorithm):
     """PPO algorithm implementation"""
-    
+
     def __init__(
         self,
         actor,
@@ -31,13 +31,14 @@ class PPOAlgorithm(BaseAlgorithm):
         use_amp=False,
         debug=False,
         use_wandb=False,
+        # --- Weight Clipping Params ---
+        # Unsupported using SimBa v2
         use_weight_clipping=False,
         weight_clip_kappa=1.0,
-        # --- Adaptive Kappa Params ---
         adaptive_kappa=False,
-        kappa_update_freq=10, # Update kappa every 10 policy updates
-        kappa_update_rate=0.01, # Adjust kappa by 1%
-        target_clip_fraction=0.05, # Target 5% of weights being clipped
+        kappa_update_freq=10,
+        kappa_update_rate=0.01,
+        target_clip_fraction=0.05,
         min_kappa=0.1,
         max_kappa=10.0,
         # ---------------------------
@@ -74,12 +75,12 @@ class PPOAlgorithm(BaseAlgorithm):
         self.min_kappa = min_kappa
         self.max_kappa = max_kappa
         self._update_counter = 0 # Counter for kappa updates
-        
+
         # Store initial weight ranges if weight clipping is enabled
         if self.use_weight_clipping:
-            self.init_weight_ranges() # Now stores base bounds (kappa=1)
-            
-        # Initialize memory with correct buffer size and device
+            self.init_weight_ranges()
+
+        # Initialize memory with buffer size and device
         self.memory = self.PPOMemory(batch_size=batch_size, buffer_size=10000, device=device)
 
         # Initialize optimizer
@@ -97,41 +98,41 @@ class PPOAlgorithm(BaseAlgorithm):
             'critic_loss': 0.0,
             'entropy_loss': 0.0,
             'total_loss': 0.0,
-            'clip_fraction': 0.0, # PPO policy clip fraction
+            'clip_fraction': 0.0,
             'explained_variance': 0.0,
             'kl_divergence': 0.0,
             'mean_advantage': 0.0,
             'mean_return': 0.0,
-            'weight_clip_fraction': 0.0, # Fraction of weights clipped
-            'current_kappa': self.weight_clip_kappa, # Current kappa value
+            'weight_clip_fraction': 0.0,
+            'current_kappa': self.weight_clip_kappa,
         }
 
         # Add episode return tracking
         self.current_episode_rewards = []
-        self.episode_returns = deque(maxlen=100)  # Store last 100 episode returns
-    
+        self.episode_returns = deque(maxlen=100)
+
     class PPOMemory:
         """Memory buffer for PPO to store experiences"""
-        
+
         def __init__(self, batch_size, buffer_size, device):
             self.batch_size = batch_size
-            
+
             self.buffer_size = buffer_size
             self.device = device
             self.pos = 0
             self.size = 0
             self.full = False
             self.use_device_tensors = device != "cpu"
-            
+
             # Initialize buffers as empty tensors
             self._reset_buffers()
-        
+
         def _reset_buffers(self):
             """Initialize all buffer tensors with the correct shapes"""
             buffer_size = self.buffer_size
             device = self.device
             use_device_tensors = self.use_device_tensors
-            
+
             # Determine tensor type based on device
             if use_device_tensors:
                 # Initialize empty tensors on the specified device
@@ -149,12 +150,12 @@ class PPOAlgorithm(BaseAlgorithm):
                 self.rewards = np.zeros((buffer_size,), dtype=np.float32)
                 self.values = np.zeros((buffer_size,), dtype=np.float32)
                 self.dones = np.zeros((buffer_size,), dtype=np.bool_)
-                
+
             # Reset position and full indicator
             self.pos = 0
             self.full = False
-            self.size = 0  # Track current buffer size
-        
+            self.size = 0
+
         def store(self, obs, action, log_prob, reward, value, done):
             """Store a single experience in the buffer"""
             # Initialize buffers on first call based on sample shapes
@@ -164,13 +165,13 @@ class PPOAlgorithm(BaseAlgorithm):
                     obs = torch.tensor(obs, dtype=torch.float32)
                 if not isinstance(action, torch.Tensor):
                     action = torch.tensor(action, dtype=torch.float32)
-                
+
                 # Ensure all tensors have batch dimension
                 if obs.dim() == 1:
                     obs = obs.unsqueeze(0)
                 if action.dim() == 1 and action.shape[0] > 1:  # If it's a vector action
                     action = action.unsqueeze(0)
-                
+
                 # Initialize buffers with correct shapes
                 if self.use_device_tensors:
                     # Store tensors directly on the target device
@@ -180,7 +181,7 @@ class PPOAlgorithm(BaseAlgorithm):
                     # Store tensors on CPU
                     self.obs = torch.zeros((self.buffer_size, *obs.shape[1:]), dtype=torch.float32)
                     self.actions = torch.zeros((self.buffer_size, *action.shape[1:]), dtype=torch.float32)
-            
+
             # Convert inputs to tensors
             if not isinstance(obs, torch.Tensor):
                 obs = torch.tensor(obs, dtype=torch.float32, device=self.device if self.use_device_tensors else "cpu")
@@ -194,7 +195,7 @@ class PPOAlgorithm(BaseAlgorithm):
                 value = torch.tensor(value, dtype=torch.float32, device=self.device if self.use_device_tensors else "cpu")
             if not isinstance(done, torch.Tensor):
                 done = torch.tensor(done, dtype=torch.bool, device=self.device if self.use_device_tensors else "cpu")
-            
+
             # Ensure tensors are on the correct device
             if self.use_device_tensors:
                 obs = obs.to(self.device)
@@ -203,49 +204,49 @@ class PPOAlgorithm(BaseAlgorithm):
                 reward = reward.to(self.device)
                 value = value.to(self.device)
                 done = done.to(self.device)
-                
+
             # Store the experience, detaching obs and action
             if obs.dim() > 1:  # If obs is batched
-                self.obs[self.pos] = obs.squeeze(0).detach() 
+                self.obs[self.pos] = obs.squeeze(0).detach()
             else:
                 self.obs[self.pos] = obs.detach()
-                
+
             if action.dim() > 1:  # If action is batched
                 self.actions[self.pos] = action.squeeze(0).detach()
             else:
                 self.actions[self.pos] = action.detach()
-                
+
             if log_prob.dim() > 0:  # If log_prob has dimensions
                 self.log_probs[self.pos] = log_prob.item()
             else:
                 self.log_probs[self.pos] = log_prob
-                
+
             if reward.dim() > 0:  # If reward has dimensions
                 self.rewards[self.pos] = reward.item()
             else:
                 self.rewards[self.pos] = reward
-                
+
             if value.dim() > 0:  # If value has dimensions
                 self.values[self.pos] = value.item()
             else:
                 self.values[self.pos] = value
-                
+
             if done.dim() > 0:  # If done has dimensions
                 self.dones[self.pos] = done.item()
             else:
                 self.dones[self.pos] = done
-            
+
             # Update position and full flag
             self.pos = (self.pos + 1) % self.buffer_size
             if not self.full and self.pos == 0:
                 self.full = True
             self.size = self.buffer_size if self.full else self.pos
-        
+
         def store_experience_at_idx(self, idx, state=None, action=None, log_prob=None, reward=None, value=None, done=None):
             """Update only specific values at an index, rather than a complete experience."""
             if idx >= self.buffer_size:
                 return  # Index out of range
-                
+
             # Only update the specified fields (non-None values)
             if state is not None and self.obs is not None:
                 if not isinstance(state, torch.Tensor):
@@ -256,7 +257,7 @@ class PPOAlgorithm(BaseAlgorithm):
                     self.obs[idx] = state_detached.squeeze(0).to(self.device) if self.use_device_tensors else state_detached.squeeze(0)
                 else:
                     self.obs[idx] = state_detached.to(self.device) if self.use_device_tensors else state_detached
-                    
+
             if action is not None and self.actions is not None:
                 if not isinstance(action, torch.Tensor):
                     action = torch.tensor(action, dtype=torch.float32, device=self.device if self.use_device_tensors else "cpu")
@@ -266,7 +267,7 @@ class PPOAlgorithm(BaseAlgorithm):
                     self.actions[idx] = action_detached.squeeze(0).to(self.device) if self.use_device_tensors else action_detached.squeeze(0)
                 else:
                     self.actions[idx] = action_detached.to(self.device) if self.use_device_tensors else action_detached
-                    
+
             if log_prob is not None and self.log_probs is not None:
                 if not isinstance(log_prob, torch.Tensor):
                     log_prob = torch.tensor(log_prob, dtype=torch.float32, device=self.device if self.use_device_tensors else "cpu")
@@ -274,7 +275,7 @@ class PPOAlgorithm(BaseAlgorithm):
                     self.log_probs[idx] = log_prob.item()
                 else:
                     self.log_probs[idx] = log_prob
-                    
+
             if reward is not None and self.rewards is not None:
                 if not isinstance(reward, torch.Tensor):
                     reward = torch.tensor(reward, dtype=torch.float32, device=self.device if self.use_device_tensors else "cpu")
@@ -282,7 +283,7 @@ class PPOAlgorithm(BaseAlgorithm):
                     self.rewards[idx] = reward.item()
                 else:
                     self.rewards[idx] = reward
-                    
+
             if value is not None and self.values is not None:
                 if not isinstance(value, torch.Tensor):
                     value = torch.tensor(value, dtype=torch.float32, device=self.device if self.use_device_tensors else "cpu")
@@ -290,7 +291,7 @@ class PPOAlgorithm(BaseAlgorithm):
                     self.values[idx] = value.item()
                 else:
                     self.values[idx] = value
-                    
+
             if done is not None and self.dones is not None:
                 if not isinstance(done, torch.Tensor):
                     done = torch.tensor(done, dtype=torch.bool, device=self.device if self.use_device_tensors else "cpu")
@@ -298,12 +299,12 @@ class PPOAlgorithm(BaseAlgorithm):
                     self.dones[idx] = done.item()
                 else:
                     self.dones[idx] = done
-        
+
         def get(self):
             """Get all data currently stored in the buffer."""
             if self.size == 0 or self.obs is None:
                 return None, None, None, None, None, None
-                
+
             return (
                 self.obs[:self.size],
                 self.actions[:self.size],
@@ -312,18 +313,18 @@ class PPOAlgorithm(BaseAlgorithm):
                 self.values[:self.size],
                 self.dones[:self.size]
             )
-            
+
         def generate_batches(self):
             """Generate batches of indices for training."""
             if self.size == 0:
                 return []
-                
+
             # Generate random indices
             if self.use_device_tensors:
                 indices = torch.randperm(self.size, device=self.device)
             else:
                 indices = np.random.permutation(self.size)
-                
+
             # Create batches
             batch_start = 0
             batches = []
@@ -332,9 +333,9 @@ class PPOAlgorithm(BaseAlgorithm):
                 batch_idx = indices[batch_start:batch_end]
                 batches.append(batch_idx)
                 batch_start = batch_end
-                
+
             return batches
-        
+
         def clear(self):
             """Reset the buffer."""
             self._reset_buffers()
@@ -343,18 +344,18 @@ class PPOAlgorithm(BaseAlgorithm):
         """Store experience in the buffer"""
         if self.debug:
             print(f"[DEBUG PPO] Storing experience - reward: {reward}")
-        
+
         # Forward to memory buffer
         self.memory.store(obs, action, log_prob, reward, value, done)
-        
+
         # Track episode rewards for calculating returns
         if isinstance(reward, torch.Tensor):
             reward_val = reward.item()
         else:
             reward_val = float(reward)
-            
+
         self.current_episode_rewards.append(reward_val)
-        
+
         # When episode is done, calculate return
         if done:
             if self.current_episode_rewards:
@@ -363,12 +364,12 @@ class PPOAlgorithm(BaseAlgorithm):
                 if self.debug:
                     print(f"[DEBUG PPO] Episode done with return: {episode_return}")
                 self.current_episode_rewards = []  # Reset for next episode
-                
+
     def store_experience_at_idx(self, idx, obs=None, action=None, log_prob=None, reward=None, value=None, done=None):
         """Update specific values of an experience at a given index"""
         if self.debug and reward is not None:
             print(f"[DEBUG PPO] Updating reward at idx {idx}: {reward}")
-            
+
         # Forward to memory buffer
         self.memory.store_experience_at_idx(idx, obs, action, log_prob, reward, value, done)
 
@@ -376,7 +377,7 @@ class PPOAlgorithm(BaseAlgorithm):
         """Get action for a given observation"""
         if not isinstance(obs, torch.Tensor):
             obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
-            
+
         with torch.no_grad():
             if return_features:
                 action_dist, actor_features = self.actor(obs, return_features=True)
@@ -385,7 +386,7 @@ class PPOAlgorithm(BaseAlgorithm):
             else:
                 action_dist = self.actor(obs)
                 value = self.critic(obs)
-            
+
             if deterministic:
                 if self.action_space_type == "discrete":
                     probs = action_dist
@@ -410,10 +411,10 @@ class PPOAlgorithm(BaseAlgorithm):
                 else:
                     action = action_dist.sample()
                     log_prob = action_dist.log_prob(action).sum(dim=-1)
-        
+
         if value.dim() < action.dim():
             value = value.unsqueeze(-1)
-            
+
         # Only move to CPU if using MPS (Apple Silicon)
         if self.device == "mps":
             action = action.cpu()
@@ -421,22 +422,20 @@ class PPOAlgorithm(BaseAlgorithm):
             value = value.cpu()
             if return_features:
                 features = features.cpu()
-    
+
         if return_features:
             return action, log_prob, value, features
         else:
             return action, log_prob, value
-    
+
     def reset(self):
         """Reset memory"""
         self.memory.clear()
 
     def update(self):
         """Update policy using PPO"""
-        # Changed from self.memory.size() to self.memory.size 
-        # since size is an attribute, not a method
         buffer_size = self.memory.size
-        
+
         if buffer_size == 0:
             if self.debug:
                 print("[DEBUG] Buffer is empty, skipping update")
@@ -444,7 +443,7 @@ class PPOAlgorithm(BaseAlgorithm):
 
         # Get experiences from buffer
         states, actions, old_log_probs, rewards, values, dones = self.memory.get()
-        
+
         if states is None:
             if self.debug:
                 print("[DEBUG] Failed to get experiences from buffer")
@@ -463,10 +462,10 @@ class PPOAlgorithm(BaseAlgorithm):
             values = torch.tensor(values, dtype=torch.float32, device=self.device)
         if not isinstance(dones, torch.Tensor):
             dones = torch.tensor(dones, dtype=torch.bool, device=self.device)
-        
+
         # Compute returns and advantages
         returns, advantages = self._compute_gae(rewards, values, dones)
-        
+
         # Check if advantages has NaNs
         if torch.isnan(advantages).any():
             if self.debug:
@@ -474,75 +473,75 @@ class PPOAlgorithm(BaseAlgorithm):
             # Clear memory even if update is skipped due to NaNs
             self.memory.clear()
             return self.metrics
-        
+
         # Update the policy and value networks using PPO
         metrics = self._update_policy(states, actions, old_log_probs, returns, advantages)
-        
+
         # Clear the memory buffer after using the data for updates
         self.memory.clear()
-        
+
         # Update the metrics
         self.metrics = {**self.metrics, **metrics}
-        
+
         # If we have episode returns, update the mean return metric
         if len(self.episode_returns) > 0:
             self.metrics['mean_return'] = sum(self.episode_returns) / len(self.episode_returns)
-        
+
         # Increment update counter for adaptive kappa
         self._update_counter += 1
-        
+
         return self.metrics
 
     def _compute_gae(self, rewards, values, dones):
         """
         Compute returns and advantages using Generalized Advantage Estimation (GAE)
-        
+
         Args:
             rewards: rewards tensor [buffer_size]
             values: value predictions tensor [buffer_size]
             dones: done flags tensor [buffer_size]
-            
+
         Returns:
             tuple of (returns, advantages) tensors
         """
         buffer_size = len(rewards)
-        
+
         # Initialize return and advantage arrays
         returns = torch.zeros_like(rewards)
         advantages = torch.zeros_like(rewards)
-        
+
         # Last value is 0 if trajectory ended, otherwise use the value prediction
         # Get the last index that's valid
         last_idx = buffer_size - 1
         next_value = 0 if dones[last_idx] else values[last_idx]
         next_advantage = 0
-        
+
         # Compute GAE for each timestep, going backwards
         for t in reversed(range(buffer_size)):
             # If this is the end of an episode, next_value is 0
             if t < buffer_size - 1:
                 next_value = 0 if dones[t] else values[t + 1]
-            
+
             # Calculate TD error: r_t + gamma * V(s_{t+1}) * (1 - done) - V(s_t)
             delta = rewards[t] + self.gamma * next_value * (1 - dones[t].float()) - values[t]
-            
+
             # Compute GAE advantage
             advantages[t] = delta + self.gamma * self.gae_lambda * next_advantage * (1 - dones[t].float())
             next_advantage = advantages[t]
-            
+
             # Compute returns as advantage + value
             returns[t] = advantages[t] + values[t]
-        
+
         # Normalize advantages
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
+
         return returns, advantages
-    
+
     def init_weight_ranges(self):
         """Store the BASE initialization ranges (kappa=1) of all network parameters"""
         self.actor_base_bounds = {}
         self.critic_base_bounds = {}
-        
+
         # Store base bounds for actor network weights
         for name, param in self.actor.named_parameters():
             if param.requires_grad:
@@ -555,7 +554,7 @@ class PPOAlgorithm(BaseAlgorithm):
                     # For biases, use a smaller base range
                     bound = 0.01 # Base bound (kappa=1)
                     self.actor_base_bounds[name] = (-bound, bound)
-                    
+
         # Store base bounds for critic network weights
         for name, param in self.critic.named_parameters():
             if param.requires_grad:
@@ -582,16 +581,16 @@ class PPOAlgorithm(BaseAlgorithm):
                 base_lower, base_upper = self.actor_base_bounds[name]
                 lower_bound = base_lower * current_kappa
                 upper_bound = base_upper * current_kappa
-                
+
                 # Store original values to check for clipping
                 original_param = param.data.clone()
                 param.data.clamp_(lower_bound, upper_bound)
-                
+
                 # Count clipped parameters
                 num_params = param.numel()
                 total_params += num_params
                 clipped_params += torch.sum(param.data != original_param).item()
-                
+
         # Clip critic network weights
         for name, param in self.critic.named_parameters():
             if name in self.critic_base_bounds and param.requires_grad:
@@ -615,14 +614,14 @@ class PPOAlgorithm(BaseAlgorithm):
     def _update_policy(self, states, actions, old_log_probs, returns, advantages):
         """
         Update policy and value networks using PPO algorithm
-        
+
         Args:
             states: batch of states [buffer_size, state_dim]
             actions: batch of actions [buffer_size, action_dim]
             old_log_probs: batch of log probabilities from old policy [buffer_size]
             returns: batch of returns [buffer_size]
             advantages: batch of advantages [buffer_size]
-            
+
         Returns:
             dict: metrics from the update
         """
@@ -635,7 +634,7 @@ class PPOAlgorithm(BaseAlgorithm):
             'clip_fraction': 0.0, # PPO policy clip fraction
             'weight_clip_fraction': 0.0, # Fraction of weights clipped this update
         }
-        
+
         # Calculate explained variance (once before updates)
         with torch.no_grad():
             y_pred = self.critic(states).squeeze()
@@ -645,19 +644,19 @@ class PPOAlgorithm(BaseAlgorithm):
         update_metrics['explained_variance'] = explained_var.item()
         update_metrics['mean_advantage'] = advantages.mean().item()
         update_metrics['kl_divergence'] = 0.0 # Will be averaged later
-        
+
         total_weight_clipped_fraction_epoch = 0.0
         num_batches_processed = 0
-        
+
         # Multiple epochs of PPO update
         for epoch in range(self.ppo_epochs):
             # Generate random batches
             batch_indices = self.memory.generate_batches()
-            
+
             # Skip if no batches
             if not batch_indices:
                 continue
-            
+
             # Process each batch
             for batch_idx in batch_indices:
                 num_batches_processed += 1
@@ -667,7 +666,7 @@ class PPOAlgorithm(BaseAlgorithm):
                 batch_old_log_probs = old_log_probs[batch_idx]
                 batch_returns = returns[batch_idx]
                 batch_advantages = advantages[batch_idx]
-                
+
                 # Get current policy distribution and values
                 if self.action_space_type == "discrete":
                     # For discrete actions
@@ -676,14 +675,14 @@ class PPOAlgorithm(BaseAlgorithm):
                     # Ensure probabilities sum to 1
                     action_probs = action_probs / action_probs.sum(dim=-1, keepdim=True)
                     dist = torch.distributions.Categorical(probs=action_probs)
-                    
+
                     # Calculate log probabilities and entropy
                     # Ensure batch_actions are indices if they are one-hot
                     if batch_actions.shape[-1] > 1 and batch_actions.dtype == torch.float32:
                          actions_indices = torch.argmax(batch_actions, dim=-1)
                     else: # Assume actions are already indices
                          actions_indices = batch_actions.long()
-                         
+
                     curr_log_probs = dist.log_prob(actions_indices)
                     entropy = dist.entropy().mean()
                 else:
@@ -691,68 +690,67 @@ class PPOAlgorithm(BaseAlgorithm):
                     action_dist = self.actor(batch_states)
                     curr_log_probs = action_dist.log_prob(batch_actions).sum(dim=-1)
                     entropy = action_dist.entropy().mean()
-                
+
                 # Calculate critic values
                 values = self.critic(batch_states).squeeze()
-                
+
                 # Calculate ratio and surrogates for PPO
                 ratio = torch.exp(curr_log_probs - batch_old_log_probs)
-                
+
                 # Clipped surrogate function
                 surr1 = ratio * batch_advantages
                 surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * batch_advantages
                 actor_loss = -torch.min(surr1, surr2).mean()
-                
+
                 # Calculate critic loss (MSE)
                 critic_loss = F.mse_loss(values, batch_returns)
-                
+
                 # Calculate entropy loss
                 entropy_loss = -entropy * self.entropy_coef
-                
+
                 # Total loss
                 total_loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
-                
+
                 # Optimize
                 self.optimizer.zero_grad()
                 total_loss.backward()
-                
+
                 # Clip gradients
                 if self.max_grad_norm > 0:
                     nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
                     nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
-                
+
                 self.optimizer.step()
-                
+
                 # Apply weight clipping after optimization step and get clipped fraction
                 current_weight_clip_fraction = self.clip_weights()
                 total_weight_clipped_fraction_epoch += current_weight_clip_fraction
-                
+
                 # Update metrics (accumulate)
                 update_metrics['actor_loss'] += actor_loss.detach().item()
                 update_metrics['critic_loss'] += critic_loss.detach().item()
                 update_metrics['entropy_loss'] += entropy_loss.detach().item()
                 update_metrics['total_loss'] += total_loss.detach().item()
-                
+
                 # Calculate PPO policy clipping fraction
                 policy_clip_fraction = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean().detach().item()
                 update_metrics['clip_fraction'] += policy_clip_fraction
-                
+
                 # Calculate KL divergence (approximate)
                 with torch.no_grad():
-                    # Detach curr_log_probs before calculation
                     kl_div = (batch_old_log_probs - curr_log_probs.detach()).mean().detach().item()
                     update_metrics['kl_divergence'] += kl_div
-        
+
         # Calculate averages over all batches and epochs
         if num_batches_processed > 0:
             update_metrics['actor_loss'] /= num_batches_processed
             update_metrics['critic_loss'] /= num_batches_processed
             update_metrics['entropy_loss'] /= num_batches_processed
             update_metrics['total_loss'] /= num_batches_processed
-            update_metrics['clip_fraction'] /= num_batches_processed # Avg PPO clip fraction
+            update_metrics['clip_fraction'] /= num_batches_processed
             update_metrics['kl_divergence'] /= num_batches_processed
-            update_metrics['weight_clip_fraction'] = total_weight_clipped_fraction_epoch / num_batches_processed # Avg weight clip fraction
-        
+            update_metrics['weight_clip_fraction'] = total_weight_clipped_fraction_epoch / num_batches_processed
+
         # --- Adaptive Kappa Update Logic ---
         if self.use_weight_clipping and self.adaptive_kappa and (self._update_counter % self.kappa_update_freq == 0):
             actual_clip_fraction = update_metrics['weight_clip_fraction']
@@ -760,14 +758,14 @@ class PPOAlgorithm(BaseAlgorithm):
                 self.weight_clip_kappa *= (1 + self.kappa_update_rate)
             elif actual_clip_fraction < self.target_clip_fraction:
                 self.weight_clip_kappa *= (1 - self.kappa_update_rate)
-                
+
             # Clamp kappa within bounds
             self.weight_clip_kappa = max(self.min_kappa, min(self.max_kappa, self.weight_clip_kappa))
-            
+
             if self.debug:
                 print(f"[DEBUG PPO] Kappa updated. New kappa: {self.weight_clip_kappa:.4f} (Clip fraction: {actual_clip_fraction:.4f})")
 
         # Store current kappa value in metrics
         update_metrics['current_kappa'] = self.weight_clip_kappa
-        
+
         return update_metrics

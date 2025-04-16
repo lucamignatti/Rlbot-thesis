@@ -7,12 +7,12 @@ from .mutators import (
 from rlgym.rocket_league.done_conditions import GoalCondition, TimeoutCondition, NoTouchTimeoutCondition
 from rlgym.rocket_league.reward_functions import CombinedReward, GoalReward, TouchReward
 from rewards import (
-    BallProximityReward, BallToGoalDistanceReward, TouchBallReward, 
+    BallProximityReward, BallToGoalDistanceReward, TouchBallReward,
     BallVelocityToGoalReward, AlignBallToGoalReward, SaveBoostReward,
-    KRCReward, DistanceWeightedAlignmentKRC, OffensivePotentialKRC,  
+    KRCReward, DistanceWeightedAlignmentKRC, OffensivePotentialKRC,
     PlayerVelocityTowardBallReward, TouchBallToGoalAccelerationReward,
     PassCompletionReward, ScoringOpportunityCreationReward, AerialControlReward,
-    AerialDirectionalTouchReward, BlockSuccessReward, DefensivePositioningReward, 
+    AerialDirectionalTouchReward, BlockSuccessReward, DefensivePositioningReward,
     BallClearanceReward, TeamSpacingReward, TeamPossessionReward,
     create_distance_weighted_alignment_reward, create_offensive_potential_reward, create_lucy_skg_reward,
     # New reward functions from rlgym-tools
@@ -21,59 +21,10 @@ from rewards import (
 import numpy as np
 import random
 
-# Try to import mutators from rlgym_tools if available
-try:
-    # Import directly from correct submodules - don't use aliases to avoid type issues
-    from rlgym_tools.rocket_league.state_mutators.augment_mutator import AugmentMutator
-    from rlgym_tools.rocket_league.state_mutators.random_physics_mutator import RandomPhysicsMutator
-    from rlgym_tools.rocket_league.state_mutators.weighted_sample_mutator import WeightedSampleMutator
-    from rlgym_tools.rocket_league.state_mutators.random_scoreboard_mutator import RandomScoreboardMutator
-    # Set flag that imports were successful
-    RLGYM_TOOLS_AVAILABLE = True
-except ImportError:
-    print("Warning: rlgym_tools not available or incompatible version. Using fallback implementations.")
-    # Define simplified versions if the real ones aren't available
-    from rlgym.api import StateMutator
-    from typing import Dict, Any, List, Optional, Union, Tuple
-    
-    class AugmentMutator(StateMutator):
-        """Simplified version of AugmentMutator for data augmentation"""
-        def __init__(self, shuffle_within_teams=True, randomize_front_back=True, randomize_left_right=True):
-            self.shuffle_within_teams = shuffle_within_teams
-            self.randomize_front_back = randomize_front_back
-            self.randomize_left_right = randomize_left_right
-            
-        def apply(self, state, shared_info: Dict[str, Any]) -> None:
-            # Simplified version that doesn't actually modify the state
-            # but allows code to run without the actual implementation
-            pass
-    
-    class RandomPhysicsMutator(StateMutator):
-        """Simplified placeholder for RandomPhysicsMutator"""
-        def apply(self, state, shared_info: Dict[str, Any]) -> None:
-            pass
-            
-    class WeightedSampleMutator(StateMutator):
-        """Simplified placeholder for WeightedSampleMutator"""
-        def __init__(self, mutators, weights):
-            self.mutators = mutators
-            self.weights = weights
-            
-        def apply(self, state, shared_info: Dict[str, Any]) -> None:
-            # Just apply the first mutator as fallback
-            if self.mutators:
-                self.mutators[0].apply(state, shared_info)
-                
-    class RandomScoreboardMutator(StateMutator):
-        """Simplified placeholder for RandomScoreboardMutator"""
-        def __init__(self, max_game_length=300.0):
-            self.max_game_length = max_game_length
-            
-        def apply(self, state, shared_info: Dict[str, Any]) -> None:
-            # Simplified implementation that does nothing
-            pass
-    
-    RLGYM_TOOLS_AVAILABLE = False
+from rlgym_tools.rocket_league.state_mutators.augment_mutator import AugmentMutator
+from rlgym_tools.rocket_league.state_mutators.random_physics_mutator import RandomPhysicsMutator
+from rlgym_tools.rocket_league.state_mutators.weighted_sample_mutator import WeightedSampleMutator
+from rlgym_tools.rocket_league.state_mutators.random_scoreboard_mutator import RandomScoreboardMutator
 from curriculum.rlbot import RLBotSkillStage
 from curriculum.skills import SkillModule, SkillBasedCurriculumStage
 from functools import partial
@@ -291,7 +242,7 @@ def get_ball_aerial_position(difficulty: str = 'basic') -> np.ndarray:
         'advanced': (1200, 1800)
     }
     min_height, max_height = height_ranges.get(difficulty, (300, 800))
-    
+
     return np.array([
         np.random.uniform(-2000, 2000),
         np.random.uniform(-2000, 2000),
@@ -367,7 +318,7 @@ def get_strategic_position(role: str = 'defense', team: int = 0) -> np.ndarray:
         'offense': (-1000, 0) if team == 0 else (0, 1000)
     }
     y_min, y_max = y_ranges.get(role, (-4500, -3500) if team == 0 else (3500, 4500))
-    
+
     return np.array([
         np.random.uniform(-1000, 1000),
         np.random.uniform(y_min, y_max),
@@ -400,7 +351,7 @@ def get_ball_aerial_velocity(speed_range: Tuple[float, float] = (100, 500)) -> n
     speed = np.random.uniform(*speed_range)
     horizontal_angle = np.random.uniform(-np.pi, np.pi)
     vertical_angle = np.random.uniform(0, np.pi/3)  # Up to 60 degrees up
-    
+
     return np.array([
         speed * np.cos(vertical_angle) * np.cos(horizontal_angle),
         speed * np.cos(vertical_angle) * np.sin(horizontal_angle),
@@ -477,11 +428,11 @@ def get_varied_approach_car_position(ball_pos=None):
             np.random.uniform(-4000, 0),  # Blue half of field
             17
         ])
-    
+
     # Position car at varied distances and angles from ball
     distance = np.random.uniform(1000, 2500)
     angle = np.random.uniform(-np.pi, np.pi)  # Full 360° approach angles
-    
+
     return np.array([
         ball_pos[0] - distance * np.cos(angle),
         ball_pos[1] - distance * np.sin(angle),
@@ -588,7 +539,7 @@ class SafePositionWrapper:
         self.func = func
         self.default_car_position = np.array([0.0, -2000.0, 17.0], dtype=np.float32)  # Safe default car position
         self.default_ball_position = np.array([0.0, 0.0, 93.0], dtype=np.float32)  # Safe default ball position
-        
+
         # Flag to identify if this is a relative position function
         # Handle both regular functions and functools.partial objects
         if hasattr(func, '__name__'):
@@ -597,15 +548,15 @@ class SafePositionWrapper:
             func_name = func.func.__name__.lower()
         else:
             func_name = str(func).lower()  # Fallback to string representation
-            
+
         self.is_relative = 'dribbling' in func_name or 'relative' in func_name
-    
+
     def __call__(self, *args, **kwargs):
         """Call the wrapped function and ensure it returns valid coordinates"""
         try:
             # Call the wrapped function to get position
             position = self.func(*args, **kwargs)
-            
+
             # Debug output for tracking issues
             if position is None:
                 # Get function name for better error messages
@@ -615,25 +566,25 @@ class SafePositionWrapper:
                     func_name = f"{self.func.func.__name__}[partial]"
                 else:
                     func_name = str(self.func)
-                    
+
                 print(f"WARNING: Position function {func_name} returned None")
-                
+
                 # For relative position functions, provide a default relative offset
                 if self.is_relative:
                     print(f"Using default relative position for {func_name}")
                     # Default position in front of car for dribbling functions
                     return np.array([0.0, 200.0, 93.0], dtype=np.float32)
-                
+
                 # For non-relative functions, use appropriate default
                 if 'car' in str(self.func).lower():
                     return self.default_car_position.copy()
                 else:
                     return self.default_ball_position.copy()
-            
+
             # Ensure position is a numpy array
             if not isinstance(position, np.ndarray):
                 position = np.array(position, dtype=np.float32)
-                
+
             # Check if position contains NaN or infinite values
             if np.isnan(position).any() or np.isinf(position).any():
                 # Get function name for better error messages
@@ -643,18 +594,18 @@ class SafePositionWrapper:
                     func_name = f"{self.func.func.__name__}[partial]"
                 else:
                     func_name = str(self.func)
-                    
+
                 print(f"WARNING: Position function {func_name} returned invalid values: {position}")
-                
+
                 # Determine appropriate default based on context clues in function name
                 if 'car' in str(self.func).lower():
                     return self.default_car_position.copy()
                 else:
                     return self.default_ball_position.copy()
-                    
+
             # If position seems valid, return it
             return position
-            
+
         except Exception as e:
             # Get function name for better error messages
             if hasattr(self.func, '__name__'):
@@ -663,14 +614,14 @@ class SafePositionWrapper:
                 func_name = f"{self.func.func.__name__}[partial]"
             else:
                 func_name = str(self.func)
-                
+
             # If any exception occurs, fall back to default position
             print(f"ERROR in position function {func_name}: {str(e)}")
             if 'car' in str(self.func).lower():
                 return self.default_car_position.copy()
             else:
                 return self.default_ball_position.copy()
-    
+
     def __str__(self):
         """Return a string representation of the position"""
         try:
@@ -682,7 +633,7 @@ class SafePositionWrapper:
                 func_name = f"{self.func.func.__name__}[partial]"
             else:
                 func_name = str(self.func)
-                
+
             return f"Position from {func_name}: {result}"
         except:
             return f"Position function (error evaluating)"
@@ -699,25 +650,25 @@ def create_car_position_mutator(car_id, position_function, orientation_function=
 def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None, use_pretraining=True): # Added use_pretraining parameter
     """
     Create a curriculum for training.
-    
+
     Args:
         debug: Whether to print debug information
         use_wandb: Whether to use Weights & Biases for logging
         lr_actor: Learning rate for the actor network (overrides default values)
         lr_critic: Learning rate for the critic network (overrides default values)
         use_pretraining: Whether to include the pretraining stage
-        
+
     Returns:
         CurriculumManager: The created curriculum manager
     """
     # Store default learning rates to use if not provided
     default_lr_actor = 0.0002  # Default actor learning rate
     default_lr_critic = 0.0005  # Default critic learning rate
-    
+
     # Use provided learning rates or fall back to defaults
     lr_actor = lr_actor if lr_actor is not None else default_lr_actor
     lr_critic = lr_critic if lr_critic is not None else default_lr_critic
-    
+
     if debug:
         print(f"[DEBUG] Creating curriculum with learning rates - Actor: {lr_actor}, Critic: {lr_critic}")
         print(f"[DEBUG] Pretraining enabled: {use_pretraining}")
@@ -763,16 +714,16 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=2, orange_size=2),
             # Add random yaw orientation
-            CarPositionMutator(car_id="blue-0", 
+            CarPositionMutator(car_id="blue-0",
                                position_function=SafePositionWrapper(get_strategic_car_position),
                                orientation_function=get_random_yaw_orientation),
-            CarPositionMutator(car_id="blue-1", 
+            CarPositionMutator(car_id="blue-1",
                                position_function=SafePositionWrapper(get_blue_attacker_position),
                                orientation_function=get_random_yaw_orientation),
-            CarPositionMutator(car_id="orange-0", 
+            CarPositionMutator(car_id="orange-0",
                                position_function=SafePositionWrapper(get_orange_primary_defender_position),
                                orientation_function=get_random_yaw_orientation),
-            CarPositionMutator(car_id="orange-1", 
+            CarPositionMutator(car_id="orange-1",
                                position_function=SafePositionWrapper(get_orange_attacker_position),
                                orientation_function=get_random_yaw_orientation),
             BallPositionMutator(position_function=SafePositionWrapper(safe_ball_position))
@@ -804,7 +755,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
             # Add random yaw orientation (Removed SafePositionWrapper)
-            CarPositionMutator(car_id="blue-0", 
+            CarPositionMutator(car_id="blue-0",
                                position_function=SafePositionWrapper(get_strategic_car_position),
                                orientation_function=get_random_yaw_orientation), # No wrapper here
             BallPositionMutator(position_function=SafePositionWrapper(safe_ball_position)) # Ball present but not focus
@@ -826,7 +777,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                 state_mutator=MutatorSequence(
                     FixedTeamSizeMutator(blue_size=1, orange_size=0),
                     # Add random yaw orientation
-                    CarPositionMutator(car_id="blue-0", 
+                    CarPositionMutator(car_id="blue-0",
                                        position_function=SafePositionWrapper(get_strategic_car_position),
                                        orientation_function=get_random_yaw_orientation),
                     BallPositionMutator(position_function=SafePositionWrapper(get_ball_ground_position)) # Target ball
@@ -846,11 +797,10 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                 state_mutator=MutatorSequence(
                     FixedTeamSizeMutator(blue_size=1, orange_size=0),
                     # Add random yaw orientation
-                    CarPositionMutator(car_id="blue-0", 
+                    CarPositionMutator(car_id="blue-0",
                                        position_function=SafePositionWrapper(get_strategic_car_position),
                                        orientation_function=get_random_yaw_orientation),
                     CarBoostMutator(boost_amount=10, car_id="blue-0"), # Start with low boost
-                    # Need a mutator to place boost pads or target specific ones - Placeholder
                     BallPositionMutator(position_function=SafePositionWrapper(safe_ball_position)) # Ball irrelevant
                 ),
                 reward_function=CombinedReward(
@@ -948,7 +898,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
             BallPositionMutator(position_function=SafePositionWrapper(get_ground_ball_position)), # Ball slightly ahead
             # Add face opponent goal orientation
-            CarPositionMutator(car_id="blue-0", 
+            CarPositionMutator(car_id="blue-0",
                                position_function=SafePositionWrapper(partial(create_position, 0, -2500, 17)),
                                orientation_function=get_face_opp_goal_orientation)
         ),
@@ -967,7 +917,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                     FixedTeamSizeMutator(blue_size=1, orange_size=0),
                     BallPositionMutator(position_function=SafePositionWrapper(get_ground_ball_position)),
                     # Add face opponent goal orientation
-                    CarPositionMutator(car_id="blue-0", 
+                    CarPositionMutator(car_id="blue-0",
                                        position_function=SafePositionWrapper(partial(create_position, 0, -2500, 17)),
                                        orientation_function=get_face_opp_goal_orientation)
                 ),
@@ -989,7 +939,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                     BallPositionMutator(position_function=SafePositionWrapper(get_varied_ground_ball_position)),
                     BallVelocityMutator(velocity_function=SafePositionWrapper(partial(get_ball_rolling_velocity, speed_range=(500, 1200)))), # Faster roll
                     # Add face own goal orientation
-                    CarPositionMutator(car_id="blue-0", 
+                    CarPositionMutator(car_id="blue-0",
                                        position_function=SafePositionWrapper(get_car_defensive_position),
                                        orientation_function=get_face_own_goal_orientation) # Start defensively
                 ),
@@ -1024,11 +974,11 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             FixedTeamSizeMutator(blue_size=1, orange_size=1), # Add opponent
             BallTowardGoalSpawnMutator(offensive_team=0, distance_from_goal=0.75),
             # Add face opponent goal orientation
-            CarPositionMutator(car_id="blue-0", 
+            CarPositionMutator(car_id="blue-0",
                                position_function=SafePositionWrapper(get_directional_shooting_car_position),
                                orientation_function=get_face_opp_goal_orientation),
             # Add face own goal orientation (relative to orange, so facing blue goal)
-            CarPositionMutator(car_id="orange-0", 
+            CarPositionMutator(car_id="orange-0",
                                position_function=SafePositionWrapper(get_car_position_near_goal(team=1)),
                                orientation_function=get_face_own_goal_orientation)
         ),
@@ -1062,7 +1012,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             BallPositionMutator(position_function=SafePositionWrapper(get_basic_aerial_ball_position)), # Low aerials
             CarBoostMutator(boost_amount=50),
             # Add face opponent goal orientation
-            CarPositionMutator(car_id="blue-0", 
+            CarPositionMutator(car_id="blue-0",
                                position_function=SafePositionWrapper(get_basic_aerial_car_position),
                                orientation_function=get_face_opp_goal_orientation)
         ),
@@ -1082,7 +1032,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                 state_mutator=MutatorSequence(
                     FixedTeamSizeMutator(blue_size=1, orange_size=0),
                     # Add random yaw orientation
-                    CarPositionMutator(car_id="blue-0", 
+                    CarPositionMutator(car_id="blue-0",
                                        position_function=SafePositionWrapper(get_car_wall_position),
                                        orientation_function=get_random_yaw_orientation),
                     BallPositionMutator(position_function=SafePositionWrapper(get_ball_wall_position)) # Ball near wall
@@ -1104,7 +1054,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                     BallPositionMutator(position_function=SafePositionWrapper(get_basic_aerial_ball_position)), # Low aerials
                     CarBoostMutator(boost_amount=50),
                     # Add face opponent goal orientation
-                    CarPositionMutator(car_id="blue-0", 
+                    CarPositionMutator(car_id="blue-0",
                                        position_function=SafePositionWrapper(get_basic_aerial_car_position),
                                        orientation_function=get_face_opp_goal_orientation)
                 ),
@@ -1139,10 +1089,10 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             FixedTeamSizeMutator(blue_size=2, orange_size=0),
             BallPositionMutator(position_function=SafePositionWrapper(get_strategic_ball_position)),
             # Add random yaw orientation
-            CarPositionMutator(car_id="blue-0", 
+            CarPositionMutator(car_id="blue-0",
                                position_function=SafePositionWrapper(get_blue_defender_position),
                                orientation_function=get_random_yaw_orientation),
-            CarPositionMutator(car_id="blue-1", 
+            CarPositionMutator(car_id="blue-1",
                                position_function=SafePositionWrapper(get_blue_attacker_position),
                                orientation_function=get_random_yaw_orientation)
         ),
@@ -1163,10 +1113,10 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                     FixedTeamSizeMutator(blue_size=2, orange_size=0),
                     BallPositionMutator(position_function=SafePositionWrapper(get_strategic_ball_position)),
                     # Add random yaw orientation
-                    CarPositionMutator(car_id="blue-0", 
+                    CarPositionMutator(car_id="blue-0",
                                        position_function=SafePositionWrapper(get_blue_defender_position),
                                        orientation_function=get_random_yaw_orientation),
-                    CarPositionMutator(car_id="blue-1", 
+                    CarPositionMutator(car_id="blue-1",
                                        position_function=SafePositionWrapper(get_blue_attacker_position),
                                        orientation_function=get_random_yaw_orientation)
                 ),
@@ -1186,10 +1136,10 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                     FixedTeamSizeMutator(blue_size=2, orange_size=0),
                     BallPositionMutator(position_function=SafePositionWrapper(get_ball_passing_position)), # Ball set up for pass
                     # Add random yaw orientation
-                    CarPositionMutator(car_id="blue-0", 
+                    CarPositionMutator(car_id="blue-0",
                                        position_function=SafePositionWrapper(get_blue_attacker_position),
                                        orientation_function=get_random_yaw_orientation), # Passer
-                    CarPositionMutator(car_id="blue-1", 
+                    CarPositionMutator(car_id="blue-1",
                                        position_function=SafePositionWrapper(get_blue_support_offensive_position),
                                        orientation_function=get_random_yaw_orientation) # Receiver
                 ),
@@ -1225,11 +1175,11 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             BallPositionMutator(position_function=SafePositionWrapper(get_defensive_save_ball_position)),
             BallVelocityMutator(velocity_function=SafePositionWrapper(get_defensive_save_ball_velocity)),
             # Add face own goal orientation
-            CarPositionMutator(car_id="blue-0", 
+            CarPositionMutator(car_id="blue-0",
                                position_function=SafePositionWrapper(get_defensive_save_car_position),
                                orientation_function=get_face_own_goal_orientation),
             # Add face opponent goal orientation (relative to orange, so facing blue goal)
-            CarPositionMutator(car_id="orange-0", 
+            CarPositionMutator(car_id="orange-0",
                                position_function=SafePositionWrapper(get_orange_attacker_position),
                                orientation_function=get_face_own_goal_orientation)
         ),
@@ -1261,7 +1211,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             # Add data augmentation for better generalization
             AugmentMutator(shuffle_within_teams=False, randomize_front_back=False, randomize_left_right=True),
             # First position the car with a predictable location
-            CarPositionMutator(car_id="blue-0", 
+            CarPositionMutator(car_id="blue-0",
                                position_function=SafePositionWrapper(partial(create_position, 0, -2800, 17)),
                                orientation_function=get_face_opp_goal_orientation),
             # Then place ball in absolute coordinates (more reliable than relative)
@@ -1283,11 +1233,11 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         base_task_truncation_condition=TimeoutCondition(12),
         skill_modules=[
             SkillModule(
-                name="Close Following", # Renamed from Cut Control for clarity
+                name="Close Following",
                 state_mutator=MutatorSequence(
                     FixedTeamSizeMutator(blue_size=1, orange_size=0),
                     # First position the car
-                    CarPositionMutator(car_id="blue-0", 
+                    CarPositionMutator(car_id="blue-0",
                                        position_function=SafePositionWrapper(partial(create_position, 0, -2800, 17)),
                                        orientation_function=get_face_opp_goal_orientation),
                     # Then place ball in absolute coordinates near the car
@@ -1310,11 +1260,11 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                 success_threshold=0.5
             ),
             SkillModule(
-                name="Cut Control", # Added Cut Control skill
+                name="Cut Control",
                 state_mutator=MutatorSequence(
                     FixedTeamSizeMutator(blue_size=1, orange_size=0),
                     # First position the car
-                    CarPositionMutator(car_id="blue-0", 
+                    CarPositionMutator(car_id="blue-0",
                                        position_function=SafePositionWrapper(partial(create_position, 0, -2800, 17)),
                                        orientation_function=get_face_opp_goal_orientation),
                     # Then place ball in absolute coordinates offset from car
@@ -1342,16 +1292,16 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                 name="Wavedash Training",
                 state_mutator=MutatorSequence(
                     FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    CarPositionMutator(car_id="blue-0", 
+                    CarPositionMutator(car_id="blue-0",
                                     position_function=SafePositionWrapper(
-                                        lambda: np.array([np.random.uniform(-1000, 1000), 
-                                                          np.random.uniform(-4000, -3000), 
+                                        lambda: np.array([np.random.uniform(-1000, 1000),
+                                                          np.random.uniform(-4000, -3000),
                                                           800])  # Start in the air
                                     ),
                                     orientation_function=get_random_yaw_orientation),
                     BallPositionMutator(position_function=SafePositionWrapper(
-                        lambda: np.array([np.random.uniform(-2000, 2000), 
-                                          np.random.uniform(1000, 3000), 
+                        lambda: np.array([np.random.uniform(-2000, 2000),
+                                          np.random.uniform(1000, 3000),
                                           93])
                     )),
                     CarBoostMutator(boost_amount=30)
@@ -1382,23 +1332,23 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             FixedTeamSizeMutator(blue_size=2, orange_size=2),
             BallPositionMutator(position_function=SafePositionWrapper(get_defensive_ball_position)),
             # Add face own goal orientation
-            CarPositionMutator(car_id="blue-0", 
+            CarPositionMutator(car_id="blue-0",
                                position_function=SafePositionWrapper(get_blue_primary_defender_position),
                                orientation_function=get_face_own_goal_orientation),
-            CarPositionMutator(car_id="blue-1", 
+            CarPositionMutator(car_id="blue-1",
                                position_function=SafePositionWrapper(get_blue_secondary_defender_position),
                                orientation_function=get_face_own_goal_orientation),
             # Add face opponent goal orientation
-            CarPositionMutator(car_id="orange-0", 
+            CarPositionMutator(car_id="orange-0",
                                position_function=SafePositionWrapper(get_orange_attacker_position),
                                orientation_function=get_face_own_goal_orientation),
-            CarPositionMutator(car_id="orange-1", 
+            CarPositionMutator(car_id="orange-1",
                                position_function=SafePositionWrapper(get_orange_support_position),
                                orientation_function=get_face_own_goal_orientation)
         ),
         base_task_reward_function=CombinedReward(
             KRCReward([
-                (BlockSuccessReward(), 0.7), # Renamed from GoalPrevention
+                (BlockSuccessReward(), 0.7),
                 (DefensivePositioningReward(), 0.5),
                 (BallClearanceReward(), 0.6)
             ], team_spirit=0.7),
@@ -1420,17 +1370,17 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             FixedTeamSizeMutator(blue_size=2, orange_size=2),
             BallPositionMutator(position_function=SafePositionWrapper(get_offensive_ball_position)),
             # Add face opponent goal orientation
-            CarPositionMutator(car_id="blue-0", 
+            CarPositionMutator(car_id="blue-0",
                                position_function=SafePositionWrapper(get_blue_attacker_offensive_position),
                                orientation_function=get_face_opp_goal_orientation),
-            CarPositionMutator(car_id="blue-1", 
+            CarPositionMutator(car_id="blue-1",
                                position_function=SafePositionWrapper(get_blue_support_offensive_position),
                                orientation_function=get_face_opp_goal_orientation),
             # Add face own goal orientation
-            CarPositionMutator(car_id="orange-0", 
+            CarPositionMutator(car_id="orange-0",
                                position_function=SafePositionWrapper(get_orange_primary_defender_position),
                                orientation_function=get_face_own_goal_orientation),
-            CarPositionMutator(car_id="orange-1", 
+            CarPositionMutator(car_id="orange-1",
                                position_function=SafePositionWrapper(get_orange_secondary_defender_position),
                                orientation_function=get_face_own_goal_orientation)
         ),
@@ -1438,7 +1388,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             (GoalReward(), 2.0),
             (goal_velocity_reward, 0.7),
             (offensive_potential_reward, 0.6),
-            (PassCompletionReward(), 0.5), # Added pass reward
+            (PassCompletionReward(), 0.5),
             (ScoringOpportunityCreationReward(), 0.6)
         ], team_spirit=0.7),
         base_task_termination_condition=goal_condition,
@@ -1459,7 +1409,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             BallPositionMutator(position_function=SafePositionWrapper(get_advanced_aerial_ball_position)), # Higher aerials
             BallVelocityMutator(velocity_function=SafePositionWrapper(get_advanced_aerial_ball_velocity)), # Moving aerials
             # Add face opponent goal orientation
-            CarPositionMutator(car_id="blue-0", 
+            CarPositionMutator(car_id="blue-0",
                                position_function=SafePositionWrapper(get_advanced_aerial_car_position),
                                orientation_function=get_face_opp_goal_orientation),
             CarBoostMutator(boost_amount=75)
@@ -1482,7 +1432,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                     AugmentMutator(shuffle_within_teams=False, randomize_front_back=True, randomize_left_right=True),
                     BallPositionMutator(position_function=SafePositionWrapper(get_fast_aerial_ball_position)), # Higher, faster targets
                     # Add face opponent goal orientation
-                    CarPositionMutator(car_id="blue-0", 
+                    CarPositionMutator(car_id="blue-0",
                                        position_function=SafePositionWrapper(get_advanced_aerial_car_position)),
                     CarBoostMutator(boost_amount=100)
                 ),
@@ -1503,7 +1453,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                     AugmentMutator(shuffle_within_teams=False, randomize_front_back=True, randomize_left_right=True),
                     BallPositionMutator(position_function=SafePositionWrapper(get_ball_wall_position)), # Ball high on wall
                     # Add random yaw orientation
-                    CarPositionMutator(car_id="blue-0", 
+                    CarPositionMutator(car_id="blue-0",
                                        position_function=SafePositionWrapper(get_car_wall_position),
                                        orientation_function=get_random_yaw_orientation),
                     CarBoostMutator(boost_amount=60)
@@ -1579,11 +1529,11 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
 
     # Create the full curriculum list
     stages = []
-    
+
     # Only include pretraining stage if use_pretraining is True
     if use_pretraining:
         stages.append(pretraining)
-    
+
     # Add all other stages
     stages.extend([
         movement_foundations,
@@ -1608,7 +1558,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         rehearsal_decay_factor=0.7,
         evaluation_window=50, # Evaluate progression every 50 episodes
         debug=debug,
-        use_wandb=use_wandb # Pass use_wandb parameter
+        use_wandb=use_wandb
     )
 
     return curriculum_manager

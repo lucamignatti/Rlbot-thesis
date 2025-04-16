@@ -5,9 +5,9 @@ from model_architectures import (
     fix_compiled_state_dict,
     load_partial_state_dict,
     print_model_info,
-    fix_rsnorm_cuda_graphs # Import the fix function if needed before compile
+    fix_rsnorm_cuda_graphs
 )
-from typing import Union, Tuple, Optional, Dict, Any, Deque # Import Deque
+from typing import Union, Tuple, Optional, Dict, Any, Deque
 from auxiliary import AuxiliaryTaskManager
 from intrinsic_rewards import create_intrinsic_reward_generator, IntrinsicRewardEnsemble
 from algorithms import BaseAlgorithm, PPOAlgorithm, StreamACAlgorithm
@@ -138,8 +138,8 @@ class Trainer:
         warmup_steps: int = 1000,
         updates_per_step: int = 1,
         # SimbaV2 Reward Scaling parameters
-        use_reward_scaling: bool = True, # Add flag to enable/disable
-        reward_scaling_G_max: float = 10.0, # Max possible return (hyperparameter)
+        use_reward_scaling: bool = True,
+        reward_scaling_G_max: float = 10.0,
         reward_scaling_eps: float = 1e-5,
     ):
         self.use_wandb = use_wandb
@@ -263,7 +263,7 @@ class Trainer:
         elif self.algorithm_type == "sac":
             # Create a second critic network for SAC's twin Q-function
             critic2 = copy.deepcopy(critic)
-            
+
             # Create SAC algorithm
             algorithm = SACAlgorithm(
                 actor=self.actor,
@@ -276,18 +276,18 @@ class Trainer:
                 lr_actor=lr_actor,
                 lr_critic=lr_critic,
                 gamma=gamma,
-                tau=tau,                      # Add this parameter to the Trainer.__init__
-                alpha=alpha,                  # Add this parameter to the Trainer.__init__
-                auto_alpha_tuning=auto_alpha_tuning,  # Add this parameter to the Trainer.__init__
-                target_entropy=target_entropy,        # Add this parameter to the Trainer.__init__
-                buffer_size=buffer_size,              # Add this parameter to the Trainer.__init__
+                tau=tau,
+                alpha=alpha,
+                auto_alpha_tuning=auto_alpha_tuning,
+                target_entropy=target_entropy,
+                buffer_size=buffer_size,
                 batch_size=batch_size,
-                warmup_steps=warmup_steps,            # Add this parameter to the Trainer.__init__
+                warmup_steps=warmup_steps,
                 update_freq=update_freq,
-                updates_per_step=updates_per_step,    # Add this parameter to the Trainer.__init__
+                updates_per_step=updates_per_step,
                 max_grad_norm=max_grad_norm,
                 use_amp=use_amp,
-                use_wandb=use_wandb,  # Add this parameter
+                use_wandb=use_wandb,
                 debug=self.debug
             )
             self.algorithm = algorithm
@@ -305,8 +305,8 @@ class Trainer:
         self.critic_losses = collections.deque(maxlen=history_len)
         self.entropy_losses = collections.deque(maxlen=history_len)
         self.total_losses = collections.deque(maxlen=history_len)
-        self.aux_sr_losses = collections.deque(maxlen=history_len) # Add deque for aux losses
-        self.aux_rp_losses = collections.deque(maxlen=history_len) # Add deque for aux losses
+        self.aux_sr_losses = collections.deque(maxlen=history_len)
+        self.aux_rp_losses = collections.deque(maxlen=history_len)
 
         # Initialize auxiliary tasks if enabled
         self.use_auxiliary_tasks = use_auxiliary_tasks
@@ -349,7 +349,7 @@ class Trainer:
                 "rp_weight": rp_weight,
                 "use_pretraining": use_pretraining,
                 "use_amp": use_amp
-            }, allow_val_change=True)  # Add allow_val_change=True
+            }, allow_val_change=True)
 
         # If requested and available, compile the models for performance
         self.use_compile = use_compile and hasattr(torch, 'compile')
@@ -359,7 +359,7 @@ class Trainer:
                 # Check if models contain RSNorm before applying fix
                 # This requires RSNorm to be imported or defined
                 try:
-                    from model_architectures.utils import RSNorm # Import RSNorm if needed
+                    from model_architectures.utils import RSNorm
                     if any(isinstance(m, RSNorm) for m in actor.modules()) or \
                        any(isinstance(m, RSNorm) for m in critic.modules()):
                         print("Applying RSNorm CUDA graphs fix before compiling...")
@@ -702,7 +702,7 @@ class Trainer:
         # Get whether we're in test mode
         test_mode = getattr(self, 'test_mode', False)
 
-        # --- Reward Scaling (SimbaV2) ---
+        # Reward Scaling (SimbaV2)
         original_reward = reward # Keep original for potential intrinsic calculation later
         if self.use_reward_scaling and not test_mode:
              # Ensure reward is a float for calculations
@@ -719,9 +719,8 @@ class Trainer:
              # Scale the reward
              reward = self._scale_reward(env_id, reward_float, variance_G, max_G)
 
-             if self.debug and self._true_training_steps() % 100 == 0: # Use _true_training_steps
+             if self.debug and self._true_training_steps() % 100 == 0:
                  print(f"[DEBUG Reward Scaling env {env_id}] Orig: {reward_float:.4f}, Scaled: {reward:.4f}, VarG: {variance_G:.4f}, MaxG: {max_G:.4f}")
-        # --- End Reward Scaling ---
 
         # Initialize extrinsic reward normalizer if it doesn't exist
         if not hasattr(self, 'extrinsic_reward_normalizer'):
@@ -891,10 +890,10 @@ class Trainer:
                     'obs': state,
                     'action': action,
                     'log_prob': log_prob,
-                    'reward': original_reward, # Store original reward in test mode
+                    'reward': original_reward,
                     'value': value,
                     'done': done,
-                    'env_id': env_id  # Add env_id to experience
+                    'env_id': env_id
                 }
                 self.algorithm.experience_buffer.append(exp)
 
@@ -917,7 +916,7 @@ class Trainer:
             # Update auxiliary tasks and get metrics
             aux_metrics = self.aux_task_manager.update(
                 observations=state,
-                rewards=reward, # Pass scaled reward tensor
+                rewards=reward,
                 features=features
             )
 
@@ -997,7 +996,7 @@ class Trainer:
         # Check and update pretraining state before policy update
         if self.use_pretraining:
             self._update_pretraining_state()
-            self._update_auxiliary_weights() # Also update weights based on state
+            self._update_auxiliary_weights()
 
         # --- Algorithm Update ---
         # Forward to specific algorithm implementation
@@ -1172,21 +1171,21 @@ class Trainer:
         # Include curriculum state if manager is registered
         if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None:
              if hasattr(self.curriculum_manager, 'get_state'):
-                 checkpoint['curriculum'] = self.curriculum_manager.get_state() # Use 'curriculum' key
+                 checkpoint['curriculum'] = self.curriculum_manager.get_state()
                  if self.debug:
                      print(f"[DEBUG Trainer Save] Included curriculum state in checkpoint.")
 
         # Include auxiliary task state if manager exists
         if hasattr(self, 'aux_task_manager') and self.aux_task_manager is not None:
              if hasattr(self.aux_task_manager, 'get_state_dict'):
-                 checkpoint['aux'] = self.aux_task_manager.get_state_dict() # Use 'aux' key
+                 checkpoint['aux'] = self.aux_task_manager.get_state_dict()
                  if self.debug:
                      print(f"[DEBUG Trainer Save] Included auxiliary task state in checkpoint.")
 
         # Include intrinsic reward state if generator exists
         if hasattr(self, 'intrinsic_reward_generator') and self.intrinsic_reward_generator is not None:
              if hasattr(self.intrinsic_reward_generator, 'get_state_dict'):
-                 checkpoint['intrinsic'] = self.intrinsic_reward_generator.get_state_dict() # Use 'intrinsic' key
+                 checkpoint['intrinsic'] = self.intrinsic_reward_generator.get_state_dict()
                  if self.debug:
                      print(f"[DEBUG Trainer Save] Included intrinsic reward state in checkpoint.")
 
@@ -1220,7 +1219,7 @@ class Trainer:
         if self.debug:
             print(f"[DEBUG Trainer Save] Saved checkpoint to {model_path}")
 
-        return model_path # Return the path where it was saved
+        return model_path
 
     def load_models(self, model_path):
         """
@@ -1832,6 +1831,5 @@ class Trainer:
 
     def _cleanup_tensors(self):
         """Clean up any cached tensors to reduce memory usage"""
-        # Clear PyTorch cache occasionally
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

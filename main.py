@@ -56,7 +56,7 @@ def print_memory_objects(top_n=5):
     Collects all objects tracked by the GC, finds the largest ones using heapq,
     and prints details for them.
     """
-    print("\n--- Memory Object Report (End of Training) ---") # Modified title
+    print("\n--- Memory Object Report (End of Training) ---")
     # Force garbage collection to get a cleaner state
     gc.collect()
 
@@ -205,7 +205,7 @@ def run_training(
         use_compile=use_compile,
         use_amp=use_amp,
         use_auxiliary_tasks=auxiliary,
-        sr_weight=sr_weight * aux_scale,  # Apply scaling to auxiliary task weights
+        sr_weight=sr_weight * aux_scale,
         rp_weight=rp_weight * aux_scale,
         aux_amp=aux_amp,
         use_pretraining=use_pretraining,
@@ -913,12 +913,6 @@ def run_training(
 
             progress_bar.set_postfix(stats_dict)
 
-        # --- Added Memory Print at the end of the try block ---
-        # if debug:
-        #     print("\n[DEBUG] Training loop finished. Printing final memory objects...")
-        #     print_memory_objects(top_n=20) # Print top 20 objects at the end
-        # --- End Added Memory Print ---
-
     except KeyboardInterrupt:
         print("\nTraining interrupted. Cleaning up...")
     except Exception as e:
@@ -1038,7 +1032,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', type=int, default=8192, help='Batch size for PPO updates')
 
     parser.add_argument('--weight_clip_kappa', type=float, default=1.0, help='Weight clipping factor for PPO')
-    parser.add_argument('--weight_clipping', type=bool, default=True, help='Enable weight clipping for PPO')
+    parser.add_argument('--weight_clipping', type=bool, default=False, help='Enable weight clipping for PPO')
 
     # Adaptive weight clipping parameters
     parser.add_argument('--adaptive_kappa', action='store_false', help='Enable adaptive weight clipping kappa')

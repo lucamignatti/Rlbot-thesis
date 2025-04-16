@@ -14,10 +14,10 @@ import select
 def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacker=None, curriculum_config=None, debug=False):
     """Worker process that runs a single environment"""
     try:
-        # Create environment first - with extra safety
+        # Create environment first
         if debug:
             print(f"[DEBUG] Worker process creating environment with config: {curriculum_config['stage_name'] if curriculum_config else 'Default'}")
-        
+
         env = None
         max_retries = 3
         for attempt in range(max_retries):
@@ -31,11 +31,11 @@ def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacke
                     time.sleep(1)  # Small delay before retry
                 else:
                     raise
-        
+
         if env is None:
             raise RuntimeError("Failed to create environment after max retries")
-            
-        # Then create renderer if needed - with safety
+
+        # Then create renderer if needed
         renderer = None
         if render:
             try:
@@ -45,11 +45,11 @@ def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacke
             except Exception as e:
                 if debug:
                     print(f"[DEBUG] Error creating renderer: {e}")
-                
+
         # Initialize tick count at creation time
         if hasattr(env, 'transition_engine'):
             env.transition_engine._tick_count = 0
-        
+
         # Initialize initial_tick for TimeoutCondition if it exists
         if hasattr(env, 'truncation_cond'):
             def set_initial_tick(cond):
@@ -59,13 +59,13 @@ def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacke
                     for sub_cond in cond.conditions:
                         set_initial_tick(sub_cond)
             set_initial_tick(env.truncation_cond)
-            
+
         curr_config = curriculum_config  # Keep track of current curriculum config
         while True:
             try:
                 # Don't use select here - it can cause issues with some platforms
                 cmd, data = remote.recv()
-                
+
                 if cmd == 'step':
                     actions_dict = data
                     # Format actions for RLGym API
@@ -75,7 +75,7 @@ def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacke
                         if isinstance(action, torch.Tensor):
                             # Properly convert tensor to numpy, regardless of dimensions
                             action_np = action.cpu().detach().numpy()
-                            
+
                             # If action is a one-hot vector, convert it to an index
                             if len(action_np.shape) == 1 and action_np.shape[0] > 1:
                                 # Get the index of the maximum value (one-hot to index)
@@ -96,18 +96,18 @@ def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacke
                                 if debug:
                                     print(f"[DEBUG] Unable to process action of type {type(action)}, using default action")
                                 formatted_actions[agent_id] = np.array([0])  # Default action
-                                
+
                         # Add action to stacker history
                         if action_stacker is not None:
                             action_stacker.add_action(agent_id, formatted_actions[agent_id])
                     # Step the environment
                     next_obs_dict, reward_dict, terminated_dict, truncated_dict = env.step(formatted_actions)
                     remote.send((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
-                
+
                 elif cmd == 'reset':
                     if debug:
                         print(f"[DEBUG] Worker resetting with stage: {curr_config.get('stage_name', 'Unknown') if curr_config else 'Default'}")
-                    
+
                     # Add retry logic for resets
                     reset_success = False
                     for reset_attempt in range(3):  # Try up to 3 times
@@ -122,21 +122,21 @@ def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacke
                             if reset_attempt == 2:  # Last attempt
                                 raise
                             time.sleep(0.1)  # Small delay between attempts
-                    
+
                     if not reset_success:
                         # If all reset attempts failed, send empty dict
                         remote.send({})
-                
+
                 elif cmd == 'set_curriculum':
                     # Update environment with new curriculum configuration
                     old_config = curr_config
                     curr_config = data
-                    
+
                     if debug:
                         old_stage = old_config.get('stage_name', 'Unknown') if old_config else 'Default'
                         new_stage = curr_config.get('stage_name', 'Unknown') if curr_config else 'Default'
                         print(f"[DEBUG] Changing stage from {old_stage} to {new_stage}")
-                    
+
                     # Safely close and recreate environment
                     try:
                         if renderer:
@@ -151,20 +151,20 @@ def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacke
                         if debug:
                             print(f"[DEBUG] Error recreating environment: {e}")
                         raise
-                
+
                 elif cmd == 'close':
                     if renderer:
                         renderer.close()
                     env.close()
                     remote.close()
                     break
-                
+
                 elif cmd == 'reset_action_stacker':
                     agent_id = data
                     if action_stacker is not None:
                         action_stacker.reset_agent(agent_id)
                     remote.send(True)  # Acknowledge
-                    
+
             except EOFError:
                 break
             except Exception as e:
@@ -172,7 +172,7 @@ def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacke
                 print(f"Error in worker: {str(e)}")
                 print(traceback.format_exc())
                 break
-                
+
     except Exception as e:
         import traceback
         print(f"Fatal error in worker initialization: {str(e)}")
@@ -205,7 +205,7 @@ class VectorizedEnv:
             if self.curriculum_manager:
                 # Get potentially different configs for each environment (for rehearsal)
                 config = self.curriculum_manager.get_environment_config()
-                
+
                 if self.debug:
                     print(f"[DEBUG] Env {env_idx} initialized with stage: {config['stage_name']}")
                     # Check if config has car position mutator
@@ -219,7 +219,7 @@ class VectorizedEnv:
                                 break
                     if not has_car_pos:
                         print(f"[DEBUG] WARNING: Env {env_idx}, stage {config['stage_name']} has NO CarPositionMutator!")
-                
+
                 # Process config to make it picklable for multiprocessing
                 if not render:  # Only needed for multiprocessing mode
                     config = self._make_config_picklable(config)
@@ -256,7 +256,7 @@ class VectorizedEnv:
             pipes = [Pipe() for _ in range(num_envs)]
             self.remotes = [remote for remote, _ in pipes]  # Store as list instead of tuple
             self.work_remotes = [work_remote for _, work_remote in pipes]  # Store as list
-            
+
             # Create and start worker processes
             self.processes = []
             for idx, work_remote in enumerate(self.work_remotes):
@@ -272,7 +272,7 @@ class VectorizedEnv:
             # Initialize all environments with proper timeout handling
             self.obs_dicts = []
             failed_workers = []
-            
+
             for env_idx, remote in enumerate(self.remotes):
                 try:
                     remote.send(('reset', None))
@@ -288,15 +288,15 @@ class VectorizedEnv:
                         obs = remote.recv()
                         self.obs_dicts.append(obs)
                         continue
-                        
+
                 except Exception as e:
                     if self.debug:
                         print(f"[DEBUG] Worker {env_idx} failed to initialize: {e}")
-                
+
                 # If we reach here, the worker failed to initialize properly
                 failed_workers.append(env_idx)
-                self.obs_dicts.append({})  # Add empty dict as placeholder
-                
+                self.obs_dicts.append({})
+
                 # Try to terminate the failed worker
                 try:
                     if env_idx < len(self.processes):
@@ -304,28 +304,28 @@ class VectorizedEnv:
                         self.processes[env_idx].join(timeout=1.0)
                 except:
                     pass
-            
+
             # Recreate failed workers if any
             if failed_workers and self.debug:
                 print(f"[DEBUG] Recreating {len(failed_workers)} failed workers")
-                
+
             for env_idx in failed_workers:
                 try:
                     # Create new pipe
                     new_remote, new_work_remote = Pipe()
                     self.remotes[env_idx] = new_remote
-                    
+
                     # Create new process
                     process = Process(
                         target=worker,
-                        args=(new_work_remote, get_env, False, action_stacker, 
+                        args=(new_work_remote, get_env, False, action_stacker,
                               self.curriculum_configs[env_idx], self.debug),
                         daemon=True
                     )
                     process.start()
                     self.processes[env_idx] = process
                     new_work_remote.close()
-                    
+
                     # Initialize the new worker
                     new_remote.send(('reset', None))
                     if select.select([new_remote], [], [], 10.0)[0]:
@@ -346,7 +346,7 @@ class VectorizedEnv:
     def _make_config_picklable(self, config):
         """Ensure valid team size configuration"""
         processed = dict(config)
-        
+
         # Make sure state_mutator is properly constructed if it's a MutatorSequence
         if "state_mutator" in processed and hasattr(processed["state_mutator"], "mutators"):
             # Ensure that the MutatorSequence is properly constructed with individual mutator arguments
@@ -357,17 +357,17 @@ class VectorizedEnv:
                 from rlgym.rocket_league.state_mutators import MutatorSequence
                 mutators = old_mutator_sequence.mutators
                 processed["state_mutator"] = MutatorSequence(*mutators)
-        
+
         # Force required_agents field
         if "required_agents" not in processed:
             from rlgym.rocket_league.state_mutators import FixedTeamSizeMutator
             team_mutators = []
-            
+
             # Check if state_mutator is a MutatorSequence with mutators attribute
             if hasattr(processed["state_mutator"], "mutators"):
                 team_mutators = [m for m in processed["state_mutator"].mutators
                                if isinstance(m, FixedTeamSizeMutator)]
-            
+
             if team_mutators:
                 processed["required_agents"] = (
                     team_mutators[0].blue_size
@@ -375,7 +375,7 @@ class VectorizedEnv:
                 )
             else:
                 processed["required_agents"] = 1
-                
+
         return processed
 
     def _step_env(self, args):
@@ -388,7 +388,7 @@ class VectorizedEnv:
             if isinstance(action, torch.Tensor):
                 # Properly convert tensor to numpy, regardless of dimensions
                 action_np = action.cpu().detach().numpy()
-                
+
                 # If action is a one-hot vector, convert it to an index
                 if len(action_np.shape) == 1 and action_np.shape[0] > 1:
                     # Get the index of the maximum value (one-hot to index)
@@ -492,9 +492,9 @@ class VectorizedEnv:
                             if env_idx == 0 and self.render:
                                 existing_renderer = self.envs[env_idx].renderer
                                 self.envs[env_idx].renderer = None  # Prevent renderer.close() in env.close()
-                            
+
                             self.envs[env_idx].close()
-                            
+
                             # 2) Reuse that same renderer (fall back to a new one if it was somehow None)
                             if env_idx == 0 and self.render:
                                 if existing_renderer is None:
@@ -503,7 +503,7 @@ class VectorizedEnv:
                                 env_renderer = existing_renderer
                             else:
                                 env_renderer = None
-                            
+
                             self.envs[env_idx] = get_env(
                                 renderer=env_renderer,
                                 action_stacker=self.action_stacker,
@@ -567,7 +567,7 @@ class VectorizedEnv:
                     if self.debug:
                         print(f"[DEBUG] Worker {i} has a broken pipe. Attempting recovery...")
                     self.dones[i] = True  # Mark as done to trigger reset
-                    
+
                     # Try to recreate this worker in the background
                     try:
                         # Close the broken connection if possible
@@ -575,20 +575,20 @@ class VectorizedEnv:
                             remote.close()
                         except:
                             pass
-                            
+
                         # Create a new connection
                         new_remote, new_work_remote = Pipe()
-                        
+
                         # Create and start a new worker process
                         process = Process(
                             target=worker,
-                            args=(new_work_remote, get_env, False, self.action_stacker, 
+                            args=(new_work_remote, get_env, False, self.action_stacker,
                                 self.curriculum_configs[i], self.debug),
                             daemon=True
                         )
                         process.start()
                         new_work_remote.close()
-                        
+
                         # Properly terminate the old process before replacing it
                         old_process = self.processes[i]
                         try:
@@ -602,18 +602,18 @@ class VectorizedEnv:
                         except Exception as e:
                             if self.debug:
                                 print(f"[DEBUG] Error cleaning up old process {i}: {e}")
-                        
+
                         # Replace the old remote with the new one
                         self.remotes[i] = new_remote
                         self.processes[i] = process
-                        
+
                         # Reset this environment
                         new_remote.send(('reset', None))
                         if hasattr(select, 'select') and select.select([new_remote], [], [], 5.0)[0]:
                             self.obs_dicts[i] = new_remote.recv()
                         else:
                             self.obs_dicts[i] = {}  # Empty dict as fallback
-                            
+
                         if self.debug:
                             print(f"[DEBUG] Worker {i} successfully recreated")
                     except Exception as e:
@@ -649,18 +649,18 @@ class VectorizedEnv:
                     # For inactive workers, use empty results
                     next_obs_dict, reward_dict, terminated_dict, truncated_dict = {}, {}, {True: True}, {True: True}
                     self.dones[i] = True
-                
+
                 # Track rewards for curriculum
                 if self.curriculum_manager is not None:
                     # Ensure episode rewards dict is initialized
                     if not isinstance(self.episode_rewards[i], dict):
                         self.episode_rewards[i] = {}
-                    
+
                     for agent_id, reward in reward_dict.items():
                         if agent_id not in self.episode_rewards[i]:
                             self.episode_rewards[i][agent_id] = 0
                         self.episode_rewards[i][agent_id] += reward
-                
+
                 # Check if episode is done
                 self.dones[i] = any(terminated_dict.values()) or any(truncated_dict.values())
 
@@ -710,7 +710,7 @@ class VectorizedEnv:
                     self.episode_counts[i] += 1
                     max_reset_attempts = 3
                     reset_success = False
-                    
+
                     for attempt in range(max_reset_attempts):
                         try:
                             remote.send(('reset', None))
@@ -733,37 +733,37 @@ class VectorizedEnv:
                                         remote.close()
                                     except:
                                         pass
-                                        
+
                                     # Create new connection
                                     new_remote, new_work_remote = Pipe()
-                                    
+
                                     # Create and start new worker
                                     process = Process(
                                         target=worker,
-                                        args=(new_work_remote, get_env, False, self.action_stacker, 
+                                        args=(new_work_remote, get_env, False, self.action_stacker,
                                             self.curriculum_configs[i], self.debug),
                                         daemon=True
                                     )
                                     process.start()
                                     new_work_remote.close()
-                                    
+
                                     # Replace old remote with new one
                                     self.remotes[i] = new_remote
                                     self.processes[i].terminate()
                                     self.processes[i] = process
-                                    
+
                                     # Reset new environment
                                     new_remote.send(('reset', None))
                                     if hasattr(select, 'select') and select.select([new_remote], [], [], 5.0)[0]:
                                         self.obs_dicts[i] = new_remote.recv()
                                         reset_success = True
-                                    
+
                                     if self.debug:
                                         print(f"[DEBUG] Worker {i} successfully recreated")
                                 except Exception as e:
                                     if self.debug:
                                         print(f"[DEBUG] Failed to recreate worker {i}: {e}")
-                    
+
                     # Reset action stacker for all agents if there's valid observation data
                     if self.action_stacker is not None and next_obs_dict and reset_success:
                         for agent_id in next_obs_dict.keys():
@@ -786,7 +786,7 @@ class VectorizedEnv:
                 results.append((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
 
         return results, self.dones.copy(), self.episode_counts.copy()
-        
+
     def force_env_reset(self, env_idx):
         """Force reset a problematic environment (thread mode)"""
         if self.mode == "thread":
@@ -835,7 +835,7 @@ class VectorizedEnv:
 
             # Wait a moment for workers to process the close command
             time.sleep(0.5)
-            
+
             # Then terminate and clean up processes
             if hasattr(self, 'processes'):
                 for i, process in enumerate(self.processes):
@@ -861,7 +861,7 @@ class VectorizedEnv:
                     except Exception as e:
                         if self.debug:
                             print(f"[DEBUG] Error closing pipe for worker {i}: {e}")
-            
+
             if hasattr(self, 'work_remotes'):
                 for i, work_remote in enumerate(self.work_remotes):
                     try:
@@ -869,7 +869,7 @@ class VectorizedEnv:
                             work_remote.close()
                     except Exception:
                         pass
-        
+
         # Force garbage collection to clean up any remaining references
         try:
             import gc
