@@ -367,7 +367,8 @@ def run_training(
         "Reward": "0.0",  # Average reward per episode
         "PLoss": "0.0",  # Actor loss
         "VLoss": "0.0",  # Critic loss
-        "Entropy": "0.0"  # Entropy loss
+        "Entropy": "0.0",  # Entropy loss
+        "Steps/s": "0.0"  # Steps per second
     })
 
     # Add auxiliary task metrics if enabled
@@ -410,6 +411,11 @@ def run_training(
     last_update_time = time.time()
     last_save_episode = 0
     last_progress_update_step = 0  # Track last step count when progress was updated
+    
+    # Variables to track steps per second
+    steps_per_second = 0
+    last_steps_time = time.time()
+    last_steps_count = 0
 
     # Add defensive initialization for episode_rewards
     episode_rewards = {}
@@ -524,6 +530,15 @@ def run_training(
 
             # Update trainer's total_env_steps attribute for logging
             trainer.total_env_steps = total_env_steps
+            
+            # Calculate steps per second
+            current_time = time.time()
+            elapsed_since_last_calc = current_time - last_steps_time
+            if elapsed_since_last_calc >= 1.0:  # Update once per second
+                steps_per_second = (total_env_steps - last_steps_count) / elapsed_since_last_calc
+                last_steps_time = current_time
+                last_steps_count = total_env_steps
+                stats_dict["Steps/s"] = f"{steps_per_second:.1f}"
 
             # Process the results from each environment.
             exp_idx = 0  # Index into our experience buffer.
@@ -794,7 +809,8 @@ def run_training(
                     # For PPO, do a normal batch update and pass the completed episode rewards and total env steps
                     stats = trainer.update(
                         completed_episode_rewards=completed_episode_rewards_since_last_update,
-                        total_env_steps=total_env_steps # Pass total env steps
+                        total_env_steps=total_env_steps, # Pass total env steps
+                        steps_per_second=steps_per_second # Pass steps per second
                     )
                     # Reset the list of completed episode rewards
                     completed_episode_rewards_since_last_update = []
@@ -940,7 +956,7 @@ def run_training(
             if debug:
                 print(f"[DEBUG] Final update with {collected_experiences} experiences")
             try:
-                trainer.update(total_env_steps=total_env_steps)  # Final update with total env steps
+                trainer.update(total_env_steps=total_env_steps, steps_per_second=steps_per_second)  # Final update with total env steps and steps per second
             except Exception as e:
                 print(f"Error during final update: {str(e)}")
                 traceback.print_exc()

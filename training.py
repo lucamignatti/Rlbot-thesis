@@ -622,6 +622,10 @@ class Trainer:
         # Add total environment steps
         log_total_env_steps = total_env_steps if total_env_steps is not None else self.total_env_steps
         system_metrics["SYS/total_env_steps"] = log_total_env_steps
+        
+        # Add steps per second if provided in metrics
+        if 'steps_per_second' in metrics:
+            system_metrics["SYS/steps_per_second"] = metrics.get('steps_per_second', 0)
 
         # Pre-training indicators
         if self.use_pretraining:
@@ -992,7 +996,7 @@ class Trainer:
         # Forward to algorithm's get_action method
         return self.algorithm.get_action(obs, deterministic, return_features)
 
-    def update(self, completed_episode_rewards=None, total_env_steps: Optional[int] = None):
+    def update(self, completed_episode_rewards=None, total_env_steps: Optional[int] = None, steps_per_second: Optional[float] = None):
         """Update policy based on collected experiences.
         Different implementations for PPO vs StreamAC."""
         metrics = {}
@@ -1011,6 +1015,10 @@ class Trainer:
         # Store total_env_steps if provided (mainly for PPO)
         if total_env_steps is not None:
             self.total_env_steps = total_env_steps
+            
+        # Store steps_per_second if provided
+        if steps_per_second is not None:
+            metrics['steps_per_second'] = steps_per_second
 
         # --- Algorithm Update ---
         # Forward to specific algorithm implementation
