@@ -406,6 +406,7 @@ def run_training(
     # Initialize variables to track training progress.
     collected_experiences = 0
     total_episodes_so_far = 0
+    total_env_steps = 0 # Initialize total environment steps counter
     last_update_time = time.time()
     last_save_episode = 0
     last_progress_update_step = 0  # Track last step count when progress was updated
@@ -517,6 +518,12 @@ def run_training(
 
             # Step all environments forward in parallel - optimized implementation
             results, dones, episode_counts = vec_env.step(actions_dict_list)
+
+            # Increment total environment steps counter
+            total_env_steps += num_envs
+
+            # Update trainer's total_env_steps attribute for logging
+            trainer.total_env_steps = total_env_steps
 
             # Process the results from each environment.
             exp_idx = 0  # Index into our experience buffer.
@@ -784,8 +791,11 @@ def run_training(
 
                 # Perform the policy update.
                 if algorithm == "ppo":
-                    # For PPO, do a normal batch update and pass the completed episode rewards
-                    stats = trainer.update(completed_episode_rewards=completed_episode_rewards_since_last_update)
+                    # For PPO, do a normal batch update and pass the completed episode rewards and total env steps
+                    stats = trainer.update(
+                        completed_episode_rewards=completed_episode_rewards_since_last_update,
+                        total_env_steps=total_env_steps # Pass total env steps
+                    )
                     # Reset the list of completed episode rewards
                     completed_episode_rewards_since_last_update = []
                 else:
@@ -813,7 +823,7 @@ def run_training(
                     stats_dict.update({
                         "StepSize": f"{stats.get('effective_step_size', 0)::.4f}",
                         "ActorLR": f"{getattr(trainer.algorithm, 'lr_actor', lr_actor):.6f}",
-                        "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic):.6f}",
+                        "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic)::.6f}",
                         "Updates": getattr(trainer.algorithm, "successful_steps", 0)
                     })
 
@@ -930,7 +940,7 @@ def run_training(
             if debug:
                 print(f"[DEBUG] Final update with {collected_experiences} experiences")
             try:
-                trainer.update()  # Final update
+                trainer.update(total_env_steps=total_env_steps)  # Final update with total env steps
             except Exception as e:
                 print(f"Error during final update: {str(e)}")
                 traceback.print_exc()
@@ -1453,11 +1463,12 @@ if __name__ == "__main__":
         # Save model with step count and wandb info
         metadata = {
             'training_step': getattr(trainer, 'training_steps', 0) + getattr(trainer, 'training_step_offset', 0),
+            'total_env_steps': getattr(trainer, 'total_env_steps', 0), # Add total env steps to metadata
             'wandb_run_id': wandb.run.id if args.wandb and wandb.run else None,
             'algorithm': args.algorithm  # Save which algorithm was used
         }
         saved_path = trainer.save_models(output_path, metadata)  # Capture the returned path
-        print(f"Training complete - Model saved to {saved_path} at step {metadata['training_step']}")
+        print(f"Training complete - Model saved to {saved_path} at step {metadata['training_step']} (Total Env Steps: {metadata['total_env_steps']})")
     else:
         print("Training failed - no model saved.")
 
@@ -1503,6 +1514,8 @@ if __name__ == "__main__":
                     'num_blocks': args.num_blocks,
                     'dropout': args.dropout
                 },
+                # Add total env steps to artifact metadata
+                'total_env_steps': getattr(trainer, 'total_env_steps', 0)
             }
 
             # Add StreamAC specific metadata if relevant

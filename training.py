@@ -395,6 +395,7 @@ class Trainer:
         self.training_step_offset = training_step_offset
         self.total_episodes = 0
         self.total_episodes_offset = 0
+        self.total_env_steps = 0 # Initialize total environment steps counter
         self.pretraining_completed = False
         self.in_transition_phase = False
         self.transition_start_step = 0  # Initialize transition_start_step to avoid the attribute error
@@ -499,7 +500,7 @@ class Trainer:
         if self.debug:
             print(f"[DEBUG Aux Weights] SR: {self.aux_task_manager.sr_weight:.4f}, RP: {self.aux_task_manager.rp_weight:.4f}, Entropy: {self.entropy_coef:.6f}")
 
-    def _log_to_wandb(self, metrics: Dict[str, Any], step: Optional[int] = None) -> None:
+    def _log_to_wandb(self, metrics: Dict[str, Any], step: Optional[int] = None, total_env_steps: Optional[int] = None) -> None:
         """Centralized wandb logging with step validation and metric organization"""
         if not self.use_wandb or wandb.run is None:
             return
@@ -617,6 +618,10 @@ class Trainer:
         system_metrics["SYS/training_step"] = current_step
         system_metrics["SYS/total_episodes"] = self.total_episodes + self.total_episodes_offset
         system_metrics["SYS/update_time"] = metrics.get("update_time", 0)
+
+        # Add total environment steps
+        log_total_env_steps = total_env_steps if total_env_steps is not None else self.total_env_steps
+        system_metrics["SYS/total_env_steps"] = log_total_env_steps
 
         # Pre-training indicators
         if self.use_pretraining:
@@ -874,7 +879,7 @@ class Trainer:
                             print(f"[STEP DEBUG] About to log to wandb with unique_step={unique_step}")
 
                         # Log metrics using our centralized logging function
-                        self._log_to_wandb(metrics, step=unique_step)
+                        self._log_to_wandb(metrics, step=unique_step, total_env_steps=self.total_env_steps)
                     except Exception as e:
                         if self.debug:
                             print(f"[STEP DEBUG] Error logging to wandb: {e}")
@@ -937,7 +942,7 @@ class Trainer:
                             "sr_loss_scalar": self.aux_task_manager.last_sr_loss,
                             "rp_loss_scalar": self.aux_task_manager.last_rp_loss
                         }
-                        self._log_to_wandb(log_data, step=current_step)
+                        self._log_to_wandb(log_data, step=current_step, total_env_steps=self.total_env_steps)
                 except Exception as e:
                     if self.debug:
                         print(f"[STEP DEBUG] Error logging auxiliary metrics: {e}")
@@ -987,7 +992,7 @@ class Trainer:
         # Forward to algorithm's get_action method
         return self.algorithm.get_action(obs, deterministic, return_features)
 
-    def update(self, completed_episode_rewards=None):
+    def update(self, completed_episode_rewards=None, total_env_steps: Optional[int] = None):
         """Update policy based on collected experiences.
         Different implementations for PPO vs StreamAC."""
         metrics = {}
@@ -1002,6 +1007,10 @@ class Trainer:
         if self.use_pretraining:
             self._update_pretraining_state()
             self._update_auxiliary_weights()
+
+        # Store total_env_steps if provided (mainly for PPO)
+        if total_env_steps is not None:
+            self.total_env_steps = total_env_steps
 
         # --- Algorithm Update ---
         # Forward to specific algorithm implementation
@@ -1099,7 +1108,8 @@ class Trainer:
         # Log metrics
         if self.use_wandb:
             try:
-                self._log_to_wandb(metrics)
+                # Pass total_env_steps to the logging function
+                self._log_to_wandb(metrics, total_env_steps=self.total_env_steps)
             except Exception as e:
                 if self.debug:
                     print(f"[DEBUG] Error logging to wandb: {str(e)}")
@@ -1149,6 +1159,7 @@ class Trainer:
             'algorithm': self.algorithm_type,
             'training_step': self.training_steps + self.training_step_offset,
             'total_episodes': self.total_episodes + self.total_episodes_offset,
+            'total_env_steps': self.total_env_steps, # Add total env steps to metadata
             'timestamp': current_timestamp,
             'version': '2.0'  # Checkpoint format version
         })
@@ -1489,9 +1500,12 @@ class Trainer:
                     self.training_step_offset = metadata['training_step']
                 if 'total_episodes' in metadata:
                     self.total_episodes_offset = metadata['total_episodes']
+                # Restore total environment steps
+                if 'total_env_steps' in metadata:
+                    self.total_env_steps = metadata['total_env_steps']
 
                 if self.debug:
-                    print(f"[DEBUG] Restored training counters: steps={self.training_step_offset}, episodes={self.total_episodes_offset}")
+                    print(f"[DEBUG] Restored training counters: steps={self.training_step_offset}, episodes={self.total_episodes_offset}, env_steps={self.total_env_steps}")
 
 
             # ===== Auto-detect models trained without pretraining =====
