@@ -1067,7 +1067,7 @@ if __name__ == "__main__":
     parser.add_argument('--save_interval', type=int, default=200,
                        help='Save the model every N episodes')
 
-    parser.add_argument('--hidden_dim', type=int, default=1024, help='Hidden dimension for the network')
+    parser.add_argument('--hidden_dim', type=int, default=512, help='Hidden dimension for the network')
     parser.add_argument('--num_blocks', type=int, default=4, help='Number of residual blocks in the network')
     parser.add_argument('--dropout', type=float, default=0.05, help='Dropout rate for regularization')
 
