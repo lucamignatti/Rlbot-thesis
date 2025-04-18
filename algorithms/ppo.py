@@ -968,10 +968,14 @@ class PPOAlgorithm(BaseAlgorithm):
                 if self.aux_task_manager is not None and (self.aux_task_manager.sr_weight > 0 or self.aux_task_manager.rp_weight > 0):
                     try:
                         # Call the new batch-specific loss computation method
+                        # Pass batch_states and batch_rewards
                         aux_losses = self.aux_task_manager.compute_losses_for_batch(batch_states, batch_rewards)
-                        # Get tensor loss if available, otherwise keep 0.0
-                        sr_loss = aux_losses.get("sr_loss", 0.0)
-                        rp_loss = aux_losses.get("rp_loss", 0.0)
+                        # Get tensor loss if available, otherwise default to zero tensor
+                        sr_loss = aux_losses.get("sr_loss", torch.tensor(0.0, device=self.device))
+                        rp_loss = aux_losses.get("rp_loss", torch.tensor(0.0, device=self.device))
+                        # Get scalar loss for tracking
+                        sr_loss_scalar = aux_losses.get("sr_loss_scalar", 0.0)
+                        rp_loss_scalar = aux_losses.get("rp_loss_scalar", 0.0)
                         # Get scalar loss for tracking
                         sr_loss_scalar = aux_losses.get("sr_loss_scalar", 0.0)
                         rp_loss_scalar = aux_losses.get("rp_loss_scalar", 0.0)
@@ -990,8 +994,18 @@ class PPOAlgorithm(BaseAlgorithm):
 
 
                 # --- Total Loss ---
-                # Adding 0.0 float to tensor is handled efficiently by PyTorch
-                total_loss = actor_loss + self.critic_coef * critic_loss + entropy_loss + sr_loss + rp_loss
+                # Ensure all components are tensors before summing
+                if not isinstance(sr_loss, torch.Tensor):
+                    sr_loss_tensor = torch.tensor(sr_loss, dtype=torch.float32, device=self.device)
+                else:
+                    sr_loss_tensor = sr_loss
+                if not isinstance(rp_loss, torch.Tensor):
+                    rp_loss_tensor = torch.tensor(rp_loss, dtype=torch.float32, device=self.device)
+                else:
+                    rp_loss_tensor = rp_loss
+
+                # Combine actor, critic, entropy, and auxiliary losses
+                total_loss = actor_loss + (self.critic_coef * critic_loss) + entropy_loss + sr_loss_tensor + rp_loss_tensor
 
                 # --- Optimization ---
                 self.optimizer.zero_grad()

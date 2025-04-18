@@ -46,6 +46,7 @@ class RewardPredictionTask(nn.Module):
     """
     LSTM-based network for Reward Prediction (RP) auxiliary task.
     Predicts immediate rewards based on a sequence of features from the main model.
+    Adjusts reward classification thresholds dynamically.
     """
     def __init__(self, input_dim, hidden_dim=64, sequence_length=20, device="cpu", debug=False):
         super(RewardPredictionTask, self).__init__()
@@ -64,17 +65,83 @@ class RewardPredictionTask(nn.Module):
         # Output layer for 3-class classification (negative, near-zero, positive reward)
         self.output_layer = nn.Linear(hidden_dim, 3)
 
-        # Thresholds for classifying rewards
-        self.pos_threshold = 0.001
-        self.neg_threshold = -0.001
+        # Thresholds for classifying rewards - initial values, will be adjusted
+        self.pos_threshold = 0.01  # Start slightly wider than default
+        self.neg_threshold = -0.01 # Start slightly wider than default
 
-        # Debug counters for reward distribution
+        # Internal buffer for recent rewards used for threshold adjustment
+        self.threshold_reward_buffer = deque(maxlen=500) # Store recent rewards
+        self.threshold_adjust_freq = 500 # How often (in rewards seen) to adjust thresholds
+        self.threshold_min_buffer_size = 100 # Min rewards needed before first adjustment
+        self.threshold_momentum = 0.95 # Momentum for threshold updates
+        self.min_threshold_separation = 0.001 # Minimum gap between pos and neg thresholds
+
+        # Debug counters
         self.debug_reward_counts = {"negative": 0, "zero": 0, "positive": 0}
         self.debug_total_rewards = 0
-        self.debug_reward_history = []
-        self.debug_threshold_adjust_counter = 0
 
         self.to(self.device)
+
+    def _adjust_thresholds(self):
+        """Dynamically adjust reward thresholds based on recent reward history."""
+        if len(self.threshold_reward_buffer) < self.threshold_min_buffer_size:
+            return # Not enough data yet
+
+        # Convert buffer to tensor for calculations
+        rewards_tensor = torch.tensor(list(self.threshold_reward_buffer), dtype=torch.float32)
+
+        # Calculate percentiles for a balanced 3-way split (e.g., 33rd and 67th)
+        try:
+            # Using quantile directly might be more robust for larger tensors
+            # Ensure the tensor is not empty
+            if rewards_tensor.numel() == 0:
+                 if self.debug: print("[RP DEBUG Adjust] Reward buffer empty, cannot adjust thresholds.")
+                 return
+
+            q_neg = torch.quantile(rewards_tensor, 0.33)
+            q_pos = torch.quantile(rewards_tensor, 0.67)
+
+            new_neg_threshold = q_neg.item()
+            new_pos_threshold = q_pos.item()
+
+        except Exception as e:
+             if self.debug: print(f"[RP DEBUG Adjust] Error calculating quantiles: {e}")
+             # Fallback to simple min/max if quantiles fail (less robust)
+             if rewards_tensor.numel() > 0:
+                 min_val = torch.min(rewards_tensor).item()
+                 max_val = torch.max(rewards_tensor).item()
+                 range_val = max_val - min_val
+                 new_neg_threshold = min_val + 0.33 * range_val
+                 new_pos_threshold = min_val + 0.67 * range_val
+             else:
+                 # Cannot proceed if buffer is empty and quantiles failed
+                 return
+
+
+        # Ensure minimum separation between thresholds
+        if new_pos_threshold - new_neg_threshold < self.min_threshold_separation:
+            mid_point = (new_pos_threshold + new_neg_threshold) / 2
+            new_neg_threshold = mid_point - self.min_threshold_separation / 2
+            new_pos_threshold = mid_point + self.min_threshold_separation / 2
+            # Ensure neg is still <= pos after adjustment
+            if new_neg_threshold > new_pos_threshold:
+                 new_neg_threshold = new_pos_threshold # Safety catch
+
+        # Update thresholds with momentum
+        self.neg_threshold = self.threshold_momentum * self.neg_threshold + (1 - self.threshold_momentum) * new_neg_threshold
+        self.pos_threshold = self.threshold_momentum * self.pos_threshold + (1 - self.threshold_momentum) * new_pos_threshold
+
+        # Final check: ensure neg <= pos
+        if self.neg_threshold > self.pos_threshold:
+            # If they crossed, reset them around the average with separation
+            avg_threshold = (self.neg_threshold + self.pos_threshold) / 2
+            self.neg_threshold = avg_threshold - self.min_threshold_separation / 2
+            self.pos_threshold = avg_threshold + self.min_threshold_separation / 2
+
+
+        if self.debug:
+            print(f"[RP DEBUG Adjust] Adjusted thresholds - Neg: {self.neg_threshold:.6f}, Pos: {self.pos_threshold:.6f} (Buffer size: {len(self.threshold_reward_buffer)})")
+
 
     def forward(self, x_seq):
         # x_seq shape: [batch_size, sequence_length, input_dim]
@@ -131,14 +198,16 @@ class RewardPredictionTask(nn.Module):
         self.debug_reward_counts["zero"] += zero_count
         self.debug_reward_counts["positive"] += pos_count
 
-        # Store some raw reward values for debugging
-        for r in rewards.cpu().tolist()[:10]:  # Limit to first 10 to avoid memory issues
-            self.debug_reward_history.append(r)
-            if len(self.debug_reward_history) > 100:
-                self.debug_reward_history.pop(0)
+        # Update internal reward buffer for threshold adjustment
+        self.threshold_reward_buffer.extend(rewards.cpu().tolist())
+
+        # Periodically adjust thresholds based on buffer
+        if self.debug_total_rewards % self.threshold_adjust_freq == 0:
+             self._adjust_thresholds()
 
         # Print detailed debug info periodically only if debug mode is enabled
-        if self.debug and self.debug_total_rewards % 500 == 0:
+        # Link debug print frequency to threshold adjustment frequency for tidiness
+        if self.debug and self.debug_total_rewards % self.threshold_adjust_freq == 0:
             total = self.debug_reward_counts["negative"] + self.debug_reward_counts["zero"] + self.debug_reward_counts["positive"]
             neg_pct = 100 * self.debug_reward_counts["negative"] / max(1, total)
             zero_pct = 100 * self.debug_reward_counts["zero"] / max(1, total)
@@ -150,33 +219,24 @@ class RewardPredictionTask(nn.Module):
             print(f"[RP DEBUG]   Positive: {self.debug_reward_counts['positive']} ({pos_pct:.1f}%)")
             print(f"[RP DEBUG] Current batch - Neg: {neg_count}, Zero: {zero_count}, Pos: {pos_count}")
             print(f"[RP DEBUG] Current batch rewards sample: {rewards[:5].cpu().tolist()}")
-            print(f"[RP DEBUG] Current thresholds - Pos: {self.pos_threshold}, Neg: {self.neg_threshold}")
+            print(f"[RP DEBUG] Current thresholds - Pos: {self.pos_threshold:.6f}, Neg: {self.neg_threshold:.6f}") # Use more precision
 
-            # Show statistics on recent rewards
-            if self.debug_reward_history:
-                min_reward = min(self.debug_reward_history)
-                max_reward = max(self.debug_reward_history)
-                avg_reward = sum(self.debug_reward_history) / len(self.debug_reward_history)
-                print(f"[RP DEBUG] Recent rewards stats - Min: {min_reward:.6f}, Max: {max_reward:.6f}, Avg: {avg_reward:.6f}")
+            # Show statistics on threshold adjustment buffer rewards
+            if len(self.threshold_reward_buffer) > 0:
+                rewards_view = list(self.threshold_reward_buffer) # Get a snapshot
+                min_reward = min(rewards_view)
+                max_reward = max(rewards_view)
+                avg_reward = sum(rewards_view) / len(rewards_view)
+                print(f"[RP DEBUG] Threshold buffer stats ({len(rewards_view)} samples) - Min: {min_reward:.6f}, Max: {max_reward:.6f}, Avg: {avg_reward:.6f}")
+            else:
+                 print("[RP DEBUG] Threshold buffer stats - Buffer empty")
 
             # Check if class imbalance is severe (>95% in one class)
             if neg_pct > 95 or zero_pct > 95 or pos_pct > 95:
                 print("[RP DEBUG] WARNING: Severe class imbalance detected in reward classes!")
 
-                # Suggest adjusting thresholds if needed
-                if zero_pct > 95:
-                    print("[RP DEBUG] Most rewards are classified as 'zero' - consider decreasing thresholds")
-                    suggested_pos = self.pos_threshold / 2
-                    suggested_neg = self.neg_threshold / 2
-                    print(f"[RP DEBUG] Suggested new thresholds - Pos: {suggested_pos:.6f}, Neg: {suggested_neg:.6f}")
-                elif pos_pct > 95:
-                    print("[RP DEBUG] Most rewards are classified as 'positive' - consider increasing positive threshold")
-                    suggested_pos = self.pos_threshold * 2
-                    print(f"[RP DEBUG] Suggested new threshold - Pos: {suggested_pos:.6f}")
-                elif neg_pct > 95:
-                    print("[RP DEBUG] Most rewards are classified as 'negative' - consider decreasing negative threshold")
-                    suggested_neg = self.neg_threshold * 2
-                    print(f"[RP DEBUG] Suggested new threshold - Neg: {suggested_neg:.6f}")
+                # Note: Suggestions are now less critical as thresholds adjust automatically
+                # Still, printing the imbalance warning is useful.
 
         # Calculate cross-entropy loss
         loss = F.cross_entropy(logits, labels)
@@ -186,7 +246,7 @@ class RewardPredictionTask(nn.Module):
             with torch.no_grad():
                 predictions = torch.argmax(logits, dim=1)
                 accuracy = (predictions == labels).float().mean().item()
-                if self.debug_total_rewards % 500 == 0:
+                if self.debug_total_rewards % self.threshold_adjust_freq == 0: # Match freq
                     print(f"[RP DEBUG] Prediction accuracy: {accuracy:.4f}")
 
                     # Check if all predictions are the same class
@@ -198,47 +258,9 @@ class RewardPredictionTask(nn.Module):
                     softmax_probs = F.softmax(logits, dim=1)
                     avg_confidence = softmax_probs.max(dim=1)[0].mean().detach().item()
                     print(f"[RP DEBUG] Average prediction confidence: {avg_confidence:.4f}")
-                    print(f"[RP DEBUG] Logits sample: {logits[0].detach().cpu().tolist()}")
+                    # print(f"[RP DEBUG] Logits sample: {logits[0].detach().cpu().tolist()}") # Maybe too verbose now
 
         return loss
-
-
-# This function is kept for compatibility but is no longer part of a class
-def _adjust_reward_thresholds(rewards_history, pos_threshold, neg_threshold, debug=False):
-    """Dynamically adjust reward thresholds to better balance classes"""
-    # Only adjust if we have enough data
-    if len(rewards_history) < 50:
-        return pos_threshold, neg_threshold
-
-    rewards_tensor = torch.tensor(rewards_history)
-
-    # Calculate percentiles
-    sorted_rewards, _ = torch.sort(rewards_tensor)
-    num_rewards = len(sorted_rewards)
-
-    # Set thresholds to the 33rd and 67th percentiles for a balanced 3-way split
-    idx_neg = max(0, int(num_rewards * 0.33) - 1)
-    idx_pos = min(num_rewards - 1, int(num_rewards * 0.67))
-
-    new_neg_threshold = sorted_rewards[idx_neg].item()
-    new_pos_threshold = sorted_rewards[idx_pos].item()
-
-    # Ensure minimum separation between thresholds
-    min_separation = 0.005
-    if new_pos_threshold - new_neg_threshold < min_separation:
-        mid_point = (new_pos_threshold + new_neg_threshold) / 2
-        new_neg_threshold = mid_point - min_separation/2
-        new_pos_threshold = mid_point + min_separation/2
-
-    # Update thresholds with some momentum to avoid rapid changes
-    momentum = 0.9
-    neg_threshold = momentum * neg_threshold + (1-momentum) * new_neg_threshold
-    pos_threshold = momentum * pos_threshold + (1-momentum) * new_pos_threshold
-
-    if debug:
-        print(f"[RP DEBUG] Adjusted thresholds - Neg: {neg_threshold:.6f}, Pos: {pos_threshold:.6f}")
-
-    return pos_threshold, neg_threshold
 
 
 class AuxiliaryTaskManager:
@@ -249,7 +271,8 @@ class AuxiliaryTaskManager:
     def __init__(self, actor, obs_dim, sr_weight=1.0, rp_weight=1.0,
                  sr_hidden_dim=128, rp_hidden_dim=64, rp_sequence_length=5,
                  device="cpu", use_amp=False, update_frequency=8,
-                 learning_mode="batch", debug=False, batch_size=64):
+                 learning_mode="batch", debug=False, batch_size=64,
+                 internal_aux_batch_size=64): # Reduced default from 128 to 64
         """
         Initialize the auxiliary task manager
 
@@ -264,9 +287,11 @@ class AuxiliaryTaskManager:
             device: Device to use for computation
             update_frequency: How often to update auxiliary tasks
             learning_mode: Either "batch" (for PPO) or "stream" (for StreamAC)
-            batch_size: Batch size for sampling from history
+            batch_size: Batch size for sampling from history (used by compute_losses)
+            internal_aux_batch_size: Size of mini-batches for processing within compute_losses_for_batch
         """
         self.device = device
+        self.internal_aux_batch_size = internal_aux_batch_size
         self.sr_weight = sr_weight
         self.rp_weight = rp_weight
         self.rp_sequence_length = rp_sequence_length
@@ -307,7 +332,7 @@ class AuxiliaryTaskManager:
             print(f"[AUX INIT] Initializing AuxiliaryTaskManager with sr_weight={sr_weight}, rp_weight={rp_weight}")
             print(f"[AUX INIT] Device: {device}, Learning mode: {learning_mode}")
             print(f"[AUX INIT] Observation dimension: {obs_dim}, Feature dimension: {self.feature_dim}")
-            print(f"[AUX INIT] RP Sequence Length: {rp_sequence_length}, Batch Size: {batch_size}")
+            print(f"[AUX INIT] RP Sequence Length: {rp_sequence_length}, Batch Size: {batch_size}, Internal Aux Batch: {internal_aux_batch_size}")
 
         # State representation task (decoder only, uses actor features as encoder)
         self.sr_task = StateRepresentationTask(
@@ -323,7 +348,7 @@ class AuxiliaryTaskManager:
             hidden_dim=rp_hidden_dim,
             sequence_length=rp_sequence_length,
             device=device,
-            debug=debug
+            debug=debug # Pass debug flag
         )
 
         # Store references for torch.compile
@@ -377,33 +402,33 @@ class AuxiliaryTaskManager:
 
         # Ensure inputs are torch tensors on CPU (history stored on CPU)
         if isinstance(observations, torch.Tensor):
-            observations = observations.detach().cpu()
+            obs_cpu = observations.detach().cpu()
         else:
-            observations = torch.tensor(observations, dtype=torch.float32)
+            obs_cpu = torch.tensor(observations, dtype=torch.float32)
 
         if isinstance(rewards, torch.Tensor):
-            rewards = rewards.detach().cpu()
+            rew_cpu = rewards.detach().cpu()
         else:
-            rewards = torch.tensor(rewards, dtype=torch.float32)
+            rew_cpu = torch.tensor(rewards, dtype=torch.float32)
 
         # Handle single vs batch inputs
-        if observations.dim() == 1:  # Single observation
-            observations = observations.unsqueeze(0)
-            rewards = rewards.unsqueeze(0) if rewards.dim() == 0 else rewards
+        if obs_cpu.dim() == 1:  # Single observation
+            obs_cpu = obs_cpu.unsqueeze(0)
+            rew_cpu = rew_cpu.unsqueeze(0) if rew_cpu.dim() == 0 else rew_cpu
 
         # Add experiences to history
         num_added = 0
-        for i in range(observations.shape[0]):
-            self.obs_history.append(observations[i])
-            self.reward_history.append(rewards[i])
+        for i in range(obs_cpu.shape[0]):
+            self.obs_history.append(obs_cpu[i])
+            self.reward_history.append(rew_cpu[i])
             num_added += 1
 
         self.history_size = len(self.obs_history)  # Update history size
 
-        # Update counter for test compatibility
-        self.update_counter += 1
-        if self.update_counter >= self.update_frequency:
-            self.update_counter = 0  # Reset when we reach the update frequency
+        # Update counter for test compatibility (though less relevant now)
+        # self.update_counter += 1
+        # if self.update_counter >= self.update_frequency:
+        #     self.update_counter = 0 # Reset when we reach the update frequency
 
         return {"items_added": num_added}
 
@@ -424,6 +449,8 @@ class AuxiliaryTaskManager:
                  indices = np.random.choice(self.history_size, self.batch_size, replace=False)
                  obs_batch = torch.stack([self.obs_history[i] for i in indices]).to(self.device)
                  rewards_batch = torch.stack([self.reward_history[i] for i in indices]).to(self.device)
+                 # Note: This bypasses the internal mini-batching of compute_losses_for_batch
+                 # It assumes the sampled self.batch_size is small enough.
                  return self.compute_losses_for_batch(obs_batch, rewards_batch)
              else:
                  return {"sr_loss": torch.tensor(0.0, device=self.device),
@@ -450,10 +477,10 @@ class AuxiliaryTaskManager:
 
         # RP Task (using most recent sequence)
         if self.rp_weight > 0 and self.history_size >= self.rp_sequence_length:
-            obs_seq = [self.obs_history[i] for i in range(self.history_size - self.rp_sequence_length, self.history_size)]
+            obs_seq_list = [self.obs_history[i] for i in range(self.history_size - self.rp_sequence_length, self.history_size)]
             reward_target = self.reward_history[-1]
 
-            obs_seq_tensor = torch.stack(obs_seq).unsqueeze(0).to(self.device) # Add batch dim
+            obs_seq_tensor = torch.stack(obs_seq_list).unsqueeze(0).to(self.device) # Add batch dim
             reward_target_tensor = reward_target.unsqueeze(0).to(self.device) # Add batch dim
 
             batch_size, seq_len, obs_dim = obs_seq_tensor.shape
@@ -471,7 +498,7 @@ class AuxiliaryTaskManager:
 
         self.last_sr_loss = sr_loss_scalar
         self.last_rp_loss = rp_loss_scalar
-        self.update_count += 1
+        self.update_count += 1 # Track compute_losses calls
 
         return {"sr_loss": sr_loss, "rp_loss": rp_loss,
                 "sr_loss_scalar": sr_loss_scalar, "rp_loss_scalar": rp_loss_scalar}
@@ -479,172 +506,252 @@ class AuxiliaryTaskManager:
 
     def compute_losses_for_batch(self, obs_batch, rewards_batch):
         """
-        Compute auxiliary task losses for a specific batch of data.
+        Compute auxiliary task losses for a specific batch of data using internal mini-batching.
         This is intended for use within PPO's update loop.
 
         Args:
-            obs_batch: Tensor of observations for the batch [batch_size, obs_dim]
-            rewards_batch: Tensor of rewards for the batch [batch_size]
+            obs_batch: Tensor of observations for the batch [batch_size, obs_dim] (on CPU or GPU)
+            rewards_batch: Tensor of rewards for the batch [batch_size] (on CPU or GPU)
 
         Returns:
             dict: Dictionary containing SR and RP loss tensors (not detached)
                   and their scalar equivalents for logging.
         """
-        sr_loss = torch.tensor(0.0, device=self.device)
-        rp_loss = torch.tensor(0.0, device=self.device)
+        total_sr_loss = torch.tensor(0.0, device=self.device)
+        total_rp_loss = torch.tensor(0.0, device=self.device)
         sr_loss_scalar = 0.0
         rp_loss_scalar = 0.0
+        sr_processed_count = 0
+        rp_processed_count = 0
         current_batch_size = obs_batch.shape[0]
 
-        # --- State Representation Task ---
+        # Ensure rewards_batch is on the correct device (needed for RP target indexing)
+        rewards_batch_device = rewards_batch.to(self.device)
+
+        # --- State Representation Task (Internal Mini-batching) ---
+        # Initialize SR loss tensor in case the loop doesn't run or sr_weight is 0
+        sr_loss = torch.tensor(0.0, device=self.device)
         if self.sr_weight > 0:
-            # Get features from actor WITH gradients for the current batch
-            with torch.set_grad_enabled(self.training):
-                try:
-                    # Ensure obs_batch is on the correct device
-                    obs_batch_device = obs_batch.to(self.device)
-                    _, features_batch = self.actor(obs_batch_device, return_features=True)
-                except (TypeError, ValueError, AttributeError) as e:
-                    if self.debug: print(f"[AUX DEBUG Batch SR] Error getting features: {e}")
-                    features_batch = None # Fallback
+            for i in range(0, current_batch_size, self.internal_aux_batch_size):
+                mini_batch_end = min(i + self.internal_aux_batch_size, current_batch_size)
+                obs_mini_batch = obs_batch[i:mini_batch_end].to(self.device) # Move mini-batch to device
+                mini_batch_actual_size = obs_mini_batch.shape[0]
 
-            # Compute SR loss if we have features
-            if features_batch is not None:
-                try:
-                    sr_loss = self.sr_task.get_loss(features_batch, obs_batch_device) * self.sr_weight
-                    if not torch.isnan(sr_loss) and not torch.isinf(sr_loss):
-                        sr_loss_scalar = sr_loss.detach().item()
-                    else:
-                        if self.debug: print("[AUX DEBUG Batch SR] Invalid SR loss detected (NaN/Inf)")
-                        sr_loss = torch.tensor(0.0, device=self.device) # Reset tensor
-                except Exception as e:
-                    if self.debug: print(f"[AUX DEBUG Batch SR] Error calculating loss: {e}")
-                    sr_loss = torch.tensor(0.0, device=self.device) # Reset tensor
-            else:
-                 if self.debug: print("[AUX DEBUG Batch SR] Skipped: No features obtained.")
+                if mini_batch_actual_size == 0: continue
 
-        # --- Reward Prediction Task ---
-        # RP requires sequences. We sample sequences ending *before* the current batch
-        # from the history buffer. This is an approximation but common.
-        min_rp_history = self.rp_sequence_length
-        # Use current_batch_size for sampling if history is large enough
-        rp_batch_size = min(current_batch_size, self.batch_size)
-
-        if self.rp_weight > 0 and self.history_size >= min_rp_history + rp_batch_size - 1:
-            # Calculate max start index for valid sequences in the history
-            max_start_index = self.history_size - self.rp_sequence_length
-            if max_start_index >= rp_batch_size - 1:
-                # Sample valid start indices for sequences from history
-                # Ensure we don't sample indices overlapping with the current batch if possible
-                # For simplicity, we sample randomly from available history sequences.
-                start_indices = np.random.choice(max_start_index + 1, rp_batch_size, replace=False)
-
-                # Prepare batches of observation sequences and their target rewards from HISTORY
-                obs_seq_batch = []
-                reward_target_batch = []
-                valid_sequences = 0
-                for start_idx in start_indices:
+                # Get features from actor WITH gradients for the mini-batch
+                with torch.set_grad_enabled(self.training):
                     try:
-                        # Extract observation sequence from history
-                        obs_seq = [self.obs_history[i] for i in range(start_idx, start_idx + self.rp_sequence_length)]
-                        obs_seq_batch.append(torch.stack(obs_seq))
+                        # Ensure actor expects features to be returned
+                        actor_output = self.actor(obs_mini_batch, return_features=True)
+                        # Handle different actor output formats (e.g., tuple or single tensor)
+                        if isinstance(actor_output, tuple):
+                            _, features_mini_batch = actor_output
+                        else:
+                            # Assuming the actor might just return features directly if return_features=True
+                            # This might need adjustment based on the specific actor implementation
+                            features_mini_batch = actor_output
+                            if self.debug: print("[AUX DEBUG Batch SR Mini] Warning: Actor output format might be unexpected (expected tuple).")
 
-                        # Extract target reward (reward at the end of the sequence) from history
-                        target_reward_idx = start_idx + self.rp_sequence_length - 1
-                        reward_target_batch.append(self.reward_history[target_reward_idx])
-                        valid_sequences += 1
-                    except IndexError:
-                        if self.debug: print(f"[AUX DEBUG Batch RP] IndexError accessing history for start_idx {start_idx}")
-                        continue # Skip if index is out of bounds (shouldn't happen with check above)
+                    except (TypeError, ValueError, AttributeError, RuntimeError) as e:
+                        if self.debug: print(f"[AUX DEBUG Batch SR Mini] Error getting features (batch {i // self.internal_aux_batch_size}): {e}")
+                        features_mini_batch = None # Fallback
 
-                if valid_sequences > 0:
-                    # Stack batches and move to device
-                    obs_seq_tensor = torch.stack(obs_seq_batch).to(self.device)  # [rp_batch_size, seq_len, obs_dim]
-                    reward_targets_tensor = torch.stack(reward_target_batch).to(self.device)  # [rp_batch_size]
-
-                    # Get feature sequences from the actor WITH gradients
-                    batch_size_rp, seq_len_rp, obs_dim_rp = obs_seq_tensor.shape
-                    obs_flat_rp = obs_seq_tensor.reshape(-1, obs_dim_rp)
-
-                    with torch.set_grad_enabled(self.training):
-                        try:
-                            _, features_flat_rp = self.actor(obs_flat_rp, return_features=True)
-                        except (TypeError, ValueError, AttributeError) as e:
-                            if self.debug: print(f"[AUX DEBUG Batch RP] Error getting features: {e}")
-                            features_flat_rp = None # Fallback
-
-                    # Compute RP loss if we have features
-                    if features_flat_rp is not None:
-                        try:
-                            # Reshape features back to sequence form
-                            feature_dim_rp = features_flat_rp.shape[-1]
-                            features_seq_tensor_rp = features_flat_rp.reshape(batch_size_rp, seq_len_rp, feature_dim_rp)
-
-                            rp_loss = self.rp_task.get_loss(features_seq_tensor_rp, reward_targets_tensor) * self.rp_weight
-
-                            if not torch.isnan(rp_loss) and not torch.isinf(rp_loss):
-                                rp_loss_scalar = rp_loss.detach().item()
-                            else:
-                                if self.debug: print("[AUX DEBUG Batch RP] Invalid RP loss detected (NaN/Inf)")
-                                rp_loss = torch.tensor(0.0, device=self.device) # Reset tensor
-                        except Exception as e:
-                            if self.debug: print(f"[AUX DEBUG Batch RP] Error calculating loss: {e}")
-                            rp_loss = torch.tensor(0.0, device=self.device) # Reset tensor
-                    else:
-                         if self.debug: print("[AUX DEBUG Batch RP] Skipped: No features obtained.")
+                # Compute SR loss if we have features
+                if features_mini_batch is not None:
+                    try:
+                        sr_loss_mini = self.sr_task.get_loss(features_mini_batch, obs_mini_batch) * self.sr_weight
+                        if not torch.isnan(sr_loss_mini) and not torch.isinf(sr_loss_mini):
+                            # Accumulate loss weighted by mini-batch size
+                            total_sr_loss += sr_loss_mini # Loss function usually averages; scale later
+                            sr_processed_count += mini_batch_actual_size
+                        else:
+                            if self.debug: print("[AUX DEBUG Batch SR Mini] Invalid SR loss detected (NaN/Inf)")
+                    except Exception as e:
+                        if self.debug: print(f"[AUX DEBUG Batch SR Mini] Error calculating SR loss (batch {i // self.internal_aux_batch_size}): {e}")
                 else:
-                    if self.debug: print("[AUX DEBUG Batch RP] Skipped: No valid sequences sampled.")
+                     if self.debug: print(f"[AUX DEBUG Batch SR Mini] Skipped loss calculation: No features obtained (batch {i // self.internal_aux_batch_size}).")
+
+            # Average the loss over all processed items
+            if sr_processed_count > 0:
+                # Average the accumulated loss (assumes get_loss returns mean loss for the mini-batch)
+                num_mini_batches = (sr_processed_count + self.internal_aux_batch_size - 1) // self.internal_aux_batch_size
+                sr_loss = total_sr_loss / max(1, num_mini_batches) # Average over mini-batches
+                sr_loss_scalar = sr_loss.detach().item()
             else:
-                 if self.debug: print(f"[AUX DEBUG Batch RP] Skipped: Not enough history for batch size ({self.history_size}/{min_rp_history + rp_batch_size -1})")
-        else:
+                # sr_loss already initialized to 0 tensor
+                sr_loss_scalar = 0.0
+                if self.debug: print("[AUX DEBUG Batch SR] No items processed for SR task.")
+        else: # sr_weight <= 0
+            # sr_loss already initialized to 0 tensor
+            sr_loss_scalar = 0.0
+
+        # --- Reward Prediction Task (Internal Mini-batching) ---
+        # Initialize RP variables before the conditional block
+        rp_loss = torch.tensor(0.0, device=self.device)
+        rp_loss_scalar = 0.0
+        obs_dim_rp = None
+        seq_len_rp = None
+
+        # Construct sequences directly from the current batch data.
+        if self.rp_weight > 0 and current_batch_size >= self.rp_sequence_length:
+            obs_seq_batch = []
+            reward_target_batch = []
+
+            # Iterate through the original batch (on CPU or GPU) to define sequences
+            for i in range(current_batch_size - self.rp_sequence_length + 1):
+                obs_seq = obs_batch[i : i + self.rp_sequence_length]
+                obs_seq_batch.append(obs_seq)
+                target_reward_idx = i + self.rp_sequence_length - 1
+                reward_target_batch.append(rewards_batch_device[target_reward_idx]) # Use rewards on device
+
+            valid_sequences = len(obs_seq_batch)
+            obs_seq_batch_tensor = None
+            reward_targets_tensor = None
+
+            if valid_sequences > 0:
+                try:
+                    # Stack sequences - keep on original device initially if possible
+                    # This might still be large, but avoids immediate GPU OOM if obs_batch was on CPU
+                    obs_seq_batch_tensor = torch.stack(obs_seq_batch)
+                    reward_targets_tensor = torch.stack(reward_target_batch) # Already on device
+                    obs_dim_rp = obs_seq_batch_tensor.shape[-1]
+                    seq_len_rp = obs_seq_batch_tensor.shape[1]
+
+                except RuntimeError as e:
+                    if self.debug: print(f"[AUX DEBUG Batch RP] Error stacking sequences/rewards: {e}")
+                    valid_sequences = 0 # Cannot proceed
+
+                # Process sequences in mini-batches only if tensors were created successfully
+                if valid_sequences > 0 and obs_seq_batch_tensor is not None and reward_targets_tensor is not None:
+                    for i in range(0, valid_sequences, self.internal_aux_batch_size):
+                        mini_batch_end = min(i + self.internal_aux_batch_size, valid_sequences)
+                        obs_seq_mini_batch = obs_seq_batch_tensor[i:mini_batch_end].to(self.device) # Move mini-batch to device
+                        reward_targets_mini_batch = reward_targets_tensor[i:mini_batch_end] # Already on device
+                        mini_batch_actual_size = obs_seq_mini_batch.shape[0]
+
+                        if mini_batch_actual_size == 0: continue
+
+                        # Ensure obs_dim_rp and seq_len_rp were set
+                        if obs_dim_rp is None or seq_len_rp is None:
+                            if self.debug: print("[AUX DEBUG Batch RP Mini] Error: obs_dim_rp or seq_len_rp not set.")
+                            break
+
+                        obs_flat_rp_mini = obs_seq_mini_batch.reshape(-1, obs_dim_rp)
+
+                        with torch.set_grad_enabled(self.training):
+                            try:
+                                # Ensure actor expects features to be returned
+                                actor_output_rp = self.actor(obs_flat_rp_mini, return_features=True)
+                                if isinstance(actor_output_rp, tuple):
+                                     _, features_flat_rp_mini = actor_output_rp
+                                else:
+                                     features_flat_rp_mini = actor_output_rp # Fallback assumption
+                                     if self.debug: print("[AUX DEBUG Batch RP Mini] Warning: Actor output format might be unexpected (expected tuple).")
+
+                            except (TypeError, ValueError, AttributeError, RuntimeError) as e:
+                                if self.debug: print(f"[AUX DEBUG Batch RP Mini] Error getting features (batch {i // self.internal_aux_batch_size}): {e}")
+                                features_flat_rp_mini = None # Fallback
+
+                        if features_flat_rp_mini is not None:
+                            try:
+                                feature_dim_rp = features_flat_rp_mini.shape[-1]
+                                features_seq_tensor_rp_mini = features_flat_rp_mini.reshape(mini_batch_actual_size, seq_len_rp, feature_dim_rp)
+
+                                rp_loss_mini = self.rp_task.get_loss(features_seq_tensor_rp_mini, reward_targets_mini_batch) * self.rp_weight
+
+                                if not torch.isnan(rp_loss_mini) and not torch.isinf(rp_loss_mini):
+                                    total_rp_loss += rp_loss_mini # Accumulate mean loss from mini-batch
+                                    rp_processed_count += mini_batch_actual_size
+                                else:
+                                    if self.debug: print("[AUX DEBUG Batch RP Mini] Invalid RP loss detected (NaN/Inf)")
+                            except Exception as e:
+                                if self.debug: print(f"[AUX DEBUG Batch RP Mini] Error calculating RP loss (batch {i // self.internal_aux_batch_size}): {e}")
+                        else:
+                             if self.debug: print(f"[AUX DEBUG Batch RP Mini] Skipped loss calculation: No features obtained (batch {i // self.internal_aux_batch_size}).")
+
+                    # Average the loss over all processed mini-batches
+                    if rp_processed_count > 0:
+                        num_mini_batches_rp = (rp_processed_count + self.internal_aux_batch_size - 1) // self.internal_aux_batch_size
+                        rp_loss = total_rp_loss / max(1, num_mini_batches_rp) # Average over mini-batches
+                        rp_loss_scalar = rp_loss.detach().item()
+                    else:
+                        # rp_loss already initialized to 0 tensor
+                        rp_loss_scalar = 0.0
+                        if self.debug: print("[AUX DEBUG Batch RP] No sequences processed for RP task.")
+                else: # Failed to create tensors or valid_sequences was 0
+                    if self.debug and valid_sequences > 0: print("[AUX DEBUG Batch RP] Skipped processing: Tensor creation failed.")
+                    # rp_loss already initialized to 0 tensor
+                    rp_loss_scalar = 0.0
+
+            else: # valid_sequences == 0
+                if self.debug: print("[AUX DEBUG Batch RP] Skipped: No valid sequences constructed from batch.")
+                # rp_loss already initialized to 0 tensor
+                rp_loss_scalar = 0.0
+        else: # rp_weight <= 0 or not enough items
             if self.debug and self.rp_weight > 0:
-                print(f"[AUX DEBUG Batch RP] Skipped: Not enough history ({self.history_size}/{min_rp_history + rp_batch_size -1})")
+                print(f"[AUX DEBUG Batch RP] Skipped: Not enough batch items ({current_batch_size}/{self.rp_sequence_length}) for sequence or RP weight is zero.")
+            # rp_loss already initialized to 0 tensor
+            rp_loss_scalar = 0.0
 
 
         # Store last computed scalar losses
         self.last_sr_loss = sr_loss_scalar
         self.last_rp_loss = rp_loss_scalar
 
-        # Increment update count (tracks how many times losses were computed)
+        # Increment update count (tracks how many times losses were computed for this batch)
         self.update_count += 1
 
+        # Return final averaged losses
         return {"sr_loss": sr_loss, "rp_loss": rp_loss,
                 "sr_loss_scalar": sr_loss_scalar, "rp_loss_scalar": rp_loss_scalar}
 
 
     def reset(self):
-        """Reset history buffers"""
+        """Reset history buffers and task states"""
         # Clear history buffers
         self.obs_history.clear()
         self.reward_history.clear()
         self.history_size = 0  # Reset size tracker
 
+        # Reset RP task specific state (like thresholds and buffer)
+        if hasattr(self.rp_task, 'threshold_reward_buffer'):
+            self.rp_task.threshold_reward_buffer.clear()
+        if hasattr(self.rp_task, 'debug_reward_counts'):
+            self.rp_task.debug_reward_counts = {"negative": 0, "zero": 0, "positive": 0}
+            self.rp_task.debug_total_rewards = 0
+            # Optionally reset thresholds to initial values or keep learned ones
+            # self.rp_task.pos_threshold = 0.01
+            # self.rp_task.neg_threshold = -0.01
+
         if self.debug:
-            print("[AUX RESET] Reset called - cleared history buffers")
+            print("[AUX RESET] Reset called - cleared history buffers and RP task state")
 
     def reset_auxiliary_tasks(self):
-        """Reset auxiliary task models"""
+        """Reset auxiliary task models entirely (re-initialize)"""
+        if self.debug:
+             print("[AUX RESET] Re-initializing auxiliary task models...")
         # Re-initialize SR task
         self.sr_task = StateRepresentationTask(
             feature_dim=self.feature_dim,
             obs_dim=self.obs_dim,
-            hidden_dim=self.sr_task.hidden_dim,
+            hidden_dim=self.sr_task.hidden_dim, # Reuse existing hidden dim
             device=self.device
         )
 
         # Re-initialize RP task
         self.rp_task = RewardPredictionTask(
             input_dim=self.feature_dim,
-            hidden_dim=self.rp_task.hidden_dim,
+            hidden_dim=self.rp_task.hidden_dim, # Reuse existing hidden dim
             sequence_length=self.rp_sequence_length,
             device=self.device,
             debug=self.debug
         )
 
-        # Reset history buffers
+        # Reset history buffers as well
         self.reset()
 
-        # Reset counters
+        # Reset manager counters
         self.update_counter = 0
         self.history_size = 0
         self.update_count = 0
@@ -652,11 +759,11 @@ class AuxiliaryTaskManager:
         self.last_rp_loss = 0.0
 
         if self.debug:
-            print("[AUX RESET] Complete reset of auxiliary task models")
+            print("[AUX RESET] Complete reset of auxiliary task models and manager state")
 
     def set_learning_mode(self, mode):
         """
-        Set the learning mode
+        Set the learning mode and adjust history buffer size accordingly.
 
         Args:
             mode: Either "batch" (for PPO) or "stream" (for StreamAC)
@@ -665,46 +772,39 @@ class AuxiliaryTaskManager:
             raise ValueError(f"Unknown learning mode: {mode}")
 
         prev_mode = self.learning_mode
+        if prev_mode == mode:
+            return # No change needed
+
         self.learning_mode = mode
 
-        # If switching modes, adjust buffer sizes
-        if prev_mode != mode:
-            if mode == "batch":
-                # Switching to batch mode, increase buffer size
-                temp_obs = list(self.obs_history)
-                temp_rewards = list(self.reward_history)
+        # Adjust buffer sizes
+        if mode == "batch":
+            new_maxlen = self.batch_history_maxlen
+        else: # mode == "stream"
+            new_maxlen = self.stream_history_maxlen
 
-                self.obs_history = deque(maxlen=self.batch_history_maxlen)
-                self.reward_history = deque(maxlen=self.batch_history_maxlen)
+        # Create new deques with the correct maxlen and populate with existing data
+        temp_obs = list(self.obs_history)
+        temp_rewards = list(self.reward_history)
 
-                # Restore data
-                self.obs_history.extend(temp_obs)
-                self.reward_history.extend(temp_rewards)
-            else:
-                # Switching to stream mode, decrease buffer size
-                # Keep recent data up to new stream mode limit
-                temp_obs = list(self.obs_history)[-self.stream_history_maxlen:] if self.obs_history else []
-                temp_rewards = list(self.reward_history)[-self.stream_history_maxlen:] if self.reward_history else []
+        self.obs_history = deque(maxlen=new_maxlen)
+        self.reward_history = deque(maxlen=new_maxlen)
 
-                self.obs_history = deque(maxlen=self.stream_history_maxlen)
-                self.reward_history = deque(maxlen=self.stream_history_maxlen)
+        # Extend with data (deque handles maxlen automatically)
+        self.obs_history.extend(temp_obs)
+        self.reward_history.extend(temp_rewards)
 
-                # Restore data
-                self.obs_history.extend(temp_obs)
-                self.reward_history.extend(temp_rewards)
+        self.history_size = len(self.obs_history)  # Update size tracker
 
-            self.history_size = len(self.obs_history)  # Update size tracker
-
-            if self.debug:
-                print(f"[AUX MODE] Changed learning mode from {prev_mode} to {mode}")
-                print(f"[AUX MODE] New history size: {self.history_size}")
+        if self.debug:
+            print(f"[AUX MODE] Changed learning mode from {prev_mode} to {mode}")
+            print(f"[AUX MODE] New history maxlen: {new_maxlen}, Current history size: {self.history_size}")
 
     def get_state_dict(self):
-        """Get state dict for saving task models"""
-        return {
+        """Get state dict for saving task models and manager state"""
+        state = {
             'sr_task': self.sr_task.state_dict(),
             'rp_task': self.rp_task.state_dict(),
-            # Add weights and history size if needed for resuming
             'sr_weight': self.sr_weight,
             'rp_weight': self.rp_weight,
             'history_size': self.history_size,
@@ -712,31 +812,51 @@ class AuxiliaryTaskManager:
             'last_sr_loss': self.last_sr_loss,
             'last_rp_loss': self.last_rp_loss,
             'learning_mode': self.learning_mode,
-            # Save history buffers (optional, can be large)
+            # Include RP thresholds if dynamic adjustment is used
+            'rp_pos_threshold': getattr(self.rp_task, 'pos_threshold', 0.01),
+            'rp_neg_threshold': getattr(self.rp_task, 'neg_threshold', -0.01),
+            # History buffers are usually not saved due to size
             # 'obs_history': list(self.obs_history),
             # 'reward_history': list(self.reward_history),
+            # RP threshold buffer also usually not saved
+            # 'rp_threshold_buffer': list(getattr(self.rp_task, 'threshold_reward_buffer', [])),
         }
+        return state
 
     def load_state_dict(self, state_dict):
-        """Load state dict for loading task models"""
+        """Load state dict for loading task models and manager state"""
         self.sr_task.load_state_dict(state_dict['sr_task'])
         self.rp_task.load_state_dict(state_dict['rp_task'])
 
         # Load other parameters
         self.sr_weight = state_dict.get('sr_weight', self.sr_weight)
         self.rp_weight = state_dict.get('rp_weight', self.rp_weight)
-        self.history_size = state_dict.get('history_size', 0)
+        # self.history_size = state_dict.get('history_size', 0) # History size will be determined by loaded buffers if they exist, otherwise 0
         self.update_count = state_dict.get('update_count', 0)
         self.last_sr_loss = state_dict.get('last_sr_loss', 0.0)
         self.last_rp_loss = state_dict.get('last_rp_loss', 0.0)
         self.learning_mode = state_dict.get('learning_mode', self.learning_mode)
 
-        # Load history buffers if saved (optional)
+        # Load RP thresholds if they exist in the state_dict
+        if hasattr(self.rp_task, 'pos_threshold'):
+            self.rp_task.pos_threshold = state_dict.get('rp_pos_threshold', self.rp_task.pos_threshold)
+        if hasattr(self.rp_task, 'neg_threshold'):
+            self.rp_task.neg_threshold = state_dict.get('rp_neg_threshold', self.rp_task.neg_threshold)
+
+        # Adjust history buffer maxlen based on loaded learning mode
+        self.set_learning_mode(self.learning_mode) # This adjusts maxlen
+
+        # Load history buffers if saved (optional) - this example assumes they aren't saved/loaded
         # if 'obs_history' in state_dict:
         #     self.obs_history = deque(state_dict['obs_history'], maxlen=self.obs_history.maxlen)
         # if 'reward_history' in state_dict:
         #     self.reward_history = deque(state_dict['reward_history'], maxlen=self.reward_history.maxlen)
-        # self.history_size = len(self.obs_history) # Recalculate size
+        self.history_size = len(self.obs_history) # Recalculate size after potential load
+
+        # Load RP threshold buffer if saved (optional)
+        # if 'rp_threshold_buffer' in state_dict and hasattr(self.rp_task, 'threshold_reward_buffer'):
+             # self.rp_task.threshold_reward_buffer = deque(state_dict['rp_threshold_buffer'], maxlen=self.rp_task.threshold_reward_buffer.maxlen)
 
         if self.debug:
-            print("[AUX LOAD] Loaded auxiliary task models and state from state dict")
+            print("[AUX LOAD] Loaded auxiliary task models and state from state dict.")
+            print(f"[AUX LOAD] Loaded RP thresholds - Pos: {getattr(self.rp_task, 'pos_threshold', 'N/A'):.6f}, Neg: {getattr(self.rp_task, 'neg_threshold', 'N/A'):.6f}")
