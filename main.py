@@ -1036,9 +1036,9 @@ if __name__ == "__main__":
     training_duration.add_argument('-t', '--time', type=str, default=None,
                                   help='Training duration in format: 5m (minutes), 5h (hours), 5d (days)')
 
-    parser.add_argument('-n', '--num_envs', type=int, default=24,
+    parser.add_argument('-n', '--num_envs', type=int, default=300,
                         help='Number of parallel environments to run for faster data collection')
-    parser.add_argument('--update_interval', type=int, default=6144,
+    parser.add_argument('--update_interval', type=int, default=131072,
                         help='Number of experiences to collect before updating the policy (PPO)')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use for training (cuda/mps/cpu).  Autodetects if not specified.')
@@ -1074,7 +1074,7 @@ if __name__ == "__main__":
 
     # Training loop parameters
     parser.add_argument('--ppo_epochs', type=int, default=10, help='Number of PPO epochs per update')
-    parser.add_argument('--batch_size', type=int, default=1024, help='Batch size for PPO updates')
+    parser.add_argument('--batch_size', type=int, default=102400, help='Batch size for PPO updates')
 
     parser.add_argument('--weight_clip_kappa', type=float, default=1.0, help='Weight clipping factor for PPO')
     parser.add_argument('--weight_clipping', type=bool, default=False, help='Enable weight clipping for PPO')
