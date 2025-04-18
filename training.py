@@ -212,7 +212,8 @@ class Trainer:
                 update_frequency=1, # Frequency handled within PPO/StreamAC logic now
                 learning_mode="batch" if algorithm_type == "ppo" else "stream", # Set mode
                 debug=self.debug,
-                batch_size=batch_size # Pass batch size for sampling
+                batch_size=batch_size,
+                internal_aux_batch_size=batch_size
             )
             # Enable debug mode for auxiliary tasks
             self.aux_task_manager.debug = self.debug
@@ -334,28 +335,6 @@ class Trainer:
         self.total_losses = collections.deque(maxlen=history_len)
         self.aux_sr_losses = collections.deque(maxlen=history_len)
         self.aux_rp_losses = collections.deque(maxlen=history_len)
-
-        # # Initialize auxiliary tasks if enabled - MOVED EARLIER
-        # self.use_auxiliary_tasks = use_auxiliary_tasks
-        # if self.use_auxiliary_tasks:
-        #     # Get observation dimension from model if available or derive from action_dim
-        #     obs_dim = getattr(actor, 'obs_shape', action_dim * 2)  # Use action_dim * 2 as fallback
-
-        #     self.aux_task_manager = AuxiliaryTaskManager(
-        #         actor=self.actor,
-        #         obs_dim=obs_dim,
-        #         sr_weight=sr_weight,
-        #         rp_weight=rp_weight,
-        #         device=self.device,
-        #         use_amp=aux_amp,
-        #         update_frequency=1,
-        #         learning_mode="stream" if algorithm_type == "streamac" else "batch",
-        #         debug=self.debug,
-        #         batch_size=batch_size
-        #     )
-
-        #     # Enable debug mode for auxiliary tasks
-        #     self.aux_task_manager.debug = self.debug
 
         if self.debug:
             print(f"[DEBUG] Initialized {self.algorithm_type.upper()} algorithm on {self.device}")

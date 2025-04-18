@@ -271,8 +271,8 @@ class AuxiliaryTaskManager:
     def __init__(self, actor, obs_dim, sr_weight=1.0, rp_weight=1.0,
                  sr_hidden_dim=128, rp_hidden_dim=64, rp_sequence_length=5,
                  device="cpu", use_amp=False, update_frequency=8,
-                 learning_mode="batch", debug=False, batch_size=64,
-                 internal_aux_batch_size=64): # Reduced default from 128 to 64
+                 learning_mode="batch", debug=False, batch_size=4096,
+                 internal_aux_batch_size=4096):
         """
         Initialize the auxiliary task manager
 

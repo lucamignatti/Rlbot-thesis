@@ -840,9 +840,7 @@ def run_training(
                     # The progress bar will be updated at the end of the loop iteration
 
 
-            # Reset intrinsic models periodically (if pretraining)
-            # Changed condition to check pretraining flag directly
-            if args.pretraining and not trainer.pretraining_completed and total_episodes_so_far % 50 == 0 and hasattr(trainer, 'intrinsic_reward_generator') and trainer.intrinsic_reward_generator is not None:
+            if args.pretraining and not trainer.pretraining_completed and total_episodes_so_far > 0 and total_episodes_so_far % 50 == 0 and hasattr(trainer, 'intrinsic_reward_generator') and trainer.intrinsic_reward_generator is not None:
                 trainer.intrinsic_reward_generator.reset_models()
 
             # Update policy only if conditions met and not in test mode
