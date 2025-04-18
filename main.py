@@ -10,6 +10,7 @@ import signal
 import torch
 import wandb
 import multiprocessing as mp
+from queue import Empty as QueueEmpty # Import Empty exception
 import numpy as np
 from collections import Counter
 from collections.abc import Sized, Iterable
@@ -31,12 +32,102 @@ from observation import StackedActionsObs, ActionStacker
 from training import Trainer
 from algorithms import PPOAlgorithm, StreamACAlgorithm  # Import from new algorithms package
 import concurrent.futures
-from tqdm import tqdm
-from typing import List, Tuple, Dict
+from tqdm import tqdm # Keep tqdm for the manager process
+from typing import List, Tuple, Dict, Union, Optional
 from envs.factory import get_env
 from envs.vectorized import VectorizedEnv
 from envs.rlbot_vectorized import RLBotVectorizedEnv
 from curriculum import create_curriculum
+
+# --- TQDM Manager Process ---
+class TqdmManager:
+    """Manages a tqdm progress bar in a separate process."""
+    def __init__(self, queue: mp.Queue, total: Optional[int], desc: str, bar_format: str, dynamic_ncols: bool):
+        self.queue = queue
+        self.total = total
+        self.desc = desc
+        self.bar_format = bar_format
+        self.dynamic_ncols = dynamic_ncols
+        self.process: Optional[mp.Process] = None
+        self._initial_postfix = {} # Store initial postfix if sent early
+
+    def _run(self):
+        """The target function for the tqdm process."""
+        progress_bar = None
+        try:
+            # Wait for initial postfix if not already received
+            while not self._initial_postfix:
+                 try:
+                     msg = self.queue.get(timeout=0.1)
+                     if isinstance(msg, dict):
+                         self._initial_postfix = msg
+                     elif msg is None: # Check for early termination
+                         return
+                 except QueueEmpty:
+                     pass # Keep waiting for initial postfix
+
+            # Initialize tqdm instance
+            progress_bar = tqdm(
+                total=self.total,
+                desc=self.desc,
+                bar_format=self.bar_format,
+                dynamic_ncols=self.dynamic_ncols,
+                postfix=self._initial_postfix # Set initial postfix
+            )
+
+            while True:
+                try:
+                    # Wait for messages from the main process
+                    msg = self.queue.get() # Blocking get
+
+                    if msg is None: # Termination signal
+                        break
+                    elif isinstance(msg, int): # Update progress bar count
+                        progress_bar.update(msg)
+                    elif isinstance(msg, float): # Update progress bar total (for time-based)
+                        progress_bar.n = min(int(msg), progress_bar.total if progress_bar.total else 0)
+                        progress_bar.refresh()
+                    elif isinstance(msg, dict): # Update postfix dictionary
+                        progress_bar.set_postfix(msg)
+                    elif isinstance(msg, tuple) and msg[0] == "set_total": # Command to update total
+                        progress_bar.total = msg[1]
+                        progress_bar.refresh()
+
+
+                except EOFError:
+                    print("[TQDM Manager] Queue closed unexpectedly.")
+                    break
+                except Exception as e:
+                    print(f"[TQDM Manager] Error: {e}")
+                    traceback.print_exc()
+                    # Continue processing if possible
+        finally:
+            if progress_bar:
+                progress_bar.close()
+
+    def start(self):
+        """Starts the tqdm manager process."""
+        if self.process is None or not self.process.is_alive():
+            self.process = mp.Process(target=self._run, daemon=True)
+            self.process.start()
+    def stop(self):
+        """Signals the tqdm manager process to stop and waits for it."""
+        if self.process and self.process.is_alive():
+            try:
+                self.queue.put(None)
+                self.process.join(timeout=5)
+                if self.process.is_alive():
+                    self.process.terminate()
+            except Exception as e:
+                 print(f"[TQDM Manager] Error during stop: {e}")
+        self.process = None
+
+# --- End TQDM Manager Process ---
+
+
+# Global queue for TQDM communication
+tqdm_queue: Optional[mp.Queue] = None
+tqdm_manager_instance: Optional[TqdmManager] = None
 
 
 def log_memory_usage(step=0, location=""):
@@ -158,6 +249,8 @@ def run_training(
     # Add reward scaling parameters
     use_reward_scaling: bool = True,
     reward_scaling_G_max: float = 10.0,
+    # Add TQDM queue
+    tqdm_q: Optional[mp.Queue] = None
 ):
     """
     Main training loop.
@@ -331,21 +424,18 @@ def run_training(
     # For time-based training, we'll need to know when we started.
     start_time = time.time()
 
-    # Set up the progress bar. It'll track episodes or time, depending on how we're training.
+    # Set up the progress bar parameters for the TqdmManager
+    tqdm_total = None
+    tqdm_desc = ""
+    tqdm_bar_format = ""
     if training_time is not None:
-        progress_bar = tqdm(
-            total=int(training_time),
-            desc="Time",
-            bar_format='{desc}: {percentage:3.0f}% [{elapsed}<{remaining}] |{bar}| {postfix}',
-            dynamic_ncols=True
-        )
+        tqdm_total = int(training_time)
+        tqdm_desc = "Time"
+        tqdm_bar_format = '{desc}: {percentage:3.0f}% [{elapsed}<{remaining}] |{bar}| {postfix}'
     else:
-        progress_bar = tqdm(
-            total=total_episodes,
-            desc="Episodes",
-            bar_format='{desc}: {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {percentage:3.0f}%|{bar}| {postfix}',
-            dynamic_ncols=True
-        )
+        tqdm_total = total_episodes
+        tqdm_desc = "Episodes"
+        tqdm_bar_format = '{desc}: {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {percentage:3.0f}%|{bar}| {postfix}'
 
     # This dictionary holds statistics we'll display in the progress bar.
     stats_dict = {
@@ -408,8 +498,9 @@ def run_training(
              "Buffer": "0"
          })
 
-
-    progress_bar.set_postfix(stats_dict)
+    # Send initial postfix to TQDM manager
+    if tqdm_q:
+        tqdm_q.put(stats_dict.copy())
 
     # Initialize variables to track training progress.
     collected_experiences = 0
@@ -444,8 +535,8 @@ def run_training(
             if training_time is not None:
                 # Using a time-based training schedule - update progress bar once per second
                 if current_time - last_progress_update >= 1.0:
-                    progress_bar.n = min(int(elapsed), int(training_time))
-                    progress_bar.refresh()
+                    if tqdm_q:
+                        tqdm_q.put(float(elapsed)) # Send elapsed time as float for 'n' update
                     last_progress_update = current_time
 
                 should_continue = elapsed < training_time
@@ -547,6 +638,10 @@ def run_training(
                 last_steps_time = current_time
                 last_steps_count = total_env_steps
                 stats_dict["Steps/s"] = f"{steps_per_second:.1f}"
+                # Send updated stats_dict to TQDM manager (includes Steps/s)
+                if tqdm_q:
+                    tqdm_q.put(stats_dict.copy())
+
 
             # --- Process Results and Update Rewards/Dones (PPO Batch) ---
             if algorithm == "ppo" and not test and store_indices is not None:
@@ -726,11 +821,14 @@ def run_training(
             newly_completed_episodes = sum(dones)
             if newly_completed_episodes > 0:
                 # Update progress bar for episodes-based training
-                if training_time is None:
-                    progress_bar.update(newly_completed_episodes)
+                if training_time is None and tqdm_q:
+                    tqdm_q.put(int(newly_completed_episodes)) # Send integer update count
 
                 total_episodes_so_far += newly_completed_episodes
                 stats_dict["Episodes"] = total_episodes_so_far
+                # Send updated stats_dict to TQDM manager
+                if tqdm_q:
+                    tqdm_q.put(stats_dict.copy())
 
                 # Check if we should save the model.
                 if save_interval > 0 and (total_episodes_so_far - last_save_episode) >= save_interval:
@@ -838,7 +936,9 @@ def run_training(
                                 "RP_Loss": f"{metrics.get('rp_loss_scalar', 0):.4f}"
                             })
 
-                    # The progress bar will be updated at the end of the loop iteration
+                    # Send updated stats_dict to TQDM manager
+                    if tqdm_q:
+                        tqdm_q.put(stats_dict.copy())
 
 
             # Check if intrinsic reward models should be reset
@@ -921,6 +1021,10 @@ def run_training(
 
                 last_update_time = time.time()
 
+                # Send updated stats_dict to TQDM manager after policy update
+                if tqdm_q:
+                    tqdm_q.put(stats_dict.copy())
+
                 # Garbage collection after updates
                 gc.collect()
                 if torch.cuda.is_available():
@@ -928,13 +1032,21 @@ def run_training(
 
             # Update the experience count in the progress bar - ONLY for PPO
             if algorithm == "ppo":
-                stats_dict["Exp"] = f"{collected_experiences}/{update_interval}"
+                # Update the 'Exp' field in stats_dict
+                new_exp_str = f"{collected_experiences}/{update_interval}"
+                if stats_dict.get("Exp") != new_exp_str:
+                    stats_dict["Exp"] = new_exp_str
+                    # Send updated stats_dict only if 'Exp' changed
+                    if tqdm_q:
+                        tqdm_q.put(stats_dict.copy())
+
 
             # Update pretraining progress if enabled
             if use_pretraining:
                 pretraining_end_step = trainer._get_pretraining_end_step()
                 in_pretraining = not trainer.pretraining_completed
                 in_transition = trainer.in_transition_phase
+                needs_postfix_update = False # Flag if pretraining status changed
 
                 # Check pretraining completion status based on current step count
                 current_step = trainer._true_training_steps() # Use trainer's step counter
@@ -942,33 +1054,51 @@ def run_training(
                     print(f"Triggering pretraining transition at step {current_step}/{pretraining_end_step}")
                     trainer.in_transition_phase = True
                     trainer.transition_start_step = current_step # Use trainer step
+                    needs_postfix_update = True
 
                 if in_pretraining:
-                    stats_dict["Mode"] = "PreTraining"
-                    stats_dict["PT_Progress"] = f"{current_step}/{pretraining_end_step}"
+                    new_mode = "PreTraining"
+                    new_progress = f"{current_step}/{pretraining_end_step}"
+                    if stats_dict.get("Mode") != new_mode or stats_dict.get("PT_Progress") != new_progress:
+                        stats_dict["Mode"] = new_mode
+                        stats_dict["PT_Progress"] = new_progress
+                        needs_postfix_update = True
                 elif in_transition:
-                    stats_dict["Mode"] = "PT_Transition"
+                    new_mode = "PT_Transition"
                     transition_progress = min(100, int(100 * (current_step - trainer.transition_start_step) /
                                               max(1, trainer.pretraining_transition_steps))) # Avoid div by zero
-                    stats_dict["PT_Progress"] = f"{transition_progress}%"
+                    new_progress = f"{transition_progress}%"
+                    if stats_dict.get("Mode") != new_mode or stats_dict.get("PT_Progress") != new_progress:
+                        stats_dict["Mode"] = new_mode
+                        stats_dict["PT_Progress"] = new_progress
+                        needs_postfix_update = True
                 else:
                     # Remove pretraining info from stats once completed
-                    if "Mode" in stats_dict: stats_dict.pop("Mode", None)
-                    if "PT_Progress" in stats_dict: stats_dict.pop("PT_Progress", None)
+                    if "Mode" in stats_dict:
+                        stats_dict.pop("Mode", None)
+                        needs_postfix_update = True
+                    if "PT_Progress" in stats_dict:
+                        stats_dict.pop("PT_Progress", None)
+                        needs_postfix_update = True
+
+                # Send updated stats_dict if pretraining status changed
+                if needs_postfix_update and tqdm_q:
+                    tqdm_q.put(stats_dict.copy())
 
 
-            # Update progress bar only once per iteration
-            progress_bar.set_postfix(stats_dict)
+            # No need to call set_postfix here, handled by sending messages to the queue
 
     except KeyboardInterrupt:
-        print("\nTraining interrupted. Cleaning up...")
+        print("\nTraining interrupted by main process. Cleaning up...")
+        # Signal handler should take care of stopping TQDM manager
     except Exception as e:
         print(f"Error during training: {str(e)}")
         traceback.print_exc()
     finally:
-        # Always clean up the environments and progress bar.
+        # Always clean up the environments.
         vec_env.close()
-        progress_bar.close()
+
+        # TQDM manager is stopped by the main script's finally block or signal handler
 
         # Perform a final policy update if there are any remaining experiences (PPO).
         if algorithm == "ppo" and collected_experiences > 0 and not test:
@@ -1024,7 +1154,11 @@ def parse_time(time_str):
 
 def signal_handler(sig, frame):
     """Handles Ctrl+C gracefully, so the program exits cleanly."""
+    global tqdm_manager_instance # Need global to access the instance
     print("\nInterrupted by user. Cleaning up...")
+    if tqdm_manager_instance:
+        print("Attempting to stop TQDM manager from signal handler...")
+        tqdm_manager_instance.stop() # Use the manager's stop method
     sys.exit(0)
 
 if __name__ == "__main__":
@@ -1032,7 +1166,16 @@ if __name__ == "__main__":
     if sys.platform == 'darwin':
         mp.set_start_method('spawn', force=True)
     elif sys.platform == 'linux':
-        mp.set_start_method('fork', force=True)
+        # Using fork can be problematic with CUDA and multiprocessing.
+        # 'spawn' is generally safer, though potentially slower initialization.
+        # Let's default to 'spawn' for safety, but allow 'fork' if needed.
+        start_method = os.environ.get("MP_START_METHOD", "spawn") # Default to spawn
+        try:
+            mp.set_start_method(start_method, force=True)
+            print(f"Using multiprocessing start method: {start_method}")
+        except ValueError:
+            print(f"Warning: Could not set start method to '{start_method}', falling back to default.")
+
 
     # Set up Ctrl+C handler to exit gracefully.
     signal.signal(signal.SIGINT, signal_handler)
@@ -1434,160 +1577,205 @@ if __name__ == "__main__":
     # This will be updated inside run_training if a model is loaded
     trainer_offset = 0
 
-    # Start the main training process
-    # Pass args.model path to run_training
-    trainer = run_training(
-        actor=actor,
-        critic=critic,
-        # Pass reward scaling args
-        use_reward_scaling=args.use_reward_scaling,
-        reward_scaling_G_max=args.reward_scaling_gmax,
-        # training_step_offset is now handled inside run_training via load_models
-        device=device,
-        num_envs=args.num_envs,
-        total_episodes=args.episodes if args.time is None else None,
-        training_time=training_time_seconds,
-        render=args.render,
-        update_interval=args.update_interval,
-        use_wandb=args.wandb,
-        debug=args.debug,
-        use_compile=args.compile,
-        use_amp=args.amp,
-        save_interval=args.save_interval,
-        output_path=args.out,
-        use_curriculum=args.curriculum,
-        # Pass model path to run_training
-        model_path_to_load=args.model,
-        algorithm=args.algorithm,
-        lr_actor=args.lra,
-        lr_critic=args.lrc,
-        gamma=args.gamma,
-        gae_lambda=args.gae_lambda,
-        clip_epsilon=args.clip_epsilon,
-        critic_coef=args.critic_coef,
-        entropy_coef=args.entropy_coef,
-        max_grad_norm=args.max_grad_norm,
-        ppo_epochs=args.ppo_epochs,
-        weight_clip_kappa=args.weight_clip_kappa,
-        use_weight_clipping=args.weight_clipping,
-        batch_size=args.batch_size,
-        aux_amp=args.aux_amp if args.aux_amp is not None else args.amp,
-        aux_scale=args.aux_scale,
-        auxiliary=args.auxiliary,
-        sr_weight=args.sr_weight,
-        rp_weight=args.rp_weight,
-        test=args.test,
-        use_pretraining=args.pretraining,
-        pretraining_fraction=args.pretraining_fraction,
-        pretraining_sr_weight=args.pretraining_sr_weight,
-        pretraining_rp_weight=args.pretraining_rp_weight,
-        pretraining_transition_steps=args.pretraining_transition_steps,
-        use_intrinsic_rewards=args.use_intrinsic,
-        intrinsic_reward_scale=args.intrinsic_scale,
-        curiosity_weight=args.curiosity_weight,
-        rnd_weight=args.rnd_weight,
-        adaptive_learning_rate=args.adaptive_learning_rate,
-        target_step_size=args.target_step_size,
-        backtracking_patience=args.backtracking_patience,
-        backtracking_zeta=args.backtracking_zeta,
-        min_lr_factor=args.min_lr_factor,
-        max_lr_factor=args.max_lr_factor,
-        use_obgd=args.use_obgd,
-        stream_buffer_size=args.stream_buffer_size,
-        use_sparse_init=args.use_sparse_init,
-        update_freq=args.update_freq,
-    )
+    # --- Initialize TQDM Manager ---
+    # Note: tqdm_queue and tqdm_manager_instance are already defined at module level
+    tqdm_queue = mp.Queue() # Assign to the module-level variable
 
-    # Save the final trained models, unless we're in test mode or training failed.
-    saved_path = None
-    if trainer is not None:  # Only check if trainer exists, not test mode
-        # Always save when trainer exists and small number of episodes were run - these are likely evaluation runs
-        output_path = args.out if args.out else None
-        # Save model with step count and wandb info
-        metadata = {
-            'training_step': getattr(trainer, 'training_steps', 0) + getattr(trainer, 'training_step_offset', 0),
-            'total_env_steps': getattr(trainer, 'total_env_steps', 0), # Add total env steps to metadata
-            'wandb_run_id': wandb.run.id if args.wandb and wandb.run else None,
-            'algorithm': args.algorithm  # Save which algorithm was used
-        }
-        saved_path = trainer.save_models(output_path, metadata)  # Capture the returned path
-        print(f"Training complete - Model saved to {saved_path} at step {metadata['training_step']} (Total Env Steps: {metadata['total_env_steps']})")
+    # Determine tqdm parameters based on training mode
+    tqdm_total = None
+    tqdm_desc = ""
+    tqdm_bar_format = ""
+    dynamic_ncols = True
+    if training_time_seconds is not None:
+        tqdm_total = int(training_time_seconds)
+        tqdm_desc = "Time"
+        tqdm_bar_format = '{desc}: {percentage:3.0f}% [{elapsed}<{remaining}] |{bar}| {postfix}'
     else:
-        print("Training failed - no model saved.")
+        tqdm_total = args.episodes
+        tqdm_desc = "Episodes"
+        tqdm_bar_format = '{desc}: {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {percentage:3.0f}%|{bar}| {postfix}'
 
-    # Upload the saved model to WandB as an artifact
-    if args.wandb and saved_path and os.path.exists(saved_path):
-        try:
-            # Create a name for the artifact
-            artifact_name = f"{args.algorithm}_{wandb.run.id}"
-            if args.time is not None:
-                artifact_name += f"_t{int(parse_time(args.time) if args.time else 0)}s"
-            else:
-                artifact_name += f"_ep{args.episodes}"
+    # Assign to the module-level variable so signal handler can access it
+    tqdm_manager_instance = TqdmManager(
+        queue=tqdm_queue,
+        total=tqdm_total,
+        desc=tqdm_desc,
+        bar_format=tqdm_bar_format,
+        dynamic_ncols=dynamic_ncols
+    )
+    tqdm_manager_instance.start()
+    # --- End TQDM Manager Initialization ---
 
-            # Log the model as an artifact with metadata
-            artifact = wandb.Artifact(
-                name=artifact_name,
-                type="model",
-                description=f"RL model trained with {args.algorithm.upper()} for {args.episodes if args.time is None else args.time}"
-            )
+    trainer = None # Initialize trainer to None
+    saved_path = None
+    try:
+        # Start the main training process
+        # Pass args.model path to run_training
+        trainer = run_training(
+            actor=actor,
+            critic=critic,
+            # Pass reward scaling args
+            use_reward_scaling=args.use_reward_scaling,
+            reward_scaling_G_max=args.reward_scaling_gmax,
+            # training_step_offset is now handled inside run_training via load_models
+            device=device,
+            num_envs=args.num_envs,
+            total_episodes=args.episodes if args.time is None else None,
+            training_time=training_time_seconds,
+            render=args.render,
+            update_interval=args.update_interval,
+            use_wandb=args.wandb,
+            debug=args.debug,
+            use_compile=args.compile,
+            use_amp=args.amp,
+            save_interval=args.save_interval,
+            output_path=args.out,
+            use_curriculum=args.curriculum,
+            # Pass model path to run_training
+            model_path_to_load=args.model,
+            algorithm=args.algorithm,
+            lr_actor=args.lra,
+            lr_critic=args.lrc,
+            gamma=args.gamma,
+            gae_lambda=args.gae_lambda,
+            clip_epsilon=args.clip_epsilon,
+            critic_coef=args.critic_coef,
+            entropy_coef=args.entropy_coef,
+            max_grad_norm=args.max_grad_norm,
+            ppo_epochs=args.ppo_epochs,
+            weight_clip_kappa=args.weight_clip_kappa,
+            use_weight_clipping=args.weight_clipping,
+            batch_size=args.batch_size,
+            aux_amp=args.aux_amp if args.aux_amp is not None else args.amp,
+            aux_scale=args.aux_scale,
+            auxiliary=args.auxiliary,
+            sr_weight=args.sr_weight,
+            rp_weight=args.rp_weight,
+            test=args.test,
+            use_pretraining=args.pretraining,
+            pretraining_fraction=args.pretraining_fraction,
+            pretraining_sr_weight=args.pretraining_sr_weight,
+            pretraining_rp_weight=args.pretraining_rp_weight,
+            pretraining_transition_steps=args.pretraining_transition_steps,
+            use_intrinsic_rewards=args.use_intrinsic,
+            intrinsic_reward_scale=args.intrinsic_scale,
+            curiosity_weight=args.curiosity_weight,
+            rnd_weight=args.rnd_weight,
+            adaptive_learning_rate=args.adaptive_learning_rate,
+            target_step_size=args.target_step_size,
+            backtracking_patience=args.backtracking_patience,
+            backtracking_zeta=args.backtracking_zeta,
+            min_lr_factor=args.min_lr_factor,
+            max_lr_factor=args.max_lr_factor,
+            use_obgd=args.use_obgd,
+            stream_buffer_size=args.stream_buffer_size,
+            use_sparse_init=args.use_sparse_init,
+            update_freq=args.update_freq,
+            tqdm_q=tqdm_queue # Pass the queue to the training function
+        )
 
-            # Add the model file
-            artifact.add_file(saved_path)
-
-            # Add metadata
+        # Save the final trained models, unless we're in test mode or training failed.
+        if trainer is not None:  # Only check if trainer exists, not test mode
+            # Always save when trainer exists and small number of episodes were run - these are likely evaluation runs
+            output_path = args.out if args.out else None
+            # Save model with step count and wandb info
             metadata = {
-                "algorithm": args.algorithm,
-                "episodes": args.episodes if args.time is None else None,
-                "training_time": args.time,
-                "device": str(device),
-                "lr_actor": args.lra,
-                "lr_critic": args.lrc,
-                "gamma": args.gamma,
-                "gae_lambda": args.gae_lambda,
-                "clip_epsilon": args.clip_epsilon,
-                "critic_coef": args.critic_coef,
-                "entropy_coef": args.entropy_coef,
-                "model_type": type(actor).__name__,
-                "num_envs": args.num_envs,
-                "update_interval": args.update_interval,
-                "saved_path": saved_path,
-                'model_config': {
-                    'hidden_dim': args.hidden_dim,
-                    'num_blocks': args.num_blocks,
-                    'dropout': args.dropout
-                },
-                # Add total env steps to artifact metadata
-                'total_env_steps': getattr(trainer, 'total_env_steps', 0)
+                'training_step': getattr(trainer, 'training_steps', 0) + getattr(trainer, 'training_step_offset', 0),
+                'total_env_steps': getattr(trainer, 'total_env_steps', 0), # Add total env steps to metadata
+                'wandb_run_id': wandb.run.id if args.wandb and wandb.run else None,
+                'algorithm': args.algorithm  # Save which algorithm was used
             }
+            saved_path = trainer.save_models(output_path, metadata)  # Capture the returned path
+            print(f"Training complete - Model saved to {saved_path} at step {metadata['training_step']} (Total Env Steps: {metadata['total_env_steps']})")
+        else:
+            print("Training failed - no model saved.")
 
-            # Add StreamAC specific metadata if relevant
-            if args.algorithm == "streamac":
-                metadata.update({
-                    "adaptive_learning_rate": args.adaptive_learning_rate,
-                    "target_step_size": args.target_step_size,
-                    "backtracking_patience": args.backtracking_patience,
-                    "backtracking_zeta": args.backtracking_zeta,
-                    "use_obgd": args.use_obgd,
-                    "stream_buffer_size": args.stream_buffer_size,
-                    "use_sparse_init": args.use_sparse_init
-                })
+    except Exception as main_exception:
+         print(f"An error occurred in the main script: {main_exception}")
+         traceback.print_exc()
+    finally:
+        # --- Stop TQDM Manager ---
+        if tqdm_manager_instance:
+            tqdm_manager_instance.stop()
+        # --- End Stop TQDM Manager ---
 
-            # Add metadata to the artifact
-            for key, value in metadata.items():
-                if value is not None:  # Only add non-None values
-                    artifact.metadata[key] = value
+        # Upload the saved model to WandB as an artifact
+        if args.wandb and saved_path and os.path.exists(saved_path):
+            try:
+                # Create a name for the artifact
+                artifact_name = f"{args.algorithm}_{wandb.run.id}"
+                if args.time is not None:
+                    artifact_name += f"_t{int(parse_time(args.time) if args.time else 0)}s"
+                else:
+                    artifact_name += f"_ep{args.episodes}"
 
-            # Log the artifact to wandb
-            wandb.log_artifact(artifact)
+                # Log the model as an artifact with metadata
+                artifact = wandb.Artifact(
+                    name=artifact_name,
+                    type="model",
+                    description=f"RL model trained with {args.algorithm.upper()} for {args.episodes if args.time is None else args.time}"
+                )
 
-            if args.debug:
-                print(f"[DEBUG] Uploaded model to WandB as artifact '{artifact_name}'")
-            else:
-                print(f"Uploaded model to WandB as artifact '{artifact_name}'")
-        except ImportError:
-            print("WandB not available, skipping artifact upload")
-        except Exception as e:
-            print(f"Error uploading model to WandB: {str(e)}")
-            if args.debug:
-                traceback.print_exc()
+                # Add the model file
+                artifact.add_file(saved_path)
+
+                # Add metadata
+                metadata = {
+                    "algorithm": args.algorithm,
+                    "episodes": args.episodes if args.time is None else None,
+                    "training_time": args.time,
+                    "device": str(device),
+                    "lr_actor": args.lra,
+                    "lr_critic": args.lrc,
+                    "gamma": args.gamma,
+                    "gae_lambda": args.gae_lambda,
+                    "clip_epsilon": args.clip_epsilon,
+                    "critic_coef": args.critic_coef,
+                    "entropy_coef": args.entropy_coef,
+                    "model_type": type(actor).__name__,
+                    "num_envs": args.num_envs,
+                    "update_interval": args.update_interval,
+                    "saved_path": saved_path,
+                    'model_config': {
+                        'hidden_dim': args.hidden_dim,
+                        'num_blocks': args.num_blocks,
+                        'dropout': args.dropout
+                    },
+                    # Add total env steps to artifact metadata
+                    'total_env_steps': getattr(trainer, 'total_env_steps', 0) if trainer else 0
+                }
+
+                # Add StreamAC specific metadata if relevant
+                if args.algorithm == "streamac":
+                    metadata.update({
+                        "adaptive_learning_rate": args.adaptive_learning_rate,
+                        "target_step_size": args.target_step_size,
+                        "backtracking_patience": args.backtracking_patience,
+                        "backtracking_zeta": args.backtracking_zeta,
+                        "use_obgd": args.use_obgd,
+                        "stream_buffer_size": args.stream_buffer_size,
+                        "use_sparse_init": args.use_sparse_init
+                    })
+
+                # Add metadata to the artifact
+                for key, value in metadata.items():
+                    if value is not None:  # Only add non-None values
+                        artifact.metadata[key] = value
+
+                # Log the artifact to wandb
+                wandb.log_artifact(artifact)
+
+                if args.debug:
+                    print(f"[DEBUG] Uploaded model to WandB as artifact '{artifact_name}'")
+                else:
+                    print(f"Uploaded model to WandB as artifact '{artifact_name}'")
+            except ImportError:
+                print("WandB not available, skipping artifact upload")
+            except Exception as e:
+                print(f"Error uploading model to WandB: {str(e)}")
+                if args.debug:
+                    traceback.print_exc()
+
+        # Ensure wandb run finishes if it exists
+        if args.wandb and wandb.run:
+            wandb.finish()
