@@ -418,6 +418,7 @@ def run_training(
     last_update_time = time.time()
     last_save_episode = 0
     last_progress_update_step = 0  # Track last step count when progress was updated
+    last_intrinsic_reset_episode = 0 # Track last episode where intrinsic models were reset
 
     # Variables to track steps per second
     steps_per_second = 0
@@ -790,7 +791,7 @@ def run_training(
                 # The buffer size check is handled inside trainer.update() now
                 should_update = collected_experiences >= update_interval
 
-                if args.debug and should_update:
+                if debug and should_update:
                     buffer_size = trainer.algorithm.memory.size if hasattr(trainer.algorithm, 'memory') else 0
                     buffer_capacity = trainer.algorithm.memory.buffer_size if hasattr(trainer.algorithm, 'memory') else 0
                     print(f"[DEBUG] PPO update triggered - collected: {collected_experiences}/{update_interval}, " +
@@ -840,8 +841,19 @@ def run_training(
                     # The progress bar will be updated at the end of the loop iteration
 
 
-            if args.pretraining and not trainer.pretraining_completed and total_episodes_so_far > 0 and total_episodes_so_far % 50 == 0 and hasattr(trainer, 'intrinsic_reward_generator') and trainer.intrinsic_reward_generator is not None:
+            # Check if intrinsic reward models should be reset
+            if use_pretraining and not trainer.pretraining_completed and \
+               total_episodes_so_far > 0 and \
+               total_episodes_so_far % 50 == 0 and \
+               total_episodes_so_far > last_intrinsic_reset_episode and \
+               hasattr(trainer, 'intrinsic_reward_generator') and \
+               trainer.intrinsic_reward_generator is not None:
+
                 trainer.intrinsic_reward_generator.reset_models()
+                last_intrinsic_reset_episode = total_episodes_so_far # Update the tracker
+                if debug:
+                    print(f"[DEBUG] Reset intrinsic reward models at episode {total_episodes_so_far}")
+
 
             # Update policy only if conditions met and not in test mode
             if should_update and not test:
