@@ -190,9 +190,9 @@ def run_training(
     num_envs: int,
     # Remove training_step_offset from signature, it's loaded by trainer.load_models
     # Add model_path_to_load parameter
-    model_path_to_load: str = None,
-    total_episodes: int = None,
-    training_time: float = None,
+    model_path_to_load: Optional[str] = None,
+    total_episodes: Optional[int] = None,
+    training_time: Optional[float] = None,
     render: bool = False,
     update_interval: int = 1000,
     use_wandb: bool = False,
@@ -200,7 +200,7 @@ def run_training(
     use_compile: bool = True,
     use_amp: bool = False,
     save_interval: int = 200,
-    output_path: str = None,
+    output_path: Optional[str] = None,
     use_curriculum: bool = False,
     # Hyperparameters
     lr_actor: float = 3e-4,
@@ -261,9 +261,9 @@ def run_training(
     os.environ['KMP_SETTINGS'] = '0'
     os.environ['KMP_AFFINITY'] = 'granularity=fine,compact,1,0'
 
-    # We need at least one way to know when to stop training.
+    # Allow indefinite training when no episode count or time limit is provided
     if total_episodes is None and training_time is None:
-        raise ValueError("Either total_episodes or training_time must be provided")
+        print("No episodes or time limit provided - training will continue indefinitely until interrupted")
 
     actor.to(device)
     critic.to(device)
@@ -425,17 +425,21 @@ def run_training(
     start_time = time.time()
 
     # Set up the progress bar parameters for the TqdmManager
-    tqdm_total = None
-    tqdm_desc = ""
-    tqdm_bar_format = ""
+    tqdm_params = {
+        "total": None,
+        "desc": "Training",
+        "bar_format": '{desc}: [{elapsed}] |{bar:30}| {postfix}'
+    }
+
     if training_time is not None:
-        tqdm_total = int(training_time)
-        tqdm_desc = "Time"
-        tqdm_bar_format = '{desc}: {percentage:3.0f}% [{elapsed}<{remaining}] |{bar}| {postfix}'
-    else:
-        tqdm_total = total_episodes
-        tqdm_desc = "Episodes"
-        tqdm_bar_format = '{desc}: {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {percentage:3.0f}%|{bar}| {postfix}'
+        tqdm_params["total"] = int(training_time)
+        tqdm_params["desc"] = "Time"
+        tqdm_params["bar_format"] = '{desc}: {percentage:3.0f}% [{elapsed}<{remaining}] |{bar}| {postfix}'
+    elif total_episodes is not None:
+        tqdm_params["total"] = total_episodes
+        tqdm_params["desc"] = "Episodes"
+        tqdm_params["bar_format"] = '{desc}: {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {percentage:3.0f}%|{bar}| {postfix}'
+    # else: use defaults for indefinite training
 
     # This dictionary holds statistics we'll display in the progress bar.
     stats_dict = {
@@ -508,7 +512,6 @@ def run_training(
     total_env_steps = 0 # Initialize total environment steps counter
     last_update_time = time.time()
     last_save_episode = 0
-    last_progress_update_step = 0  # Track last step count when progress was updated
     last_intrinsic_reset_episode = 0 # Track last episode where intrinsic models were reset
 
     # Variables to track steps per second
@@ -531,7 +534,7 @@ def run_training(
             current_time = time.time()
             elapsed = current_time - start_time
 
-            # Figure out if we should keep going based on time or episode count
+            # Figure out if we should keep going based on time or episode count, or indefinitely
             if training_time is not None:
                 # Using a time-based training schedule - update progress bar once per second
                 if current_time - last_progress_update >= 1.0:
@@ -540,9 +543,17 @@ def run_training(
                     last_progress_update = current_time
 
                 should_continue = elapsed < training_time
-            else:
+            elif total_episodes is not None:
                 # Using an episode-based schedule
                 should_continue = total_episodes_so_far < total_episodes
+            else:
+                # Neither time nor episodes specified - run indefinitely
+                should_continue = True
+                # Update progress indicators periodically
+                if current_time - last_progress_update >= 1.0:
+                    last_progress_update = current_time
+                    if tqdm_q:
+                        tqdm_q.put(stats_dict.copy())
 
             if not should_continue:
                 break
@@ -901,6 +912,12 @@ def run_training(
                 ui_update_interval = update_interval // 10 if update_interval > 100 else 50
                 should_update_ui = collected_experiences > 0 and (collected_experiences % ui_update_interval == 0)
 
+                # Handle indefinite training specially for online algorithms
+                if total_episodes is None and training_time is None:
+                    # For indefinite training, update more frequently
+                    ui_update_interval = min(ui_update_interval, 20)
+                    should_update_ui = collected_experiences > 0 and (collected_experiences % ui_update_interval == 0)
+
                 if should_update_ui:
                     # Update step count and other metrics for UI
                     stats_dict["Steps"] = collected_experiences
@@ -1185,11 +1202,11 @@ if __name__ == "__main__":
 
     # Allow user to specify training duration either by episode count OR by time.
     training_duration = parser.add_mutually_exclusive_group()
-    training_duration.add_argument('-e', '--episodes', type=int, default=5000, help='Number of episodes to run')
+    training_duration.add_argument('-e', '--episodes', type=int, default=None, help='Number of episodes to run')
     training_duration.add_argument('-t', '--time', type=str, default=None,
                                   help='Training duration in format: 5m (minutes), 5h (hours), 5d (days)')
 
-    parser.add_argument('-n', '--num_envs', type=int, default=300,
+    parser.add_argument('-n', '--num_envs', type=int, default=150,
                         help='Number of parallel environments to run for faster data collection')
     parser.add_argument('--update_interval', type=int, default=1048576,
                         help='Number of experiences to collect before updating the policy (PPO)')
@@ -1538,8 +1555,8 @@ if __name__ == "__main__":
                 "num_agents": 4,  # 2v2
 
                 # System configuration
-                "episodes": args.episodes,
-                "training_time": args.time,
+                "episodes": args.episodes if args.episodes is not None else "indefinite" if args.time is None else None,
+                "training_time": args.time if args.time is not None else "indefinite" if args.episodes is None else None,
                 "num_envs": args.num_envs,
                 "update_interval": args.update_interval,
                 "device": device,
@@ -1569,8 +1586,10 @@ if __name__ == "__main__":
         print(f"[DEBUG] Action stacking size: {args.stack_size}")
         if args.time:
             print(f"[DEBUG] Training for {args.time} ({training_time_seconds} seconds)")
-        else:
+        elif args.episodes:
             print(f"[DEBUG] Training for {args.episodes} episodes")
+        else:
+            print(f"[DEBUG] Training indefinitely - press Ctrl+C to stop")
 
 
     # Get the training step offset (initialize to 0)
@@ -1582,25 +1601,29 @@ if __name__ == "__main__":
     tqdm_queue = mp.Queue() # Assign to the module-level variable
 
     # Determine tqdm parameters based on training mode
-    tqdm_total = None
-    tqdm_desc = ""
-    tqdm_bar_format = ""
+    tqdm_params = {
+        "total": None,
+        "desc": "Training",
+        "bar_format": '{desc}: [{elapsed}] |{bar:30}| {postfix}'
+    }
     dynamic_ncols = True
+
     if training_time_seconds is not None:
-        tqdm_total = int(training_time_seconds)
-        tqdm_desc = "Time"
-        tqdm_bar_format = '{desc}: {percentage:3.0f}% [{elapsed}<{remaining}] |{bar}| {postfix}'
-    else:
-        tqdm_total = args.episodes
-        tqdm_desc = "Episodes"
-        tqdm_bar_format = '{desc}: {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {percentage:3.0f}%|{bar}| {postfix}'
+        tqdm_params["total"] = int(training_time_seconds)
+        tqdm_params["desc"] = "Time"
+        tqdm_params["bar_format"] = '{desc}: {percentage:3.0f}% [{elapsed}<{remaining}] |{bar}| {postfix}'
+    elif args.episodes is not None:
+        tqdm_params["total"] = args.episodes
+        tqdm_params["desc"] = "Episodes"
+        tqdm_params["bar_format"] = '{desc}: {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {percentage:3.0f}%|{bar}| {postfix}'
+    # else: use defaults for indefinite training
 
     # Assign to the module-level variable so signal handler can access it
     tqdm_manager_instance = TqdmManager(
         queue=tqdm_queue,
-        total=tqdm_total,
-        desc=tqdm_desc,
-        bar_format=tqdm_bar_format,
+        total=tqdm_params["total"],
+        desc=tqdm_params["desc"],
+        bar_format=tqdm_params["bar_format"],
         dynamic_ncols=dynamic_ncols
     )
     tqdm_manager_instance.start()
@@ -1702,12 +1725,21 @@ if __name__ == "__main__":
         # Upload the saved model to WandB as an artifact
         if args.wandb and saved_path and os.path.exists(saved_path):
             try:
-                # Create a name for the artifact
-                artifact_name = f"{args.algorithm}_{wandb.run.id}"
+                # Handle WandB run ID safely for artifact naming
+                run_id = getattr(wandb.run, 'id', 'unknown') if wandb.run else 'unknown'
+                artifact_name = f"{args.algorithm}_{run_id}"
                 if args.time is not None:
-                    artifact_name += f"_t{int(parse_time(args.time) if args.time else 0)}s"
-                else:
+                    time_seconds = 0
+                    if args.time:
+                        try:
+                            time_seconds = int(parse_time(args.time))
+                        except Exception:
+                            time_seconds = 0
+                    artifact_name += f"_t{time_seconds}s"
+                elif args.episodes is not None:
                     artifact_name += f"_ep{args.episodes}"
+                else:
+                    artifact_name += "_indefinite"
 
                 # Log the model as an artifact with metadata
                 artifact = wandb.Artifact(
@@ -1722,8 +1754,8 @@ if __name__ == "__main__":
                 # Add metadata
                 metadata = {
                     "algorithm": args.algorithm,
-                    "episodes": args.episodes if args.time is None else None,
-                    "training_time": args.time,
+                    "episodes": args.episodes if args.episodes is not None else "indefinite" if args.time is None else None,
+                    "training_time": args.time if args.time is not None else "indefinite" if args.episodes is None else None,
                     "device": str(device),
                     "lr_actor": args.lra,
                     "lr_critic": args.lrc,
