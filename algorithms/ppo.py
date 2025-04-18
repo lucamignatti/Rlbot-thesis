@@ -104,9 +104,9 @@ class PPOAlgorithm(BaseAlgorithm):
         # Combine parameters for a single optimizer step
         combined_params = list(self.actor.parameters()) + list(self.critic.parameters())
         if self.aux_task_manager:
-            if hasattr(self.aux_task_manager, 'sr_task'):
+            if hasattr(self.aux_task_manager, 'sr_task') and self.aux_task_manager.sr_task is not None:
                 combined_params += list(self.aux_task_manager.sr_task.parameters())
-            if hasattr(self.aux_task_manager, 'rp_task'):
+            if hasattr(self.aux_task_manager, 'rp_task') and self.aux_task_manager.rp_task is not None:
                 combined_params += list(self.aux_task_manager.rp_task.parameters())
 
         self.optimizer = torch.optim.Adam(combined_params, lr=lr_actor) # Use actor LR for combined
@@ -671,6 +671,7 @@ class PPOAlgorithm(BaseAlgorithm):
              # Ensure values tensor is not empty before accessing
              if values.numel() > 0:
                  # Use value prediction V(s_last) if not done, otherwise 0
+                 # Use .item() here as it's outside the main loop and needed for scalar logic
                  next_value = values[last_idx].item() * (1.0 - dones[last_idx].float().item())
              else:
                  next_value = 0.0 # Handle case where values tensor might be empty
@@ -696,7 +697,8 @@ class PPOAlgorithm(BaseAlgorithm):
 
             # Update next_advantage and next_value for the next iteration (t-1)
             next_advantage = advantages[t]
-            next_value = current_value # V(s_t) becomes V(s_{t+1}) for the next step back
+            # next_value needs to be the scalar value for the next iteration's calculation
+            next_value = current_value.item() # Use .item() here for the loop logic
 
             # Compute returns as advantage + value (TD(lambda) return)
             # GAE paper: A_t = R_t - V(s_t), so R_t = A_t + V(s_t)
@@ -767,6 +769,7 @@ class PPOAlgorithm(BaseAlgorithm):
                 # Count clipped parameters
                 num_params = param.numel()
                 total_params += num_params
+                # Use .item() here as it's summing over potentially many parameters
                 clipped_params += torch.sum(param.data != original_param).item()
 
         # Clip critic network weights
@@ -783,6 +786,7 @@ class PPOAlgorithm(BaseAlgorithm):
                 # Count clipped parameters
                 num_params = param.numel()
                 total_params += num_params
+                # Use .item() here
                 clipped_params += torch.sum(param.data != original_param).item()
 
         # Return the fraction of clipped parameters
@@ -804,19 +808,26 @@ class PPOAlgorithm(BaseAlgorithm):
         Returns:
             dict: metrics from the update
         """
-        # Track metrics for this update cycle
-        update_metrics = {
-            'actor_loss': 0.0,
-            'critic_loss': 0.0,
-            'entropy_loss': 0.0,
-            'sr_loss_scalar': 0.0, # Add aux metrics
-            'rp_loss_scalar': 0.0, # Add aux metrics
-            'total_loss': 0.0,
-            'clip_fraction': 0.0, # PPO policy clip fraction
+        # Track metrics for this update cycle - Initialize tensor metrics on the correct device
+        update_metrics_tensors = {
+            'actor_loss': torch.tensor(0.0, device=self.device),
+            'critic_loss': torch.tensor(0.0, device=self.device),
+            'entropy_loss': torch.tensor(0.0, device=self.device),
+            'total_loss': torch.tensor(0.0, device=self.device),
+            'clip_fraction': torch.tensor(0.0, device=self.device), # PPO policy clip fraction
+            'kl_divergence': torch.tensor(0.0, device=self.device),
+        }
+        # Scalar metrics (accumulated directly)
+        update_metrics_scalars = {
+            'sr_loss_scalar': 0.0,
+            'rp_loss_scalar': 0.0,
             'weight_clip_fraction': 0.0, # Fraction of weights clipped this update
         }
 
+
         # Calculate explained variance (once before updates)
+        explained_var_scalar = 0.0
+        mean_advantage_scalar = 0.0
         with torch.no_grad():
             # Calculate values in chunks if needed
             y_pred = []
@@ -827,12 +838,14 @@ class PPOAlgorithm(BaseAlgorithm):
                  y_pred.append(chunk_values)
             y_pred = torch.cat(y_pred)
 
-        y_true = returns
-        var_y = torch.var(y_true)
-        explained_var = 1 - torch.var(y_true - y_pred) / (var_y + 1e-8)
-        update_metrics['explained_variance'] = explained_var.item()
-        update_metrics['mean_advantage'] = advantages.mean().item() # Use normalized advantage mean
-        update_metrics['kl_divergence'] = 0.0 # Will be averaged later
+            y_true = returns
+            var_y = torch.var(y_true)
+            explained_var = 1 - torch.var(y_true - y_pred) / (var_y + 1e-8)
+            # Convert to scalar here, outside the main loop
+            explained_var_scalar = explained_var.item()
+            # Use normalized advantage mean, convert to scalar here
+            mean_advantage_scalar = advantages.mean().item()
+
 
         total_weight_clipped_fraction_epoch = 0.0
         num_batches_processed = 0
@@ -946,8 +959,9 @@ class PPOAlgorithm(BaseAlgorithm):
                 entropy_loss = -entropy * self.entropy_coef
 
                 # --- Auxiliary Loss Calculation ---
-                sr_loss = torch.tensor(0.0, device=self.device)
-                rp_loss = torch.tensor(0.0, device=self.device)
+                # Initialize with 0.0 float, will be replaced by tensor if computed
+                sr_loss = 0.0
+                rp_loss = 0.0
                 sr_loss_scalar = 0.0
                 rp_loss_scalar = 0.0
 
@@ -955,8 +969,10 @@ class PPOAlgorithm(BaseAlgorithm):
                     try:
                         # Call the new batch-specific loss computation method
                         aux_losses = self.aux_task_manager.compute_losses_for_batch(batch_states, batch_rewards)
-                        sr_loss = aux_losses.get("sr_loss", torch.tensor(0.0, device=self.device))
-                        rp_loss = aux_losses.get("rp_loss", torch.tensor(0.0, device=self.device))
+                        # Get tensor loss if available, otherwise keep 0.0
+                        sr_loss = aux_losses.get("sr_loss", 0.0)
+                        rp_loss = aux_losses.get("rp_loss", 0.0)
+                        # Get scalar loss for tracking
                         sr_loss_scalar = aux_losses.get("sr_loss_scalar", 0.0)
                         rp_loss_scalar = aux_losses.get("rp_loss_scalar", 0.0)
                         if self.debug and (sr_loss_scalar > 0 or rp_loss_scalar > 0):
@@ -966,8 +982,15 @@ class PPOAlgorithm(BaseAlgorithm):
                             print(f"[DEBUG PPO Aux] Error computing aux losses for batch: {e}")
                             import traceback
                             traceback.print_exc()
+                        # Ensure losses remain 0.0 if error occurs
+                        sr_loss = 0.0
+                        rp_loss = 0.0
+                        sr_loss_scalar = 0.0
+                        rp_loss_scalar = 0.0
+
 
                 # --- Total Loss ---
+                # Adding 0.0 float to tensor is handled efficiently by PyTorch
                 total_loss = actor_loss + self.critic_coef * critic_loss + entropy_loss + sr_loss + rp_loss
 
                 # --- Optimization ---
@@ -985,42 +1008,59 @@ class PPOAlgorithm(BaseAlgorithm):
                 current_weight_clip_fraction = self.clip_weights()
                 total_weight_clipped_fraction_epoch += current_weight_clip_fraction
 
-                # --- Update Metrics (accumulate) ---
-                update_metrics['actor_loss'] += actor_loss.detach().item()
-                update_metrics['critic_loss'] += critic_loss.detach().item()
-                update_metrics['entropy_loss'] += entropy_loss.detach().item()
-                update_metrics['sr_loss_scalar'] += sr_loss_scalar # Use scalar value
-                update_metrics['rp_loss_scalar'] += rp_loss_scalar # Use scalar value
-                update_metrics['total_loss'] += total_loss.detach().item()
+                # --- Update Metrics (accumulate tensors and scalars) ---
+                # Detach tensors before accumulating
+                update_metrics_tensors['actor_loss'] += actor_loss.detach()
+                update_metrics_tensors['critic_loss'] += critic_loss.detach()
+                update_metrics_tensors['entropy_loss'] += entropy_loss.detach()
+                update_metrics_tensors['total_loss'] += total_loss.detach()
 
-                # Calculate PPO policy clipping fraction
-                policy_clip_fraction = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean().detach().item()
-                update_metrics['clip_fraction'] += policy_clip_fraction
+                # Accumulate scalar aux losses
+                update_metrics_scalars['sr_loss_scalar'] += sr_loss_scalar
+                update_metrics_scalars['rp_loss_scalar'] += rp_loss_scalar
 
-                # Calculate KL divergence (approximate)
+                # Calculate PPO policy clipping fraction (as tensor)
                 with torch.no_grad():
-                    kl_div = (batch_old_log_probs - curr_log_probs.detach()).mean().detach().item()
-                    update_metrics['kl_divergence'] += kl_div
+                    policy_clip_fraction_tensor = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean()
+                    update_metrics_tensors['clip_fraction'] += policy_clip_fraction_tensor
 
-        # Calculate averages over all batches and epochs
+                    # Calculate KL divergence (approximate, as tensor)
+                    kl_div_tensor = (batch_old_log_probs - curr_log_probs.detach()).mean()
+                    update_metrics_tensors['kl_divergence'] += kl_div_tensor
+
+
+        # --- Finalize Metrics ---
+        final_metrics = {}
         if num_batches_processed > 0:
-            update_metrics['actor_loss'] /= num_batches_processed
-            update_metrics['critic_loss'] /= num_batches_processed
-            update_metrics['entropy_loss'] /= num_batches_processed
-            update_metrics['sr_loss_scalar'] /= num_batches_processed # Average scalar aux losses
-            update_metrics['rp_loss_scalar'] /= num_batches_processed # Average scalar aux losses
-            update_metrics['total_loss'] /= num_batches_processed
-            update_metrics['clip_fraction'] /= num_batches_processed
-            update_metrics['kl_divergence'] /= num_batches_processed
-            update_metrics['weight_clip_fraction'] = total_weight_clipped_fraction_epoch / num_batches_processed
+            # Average accumulated tensors and convert to scalar
+            for key, tensor_val in update_metrics_tensors.items():
+                final_metrics[key] = (tensor_val / num_batches_processed).item()
+
+            # Average accumulated scalars
+            for key, scalar_val in update_metrics_scalars.items():
+                final_metrics[key] = scalar_val / num_batches_processed
+
+            # Average weight clip fraction (already accumulated per batch)
+            final_metrics['weight_clip_fraction'] = total_weight_clipped_fraction_epoch / num_batches_processed
+
         else:
              if self.debug:
                  print("[DEBUG PPO _update_policy] No batches were processed in any epoch.")
+             # Initialize metrics to zero if no batches processed
+             for key in update_metrics_tensors.keys():
+                 final_metrics[key] = 0.0
+             for key in update_metrics_scalars.keys():
+                 final_metrics[key] = 0.0
+             final_metrics['weight_clip_fraction'] = 0.0
 
+
+        # Add pre-calculated metrics
+        final_metrics['explained_variance'] = explained_var_scalar
+        final_metrics['mean_advantage'] = mean_advantage_scalar
 
         # --- Adaptive Kappa Update Logic ---
         if self.use_weight_clipping and self.adaptive_kappa and (self._update_counter % self.kappa_update_freq == 0):
-            actual_clip_fraction = update_metrics['weight_clip_fraction']
+            actual_clip_fraction = final_metrics['weight_clip_fraction'] # Use the averaged value
             if actual_clip_fraction > self.target_clip_fraction:
                 self.weight_clip_kappa *= (1 + self.kappa_update_rate)
             elif actual_clip_fraction < self.target_clip_fraction:
@@ -1033,9 +1073,9 @@ class PPOAlgorithm(BaseAlgorithm):
                 print(f"[DEBUG PPO] Kappa updated. New kappa: {self.weight_clip_kappa:.4f} (Clip fraction: {actual_clip_fraction:.4f})")
 
         # Store current kappa value in metrics
-        update_metrics['current_kappa'] = self.weight_clip_kappa
+        final_metrics['current_kappa'] = self.weight_clip_kappa
 
-        return update_metrics
+        return final_metrics
 
     def get_state_dict(self):
         """Get state dict for saving algorithm state"""
@@ -1050,6 +1090,9 @@ class PPOAlgorithm(BaseAlgorithm):
             'weight_clip_kappa': self.weight_clip_kappa,
             '_update_counter': self._update_counter
         })
+        # Add aux task manager state if it exists and has a method
+        if self.aux_task_manager and hasattr(self.aux_task_manager, 'get_state_dict'):
+             state['aux_task_manager'] = self.aux_task_manager.get_state_dict()
         return state
 
     def load_state_dict(self, state_dict):
@@ -1071,3 +1114,6 @@ class PPOAlgorithm(BaseAlgorithm):
             self.weight_clip_kappa = state_dict['weight_clip_kappa']
         if '_update_counter' in state_dict:
             self._update_counter = state_dict['_update_counter']
+        # Load aux task manager state if it exists and has a method
+        if 'aux_task_manager' in state_dict and self.aux_task_manager and hasattr(self.aux_task_manager, 'load_state_dict'):
+            self.aux_task_manager.load_state_dict(state_dict['aux_task_manager'])
