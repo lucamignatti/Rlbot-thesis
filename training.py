@@ -229,7 +229,7 @@ class Trainer:
                 max_kappa=max_kappa,
             )
             # For compatibility with existing code, keep a reference to the memory
-            self.memory = self.algorithm.memory
+            # self.memory = self.algorithm.memory # No longer needed, access via self.algorithm.memory
         elif self.algorithm_type == "streamac":
             # Create StreamAC algorithm
             algorithm = StreamACAlgorithm(
@@ -537,8 +537,20 @@ class Trainer:
                          'effective_step_size', 'backtracking_count', 'mean_return',
                          'td_error_mean', 'td_error_max', 'td_error_min'}
 
+        sac_metrics = {'actor_loss', 'critic1_loss', 'critic2_loss', 'alpha_loss', 'alpha',
+                       'mean_return', 'mean_q_value', 'mean_entropy'}
+
+
         # Select appropriate metric set based on algorithm type
-        valid_metrics = ppo_metrics if self.algorithm_type == "ppo" else stream_metrics
+        if self.algorithm_type == "ppo":
+            valid_metrics = ppo_metrics
+        elif self.algorithm_type == "streamac":
+            valid_metrics = stream_metrics
+        elif self.algorithm_type == "sac":
+            valid_metrics = sac_metrics
+        else:
+            valid_metrics = set() # Empty set for unknown algorithms
+
 
         # Add algorithm metrics based on selected set
         algo_metrics = self.algorithm.get_metrics() if hasattr(self.algorithm, 'get_metrics') else metrics
@@ -552,6 +564,11 @@ class Trainer:
         algorithm_metrics[f"{alg_prefix}/entropy_coefficient"] = self.entropy_coef
         algorithm_metrics[f"{alg_prefix}/actor_learning_rate"] = getattr(self.algorithm, "lr_actor", self.lr_actor)
         algorithm_metrics[f"{alg_prefix}/critic_learning_rate"] = getattr(self.algorithm, "lr_critic", self.lr_critic)
+
+        # Add buffer size for SAC
+        if self.algorithm_type == "sac":
+            algorithm_metrics[f"{alg_prefix}/buffer_size"] = len(self.algorithm.memory) if hasattr(self.algorithm, 'memory') else 0
+
 
         # --- Auxiliary metrics ---
         if self.use_auxiliary_tasks:
@@ -622,7 +639,7 @@ class Trainer:
         # Add total environment steps
         log_total_env_steps = total_env_steps if total_env_steps is not None else self.total_env_steps
         system_metrics["SYS/total_env_steps"] = log_total_env_steps
-        
+
         # Add steps per second if provided in metrics
         if 'steps_per_second' in metrics:
             system_metrics["SYS/steps_per_second"] = metrics.get('steps_per_second', 0)
@@ -654,24 +671,6 @@ class Trainer:
                 # Only create histogram if we have enough data points
                 if len(td_errors) >= 10:
                     grouped_metrics["td_errors"]["TD/distribution"] = wandb.Histogram(np.array(td_errors))
-
-        elif self.algorithm_type == "sac":
-            # SAC metrics organization
-            grouped_metrics = {
-                "training": {
-                    "actor_loss": metrics.get("actor_loss", 0),
-                    "critic1_loss": metrics.get("critic1_loss", 0),
-                    "critic2_loss": metrics.get("critic2_loss", 0),
-                    "alpha_loss": metrics.get("alpha_loss", 0),
-                    "alpha": metrics.get("alpha", 0),
-                    "buffer_size": len(self.algorithm.memory) if hasattr(self.algorithm, 'memory') else 0,
-                },
-                "performance": {
-                    "mean_return": metrics.get("mean_return", 0),
-                    "mean_q_value": metrics.get("mean_q_value", 0),
-                    "mean_entropy": metrics.get("mean_entropy", 0),
-                }
-            }
 
         # Flatten metrics for logging
         flat_metrics = {}
@@ -705,6 +704,46 @@ class Trainer:
                 print(f"[STEP DEBUG] Error logging to wandb: {e}")
                 import traceback
                 traceback.print_exc()
+
+    def store_initial_batch(self, obs_batch, action_batch, log_prob_batch, value_batch):
+        """
+        Store the initial part of experiences (obs, action, log_prob, value) in batch.
+        Delegates to the algorithm's implementation.
+        Returns the indices where the experiences were stored.
+        """
+        if hasattr(self.algorithm, 'store_initial_batch'):
+            return self.algorithm.store_initial_batch(obs_batch, action_batch, log_prob_batch, value_batch)
+        else:
+            # Fallback or error for algorithms not supporting batch storage
+            if self.debug:
+                print(f"[DEBUG] Algorithm {self.algorithm_type} does not support store_initial_batch.")
+            # Simulate storing one by one and return indices (inefficient fallback)
+            indices = []
+            start_pos = self.algorithm.memory.pos if hasattr(self.algorithm, 'memory') else 0
+            buffer_size = self.algorithm.memory.buffer_size if hasattr(self.algorithm, 'memory') else 0
+            for i in range(len(obs_batch)):
+                self.store_experience(obs_batch[i], action_batch[i], log_prob_batch[i], 0, value_batch[i], False)
+                # Calculate index (handle wrap around)
+                idx = (start_pos + i) % buffer_size
+                indices.append(idx)
+            return torch.tensor(indices, dtype=torch.long, device=self.device)
+
+
+    def update_rewards_dones_batch(self, indices, rewards_batch, dones_batch):
+        """
+        Update rewards and dones for experiences at given indices in batch.
+        Delegates to the algorithm's implementation.
+        """
+        if hasattr(self.algorithm, 'update_rewards_dones_batch'):
+            self.algorithm.update_rewards_dones_batch(indices, rewards_batch, dones_batch)
+        else:
+            # Fallback or error for algorithms not supporting batch update
+            if self.debug:
+                print(f"[DEBUG] Algorithm {self.algorithm_type} does not support update_rewards_dones_batch.")
+            # Simulate updating one by one (inefficient fallback)
+            for i, idx in enumerate(indices):
+                self.store_experience_at_idx(idx, reward=rewards_batch[i], done=dones_batch[i])
+
 
     def store_experience(self, state, action, log_prob, reward, value, done, env_id=0):
         """Store experience in the buffer with environment ID."""
@@ -891,6 +930,7 @@ class Trainer:
                             traceback.print_exc()
             else:
                 # For other algorithms like PPO, just store normally
+                # This method is now less used for PPO due to batching
                 self.algorithm.store_experience(state, action, log_prob, reward, value, done)
         else:
             # In test mode, just store without updating (for StreamAC)
@@ -920,7 +960,16 @@ class Trainer:
             features = None
             if hasattr(self.actor, 'extract_features'):
                 with torch.no_grad():
-                    features = self.actor.extract_features(state)
+                    # Ensure state is a tensor for feature extraction
+                    if not isinstance(state, torch.Tensor):
+                        state_tensor = torch.tensor(state, dtype=torch.float32, device=self.device)
+                        if state_tensor.dim() == 1: state_tensor = state_tensor.unsqueeze(0)
+                    else:
+                        state_tensor = state.to(self.device)
+                        if state_tensor.dim() == 1: state_tensor = state_tensor.unsqueeze(0)
+
+                    features = self.actor.extract_features(state_tensor)
+
 
             # Update auxiliary tasks and get metrics
             aux_metrics = self.aux_task_manager.update(
@@ -964,14 +1013,18 @@ class Trainer:
 
         return base_step
 
-    def store_experience_at_idx(self, idx, state, action, log_prob, reward, value, done):
+    def store_experience_at_idx(self, idx, state=None, action=None, log_prob=None, reward=None, value=None, done=None):
         """Forward to algorithm's store_experience_at_idx method if it exists"""
         # Delegate to algorithm's method if available, otherwise use our own
         if hasattr(self.algorithm, 'store_experience_at_idx'):
             self.algorithm.store_experience_at_idx(idx, obs=state, action=action, log_prob=log_prob, reward=reward, value=value, done=done)
-        else:
+        elif self.algorithm_type == "ppo":
             # Only PPO uses this method via memory, so use memory directly
-            self.memory.store_experience_at_idx(idx, state=state, action=action, log_prob=log_prob, reward=reward, value=value, done=done)
+            self.algorithm.memory.store_experience_at_idx(idx, state=state, action=action, log_prob=log_prob, reward=reward, value=value, done=done)
+        else:
+             if self.debug:
+                 print(f"[DEBUG] store_experience_at_idx called but not supported by {self.algorithm_type}")
+
 
     def get_action(self, obs, deterministic=False, return_features=False):
         """
@@ -984,8 +1037,8 @@ class Trainer:
             return_features: If True, also return extracted features (for auxiliary tasks)
 
         Returns:
-            For PPO: Tuple containing (action, log_prob) or (action, log_prob, features)
-            For other algorithms: May still return (action, log_prob, value[, features])
+            Tuple containing (action, log_prob, value[, features])
+            For PPO, value is a dummy tensor of zeros.
         """
         # Convert observation to tensor if it's not already
         if not isinstance(obs, torch.Tensor):
@@ -997,25 +1050,10 @@ class Trainer:
 
         # Forward to algorithm's get_action method
         result = self.algorithm.get_action(obs, deterministic, return_features)
-        
-        # For compatibility with the rest of the codebase, if this is PPO algorithm,
-        # add a dummy value tensor (will be replaced with proper values during update)
-        if self.algorithm_type == "ppo":
-            if return_features:
-                # PPO returns: action, log_prob, features
-                action, log_prob, features = result
-                # Add dummy value tensor
-                dummy_value = torch.zeros_like(log_prob)
-                return action, log_prob, dummy_value, features
-            else:
-                # PPO returns: action, log_prob
-                action, log_prob = result
-                # Add dummy value tensor
-                dummy_value = torch.zeros_like(log_prob)
-                return action, log_prob, dummy_value
-        else:
-            # Other algorithms may still return values directly
-            return result
+
+        # PPO's get_action now returns (action, log_prob, dummy_value[, features]) directly
+        return result
+
 
     def update(self, completed_episode_rewards=None, total_env_steps: Optional[int] = None, steps_per_second: Optional[float] = None):
         """Update policy based on collected experiences.
@@ -1036,7 +1074,7 @@ class Trainer:
         # Store total_env_steps if provided (mainly for PPO)
         if total_env_steps is not None:
             self.total_env_steps = total_env_steps
-            
+
         # Store steps_per_second if provided
         if steps_per_second is not None:
             metrics['steps_per_second'] = steps_per_second
@@ -1050,43 +1088,13 @@ class Trainer:
         metrics['update_time'] = update_time
 
         # Ensure explained_variance is correctly calculated and reported for PPO
-        if self.algorithm_type == "ppo" and metrics.get('explained_variance', 0.0) == 0.0:
-            # If we need to recalculate it, we can look at the metrics data
-            if hasattr(self.algorithm, 'memory') and \
-               hasattr(self.algorithm.memory, 'values') and \
-               hasattr(self.algorithm.memory, 'rewards') and \
-               self.algorithm.memory.values is not None and \
-               self.algorithm.memory.rewards is not None and \
-               self.algorithm.memory.size > 1:
-                try:
-                    # Access tensors only after validation
-                    values = self.algorithm.memory.values[:self.algorithm.memory.size].detach().cpu().numpy()
-                    returns = self.algorithm.memory.rewards[:self.algorithm.memory.size].detach().cpu().numpy()
+        if self.algorithm_type == "ppo" and 'explained_variance' not in metrics:
+            # PPOAlgorithm._update_policy now calculates explained_variance directly
+            # If it's missing, it means the update likely failed or was skipped.
+            if self.debug:
+                print("[DEBUG] Explained variance missing from PPO update metrics.")
+            metrics['explained_variance'] = 0.0 # Default to 0 if missing
 
-                    # Calculate explained variance: 1 - (var(y - pred) / var(y))
-                    var_y = np.var(returns)
-                    # Add small epsilon to denominator to prevent division by zero
-                    explained_var = 1 - np.var(returns - values) / (var_y + 1e-8)
-                    metrics['explained_variance'] = explained_var
-
-                    if self.debug:
-                        print(f"[DEBUG] Recalculated explained_variance: {explained_var:.4f}")
-
-                except Exception as e:
-                    if self.debug:
-                        print(f"[DEBUG] Error recalculating explained_variance: {str(e)}")
-                        import traceback
-                        traceback.print_exc()
-            elif self.debug:
-                 # Log why calculation was skipped
-                 if not hasattr(self.algorithm, 'memory'):
-                     print("[DEBUG] Skipping explained_variance: algorithm has no memory attribute.")
-                 elif self.algorithm.memory.values is None:
-                     print("[DEBUG] Skipping explained_variance: memory.values is None.")
-                 elif self.algorithm.memory.rewards is None:
-                     print("[DEBUG] Skipping explained_variance: memory.rewards is None.")
-                 elif self.algorithm.memory.size <= 1:
-                     print(f"[DEBUG] Skipping explained_variance: memory size ({self.algorithm.memory.size}) <= 1.")
 
         # Update training step counter
         if self.algorithm_type != "streamac":  # For StreamAC, steps are tracked in store_experience
@@ -1097,14 +1105,17 @@ class Trainer:
             metrics['mean_episode_reward'] = np.mean(completed_episode_rewards)
             if self.debug:
                 print(f"[DEBUG] Using {len(completed_episode_rewards)} completed episode rewards, mean: {metrics['mean_episode_reward']:.4f}")
-        # Otherwise check internal episode rewards (fallback)
-        elif hasattr(self, 'episode_rewards') and len(self.episode_rewards) > 0:
-            episode_rewards = list(self.episode_rewards)
-            # Calculate mean episode reward
-            if episode_rewards:
-                metrics['mean_episode_reward'] = np.mean(episode_rewards)
-            # Clear episode rewards
-            self.episode_rewards = []
+        # Otherwise check internal episode returns (fallback, mainly for PPO)
+        elif self.algorithm_type == "ppo" and hasattr(self.algorithm, 'episode_returns') and len(self.algorithm.episode_returns) > 0:
+            episode_returns = list(self.algorithm.episode_returns)
+            if episode_returns:
+                metrics['mean_episode_reward'] = np.mean(episode_returns)
+                if self.debug:
+                    print(f"[DEBUG] Using internal PPO episode returns, mean: {metrics['mean_episode_reward']:.4f}")
+        # For StreamAC, mean_return is often calculated internally
+        elif self.algorithm_type == "streamac" and 'mean_return' in metrics:
+             metrics['mean_episode_reward'] = metrics['mean_return']
+
 
         # --- Auxiliary Task Update ---
         if self.use_auxiliary_tasks and hasattr(self, 'aux_task_manager') and not self.test_mode:
@@ -1166,7 +1177,7 @@ class Trainer:
 
     def reset_auxiliary_tasks(self):
         """Reset auxiliary task history when episodes end"""
-        if self.use_auxiliary_tasks:
+        if self.use_auxiliary_tasks and hasattr(self, 'aux_task_manager'):
             self.aux_task_manager.reset()
 
     def save_models(self, model_path=None, metadata=None):
@@ -1340,12 +1351,23 @@ class Trainer:
 
                     # Restore PPO memory state if possible
                     if hasattr(self.algorithm, 'memory'):
-                        self.algorithm.memory.pos = algorithm_state.get('memory_pos', 0)
-                        self.algorithm.memory.size = algorithm_state.get('memory_size', 0)
-                        self.algorithm.memory.full = algorithm_state.get('memory_full', False)
+                        # Restore memory state if saved (might not be in older checkpoints)
+                        if 'memory_state' in algorithm_state:
+                             try:
+                                 self.algorithm.memory.load_state_dict(algorithm_state['memory_state'])
+                                 if self.debug:
+                                     print(f"[DEBUG] Restored PPO memory state: pos={self.algorithm.memory.pos}, size={self.algorithm.memory.size}")
+                             except Exception as e:
+                                 print(f"Warning: Could not load PPO memory state: {e}. Resetting memory.")
+                                 self.algorithm.memory.clear()
+                        else:
+                             # Legacy loading for older checkpoints
+                             self.algorithm.memory.pos = algorithm_state.get('memory_pos', 0)
+                             self.algorithm.memory.size = algorithm_state.get('memory_size', 0)
+                             self.algorithm.memory.full = algorithm_state.get('memory_full', False)
+                             if self.debug:
+                                 print(f"[DEBUG] Restored legacy PPO memory state: pos={self.algorithm.memory.pos}, size={self.algorithm.memory.size}")
 
-                        if self.debug:
-                            print(f"[DEBUG] Restored PPO memory state: pos={self.algorithm.memory.pos}, size={self.algorithm.memory.size}")
 
                     # Restore episode returns tracking
                     if hasattr(self.algorithm, 'episode_returns') and 'episode_returns' in algorithm_state:
@@ -1554,7 +1576,7 @@ class Trainer:
                     self.pretraining_completed = True
 
             # ===== Restore Pretraining State =====
-            if 'metadata' in checkpoint and 'pretraining' in metadata.get('pretraining', {}):
+            if 'metadata' in checkpoint and 'pretraining' in metadata: # Check metadata first
                 pretraining_state = metadata['pretraining']
                 self.pretraining_completed = pretraining_state.get('completed', self.pretraining_completed)
                 self.in_transition_phase = pretraining_state.get('in_transition', self.in_transition_phase)
@@ -1573,13 +1595,14 @@ class Trainer:
                 # Explicitly check and print the pretraining_completed flag
                 if self.debug:
                     pretraining_status = "completed" if self.pretraining_completed else ("transitioning" if self.in_transition_phase else "active")
-                    print(f"[DEBUG] Restored pretraining state: {pretraining_status}")
+                    print(f"[DEBUG] Restored pretraining state from metadata: {pretraining_status}")
                     print(f"[DEBUG] pretraining_completed = {self.pretraining_completed}")
-            # If we explicitly find the 'pretraining_completed' at the top level, use it
+            # If we explicitly find the 'pretraining_completed' at the top level (older format), use it
             elif 'pretraining_completed' in checkpoint:
                 self.pretraining_completed = checkpoint['pretraining_completed']
                 if self.debug:
                     print(f"[DEBUG] Found top-level pretraining_completed = {self.pretraining_completed}")
+
 
             # ===== Resume WandB Run =====
             if self.use_wandb and 'wandb' in checkpoint and checkpoint['wandb']:
@@ -1587,7 +1610,7 @@ class Trainer:
 
                 try:
                     # Check if we need to resume a wandb run
-                    if 'run_id' in wandb_info and wandb.run is None or (wandb.run and wandb.run.id != wandb_info['run_id']):
+                    if 'run_id' in wandb_info and (wandb.run is None or (wandb.run and wandb.run.id != wandb_info['run_id'])):
                         run_id = wandb_info['run_id']
                         project = wandb_info.get('project', 'rlbot-training')
                         entity = wandb_info.get('entity', None)
@@ -1796,13 +1819,28 @@ class Trainer:
             # Convert inputs to tensors if needed
             if not isinstance(state, torch.Tensor): obs_tensor = torch.tensor(state, dtype=torch.float32, device=self.device)
             else: obs_tensor = state.to(self.device)
-            if not isinstance(action, torch.Tensor): action_tensor = torch.tensor(action, dtype=torch.float32, device=self.device) # Use float32 for actions too
+            if not isinstance(action, torch.Tensor):
+                 # Handle discrete vs continuous action conversion
+                 if self.action_space_type == "discrete":
+                     # Assume action is index or one-hot, convert to LongTensor index
+                     if isinstance(action, np.ndarray) and action.shape == (self.action_dim,): # One-hot
+                         action_idx = np.argmax(action)
+                     elif isinstance(action, (int, float, np.number)):
+                         action_idx = int(action)
+                     else:
+                         action_idx = 0 # Fallback
+                     action_tensor = torch.tensor([action_idx], dtype=torch.long, device=self.device)
+                 else: # Continuous
+                     action_tensor = torch.tensor(action, dtype=torch.float32, device=self.device)
             else: action_tensor = action.to(self.device)
+
             if not isinstance(next_state, torch.Tensor): next_obs_tensor = torch.tensor(next_state, dtype=torch.float32, device=self.device)
             else: next_obs_tensor = next_state.to(self.device)
+
             # Ensure batch dimension
             if obs_tensor.dim() == 1: obs_tensor = obs_tensor.unsqueeze(0)
-            if action_tensor.dim() == 1: action_tensor = action_tensor.unsqueeze(0)
+            if action_tensor.dim() == 0: action_tensor = action_tensor.unsqueeze(0) # Handle scalar action index
+            elif action_tensor.dim() == 1 and self.action_space_type != "discrete": action_tensor = action_tensor.unsqueeze(0) # Handle vector continuous action
             if next_obs_tensor.dim() == 1: next_obs_tensor = next_obs_tensor.unsqueeze(0)
 
 
@@ -1866,20 +1904,8 @@ class Trainer:
 
         # Update stored experience if index is provided (for PPO)
         if store_idx is not None and self.algorithm_type == "ppo":
-            # Convert to tensor if needed
-            if not isinstance(total_reward, torch.Tensor):
-                total_reward_tensor = torch.tensor(total_reward, dtype=torch.float32, device=self.device)
-            else:
-                total_reward_tensor = total_reward.to(self.device)
-
-            # Update the experience in memory
-            # Ensure we only update the reward field
-            if hasattr(self.algorithm, 'memory') and hasattr(self.algorithm.memory, 'rewards'):
-                 # Check bounds
-                 if 0 <= store_idx < len(self.algorithm.memory.rewards):
-                     self.algorithm.memory.rewards[store_idx] = total_reward_tensor
-                 elif self.debug:
-                     print(f"[DEBUG] Invalid store_idx {store_idx} for memory size {len(self.algorithm.memory.rewards)}")
+            # Update the experience in memory using the dedicated method
+            self.store_experience_at_idx(store_idx, reward=total_reward, done=done)
 
 
         return total_reward
@@ -1888,88 +1914,100 @@ class Trainer:
         """
         Calculates intrinsic rewards in batch for multiple agents/environments.
         This reduces redundant computation when multiple agents need intrinsic rewards.
-        
+
         Args:
             states: Batch of states/observations (numpy array or tensor)
-            actions: Batch of actions (numpy array or tensor)
+            actions: Batch of actions (numpy array or tensor) - Can be indices or one-hot for discrete
             next_states: Batch of next states/observations (numpy array or tensor)
             env_ids: List of environment IDs for each sample
-            
+
         Returns:
             Batch of intrinsic rewards (numpy array)
         """
         if not self.use_intrinsic_rewards or self.intrinsic_reward_generator is None:
             # Return zeros with the right shape
             return np.zeros(len(states))
-            
+
         # Convert inputs to tensors
         if not isinstance(states, torch.Tensor):
             states_tensor = torch.FloatTensor(states).to(self.device)
         else:
             states_tensor = states.to(self.device)
-            
+
         # Handle actions based on action space type
         if not isinstance(actions, torch.Tensor):
             if self.action_space_type == "discrete":
-                # Convert to LongTensor for discrete actions
-                # This might need adjustment based on action structure
+                # Convert to LongTensor indices for discrete actions
                 try:
-                    actions_tensor = torch.LongTensor(actions).to(self.device)
-                except:
-                    # Fallback if conversion fails
+                    # Check if actions are one-hot encoded
+                    if isinstance(actions, np.ndarray) and actions.ndim == 2 and actions.shape[1] == self.action_dim:
+                        actions_indices = np.argmax(actions, axis=1)
+                    else: # Assume already indices
+                        actions_indices = np.array(actions, dtype=int)
+                    actions_tensor = torch.LongTensor(actions_indices).to(self.device)
+                except Exception as e:
                     if self.debug:
-                        print("[DEBUG] Failed to convert actions to LongTensor, using FloatTensor")
+                        print(f"[DEBUG] Failed to convert actions to LongTensor indices: {e}. Using FloatTensor.")
                     actions_tensor = torch.FloatTensor(actions).to(self.device)
-            else:
+            else: # Continuous
                 actions_tensor = torch.FloatTensor(actions).to(self.device)
         else:
             actions_tensor = actions.to(self.device)
-            
+            # Ensure correct type for discrete actions if tensor is provided
+            if self.action_space_type == "discrete" and actions_tensor.dtype != torch.long:
+                 if actions_tensor.ndim == 2 and actions_tensor.shape[1] == self.action_dim: # One-hot float tensor
+                     actions_tensor = torch.argmax(actions_tensor, dim=1).long()
+                 else: # Assume indices, cast to long
+                     actions_tensor = actions_tensor.long()
+
+
         if not isinstance(next_states, torch.Tensor):
             next_states_tensor = torch.FloatTensor(next_states).to(self.device)
         else:
             next_states_tensor = next_states.to(self.device)
-        
-        # Ensure batch dimension
-        if states_tensor.dim() == 1:
-            states_tensor = states_tensor.unsqueeze(0)
-        if actions_tensor.dim() == 1:
-            actions_tensor = actions_tensor.unsqueeze(0)
-        if next_states_tensor.dim() == 1:
-            next_states_tensor = next_states_tensor.unsqueeze(0)
-        
+
+        # Ensure batch dimension (should already be batched, but double-check)
+        if states_tensor.dim() == 1: states_tensor = states_tensor.unsqueeze(0)
+        if actions_tensor.dim() == 0: actions_tensor = actions_tensor.unsqueeze(0) # Handle single scalar action index
+        elif actions_tensor.dim() == 1 and self.action_space_type != "discrete": actions_tensor = actions_tensor.unsqueeze(0) # Handle single vector continuous action
+        if next_states_tensor.dim() == 1: next_states_tensor = next_states_tensor.unsqueeze(0)
+
         # Compute batch intrinsic rewards
         intrinsic_rewards = self.intrinsic_reward_generator.compute_intrinsic_reward(
             states_tensor, actions_tensor, next_states_tensor
         )
-        
+
         # Initialize array for scaled intrinsic rewards
         if isinstance(intrinsic_rewards, torch.Tensor):
             intrinsic_rewards = intrinsic_rewards.detach().cpu().numpy()
-        
+
         # Flatten if needed to ensure we have a 1D array
         if intrinsic_rewards.ndim > 1:
             intrinsic_rewards = intrinsic_rewards.flatten()
-            
+
         # Array to store adaptive scaled rewards
         adaptive_scaled_rewards = np.zeros_like(intrinsic_rewards)
-        
+
         # Apply adaptive scaling based on extrinsic rewards for each environment
+        # NOTE: This scaling uses a default normalized reward of 0 because we don't
+        # have the extrinsic rewards readily available here. A more accurate scaling
+        # would require passing the extrinsic rewards to this function.
+        # For now, we use a simplified scaling based only on the intrinsic scale factor.
         for i, env_id in enumerate(env_ids):
             # Get normalization parameters
             if not hasattr(self, 'extrinsic_reward_normalizer'):
                 from intrinsic_rewards import ExtrinsicRewardNormalizer
                 self.extrinsic_reward_normalizer = ExtrinsicRewardNormalizer()
-                
-            # Use sigmoid adaptive scaling
-            normalized_reward = 0  # Default value when no extrinsic available
+
+            # Use sigmoid adaptive scaling (simplified: assumes normalized_reward=0)
+            normalized_reward = 0
             sigmoid_factor = 1.0 / (1.0 + np.exp(2.0 * normalized_reward))
             adaptive_scale = self.intrinsic_reward_scale * sigmoid_factor
             adaptive_scale = max(0.1 * self.intrinsic_reward_scale, adaptive_scale)  # Minimum scale
-            
+
             # Apply the scale
             adaptive_scaled_rewards[i] = intrinsic_rewards[i] * adaptive_scale
-        
+
         return adaptive_scaled_rewards
 
     def _cleanup_tensors(self):

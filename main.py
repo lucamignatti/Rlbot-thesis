@@ -358,9 +358,9 @@ def run_training(
     # Add algorithm-specific progress metrics
     if algorithm == "ppo":
         stats_dict["Exp"] = f"0/{update_interval}"  # Experience counter for PPO
-    else:  # StreamAC
-        stats_dict["Steps"] = 0  # Step counter for StreamAC
-        stats_dict["Updates"] = 0  # Update counter for StreamAC
+    else:  # StreamAC or SAC
+        stats_dict["Steps"] = 0  # Step counter
+        stats_dict["Updates"] = 0  # Update counter
 
     # Add common metrics
     stats_dict.update({
@@ -401,6 +401,13 @@ def run_training(
             "ActorLR": f"{lr_actor:.6f}",  # Display actor learning rate (will change with adaptive LR)
             "CriticLR": f"{lr_critic:.6f}"  # Display critic learning rate
         })
+    # Add SAC specific info
+    elif algorithm == "sac":
+         stats_dict.update({
+             "Alpha": f"{trainer.algorithm.alpha:.4f}" if hasattr(trainer.algorithm, 'alpha') else "N/A",
+             "Buffer": "0"
+         })
+
 
     progress_bar.set_postfix(stats_dict)
 
@@ -411,26 +418,14 @@ def run_training(
     last_update_time = time.time()
     last_save_episode = 0
     last_progress_update_step = 0  # Track last step count when progress was updated
-    
+
     # Variables to track steps per second
     steps_per_second = 0
     last_steps_time = time.time()
     last_steps_count = 0
 
-    # Add defensive initialization for episode_rewards
+    # Initialize episode rewards lazily within the loop
     episode_rewards = {}
-    for i in range(num_envs):
-        episode_rewards[i] = {}
-        try:
-            if vec_env.obs_dicts[i]:
-                for agent_id in vec_env.obs_dicts[i]:
-                    episode_rewards[i][agent_id] = 0
-            else:
-                if debug:
-                    print(f"[DEBUG] Warning: Empty observations for env {i}")
-        except Exception as e:
-            if debug:
-                print(f"[DEBUG] Error initializing rewards for env {i}: {e}")
 
     # Add a list to track rewards of completed episodes between PPO updates
     completed_episode_rewards_since_last_update = []
@@ -461,320 +456,270 @@ def run_training(
                 break
 
             # Batch up observations from all environments for efficiency
-            all_obs = []
+            all_obs_list = []
             all_env_indices = []
             all_agent_ids = []
             # Organize observations into lists for batch processing.
             for env_idx, obs_dict in enumerate(vec_env.obs_dicts):
-                for agent_id, obs in obs_dict.items():
-                    all_obs.append(obs)
+                 # Lazily initialize episode rewards dictionary for this env if needed
+                 if env_idx not in episode_rewards:
+                     episode_rewards[env_idx] = {}
+
+                 for agent_id, obs in obs_dict.items():
+                    all_obs_list.append(obs)
                     all_env_indices.append(env_idx)
                     all_agent_ids.append(agent_id)
+                    # Lazily initialize agent reward tracking
+                    if agent_id not in episode_rewards[env_idx]:
+                         episode_rewards[env_idx][agent_id] = 0.0
+                         if debug: print(f"[DEBUG] Initialized episode_rewards for {agent_id} in env {env_idx} (during obs collection)")
+
 
             # Only proceed if we have observations. (It's possible all environments ended at the same time.)
             actions_dict_list = [{} for _ in range(num_envs)]  # Initialize outside the block to avoid unbound issues
-            if len(all_obs) > 0:
-                obs_batch = torch.FloatTensor(np.stack(all_obs)).to(device)
+            store_indices = None # Indices where experiences are stored (for PPO)
+
+            if len(all_obs_list) > 0:
+                obs_batch = torch.FloatTensor(np.stack(all_obs_list)).to(device)
                 with torch.no_grad():
-                    # Get actions from the networks - now without values during inference
+                    # Get actions from the networks - now returns dummy values for PPO
                     action_batch, log_prob_batch, value_batch, features_batch = trainer.get_action(obs_batch, return_features=True)
-                if type(action_batch) in [int, float, np.float64, np.float32]:
-                    action_batch = [action_batch]
-                if type(log_prob_batch) in [int, float, np.float64, np.float32]:
-                    log_prob_batch = [log_prob_batch]
-                if type(value_batch) in [int, float, np.float64, np.float32]:
-                    value_batch = [value_batch]
+
+                # --- Batch Store Initial Experience (PPO) ---
+                if algorithm == "ppo" and not test:
+                    # Store obs, action, log_prob, value (placeholder) in batch
+                    store_indices = trainer.store_initial_batch(
+                        obs_batch, action_batch, log_prob_batch, value_batch
+                    )
+                    collected_experiences += len(obs_batch) # Increment collected experiences count
+                    if debug and collected_experiences % 100 == 0:
+                         print(f"[DEBUG PPO] Collected {collected_experiences} experiences (batch size {len(obs_batch)})")
+
+                # --- Prepare actions for environment step ---
+                # Convert actions to CPU numpy arrays for the environment step
+                # Handle both tensor and non-tensor actions returned by get_action
+                if isinstance(action_batch, torch.Tensor):
+                    action_batch_np = action_batch.cpu().numpy()
+                else:
+                    # If not a tensor, assume it's a list/array already compatible
+                    action_batch_np = np.array(action_batch)
+
 
                 # Organize actions into a list of dictionaries, one for each environment.
-                for i, (action, log_prob, value) in enumerate(zip(action_batch, log_prob_batch, value_batch)):
+                for i, action_np in enumerate(action_batch_np):
                     env_idx = all_env_indices[i]
                     agent_id = all_agent_ids[i]
+                    actions_dict_list[env_idx][agent_id] = action_np # Use CPU numpy action
 
-                    # Make sure actions sent to environments are CPU tensors or numpy arrays
-                    # This prevents CUDA/HIP errors when sending tensors between processes
-                    if isinstance(action, torch.Tensor) and action.is_cuda:
-                        cpu_action = action.detach().cpu()
-                        actions_dict_list[env_idx][agent_id] = cpu_action
-                    else:
-                        actions_dict_list[env_idx][agent_id] = action
+                    # --- Store Experience (Non-PPO or Test Mode) ---
+                    # If not PPO or in test mode, use the old single-store method
+                    if (algorithm != "ppo" or test) and not test: # Only store if not testing
+                        # Pass original tensors (potentially GPU) to store_experience
+                        trainer.store_experience(
+                            all_obs_list[i],
+                            action_batch[i], # Original action tensor/value
+                            log_prob_batch[i],
+                            0,  # Placeholder reward, updated after environment step
+                            value_batch[i],
+                            False,  # Placeholder done flag, updated after environment step
+                            env_id=env_idx
+                        )
+                        collected_experiences += 1 # Increment for non-PPO algorithms too
 
-                    # Store the experience (observations, actions, etc.) with env_idx for StreamAC
-                    trainer.store_experience(
-                        all_obs[i],
-                        action,
-                        log_prob,
-                        0,  # Placeholder reward, updated after environment step
-                        value,  # Value is now a dummy placeholder for PPO (recalculated during update)
-                        False,  # Placeholder done flag, updated after environment step
-                        env_id=env_idx  # Pass the environment index to support vectorized StreamAC
-                    )
-                    collected_experiences += 1
-
-                    # Add periodic debug log to verify experience collection
-                    if debug and collected_experiences % 1000 == 0:
-                        if algorithm == "ppo" and hasattr(trainer.algorithm, 'memory'):
-                            mem_buffer_size = getattr(trainer.algorithm.memory, 'buffer_size', 0)
-                            mem_pos = getattr(trainer.algorithm.memory, 'pos', 0)
-                            print(f"[DEBUG] PPO buffer status: {mem_pos}/{mem_buffer_size} filled, collected_experiences={collected_experiences}")
-                            # Check if memory has actually been initialized
-                            if hasattr(trainer.algorithm.memory, 'rewards') and trainer.algorithm.memory.rewards is not None:
-                                reward_tensor = trainer.algorithm.memory.rewards
-                                non_zero = (reward_tensor != 0).sum().item() if isinstance(reward_tensor, torch.Tensor) else 0
-                                print(f"[DEBUG] Number of non-zero rewards in buffer: {non_zero}")
 
             # Step all environments forward in parallel - optimized implementation
             results, dones, episode_counts = vec_env.step(actions_dict_list)
 
             # Increment total environment steps counter
-            total_env_steps += num_envs
+            current_batch_env_steps = len(all_obs_list) # Number of agent steps in this batch
+            total_env_steps += current_batch_env_steps
 
             # Update trainer's total_env_steps attribute for logging
             trainer.total_env_steps = total_env_steps
-            
+
             # Calculate steps per second
             current_time = time.time()
             elapsed_since_last_calc = current_time - last_steps_time
             if elapsed_since_last_calc >= 1.0:  # Update once per second
-                steps_per_second = (total_env_steps - last_steps_count) / elapsed_since_last_calc
+                steps_this_period = total_env_steps - last_steps_count
+                steps_per_second = steps_this_period / elapsed_since_last_calc
                 last_steps_time = current_time
                 last_steps_count = total_env_steps
                 stats_dict["Steps/s"] = f"{steps_per_second:.1f}"
 
-            # Process the results from each environment.
-            exp_idx = 0  # Index into our experience buffer.
-            # Initialize a list to collect data for batch intrinsic reward calculation
-            intrinsic_batch_inputs = []
+            # --- Process Results and Update Rewards/Dones (PPO Batch) ---
+            if algorithm == "ppo" and not test and store_indices is not None:
+                batch_rewards = []
+                batch_dones = []
+                batch_next_obs = []
+                batch_env_ids_for_intrinsic = []
+                batch_store_indices_for_update = [] # Indices corresponding to rewards/dones
 
-            for env_idx, result in enumerate(results):
-                # Handle both threading and multiprocessing return formats
-                if isinstance(result, tuple):
-                    if len(result) == 5:  # Thread mode: (env_idx, obs, rewards, terminated, truncated)
-                        _, next_obs_dict, reward_dict, terminated_dict, truncated_dict = result
-                    else:  # Multiprocessing mode: (obs, rewards, terminated, truncated)
-                        next_obs_dict, reward_dict, terminated_dict, truncated_dict = result
-                else:
-                    if debug:
-                        print(f"[DEBUG] Unexpected result type: {type(result)}")
-                    continue
+                exp_idx_map = {i: idx for i, idx in enumerate(store_indices.tolist())} # Map batch index to buffer index
 
-                for agent_id in reward_dict.keys():  # Use reward_dict to ensure we get the correct agent ID.
-                    # Get the actual reward and done flag for this agent in this environment.
-                    extrinsic_reward = reward_dict[agent_id]
-                    done = terminated_dict[agent_id] or truncated_dict[agent_id]
+                current_exp_idx = 0
+                for env_idx, result in enumerate(results):
+                    # Handle return formats
+                    if isinstance(result, tuple):
+                        if len(result) == 5: _, next_obs_dict, reward_dict, terminated_dict, truncated_dict = result
+                        else: next_obs_dict, reward_dict, terminated_dict, truncated_dict = result
+                    else: continue
 
-                    # Get the next observation for this agent
-                    next_obs = next_obs_dict.get(agent_id, None)
+                    # Ensure episode_rewards dict exists for this env_idx
+                    if env_idx not in episode_rewards: episode_rewards[env_idx] = {}
 
-                    # Reset action history if episode is done
-                    if done:
-                        action_stacker.reset_agent(agent_id)
-                        trainer.reset_auxiliary_tasks()
+                    for agent_id in reward_dict.keys():
+                        if current_exp_idx < len(all_obs_list): # Ensure we don't go out of bounds
+                            extrinsic_reward = reward_dict[agent_id]
+                            done = terminated_dict[agent_id] or truncated_dict[agent_id]
+                            next_obs = next_obs_dict.get(agent_id, None)
 
-                    # Update the stored experience with the correct reward and done flag.
-                    if algorithm == "ppo":
-                        # For PPO, we have a memory buffer with indices
-                        mem_idx = trainer.memory.pos - len(all_obs) + exp_idx
-                        if mem_idx < 0:  # Handle wrap-around in the circular buffer.
-                            mem_idx += trainer.memory.buffer_size
+                            batch_rewards.append(extrinsic_reward)
+                            batch_dones.append(done)
+                            if next_obs is not None: batch_next_obs.append(next_obs)
+                            batch_env_ids_for_intrinsic.append(env_idx)
+                            # Get the correct buffer index for this agent step
+                            buffer_idx = exp_idx_map.get(current_exp_idx)
+                            if buffer_idx is not None:
+                                batch_store_indices_for_update.append(buffer_idx)
 
-                        # Debug the reward update process
-                        if debug and exp_idx == 0:  # Only log for the first agent to avoid too much output
-                            print(f"[DEBUG] Updating experience at idx {mem_idx} with reward={extrinsic_reward:.4f}, done={done}")
+                            # Accumulate rewards for episode tracking (using extrinsic for now)
+                            # Defensive check/initialization before accumulating
+                            if agent_id not in episode_rewards[env_idx]:
+                                episode_rewards[env_idx][agent_id] = 0.0
+                                if debug: print(f"[DEBUG] Initialized episode_rewards for {agent_id} in env {env_idx} (during PPO result processing)")
+                            episode_rewards[env_idx][agent_id] += extrinsic_reward
 
-                        # Store extrinsic reward and done flag immediately
-                        trainer.store_experience_at_idx(mem_idx, None, None, None, extrinsic_reward, None, done)
+                            if done:
+                                action_stacker.reset_agent(agent_id)
+                                trainer.reset_auxiliary_tasks()
 
-                        # If intrinsic rewards are enabled, collect data for batch processing
-                        if next_obs is not None and trainer.use_intrinsic_rewards:
-                            orig_obs = all_obs[exp_idx]
-                            action = actions_dict_list[env_idx][agent_id]
-                            intrinsic_batch_inputs.append({
-                                'mem_idx': mem_idx,
-                                'state': orig_obs,
-                                'action': action,
-                                'next_state': next_obs,
-                                'extrinsic_reward': extrinsic_reward,
-                                'env_id': env_idx
-                            })
-                    else:
-                        # For StreamAC, we directly update the latest experience with env_idx
-                        if hasattr(trainer.algorithm, 'experience_buffers'):
-                            # Check if this environment has a buffer
-                            if env_idx in trainer.algorithm.experience_buffers and len(trainer.algorithm.experience_buffers[env_idx]) > 0:
-                                # Update the most recent experience with actual reward and done flag
-                                try:
-                                    latest_exp = trainer.algorithm.experience_buffers[env_idx][-1]
-                                    total_reward = extrinsic_reward
-
-                                    # Calculate combined reward (extrinsic + intrinsic) if next observation is available
-                                    # For StreamAC, we still calculate per-agent due to its online nature
-                                    if next_obs is not None and trainer.use_intrinsic_rewards:
-                                        total_reward = trainer.update_experience_with_intrinsic_reward(
-                                            state=latest_exp['obs'],
-                                            action=latest_exp['action'],
-                                            next_state=next_obs,
-                                            reward=extrinsic_reward,
-                                            env_id=env_idx
-                                        )
-
-                                    if 'reward' in latest_exp:  # Safety check
-                                        if isinstance(total_reward, (int, float, np.number)):
-                                            latest_exp['reward'] = torch.tensor(total_reward, dtype=torch.float32, device=trainer.device)
-                                        elif isinstance(total_reward, np.ndarray):
-                                            if total_reward.size == 1:  # If it's a scalar array
-                                                latest_exp['reward'] = torch.tensor(total_reward.item(), dtype=torch.float32, device=trainer.device)
-                                            else:
-                                                latest_exp['reward'] = torch.tensor(total_reward[0], dtype=torch.float32, device=trainer.device)
-                                        elif isinstance(total_reward, torch.Tensor):
-                                            latest_exp['reward'] = total_reward.to(device=trainer.device, dtype=torch.float32)
-                                        else:
-                                            latest_exp['reward'] = torch.tensor(float(total_reward), dtype=torch.float32, device=trainer.device)
-
-                                        # Update reward tracking for return calculation
-                                        if hasattr(trainer.algorithm, 'update_reward_tracking'):
-                                            trainer.algorithm.update_reward_tracking(total_reward, env_id=env_idx)
-                                except Exception as e:
-                                    if debug:
-                                        print(f"[DEBUG] Error updating StreamAC experience for env {env_idx}: {e}")
-                        elif hasattr(trainer.algorithm, 'experience_buffer'):
-                            # Legacy support for single environment case
-                            if len(trainer.algorithm.experience_buffer) > 0:
-                                # Update the most recent experience with actual reward and done flag
-                                try:
-                                    latest_exp = trainer.algorithm.experience_buffer[-1]
-                                    total_reward = extrinsic_reward
-                                    
-                                    # For StreamAC single buffer case, we still calculate per-agent 
-                                    if next_obs is not None and trainer.use_intrinsic_rewards:
-                                        total_reward = trainer.update_experience_with_intrinsic_reward(
-                                            state=latest_exp['obs'], 
-                                            action=latest_exp['action'], 
-                                            next_state=next_obs,
-                                            reward=extrinsic_reward,
-                                            env_id=0  # Use env_id 0 for single buffer case
-                                        )
-                                        
-                                    if 'reward' in latest_exp:  # Safety check
-                                        latest_exp['reward'] = torch.tensor([total_reward], dtype=torch.float32, device=trainer.device)
-                                        # Update reward tracking for return calculation
-                                        if hasattr(trainer.algorithm, 'update_reward_tracking'):
-                                            trainer.algorithm.update_reward_tracking(total_reward)
-                                    if 'done' in latest_exp:  # Safety check
-                                        latest_exp['done'] = torch.tensor([float(done)], dtype=torch.float32, device=trainer.device)
-
-                                        # When episode is done, explicitly track the return
-                                        if done and debug:
-                                            print(f"[DEBUG] Episode done detected for agent {agent_id} with reward {total_reward}")
-
-                                        # If the episode is done, force calculation of the return for this episode
-                                        if done and hasattr(trainer.algorithm, 'current_episode_rewards') and len(trainer.algorithm.current_episode_rewards) > 0:
-                                            episode_return = sum(trainer.algorithm.current_episode_rewards)
-                                            if hasattr(trainer.algorithm, 'episode_returns'):
-                                                trainer.algorithm.episode_returns.append(episode_return)
-                                                # Force update of mean_return metric
-                                                mean_return = sum(trainer.algorithm.episode_returns) / len(trainer.algorithm.episode_returns)
-                                                trainer.algorithm.metrics['mean_return'] = mean_return
-                                                if debug:
-                                                    print(f"[DEBUG] Calculated episode return: {episode_return:.2f}, mean: {mean_return:.2f}")
-                                                # Reset episode tracking
-                                                trainer.algorithm.current_episode_rewards_per_env[env_idx] = []
-                                except Exception as e:
-                                    if debug:
-                                        print(f"[DEBUG] Error updating StreamAC experience: {e}")
-                    
-                    # For tracking episode rewards, use original extrinsic reward for PPO 
-                    # since we'll update the actual rewards later in batch
-                    if algorithm == "ppo":
-                        reward_for_tracking = extrinsic_reward
-                    else:
-                        # For other algorithms, use the potentially combined reward that was just calculated
-                        reward_for_tracking = total_reward if 'total_reward' in locals() else extrinsic_reward
-
-                    # Accumulate rewards for episode tracking
-                    episode_rewards[env_idx][agent_id] += reward_for_tracking
-                    exp_idx += 1
-            
-            # Batch intrinsic reward calculation for PPO 
-            if algorithm == "ppo" and trainer.use_intrinsic_rewards and intrinsic_batch_inputs:
-                if debug:
-                    print(f"[DEBUG] Calculating intrinsic rewards in batch for {len(intrinsic_batch_inputs)} experiences")
-                
-                try:
-                    # Extract data into arrays
-                    states = np.stack([item['state'] for item in intrinsic_batch_inputs])
-                    next_states = np.stack([item['next_state'] for item in intrinsic_batch_inputs])
-                    env_ids = [item['env_id'] for item in intrinsic_batch_inputs]
-                    mem_indices = [item['mem_idx'] for item in intrinsic_batch_inputs]
-                    
-                    # Convert actions to appropriate format (this might need adjustment based on action structure)
-                    actions_list = [item['action'] for item in intrinsic_batch_inputs]
-                    extrinsic_rewards = [item['extrinsic_reward'] for item in intrinsic_batch_inputs]
-
-                    # Try to convert actions to a uniform format that can be batched
-                    try:
-                        if all(isinstance(a, np.ndarray) for a in actions_list):
-                            actions = np.stack(actions_list)
-                        elif all(isinstance(a, torch.Tensor) for a in actions_list):
-                            # Convert PyTorch tensors to numpy for consistent batch processing
-                            actions = np.stack([a.cpu().numpy() if a.is_cuda else a.numpy() for a in actions_list])
+                            current_exp_idx += 1
                         else:
-                            # For mixed types or single values, try a simple array conversion
-                            actions = np.array(actions_list)
-                    except Exception as e:
-                        if debug:
-                            print(f"[DEBUG] Error converting actions to batch: {e}. Falling back to array conversion.")
-                        # Fallback: convert each action individually then create array
-                        actions = []
-                        for act in actions_list:
-                            if isinstance(act, torch.Tensor):
-                                actions.append(act.cpu().numpy() if act.is_cuda else act.numpy())
-                            elif isinstance(act, np.ndarray):
-                                actions.append(act)
-                            else:
-                                actions.append(np.array([act]))
-                        actions = np.array(actions)
-                    
-                    # Calculate intrinsic rewards in batch
-                    intrinsic_rewards = trainer.calculate_intrinsic_rewards_batch(
-                        states=states,
-                        actions=actions,
-                        next_states=next_states,
-                        env_ids=env_ids
+                             if debug: print(f"[DEBUG] Warning: current_exp_idx ({current_exp_idx}) exceeded all_obs_list length ({len(all_obs_list)})")
+
+
+                # Ensure all lists have the same length before proceeding
+                min_len = min(len(batch_rewards), len(batch_dones), len(batch_store_indices_for_update))
+                if len(batch_rewards) != min_len: batch_rewards = batch_rewards[:min_len]
+                if len(batch_dones) != min_len: batch_dones = batch_dones[:min_len]
+                if len(batch_store_indices_for_update) != min_len: batch_store_indices_for_update = batch_store_indices_for_update[:min_len]
+                if len(batch_next_obs) != min_len: batch_next_obs = batch_next_obs[:min_len] # Need next_obs for intrinsic
+                if len(batch_env_ids_for_intrinsic) != min_len: batch_env_ids_for_intrinsic = batch_env_ids_for_intrinsic[:min_len]
+
+
+                if min_len > 0:
+                    batch_rewards_np = np.array(batch_rewards, dtype=np.float32)
+                    batch_dones_np = np.array(batch_dones, dtype=bool)
+                    batch_store_indices_tensor = torch.tensor(batch_store_indices_for_update, dtype=torch.long, device=device)
+
+                    final_rewards = batch_rewards_np
+
+                    # --- Batch Intrinsic Reward Calculation (PPO) ---
+                    if trainer.use_intrinsic_rewards and len(batch_next_obs) == min_len:
+                        if debug: print(f"[DEBUG PPO] Calculating intrinsic rewards for batch size {min_len}")
+                        try:
+                            # Prepare inputs for batch intrinsic calculation
+                            intrinsic_states = np.stack(all_obs_list[:min_len]) # Use the initial states for this batch
+                            intrinsic_actions = action_batch_np[:min_len] # Use the actions taken
+                            intrinsic_next_states = np.stack(batch_next_obs)
+                            intrinsic_env_ids = batch_env_ids_for_intrinsic[:min_len]
+
+                            intrinsic_rewards = trainer.calculate_intrinsic_rewards_batch(
+                                states=intrinsic_states,
+                                actions=intrinsic_actions,
+                                next_states=intrinsic_next_states,
+                                env_ids=intrinsic_env_ids
+                            )
+                            # Add intrinsic rewards to extrinsic rewards
+                            final_rewards = batch_rewards_np + intrinsic_rewards
+                            if debug and min_len > 0:
+                                print(f"[DEBUG PPO] Intrinsic reward example: Extrinsic={batch_rewards_np[0]:.4f}, Intrinsic={intrinsic_rewards[0]:.4f}, Total={final_rewards[0]:.4f}")
+
+                        except Exception as e:
+                            if debug:
+                                print(f"[DEBUG PPO] Error calculating batch intrinsic rewards: {e}")
+                                traceback.print_exc()
+                            # Use only extrinsic rewards if intrinsic calculation fails
+                            final_rewards = batch_rewards_np
+
+                    # --- Update Rewards and Dones in Buffer (PPO) ---
+                    trainer.update_rewards_dones_batch(
+                        batch_store_indices_tensor,
+                        torch.tensor(final_rewards, dtype=torch.float32, device=device),
+                        torch.tensor(batch_dones_np, dtype=torch.bool, device=device)
                     )
-                    
-                    # Update rewards in the PPO memory buffer with combined rewards
-                    for i, mem_idx in enumerate(mem_indices):
-                        # Get the stored extrinsic reward from memory
-                        if hasattr(trainer.algorithm.memory, 'rewards') and trainer.algorithm.memory.rewards is not None:
-                            extrinsic_reward = extrinsic_rewards[i]
-                            intrinsic_reward = intrinsic_rewards[i]
-                            
-                            # Calculate combined reward (extrinsic + intrinsic)
-                            total_reward = extrinsic_reward + intrinsic_reward
-                            
-                            # Update the reward in memory
-                            try:
-                                # Handle different types (tensor or scalar)
-                                if isinstance(trainer.algorithm.memory.rewards, torch.Tensor):
-                                    trainer.algorithm.memory.rewards[mem_idx] = torch.tensor(total_reward, 
-                                                                                         dtype=trainer.algorithm.memory.rewards.dtype,
-                                                                                         device=trainer.algorithm.memory.rewards.device)
-                                else:
-                                    trainer.algorithm.memory.rewards[mem_idx] = total_reward
-                                
-                                if debug and i == 0:  # Log only first update to avoid spam
-                                    print(f"[DEBUG] Updated reward at idx {mem_idx}: extrinsic={extrinsic_reward:.4f} + "
-                                          f"intrinsic={intrinsic_reward:.4f} = {total_reward:.4f}")
-                            except Exception as e:
-                                if debug:
-                                    print(f"[DEBUG] Error updating reward at idx {mem_idx}: {e}")
-                        elif debug:
-                            print("[DEBUG] Could not access memory.rewards for updating")
-                except Exception as e:
-                    if debug:
-                        print(f"[DEBUG] Error in batch intrinsic reward calculation: {e}")
-                        import traceback
-                        traceback.print_exc()
+                elif debug:
+                     print("[DEBUG PPO] No valid experiences to update rewards/dones for.")
+
+
+            # --- Process Results (Non-PPO or Test Mode) ---
+            elif algorithm != "ppo" or test:
+                exp_idx = 0
+                for env_idx, result in enumerate(results):
+                    # Handle return formats
+                    if isinstance(result, tuple):
+                        if len(result) == 5: _, next_obs_dict, reward_dict, terminated_dict, truncated_dict = result
+                        else: next_obs_dict, reward_dict, terminated_dict, truncated_dict = result
+                    else: continue
+
+                    # Ensure episode_rewards dict exists for this env_idx
+                    if env_idx not in episode_rewards: episode_rewards[env_idx] = {}
+
+                    for agent_id in reward_dict.keys():
+                        if exp_idx < len(all_obs_list): # Check bounds
+                            extrinsic_reward = reward_dict[agent_id]
+                            done = terminated_dict[agent_id] or truncated_dict[agent_id]
+                            next_obs = next_obs_dict.get(agent_id, None)
+
+                            # For StreamAC/SAC, update the stored experience with actual reward/done
+                            # This part remains similar, but uses the single store_experience_at_idx
+                            # or relies on StreamAC's internal buffer update mechanism.
+                            if not test: # Only update if not testing
+                                if algorithm == "streamac":
+                                     # StreamAC updates happen within store_experience, called earlier
+                                     # We might need to update the *last* stored reward/done if store_experience
+                                     # doesn't handle the next_state logic correctly.
+                                     # Let's assume StreamAC's store_experience handles this for now.
+                                     # We still need to track episode rewards.
+                                     # Calculate total reward (extrinsic + intrinsic) if needed for tracking
+                                     total_reward_for_tracking = extrinsic_reward
+                                     if next_obs is not None and trainer.use_intrinsic_rewards:
+                                         # Use the single update method to get the combined reward
+                                         total_reward_for_tracking = trainer.update_experience_with_intrinsic_reward(
+                                             state=all_obs_list[exp_idx],
+                                             action=action_batch[exp_idx], # Original action
+                                             next_state=next_obs,
+                                             reward=extrinsic_reward, # Original extrinsic
+                                             env_id=env_idx,
+                                             done=done # Pass done flag
+                                             # store_idx is None for StreamAC here
+                                         )
+                                     # Defensive check/initialization before accumulating reward
+                                     if agent_id not in episode_rewards[env_idx]:
+                                         episode_rewards[env_idx][agent_id] = 0.0
+                                         if debug: print(f"[DEBUG] Initialized episode_rewards for {agent_id} in env {env_idx} (during {algorithm} result processing)")
+                                     episode_rewards[env_idx][agent_id] += total_reward_for_tracking
+
+                                elif algorithm == "sac":
+                                     # SAC uses a replay buffer, update the last stored experience
+                                     # This assumes SAC's store_experience adds placeholders first
+                                     # We need a way to find the index or update the last item.
+                                     # Let's use store_experience_at_idx if SAC supports it,
+                                     # otherwise, this needs refinement based on SAC's buffer.
+                                     # Assuming SAC's store_experience handles it for now.
+                                     # Defensive check/initialization before accumulating reward
+                                     if agent_id not in episode_rewards[env_idx]:
+                                         episode_rewards[env_idx][agent_id] = 0.0
+                                         if debug: print(f"[DEBUG] Initialized episode_rewards for {agent_id} in env {env_idx} (during {algorithm} result processing)")
+                                     episode_rewards[env_idx][agent_id] += extrinsic_reward # Track extrinsic for now
+
+                            if done:
+                                action_stacker.reset_agent(agent_id)
+                                trainer.reset_auxiliary_tasks()
+
+                            exp_idx += 1
+
 
             # Check if any episodes have completed.
             newly_completed_episodes = sum(dones)
@@ -813,11 +758,11 @@ def run_training(
                     last_save_episode = total_episodes_so_far
 
                 # Reset episode rewards for the environments that finished an episode.
-                for env_idx, done in enumerate(dones):
-                    if done:
-                        # Add a safe check to prevent division by zero
-                        if len(episode_rewards[env_idx]) > 0:
-                            avg_reward = sum(episode_rewards[env_idx].values()) / max(1, len(episode_rewards[env_idx]))
+                for env_idx, done_flag in enumerate(dones): # Use dones from vec_env.step
+                    if done_flag:
+                        # Only calculate average reward if the dict is not empty
+                        if env_idx in episode_rewards and episode_rewards[env_idx]:
+                            avg_reward = sum(episode_rewards[env_idx].values()) / len(episode_rewards[env_idx])
                             if debug:
                                 print(f"Episode {episode_counts[env_idx]} in env {env_idx} completed with avg reward: {avg_reward:.2f}")
 
@@ -825,91 +770,85 @@ def run_training(
                             if algorithm == "ppo":
                                 completed_episode_rewards_since_last_update.append(avg_reward)
                         else:
-                            # Handle case where there are no rewards (shouldn't happen in normal usage)
+                            # Handle case where there are no rewards (e.g., env finished immediately)
                             if debug:
-                                print(f"Warning: Episode {episode_counts[env_idx]} in env {env_idx} completed with no rewards recorded")
+                                print(f"Warning: Episode {episode_counts[env_idx]} in env {env_idx} completed with no rewards recorded or dict missing.")
 
                         # Reset rewards dictionary for next episode
-                        episode_rewards[env_idx] = {agent_id: 0 for agent_id in vec_env.obs_dicts[env_idx]}
+                        # Use the agent IDs from the *next* observation after reset, if available
+                        if env_idx in vec_env.obs_dicts and vec_env.obs_dicts[env_idx]:
+                             episode_rewards[env_idx] = {agent_id: 0.0 for agent_id in vec_env.obs_dicts[env_idx]}
+                        else:
+                             episode_rewards[env_idx] = {} # Reset to empty if env obs are missing
+
 
             # Determine if it's time to update the policy
-            enough_experiences = False
+            should_update = False
 
             if algorithm == "ppo":
                 # For PPO, check if we've collected enough experiences based on update_interval
-                # or if the buffer is close to being full
-                buffer_capacity = trainer.algorithm.memory.buffer_size if hasattr(trainer.algorithm.memory, 'buffer_size') else update_interval
-                buffer_position = trainer.algorithm.memory.pos if hasattr(trainer.algorithm, 'pos') else collected_experiences
+                # The buffer size check is handled inside trainer.update() now
+                should_update = collected_experiences >= update_interval
 
-                # Trigger update if we've collected enough experiences OR if buffer is 90% full
-                enough_experiences = (collected_experiences >= update_interval or
-                                    buffer_position >= buffer_capacity * 0.9)
-
-                if args.debug and enough_experiences:
+                if args.debug and should_update:
+                    buffer_size = trainer.algorithm.memory.size if hasattr(trainer.algorithm, 'memory') else 0
+                    buffer_capacity = trainer.algorithm.memory.buffer_size if hasattr(trainer.algorithm, 'memory') else 0
                     print(f"[DEBUG] PPO update triggered - collected: {collected_experiences}/{update_interval}, " +
-                          f"buffer: {buffer_position}/{buffer_capacity}")
+                          f"buffer: {buffer_size}/{buffer_capacity}")
             else:
-                # For StreamAC, updates happen online with immediate wandb logging
-                # We still want to update progress bar and UI periodically
-                enough_experiences = collected_experiences % update_interval == 0
+                # For StreamAC/SAC, updates happen online or based on their own logic.
+                # We still update the progress bar periodically based on collected_experiences.
+                # Use a smaller interval for UI updates for online algorithms.
+                ui_update_interval = update_interval // 10 if update_interval > 100 else 50
+                should_update_ui = collected_experiences > 0 and (collected_experiences % ui_update_interval == 0)
 
-                # Add more frequent update status for StreamAC UI (check if >= 50 steps passed since last update)
-                if algorithm == "streamac" and (collected_experiences - last_progress_update_step >= 50) and collected_experiences > 0:
-                    # Update step count and success rate metrics for StreamAC
-                    if hasattr(trainer.algorithm, "successful_steps"):
-                        successful_steps = getattr(trainer.algorithm, "successful_steps", 0)
-                        step_sizes = getattr(trainer.algorithm, "last_step_sizes", [0])
-                        last_step = step_sizes[-1] if len(step_sizes) > 0 else 0
+                if should_update_ui:
+                    # Update step count and other metrics for UI
+                    stats_dict["Steps"] = collected_experiences
+                    if hasattr(trainer.algorithm, "update_count"): # StreamAC/SAC might have this
+                        stats_dict["Updates"] = getattr(trainer.algorithm, "update_count", 0)
 
-                        # Update stats specifically for StreamAC progress display
+                    # Get latest metrics from algorithm for UI update
+                    metrics = trainer.algorithm.get_metrics() if hasattr(trainer.algorithm, 'get_metrics') else {}
+                    if metrics:
                         stats_dict.update({
-                            "Steps": collected_experiences,
-                            "Updates": successful_steps,
-                            "StepSize": f"{last_step:.4f}",
-                            "ActorLR": f"{getattr(trainer.algorithm, 'lr_actor', lr_actor):.6f}",
-                            "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic)::.6f}"
+                            "Reward": f"{metrics.get('mean_return', 0):.2f}",
+                            "PLoss": f"{metrics.get('actor_loss', 0):.4f}",
+                            "VLoss": f"{metrics.get('critic_loss', 0):.4f}", # Or critic1/2 for SAC
+                            "Entropy": f"{metrics.get('entropy_loss', 0):.4f}"
                         })
+                        if algorithm == "streamac":
+                             stats_dict.update({
+                                 "StepSize": f"{metrics.get('effective_step_size', 0):.4f}",
+                                 "ActorLR": f"{getattr(trainer.algorithm, 'lr_actor', lr_actor):.6f}",
+                                 "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic):.6f}"
+                             })
+                        elif algorithm == "sac":
+                             stats_dict.update({
+                                 "VLoss": f"{(metrics.get('critic1_loss', 0) + metrics.get('critic2_loss', 0))/2:.4f}",
+                                 "Alpha": f"{metrics.get('alpha', 0):.4f}",
+                                 "Buffer": f"{len(trainer.algorithm.memory)}" if hasattr(trainer.algorithm, 'memory') else "N/A"
+                             })
 
-                        # Initialize metrics with latest algorithm metrics to avoid NameError
-                        metrics = trainer.algorithm.get_metrics() if hasattr(trainer.algorithm, 'get_metrics') else {}
-
-                        # Update statistics from the algorithm's metrics
-                        if metrics:
+                        # Use SCALAR versions for progress bar aux losses
+                        if 'sr_loss_scalar' in metrics or 'rp_loss_scalar' in metrics:
                             stats_dict.update({
-                                "Reward": f"{metrics.get('mean_return', 0):.2f}",
-                                "PLoss": f"{metrics.get('actor_loss', 0):.4f}",
-                                "VLoss": f"{metrics.get('critic_loss', 0):.4f}",
-                                "Entropy": f"{metrics.get('entropy_loss', 0):.4f}"
+                                "SR_Loss": f"{metrics.get('sr_loss_scalar', 0):.4f}",
+                                "RP_Loss": f"{metrics.get('rp_loss_scalar', 0):.4f}"
                             })
 
-                            # Use SCALAR versions for progress bar
-                            if 'sr_loss_scalar' in metrics or 'rp_loss_scalar' in metrics:
-                                stats_dict.update({
-                                    "SR_Loss": f"{metrics.get('sr_loss_scalar', 0):.4f}",
-                                    "RP_Loss": f"{metrics.get('rp_loss_scalar', 0):.4f}"
-                                })
+                    # The progress bar will be updated at the end of the loop iteration
 
-                        # Record the step count at which this update happened
-                        last_progress_update_step = collected_experiences
-                        
-                        # The progress bar will be updated at the end of the loop iteration
 
-                # Debug mode can show more details
-                if debug and collected_experiences % 100 == 0 and collected_experiences > 0:
-                    if algorithm == "streamac":
-                        print(f"[DEBUG] StreamAC has processed {collected_experiences} steps " +
-                              f"(with updates every {update_freq} step(s))")
-                    else:
-                        print(f"[DEBUG] PPO has collected {collected_experiences}/{update_interval} experiences")
-
-            # Reset intrinsic models periodically
-            if args.pretraining and total_episodes_so_far % 50 == 0 and hasattr(trainer, 'intrinsic_reward_generator') and trainer.intrinsic_reward_generator is not None:
+            # Reset intrinsic models periodically (if pretraining)
+            # Changed condition to check pretraining flag directly
+            if args.pretraining and not trainer.pretraining_completed and total_episodes_so_far % 50 == 0 and hasattr(trainer, 'intrinsic_reward_generator') and trainer.intrinsic_reward_generator is not None:
                 trainer.intrinsic_reward_generator.reset_models()
 
-            # Update only if we've collected enough experiences and not in test mode
-            if enough_experiences and not test:
+            # Update policy only if conditions met and not in test mode
+            if should_update and not test:
                 if debug:
-                    print(f"[DEBUG] Updating policy with {collected_experiences} experiences after {time.time() - last_update_time:.2f}s")
+                    print(f"[DEBUG] Updating policy ({algorithm.upper()}) with {collected_experiences} experiences after {time.time() - last_update_time:.2f}s")
 
                 # Perform the policy update.
                 if algorithm == "ppo":
@@ -921,10 +860,12 @@ def run_training(
                     )
                     # Reset the list of completed episode rewards
                     completed_episode_rewards_since_last_update = []
+                    collected_experiences = 0 # Reset PPO experience counter after update
                 else:
-                    # For StreamAC, we've already been updating with each step
-                    # Just get the latest metrics without triggering a full update
-                    stats = trainer.algorithm.get_metrics()
+                    # For StreamAC/SAC, update might happen internally or via trainer.update()
+                    # If trainer.update() is called, it should just fetch metrics for online algos
+                    stats = trainer.update(total_env_steps=total_env_steps, steps_per_second=steps_per_second)
+                    # Don't reset collected_experiences for online algos here
 
                 # Update the statistics displayed in the progress bar.
                 # Use SCALAR versions for display
@@ -932,36 +873,31 @@ def run_training(
                     "Device": device,
                     "Envs": num_envs,
                     "Episodes": total_episodes_so_far,
-                    "Exp": f"{collected_experiences}/{update_interval}" if algorithm == "ppo" else "",
-                    "Reward": f"{stats.get('mean_episode_reward', 0):.2f}",
+                    "Reward": f"{stats.get('mean_episode_reward', stats.get('mean_return', 0)):.2f}", # Use mean_return as fallback
                     "PLoss": f"{stats.get('actor_loss', 0):.4f}",
-                    "VLoss": f"{stats.get('critic_loss', 0):.4f}",
+                    "VLoss": f"{stats.get('critic_loss', 0):.4f}", # Default, SAC overrides below
                     "Entropy": f"{stats.get('entropy_loss', 0):.4f}",
                     "SR_Loss": f"{stats.get('sr_loss_scalar', 0):.4f}",
                     "RP_Loss": f"{stats.get('rp_loss_scalar', 0):.4f}"
                 })
 
-                # Update StreamAC specific metrics if using that algorithm
-                if algorithm == "streamac":
+                # Update algorithm-specific metrics if using that algorithm
+                if algorithm == "ppo":
+                     stats_dict["Exp"] = f"{collected_experiences}/{update_interval}" # Show 0 after update
+                elif algorithm == "streamac":
                     stats_dict.update({
                         "StepSize": f"{stats.get('effective_step_size', 0)::.4f}",
                         "ActorLR": f"{getattr(trainer.algorithm, 'lr_actor', lr_actor):.6f}",
                         "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic)::.6f}",
-                        "Updates": getattr(trainer.algorithm, "successful_steps", 0)
+                        "Updates": getattr(trainer.algorithm, "update_count", 0) # Use update_count
+                    })
+                elif algorithm == "sac":
+                    stats_dict.update({
+                        "VLoss": f"{(stats.get('critic1_loss', 0) + stats.get('critic2_loss', 0))/2:.4f}",
+                        "Alpha": f"{stats.get('alpha', 0):.4f}",
+                        "Buffer": f"{len(trainer.algorithm.memory)}" if hasattr(trainer.algorithm, 'memory') else "N/A"
                     })
 
-                # When displaying stats, add SAC-specific metrics
-                if algorithm == "sac":
-                    metrics = trainer.algorithm.get_metrics() if hasattr(trainer.algorithm, 'get_metrics') else {}
-                    if metrics:
-                        stats_dict.update({
-                            "Reward": f"{metrics.get('mean_return', 0):.2f}",
-                            "ActorLoss": f"{metrics.get('actor_loss', 0):.4f}",
-                            "CriticLoss": f"{(metrics.get('critic1_loss', 0) + metrics.get('critic2_loss', 0))/2:.4f}",
-                            "Alpha": f"{metrics.get('alpha', 0):.4f}",
-                            "QValue": f"{metrics.get('mean_q_value', 0):.4f}",
-                            "Buffer": f"{len(trainer.algorithm.memory)}"
-                        })
 
                 # Update curriculum stats if enabled
                 if curriculum_manager:
@@ -971,46 +907,18 @@ def run_training(
                         "Diff": f"{curriculum_stats['difficulty_level']:.2f}"
                     })
 
-                    if use_wandb:
-                        # Get current stage stats
-                        current_stage_stats = curriculum_stats["current_stage_stats"]
+                    # WandB logging for curriculum is handled within trainer.update -> _log_to_wandb
 
-                        # Use trainer's _true_training_steps as source of truth for step counting
-                        # This ensures we're using EXACTLY the same step as the trainer just used
-                        current_step = trainer.training_steps + trainer.training_step_offset
-
-                        # Synchronize curriculum manager step counter to match trainer exactly
-                        curriculum_manager._last_wandb_step = current_step
-
-                        # Don't log curriculum metrics separately - the PPOTrainer.update() method
-                        # already logs these through the synchronized step counter
-                        # This prevents duplicate/competing logging attempts
-
-                        # Instead, we'll update the trainer's curriculum manager reference
-                        # to ensure that it has the most up-to-date curriculum statistics
-                        # for its own logging in the next update
-                        if hasattr(trainer, 'curriculum_manager'):
-                            # Just make sure the trainer's reference is up to date
-                            trainer.curriculum_manager = curriculum_manager
-
-                # Stats will be displayed at the end of the loop iteration
-                collected_experiences = 0
                 last_update_time = time.time()
 
                 # Garbage collection after updates
-                if collected_experiences % (update_interval * 10) == 0:  # Every 10 updates
-                    # Force garbage collection and clear CUDA cache
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             # Update the experience count in the progress bar - ONLY for PPO
             if algorithm == "ppo":
                 stats_dict["Exp"] = f"{collected_experiences}/{update_interval}"
-                # Add debug logging to track experience collection
-                if debug and (collected_experiences % 100 == 0 or collected_experiences == 1) and collected_experiences > 0:
-                    print(f"[DEBUG] PPO has collected {collected_experiences}/{update_interval} experiences")
-                    # We'll update the progress bar at the end of the loop iteration instead
 
             # Update pretraining progress if enabled
             if use_pretraining:
@@ -1018,12 +926,12 @@ def run_training(
                 in_pretraining = not trainer.pretraining_completed
                 in_transition = trainer.in_transition_phase
 
-                # Force check of pretraining completion status based on current episode count
-                current_step = total_episodes_so_far + trainer.total_episodes_offset
+                # Check pretraining completion status based on current step count
+                current_step = trainer._true_training_steps() # Use trainer's step counter
                 if current_step >= pretraining_end_step and not trainer.pretraining_completed and not trainer.in_transition_phase:
-                    print(f"Triggering pretraining transition at episode {current_step}/{pretraining_end_step}")
+                    print(f"Triggering pretraining transition at step {current_step}/{pretraining_end_step}")
                     trainer.in_transition_phase = True
-                    trainer.transition_start_step = current_step
+                    trainer.transition_start_step = current_step # Use trainer step
 
                 if in_pretraining:
                     stats_dict["Mode"] = "PreTraining"
@@ -1031,14 +939,13 @@ def run_training(
                 elif in_transition:
                     stats_dict["Mode"] = "PT_Transition"
                     transition_progress = min(100, int(100 * (current_step - trainer.transition_start_step) /
-                                              trainer.pretraining_transition_steps))
+                                              max(1, trainer.pretraining_transition_steps))) # Avoid div by zero
                     stats_dict["PT_Progress"] = f"{transition_progress}%"
                 else:
                     # Remove pretraining info from stats once completed
-                    if "Mode" in stats_dict:
-                        stats_dict.pop("Mode", None)
-                    if "PT_Progress" in stats_dict:
-                        stats_dict.pop("PT_Progress", None)
+                    if "Mode" in stats_dict: stats_dict.pop("Mode", None)
+                    if "PT_Progress" in stats_dict: stats_dict.pop("PT_Progress", None)
+
 
             # Update progress bar only once per iteration
             progress_bar.set_postfix(stats_dict)
@@ -1053,12 +960,20 @@ def run_training(
         vec_env.close()
         progress_bar.close()
 
-        # Perform a final policy update if there are any remaining experiences.
-        if collected_experiences > 0 and not test:
+        # Perform a final policy update if there are any remaining experiences (PPO).
+        if algorithm == "ppo" and collected_experiences > 0 and not test:
             if debug:
-                print(f"[DEBUG] Final update with {collected_experiences} experiences")
+                print(f"[DEBUG] Final PPO update with {collected_experiences} experiences")
             try:
-                trainer.update(total_env_steps=total_env_steps, steps_per_second=steps_per_second)  # Final update with total env steps and steps per second
+                # Ensure buffer has enough data for at least one batch before final update
+                if trainer.algorithm.memory.size >= trainer.batch_size:
+                     trainer.update(
+                         completed_episode_rewards=completed_episode_rewards_since_last_update,
+                         total_env_steps=total_env_steps,
+                         steps_per_second=steps_per_second
+                     )
+                elif debug:
+                     print(f"[DEBUG] Skipping final PPO update, buffer size ({trainer.algorithm.memory.size}) < batch size ({trainer.batch_size})")
             except Exception as e:
                 print(f"Error during final update: {str(e)}")
                 traceback.print_exc()
@@ -1124,7 +1039,7 @@ if __name__ == "__main__":
     parser.add_argument('-n', '--num_envs', type=int, default=24,
                         help='Number of parallel environments to run for faster data collection')
     parser.add_argument('--update_interval', type=int, default=6144,
-                        help='Number of experiences to collect before updating the policy')
+                        help='Number of experiences to collect before updating the policy (PPO)')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use for training (cuda/mps/cpu).  Autodetects if not specified.')
     parser.add_argument('--wandb', action='store_true', help='Enable logging to Weights & Biases')
