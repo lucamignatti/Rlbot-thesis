@@ -29,3 +29,7 @@ runnable_bots.txt
 .aider*
 
 .DS_Store
+
+
+# Profiling
+result.json
