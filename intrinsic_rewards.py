@@ -138,11 +138,30 @@ class CuriosityReward:
                 state = state.unsqueeze(0)
             if next_state.dim() == 1:
                 next_state = next_state.unsqueeze(0)
-            if action.dim() == 1:
-                action = action.unsqueeze(0)
-
+                
+            # Handle differently shaped action tensors
+            if action.dim() == 0:  # Single scalar value
+                action = action.unsqueeze(0).unsqueeze(0)  # Make it [1, 1]
+            elif action.dim() == 1:  # Vector of indices [batch_size]
+                # For discrete actions, we'll convert to one-hot later
+                # For continuous actions with a single value, add a feature dimension
+                if not isinstance(self.action_dim, int):  # Continuous case
+                    action = action.unsqueeze(1)  # Make it [batch_size, 1]
+                else:
+                    # Make discrete actions [batch_size, 1] for one-hot encoding later
+                    action = action.unsqueeze(1)
+            
+            # Ensure batch dimensions match
+            batch_size = state.size(0)
+            if action.size(0) != batch_size:
+                if action.size(0) == 1:  # Single action for multiple states
+                    action = action.repeat(batch_size, 1)
+                else:
+                    # This case should be handled by the caller, but just in case
+                    raise ValueError(f"Action batch size {action.size(0)} doesn't match state batch size {batch_size}")
+            
             # Handle discrete actions by converting to one-hot encoding
-            if action.shape[1] == 1 and isinstance(self.action_dim, int):
+            if isinstance(self.action_dim, int):
                 one_hot_action = torch.zeros((action.size(0), self.action_dim), device=self.device)
                 # Ensure action is long type for scatter_
                 one_hot_action.scatter_(1, action.long(), 1.0) 
@@ -159,6 +178,10 @@ class CuriosityReward:
 
             # Calculate prediction error (MSE)
             prediction_error = F.mse_loss(predicted_next_features, next_features, reduction='none').sum(dim=1)
+
+            # Ensure prediction_error is a tensor before converting to numpy
+            if not isinstance(prediction_error, torch.Tensor):
+                prediction_error = torch.tensor(prediction_error, device=self.device)
 
             # Normalize reward
             raw_reward = prediction_error.cpu().numpy()

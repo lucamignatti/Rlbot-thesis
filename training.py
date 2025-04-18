@@ -1968,22 +1968,102 @@ class Trainer:
 
         # Ensure batch dimension (should already be batched, but double-check)
         if states_tensor.dim() == 1: states_tensor = states_tensor.unsqueeze(0)
-        if actions_tensor.dim() == 0: actions_tensor = actions_tensor.unsqueeze(0) # Handle single scalar action index
-        elif actions_tensor.dim() == 1 and self.action_space_type != "discrete": actions_tensor = actions_tensor.unsqueeze(0) # Handle single vector continuous action
         if next_states_tensor.dim() == 1: next_states_tensor = next_states_tensor.unsqueeze(0)
-
+        
+        # Get the batch size from states for consistent dimensions
+        batch_size = states_tensor.size(0)
+        
+        # Properly handle actions tensor based on action space type
+        if self.action_space_type == "discrete":
+            if actions_tensor.dim() == 0:  # Single scalar
+                actions_tensor = actions_tensor.unsqueeze(0)
+            elif actions_tensor.dim() == 1:  # Vector of indices
+                # Ensure it matches batch size
+                if actions_tensor.size(0) != batch_size:
+                    if self.debug:
+                        print(f"[DEBUG] Reshaping actions_tensor from shape {actions_tensor.shape} to match batch size {batch_size}")
+                    # If it's a single action being applied to all states, repeat it
+                    if actions_tensor.size(0) == 1:
+                        actions_tensor = actions_tensor.repeat(batch_size)
+            
+            # For discrete actions, we might need to convert to one-hot for the forward model
+            # This depends on how the intrinsic_reward_generator expects actions
+            # If one-hot is needed, will be handled in the generator
+        else:  # Continuous action space
+            if actions_tensor.dim() == 1:  # Single vector action
+                if actions_tensor.size(0) == self.action_dim:  # If it's a single action vector
+                    actions_tensor = actions_tensor.unsqueeze(0).repeat(batch_size, 1)
+                else:  # It's already a batch of scalar actions
+                    actions_tensor = actions_tensor.unsqueeze(1) if actions_tensor.size(0) == batch_size else actions_tensor.unsqueeze(0)
+            elif actions_tensor.dim() == 2 and actions_tensor.size(0) != batch_size:
+                # If we have a 2D tensor but wrong batch size
+                if actions_tensor.size(0) == 1:
+                    actions_tensor = actions_tensor.repeat(batch_size, 1)
+        
+        if self.debug:
+            print(f"[DEBUG] Tensor shapes before intrinsic reward calculation:")
+            print(f"  - states_tensor: {states_tensor.shape}")
+            print(f"  - actions_tensor: {actions_tensor.shape}")
+            print(f"  - next_states_tensor: {next_states_tensor.shape}")
+            
         # Compute batch intrinsic rewards
-        intrinsic_rewards = self.intrinsic_reward_generator.compute_intrinsic_reward(
-            states_tensor, actions_tensor, next_states_tensor
-        )
+        try:
+            intrinsic_rewards = self.intrinsic_reward_generator.compute_intrinsic_reward(
+                states_tensor, actions_tensor, next_states_tensor
+            )
+        except RuntimeError as e:
+            if self.debug:
+                print(f"[DEBUG] Error in compute_intrinsic_reward: {e}")
+                print(f"Falling back to single item processing")
+            
+            # Fallback: process one by one
+            intrinsic_rewards_list = []
+            for i in range(batch_size):
+                single_reward = self.intrinsic_reward_generator.compute_intrinsic_reward(
+                    states_tensor[i:i+1],  # Keep batch dimension
+                    actions_tensor[i:i+1] if actions_tensor.dim() > 0 and actions_tensor.size(0) >= i+1 else actions_tensor,
+                    next_states_tensor[i:i+1]  # Keep batch dimension
+                )
+                if isinstance(single_reward, torch.Tensor):
+                    intrinsic_rewards_list.append(single_reward.item())
+                else:
+                    intrinsic_rewards_list.append(single_reward)
+            
+            # Convert to numpy array for consistency
+            intrinsic_rewards = np.array(intrinsic_rewards_list)
 
-        # Initialize array for scaled intrinsic rewards
+        # Handle different types of intrinsic rewards output
         if isinstance(intrinsic_rewards, torch.Tensor):
             intrinsic_rewards = intrinsic_rewards.detach().cpu().numpy()
+        elif isinstance(intrinsic_rewards, (float, int)):
+            # If we got a single value, repeat it for each item in the batch
+            intrinsic_rewards = np.array([float(intrinsic_rewards)] * batch_size)
+        elif isinstance(intrinsic_rewards, (list, tuple)):
+            intrinsic_rewards = np.array(intrinsic_rewards)
+        elif not isinstance(intrinsic_rewards, np.ndarray):
+            if self.debug:
+                print(f"[DEBUG] Unexpected intrinsic rewards type: {type(intrinsic_rewards)}")
+            # Fallback to zeros if we got an unexpected type
+            intrinsic_rewards = np.zeros(batch_size)
 
-        # Flatten if needed to ensure we have a 1D array
-        if intrinsic_rewards.ndim > 1:
-            intrinsic_rewards = intrinsic_rewards.flatten()
+        # Ensure we have a 1D array of the correct size
+        if isinstance(intrinsic_rewards, np.ndarray):
+            if intrinsic_rewards.ndim > 1:
+                intrinsic_rewards = intrinsic_rewards.flatten()
+            # Ensure length matches batch size
+            if len(intrinsic_rewards) != batch_size:
+                if len(intrinsic_rewards) == 1:
+                    intrinsic_rewards = np.repeat(intrinsic_rewards, batch_size)
+                else:
+                    if self.debug:
+                        print(f"[DEBUG] Intrinsic rewards length {len(intrinsic_rewards)} doesn't match batch size {batch_size}")
+                    # Truncate or pad with zeros as needed
+                    if len(intrinsic_rewards) > batch_size:
+                        intrinsic_rewards = intrinsic_rewards[:batch_size]
+                    else:
+                        intrinsic_rewards = np.pad(intrinsic_rewards, 
+                                                 (0, batch_size - len(intrinsic_rewards)),
+                                                 'constant', constant_values=0)
 
         # Array to store adaptive scaled rewards
         adaptive_scaled_rewards = np.zeros_like(intrinsic_rewards)
