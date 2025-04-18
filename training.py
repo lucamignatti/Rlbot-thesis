@@ -1,5 +1,6 @@
 from collections import deque
 from torch.distributions import Categorical, Normal
+# Import GradScaler and autocast
 from torch.amp import autocast, GradScaler
 from model_architectures import (
     fix_compiled_state_dict,
@@ -105,7 +106,7 @@ class Trainer:
         use_auxiliary_tasks: bool = True,
         sr_weight: float = 1.0,
         rp_weight: float = 1.0,
-        aux_amp: bool = False,
+        aux_amp: bool = False, # Keep aux_amp for specific control over aux tasks
         use_pretraining: bool = False,
         pretraining_fraction: float = 0.1,
         pretraining_sr_weight: float = 10.0,
@@ -161,6 +162,12 @@ class Trainer:
                 device = "cpu"
         self.device = device
 
+        # Use Automatic Mixed Precision (AMP) if requested and on CUDA
+        self.use_amp = "cuda" in str(device) and use_amp
+        # Use separate flag for auxiliary task AMP
+        self.aux_amp = "cuda" in str(device) and aux_amp
+        # GradScaler is now initialized within the algorithm (e.g., PPOAlgorithm)
+
         self.action_space_type = action_space_type
         self.action_dim = action_dim
         self.action_bounds = action_bounds
@@ -208,10 +215,10 @@ class Trainer:
                 sr_weight=sr_weight,
                 rp_weight=rp_weight,
                 device=self.device,
-                use_amp=aux_amp, # Use specific aux_amp setting
+                use_amp=self.aux_amp, # Use specific aux_amp setting
                 update_frequency=1, # Frequency handled within PPO/StreamAC logic now
                 learning_mode="batch" if algorithm_type == "ppo" else "stream", # Set mode
-                debug=self.debug,
+                debug=debug,
                 batch_size=batch_size,
                 internal_aux_batch_size=batch_size
             )
@@ -244,7 +251,7 @@ class Trainer:
                 max_grad_norm=max_grad_norm,
                 ppo_epochs=ppo_epochs,
                 batch_size=batch_size,
-                use_amp=use_amp,
+                use_amp=self.use_amp, # Pass the trainer's use_amp flag
                 debug=debug,
                 use_wandb=use_wandb,
                 use_weight_clipping=use_weight_clipping,
@@ -283,6 +290,7 @@ class Trainer:
                 buffer_size=stream_buffer_size,
                 use_sparse_init=use_sparse_init,
                 update_freq=update_freq,
+                use_amp=self.use_amp, # Pass AMP flag
                 debug=self.debug
             )
             # Set reference to trainer so StreamAC can update auxiliary tasks
@@ -314,18 +322,13 @@ class Trainer:
                 update_freq=update_freq,
                 updates_per_step=updates_per_step,
                 max_grad_norm=max_grad_norm,
-                use_amp=use_amp,
+                use_amp=self.use_amp, # Pass AMP flag
                 use_wandb=use_wandb,
                 debug=self.debug
             )
             self.algorithm = algorithm
         else:
             raise ValueError(f"Unknown algorithm type: {algorithm_type}. Use 'ppo', 'streamac', or 'sac'.")
-
-        # Use Automatic Mixed Precision (AMP) if requested and on CUDA
-        self.use_amp = "cuda" in str(device) and use_amp
-        if self.use_amp:
-            self.scaler = GradScaler()
 
         # Track metrics using deques with a max length (e.g., 1000)
         history_len = 1000
@@ -356,7 +359,8 @@ class Trainer:
                 "sr_weight": sr_weight,
                 "rp_weight": rp_weight,
                 "use_pretraining": use_pretraining,
-                "use_amp": use_amp
+                "use_amp": use_amp,
+                "aux_amp": aux_amp # Log aux_amp setting
             }, allow_val_change=True)
 
         # If requested and available, compile the models for performance
@@ -398,9 +402,9 @@ class Trainer:
         print_model_info(self.critic, model_name="Critic", print_amp=self.use_amp, debug=self.debug)
         if self.aux_task_manager:
             if hasattr(self.aux_task_manager, 'sr_task'):
-                print_model_info(self.aux_task_manager.sr_task, model_name="SR Task", print_amp=self.use_amp, debug=self.debug)
+                print_model_info(self.aux_task_manager.sr_task, model_name="SR Task", print_amp=self.aux_amp, debug=self.debug) # Use aux_amp
             if hasattr(self.aux_task_manager, 'rp_task'):
-                print_model_info(self.aux_task_manager.rp_task, model_name="RP Task", print_amp=self.use_amp, debug=self.debug)
+                print_model_info(self.aux_task_manager.rp_task, model_name="RP Task", print_amp=self.aux_amp, debug=self.debug) # Use aux_amp
 
 
         # Pre-training parameters
@@ -443,7 +447,8 @@ class Trainer:
                 action_dim=action_dim,
                 device=device,
                 curiosity_weight=curiosity_weight,
-                rnd_weight=rnd_weight
+                rnd_weight=rnd_weight,
+                use_amp=self.use_amp # Pass main use_amp flag
             )
             if self.debug:
                 print(f"[DEBUG] Initialized intrinsic reward generator with scale {intrinsic_reward_scale}")
@@ -924,7 +929,7 @@ class Trainer:
                 if self.debug:
                     print(f"[STEP DEBUG] Trainer.store_experience calling StreamAC.store_experience, current step: {self._true_training_steps()}")
 
-                metrics, did_update = self.algorithm.store_experience(state, action, log_prob, reward, value, done, env_id=env_id)
+                metrics, did_update = self.algorithm.store_experience(state, action, log_prob, total_reward, value, done, env_id=env_id) # Use total_reward
 
                 # If StreamAC performed an update, log to wandb immediately
                 if did_update and self.use_wandb:
@@ -949,7 +954,7 @@ class Trainer:
             else:
                 # For other algorithms like PPO, just store normally
                 # This method is now less used for PPO due to batching
-                self.algorithm.store_experience(state, action, log_prob, reward, value, done)
+                self.algorithm.store_experience(state, action, log_prob, total_reward, value, done) # Use total_reward
         else:
             # In test mode, just store without updating (for StreamAC)
             if hasattr(self.algorithm, 'experience_buffer'):
@@ -957,7 +962,7 @@ class Trainer:
                     'obs': state,
                     'action': action,
                     'log_prob': log_prob,
-                    'reward': original_reward,
+                    'reward': original_reward, # Store original reward in test mode
                     'value': value,
                     'done': done,
                     'env_id': env_id
@@ -976,7 +981,7 @@ class Trainer:
             # Pass the ORIGINAL observation and the SCALED reward to the history
             self.aux_task_manager.update(
                 observations=state,
-                rewards=reward # Use the potentially scaled reward
+                rewards=total_reward # Use the total reward (scaled extrinsic + scaled intrinsic)
             )
 
             # For StreamAC, log metrics immediately (if aux manager computes them in update)
@@ -1366,22 +1371,22 @@ class Trainer:
                     if hasattr(self.intrinsic_reward_generator, 'load_state_dict'):
                         try:
                             # Filter out configuration items and only pass the model state
-                            model_state = {k: v for k, v in intrinsic_state.items()
-                                        if k not in ['intrinsic_reward_scale', 'curiosity_weight', 'rnd_weight', 'extrinsic_normalizer']}
-                            if model_state:
-                                self.intrinsic_reward_generator.load_state_dict(model_state)
+                            # model_state = {k: v for k, v in intrinsic_state.items()
+                            #             if k not in ['intrinsic_reward_scale', 'curiosity_weight', 'rnd_weight', 'extrinsic_normalizer']}
+                            # if model_state:
+                            self.intrinsic_reward_generator.load_state_dict(intrinsic_state) # Pass the whole dict
                         except Exception as e:
                             print(f"Warning: Could not load intrinsic reward generator state: {e}")
 
-                    # Restore configuration values
-                    if 'intrinsic_reward_scale' in intrinsic_state:
-                        self.intrinsic_reward_scale = intrinsic_state['intrinsic_reward_scale']
+                    # Restore configuration values (these might be part of the generator's state dict now)
+                    # if 'intrinsic_reward_scale' in intrinsic_state:
+                    #     self.intrinsic_reward_scale = intrinsic_state['intrinsic_reward_scale']
 
                     # Set component weights if the generator has those attributes
-                    if hasattr(self.intrinsic_reward_generator, 'curiosity_weight') and 'curiosity_weight' in intrinsic_state:
-                        self.intrinsic_reward_generator.curiosity_weight = intrinsic_state['curiosity_weight']
-                    if hasattr(self.intrinsic_reward_generator, 'rnd_weight') and 'rnd_weight' in intrinsic_state:
-                        self.intrinsic_reward_generator.rnd_weight = intrinsic_state['rnd_weight']
+                    # if hasattr(self.intrinsic_reward_generator, 'curiosity_weight') and 'curiosity_weight' in intrinsic_state:
+                    #     self.intrinsic_reward_generator.curiosity_weight = intrinsic_state['curiosity_weight']
+                    # if hasattr(self.intrinsic_reward_generator, 'rnd_weight') and 'rnd_weight' in intrinsic_state:
+                    #     self.intrinsic_reward_generator.rnd_weight = intrinsic_state['rnd_weight']
 
                     # Restore extrinsic reward normalizer if it exists in the checkpoint
                     if 'extrinsic_normalizer' in intrinsic_state:
@@ -1391,12 +1396,13 @@ class Trainer:
                             self.extrinsic_reward_normalizer = ExtrinsicRewardNormalizer()
 
                         try:
-                            if 'mean' in normalizer_state:
-                                self.extrinsic_reward_normalizer.mean = np.array(normalizer_state['mean'])
-                            if 'var' in normalizer_state:
-                                self.extrinsic_reward_normalizer.var = np.array(normalizer_state['var'])
-                            if 'count' in normalizer_state:
-                                self.extrinsic_reward_normalizer.count = normalizer_state['count']
+                            self.extrinsic_reward_normalizer.load_state_dict(normalizer_state) # Use load_state_dict
+                            # if 'mean' in normalizer_state:
+                            #     self.extrinsic_reward_normalizer.mean = np.array(normalizer_state['mean'])
+                            # if 'var' in normalizer_state:
+                            #     self.extrinsic_reward_normalizer.var = np.array(normalizer_state['var'])
+                            # if 'count' in normalizer_state:
+                            #     self.extrinsic_reward_normalizer.count = normalizer_state['count']
                         except Exception as e:
                             print(f"Warning: Could not restore extrinsic reward normalizer: {e}")
 

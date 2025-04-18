@@ -8,6 +8,8 @@ from typing import Dict, Tuple, List, Optional, Union, Any
 from .base import BaseAlgorithm
 # Import AuxiliaryTaskManager to use its methods
 from auxiliary import AuxiliaryTaskManager
+# Import GradScaler for AMP
+from torch.amp import GradScaler, autocast
 
 class PPOAlgorithm(BaseAlgorithm):
     """PPO algorithm implementation"""
@@ -64,7 +66,7 @@ class PPOAlgorithm(BaseAlgorithm):
             max_grad_norm=max_grad_norm,
             ppo_epochs=ppo_epochs,
             batch_size=batch_size,
-            use_amp=use_amp,
+            use_amp=use_amp, # Pass use_amp to base class
             debug=debug,
             use_wandb=use_wandb,
         )
@@ -98,8 +100,9 @@ class PPOAlgorithm(BaseAlgorithm):
         )
 
         # Initialize optimizer
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr_actor)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
+        # These individual optimizers might not be strictly necessary if using the combined one
+        # self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr_actor)
+        # self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
 
         # Combine parameters for a single optimizer step
         combined_params = list(self.actor.parameters()) + list(self.critic.parameters())
@@ -110,6 +113,9 @@ class PPOAlgorithm(BaseAlgorithm):
                 combined_params += list(self.aux_task_manager.rp_task.parameters())
 
         self.optimizer = torch.optim.Adam(combined_params, lr=lr_actor) # Use actor LR for combined
+
+        # Initialize GradScaler if AMP is enabled
+        self.scaler = GradScaler(enabled=self.use_amp)
 
         # Tracking metrics
         self.metrics = {
@@ -512,6 +518,8 @@ class PPOAlgorithm(BaseAlgorithm):
         if not isinstance(obs, torch.Tensor):
             obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
 
+        # Use autocast only if AMP is enabled and device is CUDA
+        # Inference should generally not use autocast unless specifically needed
         with torch.no_grad():
             if return_features:
                 # Request features from the actor
@@ -605,7 +613,9 @@ class PPOAlgorithm(BaseAlgorithm):
             values = []
             for i in range(0, buffer_size, self.batch_size):
                  chunk_states = states[i:min(i + self.batch_size, buffer_size)]
-                 chunk_values = self.critic(chunk_states).squeeze()
+                 # Use autocast for critic evaluation if AMP is enabled
+                 with autocast("cuda", enabled=self.use_amp):
+                     chunk_values = self.critic(chunk_states).squeeze()
                  values.append(chunk_values)
             values = torch.cat(values)
 
@@ -836,7 +846,9 @@ class PPOAlgorithm(BaseAlgorithm):
             buffer_size = states.shape[0]
             for i in range(0, buffer_size, self.batch_size):
                  chunk_states = states[i:min(i + self.batch_size, buffer_size)]
-                 chunk_values = self.critic(chunk_states).squeeze()
+                 # Use autocast for critic evaluation if AMP is enabled
+                 with autocast("cuda", enabled=self.use_amp):
+                     chunk_values = self.critic(chunk_states).squeeze()
                  y_pred.append(chunk_values)
             y_pred = torch.cat(y_pred)
 
@@ -879,142 +891,152 @@ class PPOAlgorithm(BaseAlgorithm):
                 batch_rewards = rewards[batch_idx] # Get rewards for this batch
 
                 # --- PPO Loss Calculation ---
-                # Get current policy distribution, features, and values
-                # Call actor ONCE to get action distribution and features
-                try:
-                    actor_output, current_features = self.actor(batch_states, return_features=True)
-                    if self.debug and current_features is None:
-                         print("[DEBUG PPO _update_policy] Warning: Actor did not return features when requested.")
-                except Exception as e:
-                    if self.debug: print(f"[DEBUG PPO _update_policy] Error getting actor output/features: {e}")
-                    continue # Skip batch if actor fails
-
-                # Calculate log probabilities and entropy based on action space type
-                if self.action_space_type == "discrete":
-                    action_probs = actor_output # Assume output is probs
-                    action_probs = torch.clamp(action_probs, min=1e-10) # Prevent zeros
-                    action_probs = action_probs / action_probs.sum(dim=-1, keepdim=True) # Normalize
-
+                # Use autocast context manager for forward passes and loss calculations if AMP is enabled
+                with autocast("cuda", enabled=self.use_amp):
+                    # Get current policy distribution, features, and values
+                    # Call actor ONCE to get action distribution and features
                     try:
-                        dist = torch.distributions.Categorical(probs=action_probs)
-                    except ValueError as e:
-                         if self.debug:
-                             print(f"[DEBUG PPO _update_policy] Error creating Categorical distribution in batch: {e}")
-                             print(f"Probs shape: {action_probs.shape}, Probs sum: {action_probs.sum(dim=-1)}")
-                             print(f"Probs sample: {action_probs[0]}")
-                         continue # Skip batch
-
-                    # Calculate log probabilities and entropy
-                    if batch_actions.dtype != torch.long:
-                         if self.debug: print(f"[DEBUG PPO _update_policy] Warning: batch_actions dtype is {batch_actions.dtype}, expected Long.")
-                         try: actions_indices = batch_actions.long()
-                         except RuntimeError:
-                             if self.debug: print("[DEBUG PPO _update_policy] Failed to cast batch_actions to Long.")
-                             continue # Skip batch
-                    else: actions_indices = batch_actions
-
-                    if actions_indices.max() >= dist.probs.shape[-1] or actions_indices.min() < 0:
-                         if self.debug: print(f"[DEBUG PPO _update_policy] Invalid action indices found.")
-                         continue # Skip batch
-
-                    try:
-                        curr_log_probs = dist.log_prob(actions_indices)
-                        entropy = dist.entropy().mean()
-                    except (IndexError, ValueError) as e:
-                         if self.debug: print(f"[DEBUG PPO _update_policy] Error calculating log_prob/entropy: {e}")
-                         continue # Skip batch
-
-                else: # Continuous
-                    if batch_actions.dtype != torch.float:
-                         if self.debug: print(f"[DEBUG PPO _update_policy] Warning: batch_actions dtype is {batch_actions.dtype}, expected Float.")
-                         try: batch_actions = batch_actions.float()
-                         except RuntimeError:
-                             if self.debug: print("[DEBUG PPO _update_policy] Failed to cast batch_actions to Float.")
-                             continue # Skip batch
-
-                    action_dist = actor_output # Assume output is distribution object
-                    curr_log_probs = action_dist.log_prob(batch_actions).sum(dim=-1)
-                    entropy = action_dist.entropy().mean()
-
-                # Calculate critic values
-                values = self.critic(batch_states).squeeze()
-
-                # Calculate ratio and surrogates for PPO
-                ratio = torch.exp(curr_log_probs - batch_old_log_probs)
-                surr1 = ratio * batch_advantages
-                surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * batch_advantages
-                actor_loss = -torch.min(surr1, surr2).mean()
-
-                # Calculate critic loss (MSE)
-                critic_loss = F.mse_loss(values, batch_returns)
-
-                # Calculate entropy loss
-                entropy_loss = -entropy * self.entropy_coef
-
-                # --- Auxiliary Loss Calculation ---
-                # Initialize with 0.0 float, will be replaced by tensor if computed
-                sr_loss = 0.0
-                rp_loss = 0.0
-                sr_loss_scalar = 0.0
-                rp_loss_scalar = 0.0
-
-                # Calculate aux losses only if manager exists and features were obtained
-                if self.aux_task_manager is not None and current_features is not None and \
-                   (self.aux_task_manager.sr_weight > 0 or self.aux_task_manager.rp_weight > 0):
-                    try:
-                        # Pass pre-computed features, observations, and rewards
-                        aux_losses = self.aux_task_manager.compute_losses_for_batch(
-                            obs_batch=batch_states,
-                            rewards_batch=batch_rewards,
-                            features_batch=current_features
-                        )
-                        # Get tensor loss if available, otherwise default to zero tensor
-                        sr_loss = aux_losses.get("sr_loss", torch.tensor(0.0, device=self.device))
-                        rp_loss = aux_losses.get("rp_loss", torch.tensor(0.0, device=self.device))
-                        # Get scalar loss for tracking
-                        sr_loss_scalar = aux_losses.get("sr_loss_scalar", 0.0)
-                        rp_loss_scalar = aux_losses.get("rp_loss_scalar", 0.0)
-
-                        if self.debug and (sr_loss_scalar > 0 or rp_loss_scalar > 0):
-                            print(f"[DEBUG PPO Aux] Batch Aux Losses - SR: {sr_loss_scalar:.6f}, RP: {rp_loss_scalar:.6f}")
+                        actor_output, current_features = self.actor(batch_states, return_features=True)
+                        if self.debug and current_features is None:
+                             print("[DEBUG PPO _update_policy] Warning: Actor did not return features when requested.")
                     except Exception as e:
-                        if self.debug:
-                            print(f"[DEBUG PPO Aux] Error computing aux losses for batch: {e}")
-                            import traceback
-                            traceback.print_exc()
-                        # Ensure losses remain 0.0 if error occurs
-                        sr_loss = 0.0
-                        rp_loss = 0.0
-                        sr_loss_scalar = 0.0
-                        rp_loss_scalar = 0.0
-                elif self.debug and self.aux_task_manager is not None and current_features is None:
-                     print("[DEBUG PPO Aux] Skipping aux loss calculation as features were not obtained from actor.")
+                        if self.debug: print(f"[DEBUG PPO _update_policy] Error getting actor output/features: {e}")
+                        continue # Skip batch if actor fails
+
+                    # Calculate log probabilities and entropy based on action space type
+                    if self.action_space_type == "discrete":
+                        action_probs = actor_output # Assume output is probs
+                        action_probs = torch.clamp(action_probs, min=1e-10) # Prevent zeros
+                        action_probs = action_probs / action_probs.sum(dim=-1, keepdim=True) # Normalize
+
+                        try:
+                            dist = torch.distributions.Categorical(probs=action_probs)
+                        except ValueError as e:
+                             if self.debug:
+                                 print(f"[DEBUG PPO _update_policy] Error creating Categorical distribution in batch: {e}")
+                                 print(f"Probs shape: {action_probs.shape}, Probs sum: {action_probs.sum(dim=-1)}")
+                                 print(f"Probs sample: {action_probs[0]}")
+                             continue # Skip batch
+
+                        # Calculate log probabilities and entropy
+                        if batch_actions.dtype != torch.long:
+                             if self.debug: print(f"[DEBUG PPO _update_policy] Warning: batch_actions dtype is {batch_actions.dtype}, expected Long.")
+                             try: actions_indices = batch_actions.long()
+                             except RuntimeError:
+                                 if self.debug: print("[DEBUG PPO _update_policy] Failed to cast batch_actions to Long.")
+                                 continue # Skip batch
+                        else: actions_indices = batch_actions
+
+                        if actions_indices.max() >= dist.probs.shape[-1] or actions_indices.min() < 0:
+                             if self.debug: print(f"[DEBUG PPO _update_policy] Invalid action indices found.")
+                             continue # Skip batch
+
+                        try:
+                            curr_log_probs = dist.log_prob(actions_indices)
+                            entropy = dist.entropy().mean()
+                        except (IndexError, ValueError) as e:
+                             if self.debug: print(f"[DEBUG PPO _update_policy] Error calculating log_prob/entropy: {e}")
+                             continue # Skip batch
+
+                    else: # Continuous
+                        if batch_actions.dtype != torch.float:
+                             if self.debug: print(f"[DEBUG PPO _update_policy] Warning: batch_actions dtype is {batch_actions.dtype}, expected Float.")
+                             try: batch_actions = batch_actions.float()
+                             except RuntimeError:
+                                 if self.debug: print("[DEBUG PPO _update_policy] Failed to cast batch_actions to Float.")
+                                 continue # Skip batch
+
+                        action_dist = actor_output # Assume output is distribution object
+                        curr_log_probs = action_dist.log_prob(batch_actions).sum(dim=-1)
+                        entropy = action_dist.entropy().mean()
+
+                    # Calculate critic values
+                    values = self.critic(batch_states).squeeze()
+
+                    # Calculate ratio and surrogates for PPO
+                    ratio = torch.exp(curr_log_probs - batch_old_log_probs)
+                    surr1 = ratio * batch_advantages
+                    surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * batch_advantages
+                    actor_loss = -torch.min(surr1, surr2).mean()
+
+                    # Calculate critic loss (MSE)
+                    critic_loss = F.mse_loss(values, batch_returns)
+
+                    # Calculate entropy loss
+                    entropy_loss = -entropy * self.entropy_coef
+
+                    # --- Auxiliary Loss Calculation ---
+                    # Initialize with 0.0 float, will be replaced by tensor if computed
+                    sr_loss = 0.0
+                    rp_loss = 0.0
+                    sr_loss_scalar = 0.0
+                    rp_loss_scalar = 0.0
+
+                    # Calculate aux losses only if manager exists and features were obtained
+                    if self.aux_task_manager is not None and current_features is not None and \
+                       (self.aux_task_manager.sr_weight > 0 or self.aux_task_manager.rp_weight > 0):
+                        try:
+                            # Pass pre-computed features, observations, and rewards
+                            # Aux tasks are also computed within the autocast context
+                            aux_losses = self.aux_task_manager.compute_losses_for_batch(
+                                obs_batch=batch_states,
+                                rewards_batch=batch_rewards,
+                                features_batch=current_features
+                            )
+                            # Get tensor loss if available, otherwise default to zero tensor
+                            sr_loss = aux_losses.get("sr_loss", torch.tensor(0.0, device=self.device))
+                            rp_loss = aux_losses.get("rp_loss", torch.tensor(0.0, device=self.device))
+                            # Get scalar loss for tracking
+                            sr_loss_scalar = aux_losses.get("sr_loss_scalar", 0.0)
+                            rp_loss_scalar = aux_losses.get("rp_loss_scalar", 0.0)
+
+                            if self.debug and (sr_loss_scalar > 0 or rp_loss_scalar > 0):
+                                print(f"[DEBUG PPO Aux] Batch Aux Losses - SR: {sr_loss_scalar:.6f}, RP: {rp_loss_scalar:.6f}")
+                        except Exception as e:
+                            if self.debug:
+                                print(f"[DEBUG PPO Aux] Error computing aux losses for batch: {e}")
+                                import traceback
+                                traceback.print_exc()
+                            # Ensure losses remain 0.0 if error occurs
+                            sr_loss = 0.0
+                            rp_loss = 0.0
+                            sr_loss_scalar = 0.0
+                            rp_loss_scalar = 0.0
+                    elif self.debug and self.aux_task_manager is not None and current_features is None:
+                         print("[DEBUG PPO Aux] Skipping aux loss calculation as features were not obtained from actor.")
 
 
-                # --- Total Loss ---
-                # Ensure all components are tensors before summing
-                if not isinstance(sr_loss, torch.Tensor):
-                    sr_loss_tensor = torch.tensor(sr_loss, dtype=torch.float32, device=self.device)
-                else:
-                    sr_loss_tensor = sr_loss
-                if not isinstance(rp_loss, torch.Tensor):
-                    rp_loss_tensor = torch.tensor(rp_loss, dtype=torch.float32, device=self.device)
-                else:
-                    rp_loss_tensor = rp_loss
+                    # --- Total Loss ---
+                    # Ensure all components are tensors before summing
+                    if not isinstance(sr_loss, torch.Tensor):
+                        sr_loss_tensor = torch.tensor(sr_loss, dtype=torch.float32, device=self.device)
+                    else:
+                        sr_loss_tensor = sr_loss
+                    if not isinstance(rp_loss, torch.Tensor):
+                        rp_loss_tensor = torch.tensor(rp_loss, dtype=torch.float32, device=self.device)
+                    else:
+                        rp_loss_tensor = rp_loss
 
-                # Combine actor, critic, entropy, and auxiliary losses
-                total_loss = actor_loss + (self.critic_coef * critic_loss) + entropy_loss + sr_loss_tensor + rp_loss_tensor
+                    # Combine actor, critic, entropy, and auxiliary losses
+                    total_loss = actor_loss + (self.critic_coef * critic_loss) + entropy_loss + sr_loss_tensor + rp_loss_tensor
 
-                # --- Optimization ---
+                # --- Optimization (outside autocast context) ---
                 self.optimizer.zero_grad()
-                total_loss.backward()
+                # Scale the loss using GradScaler
+                self.scaler.scale(total_loss).backward()
+
+                # Unscale gradients before clipping (required by GradScaler)
+                self.scaler.unscale_(self.optimizer)
 
                 # Clip gradients
                 if self.max_grad_norm > 0:
                     # Clip gradients for all parameters managed by the optimizer
                     nn.utils.clip_grad_norm_(self.optimizer.param_groups[0]['params'], self.max_grad_norm)
 
-                self.optimizer.step()
+                # Optimizer step using GradScaler
+                self.scaler.step(self.optimizer)
+                # Update the scaler for the next iteration
+                self.scaler.update()
 
                 # Apply weight clipping after optimization step and get clipped fraction
                 current_weight_clip_fraction = self.clip_weights()
@@ -1093,9 +1115,10 @@ class PPOAlgorithm(BaseAlgorithm):
         """Get state dict for saving algorithm state"""
         state = super().get_state_dict() # Get base state if needed
         state.update({
-            'actor_optimizer': self.actor_optimizer.state_dict(),
-            'critic_optimizer': self.critic_optimizer.state_dict(),
+            # 'actor_optimizer': self.actor_optimizer.state_dict(), # Removed individual optimizers
+            # 'critic_optimizer': self.critic_optimizer.state_dict(), # Removed individual optimizers
             'optimizer': self.optimizer.state_dict(), # Save combined optimizer
+            'scaler': self.scaler.state_dict(), # Save GradScaler state
             'memory_state': self.memory.get_state_dict() if hasattr(self.memory, 'get_state_dict') else None, # Save memory state if possible
             'episode_returns': list(self.episode_returns),
             'current_episode_rewards': self.current_episode_rewards,
@@ -1110,12 +1133,14 @@ class PPOAlgorithm(BaseAlgorithm):
     def load_state_dict(self, state_dict):
         """Load state dict for resuming algorithm state"""
         super().load_state_dict(state_dict) # Load base state if needed
-        if 'actor_optimizer' in state_dict:
-            self.actor_optimizer.load_state_dict(state_dict['actor_optimizer'])
-        if 'critic_optimizer' in state_dict:
-            self.critic_optimizer.load_state_dict(state_dict['critic_optimizer'])
+        # if 'actor_optimizer' in state_dict: # Removed individual optimizers
+        #     self.actor_optimizer.load_state_dict(state_dict['actor_optimizer'])
+        # if 'critic_optimizer' in state_dict: # Removed individual optimizers
+        #     self.critic_optimizer.load_state_dict(state_dict['critic_optimizer'])
         if 'optimizer' in state_dict:
             self.optimizer.load_state_dict(state_dict['optimizer']) # Load combined optimizer
+        if 'scaler' in state_dict:
+            self.scaler.load_state_dict(state_dict['scaler']) # Load GradScaler state
         if 'memory_state' in state_dict and hasattr(self.memory, 'load_state_dict'):
             self.memory.load_state_dict(state_dict['memory_state'])
         if 'episode_returns' in state_dict:
