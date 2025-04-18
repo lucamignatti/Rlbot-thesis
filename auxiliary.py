@@ -280,7 +280,28 @@ class AuxiliaryTaskManager:
         self.obs_dim = obs_dim  # Store observation dimension
 
         # Get feature dimension from actor (for SR and RP tasks)
-        self.feature_dim = getattr(actor, 'hidden_dim', 1536)
+        # Try to infer feature_dim more robustly
+        try:
+            # Attempt to get hidden_dim attribute
+            self.feature_dim = getattr(actor, 'hidden_dim')
+        except AttributeError:
+            # Fallback: Try to infer from the last linear layer's output size before the final action head
+            last_linear_out = None
+            for module in reversed(list(actor.modules())):
+                if isinstance(module, nn.Linear):
+                    # Check if it's likely the layer before the final output
+                    # This is heuristic and might need adjustment based on model structure
+                    if module.out_features != getattr(actor, 'action_shape', -1): # Assuming action_shape exists
+                        last_linear_out = module.out_features
+                        break
+            if last_linear_out:
+                self.feature_dim = last_linear_out
+            else:
+                # Final fallback if inference fails
+                self.feature_dim = 512 # Default fallback
+                if self.debug:
+                    print("[AUX WARNING] Could not reliably infer feature_dim from actor. Using default 512.")
+
 
         if self.debug:
             print(f"[AUX INIT] Initializing AuxiliaryTaskManager with sr_weight={sr_weight}, rp_weight={rp_weight}")
@@ -388,138 +409,208 @@ class AuxiliaryTaskManager:
 
     def compute_losses(self):
         """
-        Compute auxiliary task losses that flow gradients through the shared
-        layers of the actor network.
+        DEPRECATED for PPO. Use compute_losses_for_batch instead.
+        Compute auxiliary task losses by sampling from the history buffer.
+        This is kept for potential use with stream-based algorithms.
 
         Returns:
             dict: Dictionary containing SR and RP loss tensors (not detached)
         """
+        if self.learning_mode == "batch":
+             if self.debug:
+                 print("[AUX WARNING] compute_losses called in batch mode. Use compute_losses_for_batch for PPO.")
+             # Simulate batch computation by sampling
+             if self.history_size >= self.batch_size:
+                 indices = np.random.choice(self.history_size, self.batch_size, replace=False)
+                 obs_batch = torch.stack([self.obs_history[i] for i in indices]).to(self.device)
+                 rewards_batch = torch.stack([self.reward_history[i] for i in indices]).to(self.device)
+                 return self.compute_losses_for_batch(obs_batch, rewards_batch)
+             else:
+                 return {"sr_loss": torch.tensor(0.0, device=self.device),
+                         "rp_loss": torch.tensor(0.0, device=self.device),
+                         "sr_loss_scalar": 0.0, "rp_loss_scalar": 0.0}
+
+        # --- Logic for stream mode (if needed) ---
+        # This part might need adjustments based on how stream algorithms handle aux tasks
         sr_loss = torch.tensor(0.0, device=self.device)
         rp_loss = torch.tensor(0.0, device=self.device)
+        sr_loss_scalar = 0.0
+        rp_loss_scalar = 0.0
 
-        # --- State Representation Task ---
-        if self.sr_weight > 0 and self.history_size >= self.batch_size:
-            # Sample a batch of observations from history
-            indices = np.random.choice(self.history_size, self.batch_size, replace=False)
-            obs_batch = torch.stack([self.obs_history[i] for i in indices]).to(self.device)
-
-            # Get features from actor WITH gradients
+        # SR Task (using most recent observation)
+        if self.sr_weight > 0 and self.history_size > 0:
+            obs_latest = self.obs_history[-1].unsqueeze(0).to(self.device) # Add batch dim
             with torch.set_grad_enabled(self.training):
                 try:
-                    _, features_batch = self.actor(obs_batch, return_features=True)
-                except (TypeError, ValueError):
-                    # Try common alternate patterns if the standard approach fails
-                    if hasattr(self.actor, 'get_features'):
-                        features_batch = self.actor.get_features(obs_batch)
-                    elif hasattr(self.actor, 'extract_features'):
-                        features_batch = self.actor.extract_features(obs_batch)
-                    else:
-                        # Last resort fallback - warn and continue
-                        if self.debug:
-                            print("[AUX DEBUG] Cannot extract features from actor, skipping SR loss")
-                        features_batch = None
+                    _, features_latest = self.actor(obs_latest, return_features=True)
+                    sr_loss = self.sr_task.get_loss(features_latest, obs_latest) * self.sr_weight
+                    sr_loss_scalar = sr_loss.detach().item()
+                except Exception as e:
+                    if self.debug: print(f"[AUX DEBUG Stream SR] Error: {e}")
 
-            # Compute SR loss if we have features
-            if features_batch is not None:
-                sr_loss = self.sr_task.get_loss(features_batch, obs_batch) * self.sr_weight
+        # RP Task (using most recent sequence)
+        if self.rp_weight > 0 and self.history_size >= self.rp_sequence_length:
+            obs_seq = [self.obs_history[i] for i in range(self.history_size - self.rp_sequence_length, self.history_size)]
+            reward_target = self.reward_history[-1]
 
-                # Store scalar for logging (don't detach the tensor for gradient flow)
-                if not torch.isnan(sr_loss) and not torch.isinf(sr_loss):
-                    self.last_sr_loss = sr_loss.detach().item()
-                else:
-                    if self.debug:
-                        print("[AUX DEBUG] Invalid SR loss detected")
-                    self.last_sr_loss = 0.0
-                    sr_loss = torch.tensor(0.0, device=self.device)  # Reset to valid value
-            else:
-                self.last_sr_loss = 0.0
-        else:
-            if self.debug and self.sr_weight > 0:
-                print(f"[AUX DEBUG] SR Task skipped: Not enough history ({self.history_size}/{self.batch_size})")
-            self.last_sr_loss = 0.0
+            obs_seq_tensor = torch.stack(obs_seq).unsqueeze(0).to(self.device) # Add batch dim
+            reward_target_tensor = reward_target.unsqueeze(0).to(self.device) # Add batch dim
 
-        # --- Reward Prediction Task ---
-        min_rp_history = self.rp_sequence_length
-        if self.rp_weight > 0 and self.history_size >= min_rp_history + self.batch_size - 1:
-            # Calculate max start index for valid sequences
-            max_start_index = self.history_size - self.rp_sequence_length
-            if max_start_index < self.batch_size - 1:
-                if self.debug:
-                    print(f"[AUX DEBUG] RP Task skipped: Not enough valid start indices ({max_start_index+1}/{self.batch_size})")
-                self.last_rp_loss = 0.0
-                # Return early if RP cannot run, SR loss might still be valid
-                return {"sr_loss": sr_loss, "rp_loss": rp_loss}
-
-            # Sample valid start indices for sequences
-            start_indices = np.random.choice(max_start_index + 1, self.batch_size, replace=False)
-
-            # Prepare batches of observation sequences and their target rewards
-            obs_seq_batch = []
-            reward_target_batch = []
-
-            for start_idx in start_indices:
-                # Extract observation sequence
-                obs_seq = [self.obs_history[i] for i in range(start_idx, start_idx + self.rp_sequence_length)]
-                obs_seq_batch.append(torch.stack(obs_seq))
-
-                # Extract target reward (reward at the end of the sequence)
-                target_reward_idx = start_idx + self.rp_sequence_length - 1
-                reward_target_batch.append(self.reward_history[target_reward_idx])
-
-            # Stack batches and move to device
-            obs_seq_tensor = torch.stack(obs_seq_batch).to(self.device)  # [batch_size, seq_len, obs_dim]
-            reward_targets_tensor = torch.stack(reward_target_batch).to(self.device)  # [batch_size]
-
-            # Get feature sequences from the actor WITH gradients
-            # First reshape to handle batch sequences through the actor
             batch_size, seq_len, obs_dim = obs_seq_tensor.shape
-            obs_flat = obs_seq_tensor.reshape(-1, obs_dim)  # [batch_size*seq_len, obs_dim]
+            obs_flat = obs_seq_tensor.reshape(-1, obs_dim)
 
             with torch.set_grad_enabled(self.training):
                 try:
                     _, features_flat = self.actor(obs_flat, return_features=True)
-                except (TypeError, ValueError):
-                    # Try alternate patterns if standard approach fails
-                    if hasattr(self.actor, 'get_features'):
-                        features_flat = self.actor.get_features(obs_flat)
-                    elif hasattr(self.actor, 'extract_features'):
-                        features_flat = self.actor.extract_features(obs_flat)
+                    feature_dim = features_flat.shape[-1]
+                    features_seq_tensor = features_flat.reshape(batch_size, seq_len, feature_dim)
+                    rp_loss = self.rp_task.get_loss(features_seq_tensor, reward_target_tensor) * self.rp_weight
+                    rp_loss_scalar = rp_loss.detach().item()
+                except Exception as e:
+                    if self.debug: print(f"[AUX DEBUG Stream RP] Error: {e}")
+
+        self.last_sr_loss = sr_loss_scalar
+        self.last_rp_loss = rp_loss_scalar
+        self.update_count += 1
+
+        return {"sr_loss": sr_loss, "rp_loss": rp_loss,
+                "sr_loss_scalar": sr_loss_scalar, "rp_loss_scalar": rp_loss_scalar}
+
+
+    def compute_losses_for_batch(self, obs_batch, rewards_batch):
+        """
+        Compute auxiliary task losses for a specific batch of data.
+        This is intended for use within PPO's update loop.
+
+        Args:
+            obs_batch: Tensor of observations for the batch [batch_size, obs_dim]
+            rewards_batch: Tensor of rewards for the batch [batch_size]
+
+        Returns:
+            dict: Dictionary containing SR and RP loss tensors (not detached)
+                  and their scalar equivalents for logging.
+        """
+        sr_loss = torch.tensor(0.0, device=self.device)
+        rp_loss = torch.tensor(0.0, device=self.device)
+        sr_loss_scalar = 0.0
+        rp_loss_scalar = 0.0
+        current_batch_size = obs_batch.shape[0]
+
+        # --- State Representation Task ---
+        if self.sr_weight > 0:
+            # Get features from actor WITH gradients for the current batch
+            with torch.set_grad_enabled(self.training):
+                try:
+                    # Ensure obs_batch is on the correct device
+                    obs_batch_device = obs_batch.to(self.device)
+                    _, features_batch = self.actor(obs_batch_device, return_features=True)
+                except (TypeError, ValueError, AttributeError) as e:
+                    if self.debug: print(f"[AUX DEBUG Batch SR] Error getting features: {e}")
+                    features_batch = None # Fallback
+
+            # Compute SR loss if we have features
+            if features_batch is not None:
+                try:
+                    sr_loss = self.sr_task.get_loss(features_batch, obs_batch_device) * self.sr_weight
+                    if not torch.isnan(sr_loss) and not torch.isinf(sr_loss):
+                        sr_loss_scalar = sr_loss.detach().item()
                     else:
-                        # Last resort fallback
-                        if self.debug:
-                            print("[AUX DEBUG] Cannot extract features from actor, skipping RP loss")
-                        features_flat = None
-
-            # Compute RP loss if we have features
-            if features_flat is not None:
-                # Reshape features back to sequence form
-                feature_dim = features_flat.shape[-1]
-                features_seq_tensor = features_flat.reshape(batch_size, seq_len, feature_dim)
-
-                rp_loss = self.rp_task.get_loss(features_seq_tensor, reward_targets_tensor) * self.rp_weight
-
-                # Store scalar for logging (don't detach the tensor for gradient flow)
-                if not torch.isnan(rp_loss) and not torch.isinf(rp_loss):
-                    self.last_rp_loss = rp_loss.detach().item()
-                else:
-                    if self.debug:
-                        print("[AUX DEBUG] Invalid RP loss detected")
-                    self.last_rp_loss = 0.0
-                    rp_loss = torch.tensor(0.0, device=self.device)  # Reset to valid value
+                        if self.debug: print("[AUX DEBUG Batch SR] Invalid SR loss detected (NaN/Inf)")
+                        sr_loss = torch.tensor(0.0, device=self.device) # Reset tensor
+                except Exception as e:
+                    if self.debug: print(f"[AUX DEBUG Batch SR] Error calculating loss: {e}")
+                    sr_loss = torch.tensor(0.0, device=self.device) # Reset tensor
             else:
-                self.last_rp_loss = 0.0
+                 if self.debug: print("[AUX DEBUG Batch SR] Skipped: No features obtained.")
+
+        # --- Reward Prediction Task ---
+        # RP requires sequences. We sample sequences ending *before* the current batch
+        # from the history buffer. This is an approximation but common.
+        min_rp_history = self.rp_sequence_length
+        # Use current_batch_size for sampling if history is large enough
+        rp_batch_size = min(current_batch_size, self.batch_size)
+
+        if self.rp_weight > 0 and self.history_size >= min_rp_history + rp_batch_size - 1:
+            # Calculate max start index for valid sequences in the history
+            max_start_index = self.history_size - self.rp_sequence_length
+            if max_start_index >= rp_batch_size - 1:
+                # Sample valid start indices for sequences from history
+                # Ensure we don't sample indices overlapping with the current batch if possible
+                # For simplicity, we sample randomly from available history sequences.
+                start_indices = np.random.choice(max_start_index + 1, rp_batch_size, replace=False)
+
+                # Prepare batches of observation sequences and their target rewards from HISTORY
+                obs_seq_batch = []
+                reward_target_batch = []
+                valid_sequences = 0
+                for start_idx in start_indices:
+                    try:
+                        # Extract observation sequence from history
+                        obs_seq = [self.obs_history[i] for i in range(start_idx, start_idx + self.rp_sequence_length)]
+                        obs_seq_batch.append(torch.stack(obs_seq))
+
+                        # Extract target reward (reward at the end of the sequence) from history
+                        target_reward_idx = start_idx + self.rp_sequence_length - 1
+                        reward_target_batch.append(self.reward_history[target_reward_idx])
+                        valid_sequences += 1
+                    except IndexError:
+                        if self.debug: print(f"[AUX DEBUG Batch RP] IndexError accessing history for start_idx {start_idx}")
+                        continue # Skip if index is out of bounds (shouldn't happen with check above)
+
+                if valid_sequences > 0:
+                    # Stack batches and move to device
+                    obs_seq_tensor = torch.stack(obs_seq_batch).to(self.device)  # [rp_batch_size, seq_len, obs_dim]
+                    reward_targets_tensor = torch.stack(reward_target_batch).to(self.device)  # [rp_batch_size]
+
+                    # Get feature sequences from the actor WITH gradients
+                    batch_size_rp, seq_len_rp, obs_dim_rp = obs_seq_tensor.shape
+                    obs_flat_rp = obs_seq_tensor.reshape(-1, obs_dim_rp)
+
+                    with torch.set_grad_enabled(self.training):
+                        try:
+                            _, features_flat_rp = self.actor(obs_flat_rp, return_features=True)
+                        except (TypeError, ValueError, AttributeError) as e:
+                            if self.debug: print(f"[AUX DEBUG Batch RP] Error getting features: {e}")
+                            features_flat_rp = None # Fallback
+
+                    # Compute RP loss if we have features
+                    if features_flat_rp is not None:
+                        try:
+                            # Reshape features back to sequence form
+                            feature_dim_rp = features_flat_rp.shape[-1]
+                            features_seq_tensor_rp = features_flat_rp.reshape(batch_size_rp, seq_len_rp, feature_dim_rp)
+
+                            rp_loss = self.rp_task.get_loss(features_seq_tensor_rp, reward_targets_tensor) * self.rp_weight
+
+                            if not torch.isnan(rp_loss) and not torch.isinf(rp_loss):
+                                rp_loss_scalar = rp_loss.detach().item()
+                            else:
+                                if self.debug: print("[AUX DEBUG Batch RP] Invalid RP loss detected (NaN/Inf)")
+                                rp_loss = torch.tensor(0.0, device=self.device) # Reset tensor
+                        except Exception as e:
+                            if self.debug: print(f"[AUX DEBUG Batch RP] Error calculating loss: {e}")
+                            rp_loss = torch.tensor(0.0, device=self.device) # Reset tensor
+                    else:
+                         if self.debug: print("[AUX DEBUG Batch RP] Skipped: No features obtained.")
+                else:
+                    if self.debug: print("[AUX DEBUG Batch RP] Skipped: No valid sequences sampled.")
+            else:
+                 if self.debug: print(f"[AUX DEBUG Batch RP] Skipped: Not enough history for batch size ({self.history_size}/{min_rp_history + rp_batch_size -1})")
         else:
             if self.debug and self.rp_weight > 0:
-                print(f"[AUX DEBUG] RP Task skipped: Not enough history ({self.history_size}/{min_rp_history + self.batch_size -1})")
-            self.last_rp_loss = 0.0
+                print(f"[AUX DEBUG Batch RP] Skipped: Not enough history ({self.history_size}/{min_rp_history + rp_batch_size -1})")
 
-        # Log detailed results in debug mode
-        if self.debug and (self.last_sr_loss > 0 or self.last_rp_loss > 0):
-            print(f"[AUX DEBUG] Computed Losses - SR: {self.last_sr_loss:.6f}, RP: {self.last_rp_loss:.6f}")
 
-        self.update_count += 1  # Increment internal update counter
+        # Store last computed scalar losses
+        self.last_sr_loss = sr_loss_scalar
+        self.last_rp_loss = rp_loss_scalar
 
-        return {"sr_loss": sr_loss, "rp_loss": rp_loss}
+        # Increment update count (tracks how many times losses were computed)
+        self.update_count += 1
+
+        return {"sr_loss": sr_loss, "rp_loss": rp_loss,
+                "sr_loss_scalar": sr_loss_scalar, "rp_loss_scalar": rp_loss_scalar}
+
 
     def reset(self):
         """Reset history buffers"""
@@ -613,6 +704,17 @@ class AuxiliaryTaskManager:
         return {
             'sr_task': self.sr_task.state_dict(),
             'rp_task': self.rp_task.state_dict(),
+            # Add weights and history size if needed for resuming
+            'sr_weight': self.sr_weight,
+            'rp_weight': self.rp_weight,
+            'history_size': self.history_size,
+            'update_count': self.update_count,
+            'last_sr_loss': self.last_sr_loss,
+            'last_rp_loss': self.last_rp_loss,
+            'learning_mode': self.learning_mode,
+            # Save history buffers (optional, can be large)
+            # 'obs_history': list(self.obs_history),
+            # 'reward_history': list(self.reward_history),
         }
 
     def load_state_dict(self, state_dict):
@@ -620,5 +722,21 @@ class AuxiliaryTaskManager:
         self.sr_task.load_state_dict(state_dict['sr_task'])
         self.rp_task.load_state_dict(state_dict['rp_task'])
 
+        # Load other parameters
+        self.sr_weight = state_dict.get('sr_weight', self.sr_weight)
+        self.rp_weight = state_dict.get('rp_weight', self.rp_weight)
+        self.history_size = state_dict.get('history_size', 0)
+        self.update_count = state_dict.get('update_count', 0)
+        self.last_sr_loss = state_dict.get('last_sr_loss', 0.0)
+        self.last_rp_loss = state_dict.get('last_rp_loss', 0.0)
+        self.learning_mode = state_dict.get('learning_mode', self.learning_mode)
+
+        # Load history buffers if saved (optional)
+        # if 'obs_history' in state_dict:
+        #     self.obs_history = deque(state_dict['obs_history'], maxlen=self.obs_history.maxlen)
+        # if 'reward_history' in state_dict:
+        #     self.reward_history = deque(state_dict['reward_history'], maxlen=self.reward_history.maxlen)
+        # self.history_size = len(self.obs_history) # Recalculate size
+
         if self.debug:
-            print("[AUX LOAD] Loaded auxiliary task models from state dict")
+            print("[AUX LOAD] Loaded auxiliary task models and state from state dict")

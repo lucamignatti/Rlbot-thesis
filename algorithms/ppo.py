@@ -6,6 +6,8 @@ from collections import deque
 import math
 from typing import Dict, Tuple, List, Optional, Union, Any
 from .base import BaseAlgorithm
+# Import AuxiliaryTaskManager to use its methods
+from auxiliary import AuxiliaryTaskManager
 
 class PPOAlgorithm(BaseAlgorithm):
     """PPO algorithm implementation"""
@@ -14,6 +16,8 @@ class PPOAlgorithm(BaseAlgorithm):
         self,
         actor,
         critic,
+        # Add aux_task_manager parameter
+        aux_task_manager: Optional[AuxiliaryTaskManager] = None,
         action_space_type="discrete",
         action_dim=None,
         action_bounds=(-1.0, 1.0),
@@ -65,6 +69,9 @@ class PPOAlgorithm(BaseAlgorithm):
             use_wandb=use_wandb,
         )
 
+        # Store the auxiliary task manager
+        self.aux_task_manager = aux_task_manager
+
         # Weight clipping parameters
         self.use_weight_clipping = use_weight_clipping
         self.weight_clip_kappa = weight_clip_kappa
@@ -83,7 +90,8 @@ class PPOAlgorithm(BaseAlgorithm):
         # Initialize memory with buffer size and device
         self.memory = self.PPOMemory(
             batch_size=batch_size,
-            buffer_size=10000,
+            # Increase buffer size to match update_interval typically used
+            buffer_size=131072, # Example size, adjust if needed
             device=device,
             debug=debug,
             action_space_type=self.action_space_type # Pass action space type
@@ -92,17 +100,24 @@ class PPOAlgorithm(BaseAlgorithm):
         # Initialize optimizer
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr_actor)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
-        # Combined optimizer for single backward pass
-        self.optimizer = torch.optim.Adam(
-            list(self.actor.parameters()) + list(self.critic.parameters()),
-            lr=lr_actor
-        )
+
+        # Combine parameters for a single optimizer step
+        combined_params = list(self.actor.parameters()) + list(self.critic.parameters())
+        if self.aux_task_manager:
+            if hasattr(self.aux_task_manager, 'sr_task'):
+                combined_params += list(self.aux_task_manager.sr_task.parameters())
+            if hasattr(self.aux_task_manager, 'rp_task'):
+                combined_params += list(self.aux_task_manager.rp_task.parameters())
+
+        self.optimizer = torch.optim.Adam(combined_params, lr=lr_actor) # Use actor LR for combined
 
         # Tracking metrics
         self.metrics = {
             'actor_loss': 0.0,
             'critic_loss': 0.0,
             'entropy_loss': 0.0,
+            'sr_loss_scalar': 0.0, # Add aux metrics
+            'rp_loss_scalar': 0.0, # Add aux metrics
             'total_loss': 0.0,
             'clip_fraction': 0.0,
             'explained_variance': 0.0,
@@ -130,7 +145,8 @@ class PPOAlgorithm(BaseAlgorithm):
             self.pos = 0
             self.size = 0
             self.full = False
-            self.use_device_tensors = device != "cpu"
+            # Removed use_device_tensors, always use torch tensors on self.device
+            # self.use_device_tensors = device != "cpu"
 
             # Initialize buffers as empty tensors
             self._reset_buffers()
@@ -139,25 +155,25 @@ class PPOAlgorithm(BaseAlgorithm):
             """Initialize all buffer tensors with the correct shapes"""
             buffer_size = self.buffer_size
             device = self.device
-            use_device_tensors = self.use_device_tensors
+            # use_device_tensors = self.use_device_tensors # Removed
 
-            # Determine tensor type based on device
-            if use_device_tensors:
-                # Initialize empty tensors on the specified device
-                self.obs = None  # Will be initialized on first store() call
-                self.actions = None  # Will be initialized on first store() call
-                self.log_probs = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
-                self.rewards = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
-                self.values = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
-                self.dones = torch.zeros((buffer_size,), dtype=torch.bool, device=device)
-            else:
-                # Initialize empty numpy arrays for CPU
-                self.obs = None  # Will be initialized on first store() call
-                self.actions = None  # Will be initialized on first store() call
-                self.log_probs = np.zeros((buffer_size,), dtype=np.float32)
-                self.rewards = np.zeros((buffer_size,), dtype=np.float32)
-                self.values = np.zeros((buffer_size,), dtype=np.float32)
-                self.dones = np.zeros((buffer_size,), dtype=np.bool_)
+            # Determine tensor type based on device - Always use torch tensors now
+            # if use_device_tensors: # Removed
+            # Initialize empty tensors on the specified device
+            self.obs = None  # Will be initialized on first store() call
+            self.actions = None  # Will be initialized on first store() call
+            self.log_probs = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
+            self.rewards = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
+            self.values = torch.zeros((buffer_size,), dtype=torch.float32, device=device)
+            self.dones = torch.zeros((buffer_size,), dtype=torch.bool, device=device)
+            # else: # Removed
+            #     # Initialize empty numpy arrays for CPU
+            #     self.obs = None  # Will be initialized on first store() call
+            #     self.actions = None  # Will be initialized on first store() call
+            #     self.log_probs = np.zeros((buffer_size,), dtype=np.float32)
+            #     self.rewards = np.zeros((buffer_size,), dtype=np.float32)
+            #     self.values = np.zeros((buffer_size,), dtype=np.float32)
+            #     self.dones = np.zeros((buffer_size,), dtype=np.bool_)
 
             # Reset position and full indicator
             self.pos = 0
@@ -198,14 +214,15 @@ class PPOAlgorithm(BaseAlgorithm):
                 if self.debug:
                     print(f"[DEBUG PPOMemory] Initializing buffers: obs_shape={obs_shape}, action_shape={action_shape}, action_dtype={action_dtype}")
 
-                if self.use_device_tensors:
-                    self.obs = torch.zeros((self.buffer_size, *obs_shape), dtype=torch.float32, device=self.device)
-                    self.actions = torch.zeros((self.buffer_size, *action_shape), dtype=action_dtype, device=self.device)
-                else:
-                    # For CPU, initialize with torch tensors first, then convert if needed?
-                    # Let's keep them as torch tensors for consistency, even on CPU.
-                    self.obs = torch.zeros((self.buffer_size, *obs_shape), dtype=torch.float32)
-                    self.actions = torch.zeros((self.buffer_size, *action_shape), dtype=action_dtype)
+                # Always use torch tensors on the specified device
+                # if self.use_device_tensors: # Removed
+                self.obs = torch.zeros((self.buffer_size, *obs_shape), dtype=torch.float32, device=self.device)
+                self.actions = torch.zeros((self.buffer_size, *action_shape), dtype=action_dtype, device=self.device)
+                # else: # Removed
+                #     # For CPU, initialize with torch tensors first, then convert if needed?
+                #     # Let's keep them as torch tensors for consistency, even on CPU.
+                #     self.obs = torch.zeros((self.buffer_size, *obs_shape), dtype=torch.float32)
+                #     self.actions = torch.zeros((self.buffer_size, *action_shape), dtype=action_dtype)
 
 
         def store_initial_batch(self, obs_batch, action_batch, log_prob_batch, value_batch):
@@ -497,12 +514,12 @@ class PPOAlgorithm(BaseAlgorithm):
 
         with torch.no_grad():
             if return_features:
+                # Request features from the actor
                 action_dist_output, actor_features = self.actor(obs, return_features=True)
-                features = actor_features  # Only use actor features
+                features = actor_features
             else:
                 action_dist_output = self.actor(obs)
                 features = None # Ensure features is defined
-                # No critic call during inference
 
             if deterministic:
                 if self.action_space_type == "discrete":
@@ -561,7 +578,11 @@ class PPOAlgorithm(BaseAlgorithm):
         if buffer_size < self.batch_size: # Don't update if buffer has less than one batch
             if self.debug:
                 print(f"[DEBUG PPO] Buffer size ({buffer_size}) < batch size ({self.batch_size}), skipping update")
-            return self.metrics # Return previous metrics
+            # Return previous metrics, ensuring aux losses are included if manager exists
+            if self.aux_task_manager:
+                self.metrics['sr_loss_scalar'] = self.aux_task_manager.last_sr_loss
+                self.metrics['rp_loss_scalar'] = self.aux_task_manager.last_rp_loss
+            return self.metrics
 
         if self.debug:
             print(f"[DEBUG PPO] Starting update with buffer size: {buffer_size}")
@@ -602,13 +623,14 @@ class PPOAlgorithm(BaseAlgorithm):
             return self.metrics # Return previous metrics to avoid logging NaNs
 
         # Update the policy and value networks using PPO
-        metrics = self._update_policy(states, actions, old_log_probs, returns, advantages)
+        # Pass rewards tensor needed for auxiliary task batch computation
+        metrics = self._update_policy(states, actions, old_log_probs, returns, advantages, rewards)
 
         # Clear the memory buffer after using the data for updates
         self.memory.clear()
 
-        # Update the metrics
-        self.metrics = {**self.metrics, **metrics}
+        # Update the metrics dictionary with results from _update_policy
+        self.metrics.update(metrics)
 
         # If we have episode returns, update the mean return metric
         if len(self.episode_returns) > 0:
@@ -618,7 +640,7 @@ class PPOAlgorithm(BaseAlgorithm):
         self._update_counter += 1
 
         if self.debug:
-            print(f"[DEBUG PPO] Update finished. Actor Loss: {metrics.get('actor_loss', 0):.4f}, Critic Loss: {metrics.get('critic_loss', 0):.4f}")
+            print(f"[DEBUG PPO] Update finished. Actor Loss: {metrics.get('actor_loss', 0):.4f}, Critic Loss: {metrics.get('critic_loss', 0):.4f}, SR Loss: {metrics.get('sr_loss_scalar', 0):.4f}, RP Loss: {metrics.get('rp_loss_scalar', 0):.4f}")
 
 
         return self.metrics
@@ -648,7 +670,8 @@ class PPOAlgorithm(BaseAlgorithm):
         if buffer_size > 0:
              # Ensure values tensor is not empty before accessing
              if values.numel() > 0:
-                 next_value = 0.0 if dones[last_idx] else values[last_idx].item()
+                 # Use value prediction V(s_last) if not done, otherwise 0
+                 next_value = values[last_idx].item() * (1.0 - dones[last_idx].float().item())
              else:
                  next_value = 0.0 # Handle case where values tensor might be empty
 
@@ -766,9 +789,9 @@ class PPOAlgorithm(BaseAlgorithm):
         return float(clipped_params) / total_params if total_params > 0 else 0.0
 
 
-    def _update_policy(self, states, actions, old_log_probs, returns, advantages):
+    def _update_policy(self, states, actions, old_log_probs, returns, advantages, rewards):
         """
-        Update policy and value networks using PPO algorithm
+        Update policy and value networks using PPO algorithm, including auxiliary losses.
 
         Args:
             states: batch of states [buffer_size, state_dim]
@@ -776,6 +799,7 @@ class PPOAlgorithm(BaseAlgorithm):
             old_log_probs: batch of log probabilities from old policy [buffer_size]
             returns: batch of returns [buffer_size]
             advantages: batch of advantages [buffer_size]
+            rewards: batch of rewards [buffer_size] (needed for aux tasks)
 
         Returns:
             dict: metrics from the update
@@ -785,6 +809,8 @@ class PPOAlgorithm(BaseAlgorithm):
             'actor_loss': 0.0,
             'critic_loss': 0.0,
             'entropy_loss': 0.0,
+            'sr_loss_scalar': 0.0, # Add aux metrics
+            'rp_loss_scalar': 0.0, # Add aux metrics
             'total_loss': 0.0,
             'clip_fraction': 0.0, # PPO policy clip fraction
             'weight_clip_fraction': 0.0, # Fraction of weights clipped this update
@@ -835,7 +861,9 @@ class PPOAlgorithm(BaseAlgorithm):
                 batch_old_log_probs = old_log_probs[batch_idx]
                 batch_returns = returns[batch_idx]
                 batch_advantages = advantages[batch_idx]
+                batch_rewards = rewards[batch_idx] # Get rewards for this batch
 
+                # --- PPO Loss Calculation ---
                 # Get current policy distribution and values
                 if self.action_space_type == "discrete":
                     # For discrete actions
@@ -917,17 +945,39 @@ class PPOAlgorithm(BaseAlgorithm):
                 # Calculate entropy loss
                 entropy_loss = -entropy * self.entropy_coef
 
-                # Total loss
-                total_loss = actor_loss + self.critic_coef * critic_loss + entropy_loss
+                # --- Auxiliary Loss Calculation ---
+                sr_loss = torch.tensor(0.0, device=self.device)
+                rp_loss = torch.tensor(0.0, device=self.device)
+                sr_loss_scalar = 0.0
+                rp_loss_scalar = 0.0
 
-                # Optimize
+                if self.aux_task_manager is not None and (self.aux_task_manager.sr_weight > 0 or self.aux_task_manager.rp_weight > 0):
+                    try:
+                        # Call the new batch-specific loss computation method
+                        aux_losses = self.aux_task_manager.compute_losses_for_batch(batch_states, batch_rewards)
+                        sr_loss = aux_losses.get("sr_loss", torch.tensor(0.0, device=self.device))
+                        rp_loss = aux_losses.get("rp_loss", torch.tensor(0.0, device=self.device))
+                        sr_loss_scalar = aux_losses.get("sr_loss_scalar", 0.0)
+                        rp_loss_scalar = aux_losses.get("rp_loss_scalar", 0.0)
+                        if self.debug and (sr_loss_scalar > 0 or rp_loss_scalar > 0):
+                            print(f"[DEBUG PPO Aux] Batch Aux Losses - SR: {sr_loss_scalar:.6f}, RP: {rp_loss_scalar:.6f}")
+                    except Exception as e:
+                        if self.debug:
+                            print(f"[DEBUG PPO Aux] Error computing aux losses for batch: {e}")
+                            import traceback
+                            traceback.print_exc()
+
+                # --- Total Loss ---
+                total_loss = actor_loss + self.critic_coef * critic_loss + entropy_loss + sr_loss + rp_loss
+
+                # --- Optimization ---
                 self.optimizer.zero_grad()
                 total_loss.backward()
 
                 # Clip gradients
                 if self.max_grad_norm > 0:
-                    nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
-                    nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
+                    # Clip gradients for all parameters managed by the optimizer
+                    nn.utils.clip_grad_norm_(self.optimizer.param_groups[0]['params'], self.max_grad_norm)
 
                 self.optimizer.step()
 
@@ -935,10 +985,12 @@ class PPOAlgorithm(BaseAlgorithm):
                 current_weight_clip_fraction = self.clip_weights()
                 total_weight_clipped_fraction_epoch += current_weight_clip_fraction
 
-                # Update metrics (accumulate)
+                # --- Update Metrics (accumulate) ---
                 update_metrics['actor_loss'] += actor_loss.detach().item()
                 update_metrics['critic_loss'] += critic_loss.detach().item()
                 update_metrics['entropy_loss'] += entropy_loss.detach().item()
+                update_metrics['sr_loss_scalar'] += sr_loss_scalar # Use scalar value
+                update_metrics['rp_loss_scalar'] += rp_loss_scalar # Use scalar value
                 update_metrics['total_loss'] += total_loss.detach().item()
 
                 # Calculate PPO policy clipping fraction
@@ -955,6 +1007,8 @@ class PPOAlgorithm(BaseAlgorithm):
             update_metrics['actor_loss'] /= num_batches_processed
             update_metrics['critic_loss'] /= num_batches_processed
             update_metrics['entropy_loss'] /= num_batches_processed
+            update_metrics['sr_loss_scalar'] /= num_batches_processed # Average scalar aux losses
+            update_metrics['rp_loss_scalar'] /= num_batches_processed # Average scalar aux losses
             update_metrics['total_loss'] /= num_batches_processed
             update_metrics['clip_fraction'] /= num_batches_processed
             update_metrics['kl_divergence'] /= num_batches_processed
@@ -982,3 +1036,38 @@ class PPOAlgorithm(BaseAlgorithm):
         update_metrics['current_kappa'] = self.weight_clip_kappa
 
         return update_metrics
+
+    def get_state_dict(self):
+        """Get state dict for saving algorithm state"""
+        state = super().get_state_dict() # Get base state if needed
+        state.update({
+            'actor_optimizer': self.actor_optimizer.state_dict(),
+            'critic_optimizer': self.critic_optimizer.state_dict(),
+            'optimizer': self.optimizer.state_dict(), # Save combined optimizer
+            'memory_state': self.memory.get_state_dict() if hasattr(self.memory, 'get_state_dict') else None, # Save memory state if possible
+            'episode_returns': list(self.episode_returns),
+            'current_episode_rewards': self.current_episode_rewards,
+            'weight_clip_kappa': self.weight_clip_kappa,
+            '_update_counter': self._update_counter
+        })
+        return state
+
+    def load_state_dict(self, state_dict):
+        """Load state dict for resuming algorithm state"""
+        super().load_state_dict(state_dict) # Load base state if needed
+        if 'actor_optimizer' in state_dict:
+            self.actor_optimizer.load_state_dict(state_dict['actor_optimizer'])
+        if 'critic_optimizer' in state_dict:
+            self.critic_optimizer.load_state_dict(state_dict['critic_optimizer'])
+        if 'optimizer' in state_dict:
+            self.optimizer.load_state_dict(state_dict['optimizer']) # Load combined optimizer
+        if 'memory_state' in state_dict and hasattr(self.memory, 'load_state_dict'):
+            self.memory.load_state_dict(state_dict['memory_state'])
+        if 'episode_returns' in state_dict:
+            self.episode_returns = deque(state_dict['episode_returns'], maxlen=self.episode_returns.maxlen)
+        if 'current_episode_rewards' in state_dict:
+            self.current_episode_rewards = state_dict['current_episode_rewards']
+        if 'weight_clip_kappa' in state_dict:
+            self.weight_clip_kappa = state_dict['weight_clip_kappa']
+        if '_update_counter' in state_dict:
+            self._update_counter = state_dict['_update_counter']
