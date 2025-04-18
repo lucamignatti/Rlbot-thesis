@@ -56,11 +56,9 @@ class RewardPredictionTask(nn.Module):
         self.debug = debug
         self.input_dim = input_dim  # Store the expected input dimension (feature dim)
 
-        # Projection layer to handle varying input dimensions
-        self.projection = nn.Linear(input_dim, hidden_dim)
-
         # LSTM layer to process feature sequences
-        self.lstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True)
+        # No projection needed here as input_dim should match feature_dim from actor
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True) # Use input_dim directly
 
         # Output layer for 3-class classification (negative, near-zero, positive reward)
         self.output_layer = nn.Linear(hidden_dim, 3)
@@ -88,6 +86,7 @@ class RewardPredictionTask(nn.Module):
             return # Not enough data yet
 
         # Convert buffer to tensor for calculations
+        # This tensor creation happens infrequently, so it's less critical than the main loop.
         rewards_tensor = torch.tensor(list(self.threshold_reward_buffer), dtype=torch.float32)
 
         # Calculate percentiles for a balanced 3-way split (e.g., 33rd and 67th)
@@ -143,32 +142,27 @@ class RewardPredictionTask(nn.Module):
             print(f"[RP DEBUG Adjust] Adjusted thresholds - Neg: {self.neg_threshold:.6f}, Pos: {self.pos_threshold:.6f} (Buffer size: {len(self.threshold_reward_buffer)})")
 
 
-    def forward(self, x_seq):
-        # x_seq shape: [batch_size, sequence_length, input_dim]
-        batch_size, seq_len, actual_dim = x_seq.shape
+    def forward(self, feature_seq):
+        # feature_seq shape: [batch_size, sequence_length, feature_dim]
+        batch_size, seq_len, actual_feature_dim = feature_seq.shape
 
-        # Check if input dimensions match the expected dimensions
-        # If not, recreate the projection layer with the correct dimensions
-        if actual_dim != self.input_dim:
+        # Check if input dimensions match the expected dimensions (input_dim stored from init)
+        # If not, recreate the LSTM layer with the correct dimensions. This handles cases
+        # where the actor's feature dimension might change (though less common).
+        if actual_feature_dim != self.input_dim:
             if self.debug:
-                print(f"[RP DEBUG] Input dimension mismatch. Expected: {self.input_dim}, Got: {actual_dim}. Recreating projection layer.")
+                print(f"[RP DEBUG] Feature dimension mismatch in forward. Expected: {self.input_dim}, Got: {actual_feature_dim}. Recreating LSTM layer.")
 
-            # Create a new projection layer with correct input dimensions
-            self.projection = nn.Linear(actual_dim, self.hidden_dim).to(self.device)
+            # Recreate LSTM layer with correct input dimensions
+            self.lstm = nn.LSTM(actual_feature_dim, self.hidden_dim, batch_first=True).to(self.device)
+            # Recreate output layer if hidden_dim changed (unlikely but safe)
+            if self.output_layer.in_features != self.hidden_dim:
+                 self.output_layer = nn.Linear(self.hidden_dim, 3).to(self.device)
             # Update stored input dimension
-            self.input_dim = actual_dim
-
-        # Reshape to process all sequence elements at once
-        x_reshaped = x_seq.reshape(batch_size * seq_len, -1)
-
-        # Now apply the projection
-        projected = self.projection(x_reshaped)
-
-        # Reshape back to sequence format
-        projected = projected.reshape(batch_size, seq_len, self.hidden_dim)
+            self.input_dim = actual_feature_dim
 
         # Now pass through LSTM
-        lstm_out, _ = self.lstm(projected)
+        lstm_out, _ = self.lstm(feature_seq) # Use feature_seq directly
 
         # Take only the last timestep's output
         last_output = lstm_out[:, -1, :]
@@ -177,9 +171,9 @@ class RewardPredictionTask(nn.Module):
         logits = self.output_layer(last_output)
         return logits
 
-    def get_loss(self, x_seq, rewards):
+    def get_loss(self, feature_seq, rewards):
         # Get reward class predictions
-        logits = self.forward(x_seq)
+        logits = self.forward(feature_seq)
 
         # Convert rewards to class labels:
         # 0: negative, 1: near-zero, 2: positive
@@ -295,7 +289,7 @@ class AuxiliaryTaskManager:
         self.sr_weight = sr_weight
         self.rp_weight = rp_weight
         self.rp_sequence_length = rp_sequence_length
-        self.actor = actor
+        self.actor = actor # Store actor reference, but try not to use it directly in compute_losses_for_batch
         self.debug = debug
         self.use_amp = use_amp  # Store use_amp parameter for compatibility
         self.learning_mode = learning_mode
@@ -444,21 +438,23 @@ class AuxiliaryTaskManager:
         if self.learning_mode == "batch":
              if self.debug:
                  print("[AUX WARNING] compute_losses called in batch mode. Use compute_losses_for_batch for PPO.")
-             # Simulate batch computation by sampling
-             if self.history_size >= self.batch_size:
-                 indices = np.random.choice(self.history_size, self.batch_size, replace=False)
-                 obs_batch = torch.stack([self.obs_history[i] for i in indices]).to(self.device)
-                 rewards_batch = torch.stack([self.reward_history[i] for i in indices]).to(self.device)
-                 # Note: This bypasses the internal mini-batching of compute_losses_for_batch
-                 # It assumes the sampled self.batch_size is small enough.
-                 return self.compute_losses_for_batch(obs_batch, rewards_batch)
-             else:
-                 return {"sr_loss": torch.tensor(0.0, device=self.device),
-                         "rp_loss": torch.tensor(0.0, device=self.device),
-                         "sr_loss_scalar": 0.0, "rp_loss_scalar": 0.0}
+             # Simulate batch computation by sampling - THIS PATH IS NOW PROBLEMATIC
+             # as compute_losses_for_batch requires pre-computed features.
+             # Returning zero loss is safer.
+             # if self.history_size >= self.batch_size:
+             #     indices = np.random.choice(self.history_size, self.batch_size, replace=False)
+             #     obs_batch = torch.stack([self.obs_history[i] for i in indices]).to(self.device)
+             #     rewards_batch = torch.stack([self.reward_history[i] for i in indices]).to(self.device)
+             #     # We cannot easily generate features here without the actor and proper context.
+             #     # Return zero loss instead.
+             #     # return self.compute_losses_for_batch(obs_batch, rewards_batch) # Error: features_batch missing
+             # else:
+             return {"sr_loss": torch.tensor(0.0, device=self.device),
+                     "rp_loss": torch.tensor(0.0, device=self.device),
+                     "sr_loss_scalar": 0.0, "rp_loss_scalar": 0.0}
 
         # --- Logic for stream mode (if needed) ---
-        # This part might need adjustments based on how stream algorithms handle aux tasks
+        # This part still generates features internally as it processes single steps/sequences
         sr_loss = torch.tensor(0.0, device=self.device)
         rp_loss = torch.tensor(0.0, device=self.device)
         sr_loss_scalar = 0.0
@@ -467,8 +463,9 @@ class AuxiliaryTaskManager:
         # SR Task (using most recent observation)
         if self.sr_weight > 0 and self.history_size > 0:
             obs_latest = self.obs_history[-1].unsqueeze(0).to(self.device) # Add batch dim
-            with torch.set_grad_enabled(self.training):
+            with torch.set_grad_enabled(self.training): # Keep grad enabled here for stream mode
                 try:
+                    # Generate features internally for stream mode
                     _, features_latest = self.actor(obs_latest, return_features=True)
                     sr_loss = self.sr_task.get_loss(features_latest, obs_latest) * self.sr_weight
                     sr_loss_scalar = sr_loss.detach().item()
@@ -486,8 +483,9 @@ class AuxiliaryTaskManager:
             batch_size, seq_len, obs_dim = obs_seq_tensor.shape
             obs_flat = obs_seq_tensor.reshape(-1, obs_dim)
 
-            with torch.set_grad_enabled(self.training):
+            with torch.set_grad_enabled(self.training): # Keep grad enabled here for stream mode
                 try:
+                    # Generate features internally for stream mode
                     _, features_flat = self.actor(obs_flat, return_features=True)
                     feature_dim = features_flat.shape[-1]
                     features_seq_tensor = features_flat.reshape(batch_size, seq_len, feature_dim)
@@ -504,14 +502,15 @@ class AuxiliaryTaskManager:
                 "sr_loss_scalar": sr_loss_scalar, "rp_loss_scalar": rp_loss_scalar}
 
 
-    def compute_losses_for_batch(self, obs_batch, rewards_batch):
+    def compute_losses_for_batch(self, obs_batch, rewards_batch, features_batch):
         """
-        Compute auxiliary task losses for a specific batch of data using internal mini-batching.
-        This is intended for use within PPO's update loop.
+        Compute auxiliary task losses for a specific batch of data using pre-computed features
+        and internal mini-batching. This is intended for use within PPO's update loop.
 
         Args:
-            obs_batch: Tensor of observations for the batch [batch_size, obs_dim] (on CPU or GPU)
-            rewards_batch: Tensor of rewards for the batch [batch_size] (on CPU or GPU)
+            obs_batch: Tensor of observations for the batch [batch_size, obs_dim] (on device)
+            rewards_batch: Tensor of rewards for the batch [batch_size] (on device)
+            features_batch: Tensor of pre-computed features for the batch [batch_size, feature_dim] (on device)
 
         Returns:
             dict: Dictionary containing SR and RP loss tensors (not detached)
@@ -524,57 +523,50 @@ class AuxiliaryTaskManager:
         sr_processed_count = 0
         rp_processed_count = 0
         current_batch_size = obs_batch.shape[0]
-
-        # Ensure rewards_batch is on the correct device (needed for RP target indexing)
-        rewards_batch_device = rewards_batch.to(self.device)
+        feature_dim = features_batch.shape[-1] # Get feature dim from input
 
         # --- State Representation Task (Internal Mini-batching) ---
         # Initialize SR loss tensor in case the loop doesn't run or sr_weight is 0
         sr_loss = torch.tensor(0.0, device=self.device)
         if self.sr_weight > 0:
+            # Process using pre-computed features in mini-batches
             for i in range(0, current_batch_size, self.internal_aux_batch_size):
                 mini_batch_end = min(i + self.internal_aux_batch_size, current_batch_size)
-                obs_mini_batch = obs_batch[i:mini_batch_end].to(self.device) # Move mini-batch to device
+                # Slice observations and features for the mini-batch
+                obs_mini_batch = obs_batch[i:mini_batch_end] # Assumed on device
+                features_mini_batch = features_batch[i:mini_batch_end] # Use pre-computed features
                 mini_batch_actual_size = obs_mini_batch.shape[0]
 
                 if mini_batch_actual_size == 0: continue
 
-                # Get features from actor WITH gradients for the mini-batch
-                with torch.set_grad_enabled(self.training):
-                    try:
-                        # Ensure actor expects features to be returned
-                        actor_output = self.actor(obs_mini_batch, return_features=True)
-                        # Handle different actor output formats (e.g., tuple or single tensor)
-                        if isinstance(actor_output, tuple):
-                            _, features_mini_batch = actor_output
-                        else:
-                            # Assuming the actor might just return features directly if return_features=True
-                            # This might need adjustment based on the specific actor implementation
-                            features_mini_batch = actor_output
-                            if self.debug: print("[AUX DEBUG Batch SR Mini] Warning: Actor output format might be unexpected (expected tuple).")
+                # Compute SR loss using the provided features
+                # No need for torch.set_grad_enabled here, handled by caller (PPO loop)
+                try:
+                    # Ensure feature dimension matches SR task expectations
+                    if features_mini_batch.shape[-1] != self.sr_task.feature_dim:
+                         if self.debug: print(f"[AUX DEBUG Batch SR Mini] Feature dim mismatch! Expected {self.sr_task.feature_dim}, got {features_mini_batch.shape[-1]}. Recreating SR task.")
+                         # Recreate SR task if dimension mismatch
+                         self.sr_task = StateRepresentationTask(
+                             feature_dim=features_mini_batch.shape[-1],
+                             obs_dim=self.obs_dim,
+                             hidden_dim=self.sr_task.hidden_dim,
+                             device=self.device
+                         )
+                         self.feature_dim = features_mini_batch.shape[-1] # Update manager's feature dim
 
-                    except (TypeError, ValueError, AttributeError, RuntimeError) as e:
-                        if self.debug: print(f"[AUX DEBUG Batch SR Mini] Error getting features (batch {i // self.internal_aux_batch_size}): {e}")
-                        features_mini_batch = None # Fallback
 
-                # Compute SR loss if we have features
-                if features_mini_batch is not None:
-                    try:
-                        sr_loss_mini = self.sr_task.get_loss(features_mini_batch, obs_mini_batch) * self.sr_weight
-                        if not torch.isnan(sr_loss_mini) and not torch.isinf(sr_loss_mini):
-                            # Accumulate loss weighted by mini-batch size
-                            total_sr_loss += sr_loss_mini # Loss function usually averages; scale later
-                            sr_processed_count += mini_batch_actual_size
-                        else:
-                            if self.debug: print("[AUX DEBUG Batch SR Mini] Invalid SR loss detected (NaN/Inf)")
-                    except Exception as e:
-                        if self.debug: print(f"[AUX DEBUG Batch SR Mini] Error calculating SR loss (batch {i // self.internal_aux_batch_size}): {e}")
-                else:
-                     if self.debug: print(f"[AUX DEBUG Batch SR Mini] Skipped loss calculation: No features obtained (batch {i // self.internal_aux_batch_size}).")
+                    sr_loss_mini = self.sr_task.get_loss(features_mini_batch, obs_mini_batch) * self.sr_weight
+                    if not torch.isnan(sr_loss_mini) and not torch.isinf(sr_loss_mini):
+                        total_sr_loss += sr_loss_mini # Loss function usually averages; scale later
+                        sr_processed_count += mini_batch_actual_size
+                    else:
+                        if self.debug: print("[AUX DEBUG Batch SR Mini] Invalid SR loss detected (NaN/Inf)")
+                except Exception as e:
+                    if self.debug: print(f"[AUX DEBUG Batch SR Mini] Error calculating SR loss (batch {i // self.internal_aux_batch_size}): {e}")
+
 
             # Average the loss over all processed items
             if sr_processed_count > 0:
-                # Average the accumulated loss (assumes get_loss returns mean loss for the mini-batch)
                 num_mini_batches = (sr_processed_count + self.internal_aux_batch_size - 1) // self.internal_aux_batch_size
                 sr_loss = total_sr_loss / max(1, num_mini_batches) # Average over mini-batches
                 sr_loss_scalar = sr_loss.detach().item()
@@ -590,108 +582,88 @@ class AuxiliaryTaskManager:
         # Initialize RP variables before the conditional block
         rp_loss = torch.tensor(0.0, device=self.device)
         rp_loss_scalar = 0.0
-        obs_dim_rp = None
-        seq_len_rp = None
+        seq_len_rp = self.rp_sequence_length
 
-        # Construct sequences directly from the current batch data.
+        # Construct feature sequences and reward targets efficiently using tensor operations.
         if self.rp_weight > 0 and current_batch_size >= self.rp_sequence_length:
-            obs_seq_batch = []
-            reward_target_batch = []
-
-            # Iterate through the original batch (on CPU or GPU) to define sequences
-            for i in range(current_batch_size - self.rp_sequence_length + 1):
-                obs_seq = obs_batch[i : i + self.rp_sequence_length]
-                obs_seq_batch.append(obs_seq)
-                target_reward_idx = i + self.rp_sequence_length - 1
-                reward_target_batch.append(rewards_batch_device[target_reward_idx]) # Use rewards on device
-
-            valid_sequences = len(obs_seq_batch)
-            obs_seq_batch_tensor = None
+            valid_sequences = 0 # Initialize
+            feature_seq_batch_tensor = None
             reward_targets_tensor = None
 
-            if valid_sequences > 0:
-                try:
-                    # Stack sequences - keep on original device initially if possible
-                    # This might still be large, but avoids immediate GPU OOM if obs_batch was on CPU
-                    obs_seq_batch_tensor = torch.stack(obs_seq_batch)
-                    reward_targets_tensor = torch.stack(reward_target_batch) # Already on device
-                    obs_dim_rp = obs_seq_batch_tensor.shape[-1]
-                    seq_len_rp = obs_seq_batch_tensor.shape[1]
+            try:
+                # Use unfold to create overlapping feature sequences
+                # features_batch shape: [batch_size, feature_dim]
+                # unfold result shape: [num_sequences, feature_dim, seq_len_rp]
+                unfolded_features = features_batch.unfold(0, seq_len_rp, 1)
 
-                except RuntimeError as e:
-                    if self.debug: print(f"[AUX DEBUG Batch RP] Error stacking sequences/rewards: {e}")
-                    valid_sequences = 0 # Cannot proceed
+                # Permute dimensions to match LSTM expected input: [num_sequences, seq_len_rp, feature_dim]
+                feature_seq_batch_tensor = unfolded_features.permute(0, 2, 1)
+                valid_sequences = feature_seq_batch_tensor.shape[0]
 
-                # Process sequences in mini-batches only if tensors were created successfully
-                if valid_sequences > 0 and obs_seq_batch_tensor is not None and reward_targets_tensor is not None:
-                    for i in range(0, valid_sequences, self.internal_aux_batch_size):
-                        mini_batch_end = min(i + self.internal_aux_batch_size, valid_sequences)
-                        obs_seq_mini_batch = obs_seq_batch_tensor[i:mini_batch_end].to(self.device) # Move mini-batch to device
-                        reward_targets_mini_batch = reward_targets_tensor[i:mini_batch_end] # Already on device
-                        mini_batch_actual_size = obs_seq_mini_batch.shape[0]
+                # Efficiently get the target rewards (the reward corresponding to the *last* element of each sequence)
+                # Indices needed: seq_len_rp - 1, seq_len_rp, ..., batch_size - 1
+                target_indices = torch.arange(seq_len_rp - 1, current_batch_size, device=self.device)
+                reward_targets_tensor = rewards_batch[target_indices]
 
-                        if mini_batch_actual_size == 0: continue
+                # Ensure reward targets have the same number of elements as sequences
+                if reward_targets_tensor.shape[0] != valid_sequences:
+                     if self.debug: print(f"[AUX DEBUG Batch RP] Mismatch between num sequences ({valid_sequences}) and num reward targets ({reward_targets_tensor.shape[0]})")
+                     valid_sequences = 0 # Invalidate if shapes don't match
 
-                        # Ensure obs_dim_rp and seq_len_rp were set
-                        if obs_dim_rp is None or seq_len_rp is None:
-                            if self.debug: print("[AUX DEBUG Batch RP Mini] Error: obs_dim_rp or seq_len_rp not set.")
-                            break
+            except RuntimeError as e:
+                if self.debug: print(f"[AUX DEBUG Batch RP] Error unfolding features or slicing rewards: {e}")
+                valid_sequences = 0 # Cannot proceed
 
-                        obs_flat_rp_mini = obs_seq_mini_batch.reshape(-1, obs_dim_rp)
+            # Process sequences in mini-batches only if tensors were created successfully
+            if valid_sequences > 0 and feature_seq_batch_tensor is not None and reward_targets_tensor is not None:
+                # Check feature dimension before processing mini-batches
+                if feature_dim != self.rp_task.input_dim:
+                    if self.debug: print(f"[AUX DEBUG Batch RP] Feature dim mismatch! Expected {self.rp_task.input_dim}, got {feature_dim}. Recreating RP task.")
+                    self.rp_task = RewardPredictionTask(
+                            input_dim=feature_dim,
+                            hidden_dim=self.rp_task.hidden_dim,
+                            sequence_length=self.rp_sequence_length,
+                            device=self.device,
+                            debug=self.debug
+                        )
+                    self.feature_dim = feature_dim # Update manager's feature dim
 
-                        with torch.set_grad_enabled(self.training):
-                            try:
-                                # Ensure actor expects features to be returned
-                                actor_output_rp = self.actor(obs_flat_rp_mini, return_features=True)
-                                if isinstance(actor_output_rp, tuple):
-                                     _, features_flat_rp_mini = actor_output_rp
-                                else:
-                                     features_flat_rp_mini = actor_output_rp # Fallback assumption
-                                     if self.debug: print("[AUX DEBUG Batch RP Mini] Warning: Actor output format might be unexpected (expected tuple).")
+                for i in range(0, valid_sequences, self.internal_aux_batch_size):
+                    mini_batch_end = min(i + self.internal_aux_batch_size, valid_sequences)
+                    # Slice the pre-created sequence tensors
+                    feature_seq_mini_batch = feature_seq_batch_tensor[i:mini_batch_end]
+                    reward_targets_mini_batch = reward_targets_tensor[i:mini_batch_end]
+                    mini_batch_actual_size = feature_seq_mini_batch.shape[0]
 
-                            except (TypeError, ValueError, AttributeError, RuntimeError) as e:
-                                if self.debug: print(f"[AUX DEBUG Batch RP Mini] Error getting features (batch {i // self.internal_aux_batch_size}): {e}")
-                                features_flat_rp_mini = None # Fallback
+                    if mini_batch_actual_size == 0: continue
 
-                        if features_flat_rp_mini is not None:
-                            try:
-                                feature_dim_rp = features_flat_rp_mini.shape[-1]
-                                features_seq_tensor_rp_mini = features_flat_rp_mini.reshape(mini_batch_actual_size, seq_len_rp, feature_dim_rp)
+                    # Compute RP loss using the feature sequences
+                    try:
+                        rp_loss_mini = self.rp_task.get_loss(feature_seq_mini_batch, reward_targets_mini_batch) * self.rp_weight
 
-                                rp_loss_mini = self.rp_task.get_loss(features_seq_tensor_rp_mini, reward_targets_mini_batch) * self.rp_weight
-
-                                if not torch.isnan(rp_loss_mini) and not torch.isinf(rp_loss_mini):
-                                    total_rp_loss += rp_loss_mini # Accumulate mean loss from mini-batch
-                                    rp_processed_count += mini_batch_actual_size
-                                else:
-                                    if self.debug: print("[AUX DEBUG Batch RP Mini] Invalid RP loss detected (NaN/Inf)")
-                            except Exception as e:
-                                if self.debug: print(f"[AUX DEBUG Batch RP Mini] Error calculating RP loss (batch {i // self.internal_aux_batch_size}): {e}")
+                        if not torch.isnan(rp_loss_mini) and not torch.isinf(rp_loss_mini):
+                            total_rp_loss += rp_loss_mini # Accumulate mean loss from mini-batch
+                            rp_processed_count += mini_batch_actual_size
                         else:
-                             if self.debug: print(f"[AUX DEBUG Batch RP Mini] Skipped loss calculation: No features obtained (batch {i // self.internal_aux_batch_size}).")
+                            if self.debug: print("[AUX DEBUG Batch RP Mini] Invalid RP loss detected (NaN/Inf)")
+                    except Exception as e:
+                        if self.debug: print(f"[AUX DEBUG Batch RP Mini] Error calculating RP loss (batch {i // self.internal_aux_batch_size}): {e}")
 
-                    # Average the loss over all processed mini-batches
-                    if rp_processed_count > 0:
-                        num_mini_batches_rp = (rp_processed_count + self.internal_aux_batch_size - 1) // self.internal_aux_batch_size
-                        rp_loss = total_rp_loss / max(1, num_mini_batches_rp) # Average over mini-batches
-                        rp_loss_scalar = rp_loss.detach().item()
-                    else:
-                        # rp_loss already initialized to 0 tensor
-                        rp_loss_scalar = 0.0
-                        if self.debug: print("[AUX DEBUG Batch RP] No sequences processed for RP task.")
-                else: # Failed to create tensors or valid_sequences was 0
-                    if self.debug and valid_sequences > 0: print("[AUX DEBUG Batch RP] Skipped processing: Tensor creation failed.")
-                    # rp_loss already initialized to 0 tensor
+                # Average the loss over all processed mini-batches
+                if rp_processed_count > 0:
+                    num_mini_batches_rp = (rp_processed_count + self.internal_aux_batch_size - 1) // self.internal_aux_batch_size
+                    rp_loss = total_rp_loss / max(1, num_mini_batches_rp) # Average over mini-batches
+                    rp_loss_scalar = rp_loss.detach().item()
+                else:
                     rp_loss_scalar = 0.0
-
-            else: # valid_sequences == 0
-                if self.debug: print("[AUX DEBUG Batch RP] Skipped: No valid sequences constructed from batch.")
-                # rp_loss already initialized to 0 tensor
+                    if self.debug: print("[AUX DEBUG Batch RP] No sequences processed for RP task.")
+            else: # Failed to create tensors or valid_sequences was 0
+                if self.debug and valid_sequences > 0 : print("[AUX DEBUG Batch RP] Skipped processing: Tensor creation/slicing failed.")
+                elif self.debug and valid_sequences == 0: print("[AUX DEBUG Batch RP] Skipped: No valid sequences constructed from batch.")
                 rp_loss_scalar = 0.0
         else: # rp_weight <= 0 or not enough items
             if self.debug and self.rp_weight > 0:
                 print(f"[AUX DEBUG Batch RP] Skipped: Not enough batch items ({current_batch_size}/{self.rp_sequence_length}) for sequence or RP weight is zero.")
-            # rp_loss already initialized to 0 tensor
             rp_loss_scalar = 0.0
 
 
@@ -825,6 +797,26 @@ class AuxiliaryTaskManager:
 
     def load_state_dict(self, state_dict):
         """Load state dict for loading task models and manager state"""
+        # Infer feature dim before loading models, might be needed if actor changed
+        try:
+             self.feature_dim = getattr(self.actor, 'hidden_dim') # Or other reliable attribute
+        except AttributeError:
+             if self.debug: print("[AUX LOAD WARN] Cannot infer feature_dim from actor, using default 512. Model loading might fail if mismatch.")
+             self.feature_dim = 512 # Fallback
+
+        # Re-initialize models with potentially correct feature_dim before loading state_dict
+        # This prevents size mismatches if feature_dim changed between saving and loading
+        try:
+            self.sr_task = StateRepresentationTask(
+                feature_dim=self.feature_dim, obs_dim=self.obs_dim,
+                hidden_dim=self.sr_task.hidden_dim, device=self.device)
+            self.rp_task = RewardPredictionTask(
+                input_dim=self.feature_dim, hidden_dim=self.rp_task.hidden_dim,
+                sequence_length=self.rp_sequence_length, device=self.device, debug=self.debug)
+        except Exception as e:
+             if self.debug: print(f"[AUX LOAD ERROR] Failed to re-initialize tasks before loading state_dict: {e}")
+             # Continue trying to load state dict, might still work if dims match
+
         self.sr_task.load_state_dict(state_dict['sr_task'])
         self.rp_task.load_state_dict(state_dict['rp_task'])
 

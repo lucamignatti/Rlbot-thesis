@@ -515,26 +515,28 @@ class PPOAlgorithm(BaseAlgorithm):
         with torch.no_grad():
             if return_features:
                 # Request features from the actor
-                action_dist_output, actor_features = self.actor(obs, return_features=True)
+                # Assume actor returns (action_dist_output, features)
+                actor_output, actor_features = self.actor(obs, return_features=True)
                 features = actor_features
             else:
-                action_dist_output = self.actor(obs)
+                # Assume actor returns only action_dist_output
+                actor_output = self.actor(obs, return_features=False) # Explicitly set return_features=False
                 features = None # Ensure features is defined
 
             if deterministic:
                 if self.action_space_type == "discrete":
                     # Assuming actor outputs probabilities for discrete actions
-                    probs = action_dist_output
+                    probs = actor_output
                     action = torch.argmax(probs, dim=-1) # Get index of max probability (Long)
                     # Calculate log_prob of the chosen action index
                     log_prob = torch.log(torch.gather(probs, -1, action.unsqueeze(-1)).squeeze(-1) + 1e-10)
                 else: # Continuous
-                    action_dist = action_dist_output # Assume output is already a distribution object
+                    action_dist = actor_output # Assume output is already a distribution object
                     action = action_dist.loc # Mean action (Float)
                     log_prob = action_dist.log_prob(action).sum(dim=-1)
             else: # Sample action
                 if self.action_space_type == "discrete":
-                    probs = action_dist_output
+                    probs = actor_output
                     # Ensure probs are valid before creating Categorical distribution
                     probs = torch.clamp(probs, min=1e-10) # Prevent zeros
                     probs = probs / probs.sum(dim=-1, keepdim=True) # Normalize
@@ -551,7 +553,7 @@ class PPOAlgorithm(BaseAlgorithm):
                          action = torch.argmax(probs, dim=-1)
                          log_prob = torch.log(torch.gather(probs, -1, action.unsqueeze(-1)).squeeze(-1) + 1e-10)
                 else: # Continuous
-                    action_dist = action_dist_output # Assume output is already a distribution object
+                    action_dist = actor_output # Assume output is already a distribution object
                     action = action_dist.sample() # Float
                     log_prob = action_dist.log_prob(action).sum(dim=-1)
 
@@ -877,10 +879,19 @@ class PPOAlgorithm(BaseAlgorithm):
                 batch_rewards = rewards[batch_idx] # Get rewards for this batch
 
                 # --- PPO Loss Calculation ---
-                # Get current policy distribution and values
+                # Get current policy distribution, features, and values
+                # Call actor ONCE to get action distribution and features
+                try:
+                    actor_output, current_features = self.actor(batch_states, return_features=True)
+                    if self.debug and current_features is None:
+                         print("[DEBUG PPO _update_policy] Warning: Actor did not return features when requested.")
+                except Exception as e:
+                    if self.debug: print(f"[DEBUG PPO _update_policy] Error getting actor output/features: {e}")
+                    continue # Skip batch if actor fails
+
+                # Calculate log probabilities and entropy based on action space type
                 if self.action_space_type == "discrete":
-                    # For discrete actions
-                    action_probs = self.actor(batch_states)
+                    action_probs = actor_output # Assume output is probs
                     action_probs = torch.clamp(action_probs, min=1e-10) # Prevent zeros
                     action_probs = action_probs / action_probs.sum(dim=-1, keepdim=True) # Normalize
 
@@ -891,53 +902,37 @@ class PPOAlgorithm(BaseAlgorithm):
                              print(f"[DEBUG PPO _update_policy] Error creating Categorical distribution in batch: {e}")
                              print(f"Probs shape: {action_probs.shape}, Probs sum: {action_probs.sum(dim=-1)}")
                              print(f"Probs sample: {action_probs[0]}")
-                         # Skip this batch if distribution is invalid
-                         continue
+                         continue # Skip batch
 
                     # Calculate log probabilities and entropy
-                    # batch_actions should be Long indices here
                     if batch_actions.dtype != torch.long:
                          if self.debug: print(f"[DEBUG PPO _update_policy] Warning: batch_actions dtype is {batch_actions.dtype}, expected Long.")
-                         # Attempt to cast, but this might indicate an earlier issue
-                         try:
-                             actions_indices = batch_actions.long()
+                         try: actions_indices = batch_actions.long()
                          except RuntimeError:
                              if self.debug: print("[DEBUG PPO _update_policy] Failed to cast batch_actions to Long.")
                              continue # Skip batch
-                    else:
-                         actions_indices = batch_actions
+                    else: actions_indices = batch_actions
 
-                    # Ensure indices are within the valid range for the distribution
                     if actions_indices.max() >= dist.probs.shape[-1] or actions_indices.min() < 0:
-                         if self.debug:
-                             print(f"[DEBUG PPO _update_policy] Invalid action indices found.")
-                             print(f"Indices shape: {actions_indices.shape}, max: {actions_indices.max()}, min: {actions_indices.min()}")
-                             print(f"Probs shape: {dist.probs.shape}")
+                         if self.debug: print(f"[DEBUG PPO _update_policy] Invalid action indices found.")
                          continue # Skip batch
-
 
                     try:
                         curr_log_probs = dist.log_prob(actions_indices)
                         entropy = dist.entropy().mean()
                     except (IndexError, ValueError) as e:
-                         if self.debug:
-                             print(f"[DEBUG PPO _update_policy] Error calculating log_prob/entropy: {e}")
-                             print(f"Action indices shape: {actions_indices.shape}, max index: {actions_indices.max()}, min index: {actions_indices.min()}")
-                             print(f"Probs shape: {action_probs.shape}")
+                         if self.debug: print(f"[DEBUG PPO _update_policy] Error calculating log_prob/entropy: {e}")
                          continue # Skip batch
 
-                else:
-                    # For continuous actions
-                    # batch_actions should be Float
+                else: # Continuous
                     if batch_actions.dtype != torch.float:
                          if self.debug: print(f"[DEBUG PPO _update_policy] Warning: batch_actions dtype is {batch_actions.dtype}, expected Float.")
-                         try:
-                             batch_actions = batch_actions.float()
+                         try: batch_actions = batch_actions.float()
                          except RuntimeError:
                              if self.debug: print("[DEBUG PPO _update_policy] Failed to cast batch_actions to Float.")
                              continue # Skip batch
 
-                    action_dist = self.actor(batch_states) # Assume actor returns distribution object
+                    action_dist = actor_output # Assume output is distribution object
                     curr_log_probs = action_dist.log_prob(batch_actions).sum(dim=-1)
                     entropy = action_dist.entropy().mean()
 
@@ -946,8 +941,6 @@ class PPOAlgorithm(BaseAlgorithm):
 
                 # Calculate ratio and surrogates for PPO
                 ratio = torch.exp(curr_log_probs - batch_old_log_probs)
-
-                # Clipped surrogate function
                 surr1 = ratio * batch_advantages
                 surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * batch_advantages
                 actor_loss = -torch.min(surr1, surr2).mean()
@@ -965,20 +958,23 @@ class PPOAlgorithm(BaseAlgorithm):
                 sr_loss_scalar = 0.0
                 rp_loss_scalar = 0.0
 
-                if self.aux_task_manager is not None and (self.aux_task_manager.sr_weight > 0 or self.aux_task_manager.rp_weight > 0):
+                # Calculate aux losses only if manager exists and features were obtained
+                if self.aux_task_manager is not None and current_features is not None and \
+                   (self.aux_task_manager.sr_weight > 0 or self.aux_task_manager.rp_weight > 0):
                     try:
-                        # Call the new batch-specific loss computation method
-                        # Pass batch_states and batch_rewards
-                        aux_losses = self.aux_task_manager.compute_losses_for_batch(batch_states, batch_rewards)
+                        # Pass pre-computed features, observations, and rewards
+                        aux_losses = self.aux_task_manager.compute_losses_for_batch(
+                            obs_batch=batch_states,
+                            rewards_batch=batch_rewards,
+                            features_batch=current_features
+                        )
                         # Get tensor loss if available, otherwise default to zero tensor
                         sr_loss = aux_losses.get("sr_loss", torch.tensor(0.0, device=self.device))
                         rp_loss = aux_losses.get("rp_loss", torch.tensor(0.0, device=self.device))
                         # Get scalar loss for tracking
                         sr_loss_scalar = aux_losses.get("sr_loss_scalar", 0.0)
                         rp_loss_scalar = aux_losses.get("rp_loss_scalar", 0.0)
-                        # Get scalar loss for tracking
-                        sr_loss_scalar = aux_losses.get("sr_loss_scalar", 0.0)
-                        rp_loss_scalar = aux_losses.get("rp_loss_scalar", 0.0)
+
                         if self.debug and (sr_loss_scalar > 0 or rp_loss_scalar > 0):
                             print(f"[DEBUG PPO Aux] Batch Aux Losses - SR: {sr_loss_scalar:.6f}, RP: {rp_loss_scalar:.6f}")
                     except Exception as e:
@@ -991,6 +987,8 @@ class PPOAlgorithm(BaseAlgorithm):
                         rp_loss = 0.0
                         sr_loss_scalar = 0.0
                         rp_loss_scalar = 0.0
+                elif self.debug and self.aux_task_manager is not None and current_features is None:
+                     print("[DEBUG PPO Aux] Skipping aux loss calculation as features were not obtained from actor.")
 
 
                 # --- Total Loss ---
