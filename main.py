@@ -476,7 +476,7 @@ def run_training(
             if len(all_obs) > 0:
                 obs_batch = torch.FloatTensor(np.stack(all_obs)).to(device)
                 with torch.no_grad():
-                    # Get actions and values from the networks in a single forward pass
+                    # Get actions from the networks - now without values during inference
                     action_batch, log_prob_batch, value_batch, features_batch = trainer.get_action(obs_batch, return_features=True)
                 if type(action_batch) in [int, float, np.float64, np.float32]:
                     action_batch = [action_batch]
@@ -504,7 +504,7 @@ def run_training(
                         action,
                         log_prob,
                         0,  # Placeholder reward, updated after environment step
-                        value,
+                        value,  # Value is now a dummy placeholder for PPO (recalculated during update)
                         False,  # Placeholder done flag, updated after environment step
                         env_id=env_idx  # Pass the environment index to support vectorized StreamAC
                     )
@@ -542,6 +542,9 @@ def run_training(
 
             # Process the results from each environment.
             exp_idx = 0  # Index into our experience buffer.
+            # Initialize a list to collect data for batch intrinsic reward calculation
+            intrinsic_batch_inputs = []
+
             for env_idx, result in enumerate(results):
                 # Handle both threading and multiprocessing return formats
                 if isinstance(result, tuple):
@@ -556,7 +559,7 @@ def run_training(
 
                 for agent_id in reward_dict.keys():  # Use reward_dict to ensure we get the correct agent ID.
                     # Get the actual reward and done flag for this agent in this environment.
-                    reward = reward_dict[agent_id]
+                    extrinsic_reward = reward_dict[agent_id]
                     done = terminated_dict[agent_id] or truncated_dict[agent_id]
 
                     # Get the next observation for this agent
@@ -576,22 +579,23 @@ def run_training(
 
                         # Debug the reward update process
                         if debug and exp_idx == 0:  # Only log for the first agent to avoid too much output
-                            print(f"[DEBUG] Updating experience at idx {mem_idx} with reward={reward:.4f}, done={done}")
+                            print(f"[DEBUG] Updating experience at idx {mem_idx} with reward={extrinsic_reward:.4f}, done={done}")
 
-                        # Get original observation and action from memory
-                        orig_obs = all_obs[exp_idx]
+                        # Store extrinsic reward and done flag immediately
+                        trainer.store_experience_at_idx(mem_idx, None, None, None, extrinsic_reward, None, done)
 
-                        # Calculate combined reward (extrinsic + intrinsic) if next observation is available
+                        # If intrinsic rewards are enabled, collect data for batch processing
                         if next_obs is not None and trainer.use_intrinsic_rewards:
-                            reward = trainer.update_experience_with_intrinsic_reward(
-                                state=orig_obs,
-                                action=actions_dict_list[env_idx][agent_id],
-                                next_state=next_obs,
-                                reward=reward,
-                                env_id=env_idx
-                            )
-
-                        trainer.store_experience_at_idx(mem_idx, None, None, None, reward, None, done)
+                            orig_obs = all_obs[exp_idx]
+                            action = actions_dict_list[env_idx][agent_id]
+                            intrinsic_batch_inputs.append({
+                                'mem_idx': mem_idx,
+                                'state': orig_obs,
+                                'action': action,
+                                'next_state': next_obs,
+                                'extrinsic_reward': extrinsic_reward,
+                                'env_id': env_idx
+                            })
                     else:
                         # For StreamAC, we directly update the latest experience with env_idx
                         if hasattr(trainer.algorithm, 'experience_buffers'):
@@ -600,33 +604,35 @@ def run_training(
                                 # Update the most recent experience with actual reward and done flag
                                 try:
                                     latest_exp = trainer.algorithm.experience_buffers[env_idx][-1]
+                                    total_reward = extrinsic_reward
 
                                     # Calculate combined reward (extrinsic + intrinsic) if next observation is available
+                                    # For StreamAC, we still calculate per-agent due to its online nature
                                     if next_obs is not None and trainer.use_intrinsic_rewards:
-                                        reward = trainer.update_experience_with_intrinsic_reward(
+                                        total_reward = trainer.update_experience_with_intrinsic_reward(
                                             state=latest_exp['obs'],
                                             action=latest_exp['action'],
                                             next_state=next_obs,
-                                            reward=reward,
+                                            reward=extrinsic_reward,
                                             env_id=env_idx
                                         )
 
                                     if 'reward' in latest_exp:  # Safety check
-                                        if isinstance(reward, (int, float, np.number)):
-                                            latest_exp['reward'] = torch.tensor(reward, dtype=torch.float32, device=trainer.device)
-                                        elif isinstance(reward, np.ndarray):
-                                            if reward.size == 1:  # If it's a scalar array
-                                                latest_exp['reward'] = torch.tensor(reward.item(), dtype=torch.float32, device=trainer.device)
+                                        if isinstance(total_reward, (int, float, np.number)):
+                                            latest_exp['reward'] = torch.tensor(total_reward, dtype=torch.float32, device=trainer.device)
+                                        elif isinstance(total_reward, np.ndarray):
+                                            if total_reward.size == 1:  # If it's a scalar array
+                                                latest_exp['reward'] = torch.tensor(total_reward.item(), dtype=torch.float32, device=trainer.device)
                                             else:
-                                                latest_exp['reward'] = torch.tensor(reward[0], dtype=torch.float32, device=trainer.device)
-                                        elif isinstance(reward, torch.Tensor):
-                                            latest_exp['reward'] = reward.to(device=trainer.device, dtype=torch.float32)
+                                                latest_exp['reward'] = torch.tensor(total_reward[0], dtype=torch.float32, device=trainer.device)
+                                        elif isinstance(total_reward, torch.Tensor):
+                                            latest_exp['reward'] = total_reward.to(device=trainer.device, dtype=torch.float32)
                                         else:
-                                            latest_exp['reward'] = torch.tensor(float(reward), dtype=torch.float32, device=trainer.device)
+                                            latest_exp['reward'] = torch.tensor(float(total_reward), dtype=torch.float32, device=trainer.device)
 
                                         # Update reward tracking for return calculation
                                         if hasattr(trainer.algorithm, 'update_reward_tracking'):
-                                            trainer.algorithm.update_reward_tracking(reward, env_id=env_idx)
+                                            trainer.algorithm.update_reward_tracking(total_reward, env_id=env_idx)
                                 except Exception as e:
                                     if debug:
                                         print(f"[DEBUG] Error updating StreamAC experience for env {env_idx}: {e}")
@@ -636,17 +642,29 @@ def run_training(
                                 # Update the most recent experience with actual reward and done flag
                                 try:
                                     latest_exp = trainer.algorithm.experience_buffer[-1]
+                                    total_reward = extrinsic_reward
+                                    
+                                    # For StreamAC single buffer case, we still calculate per-agent 
+                                    if next_obs is not None and trainer.use_intrinsic_rewards:
+                                        total_reward = trainer.update_experience_with_intrinsic_reward(
+                                            state=latest_exp['obs'], 
+                                            action=latest_exp['action'], 
+                                            next_state=next_obs,
+                                            reward=extrinsic_reward,
+                                            env_id=0  # Use env_id 0 for single buffer case
+                                        )
+                                        
                                     if 'reward' in latest_exp:  # Safety check
-                                        latest_exp['reward'] = torch.tensor([reward], dtype=torch.float32, device=trainer.device)
+                                        latest_exp['reward'] = torch.tensor([total_reward], dtype=torch.float32, device=trainer.device)
                                         # Update reward tracking for return calculation
                                         if hasattr(trainer.algorithm, 'update_reward_tracking'):
-                                            trainer.algorithm.update_reward_tracking(reward)
+                                            trainer.algorithm.update_reward_tracking(total_reward)
                                     if 'done' in latest_exp:  # Safety check
                                         latest_exp['done'] = torch.tensor([float(done)], dtype=torch.float32, device=trainer.device)
 
                                         # When episode is done, explicitly track the return
                                         if done and debug:
-                                            print(f"[DEBUG] Episode done detected for agent {agent_id} with reward {reward}")
+                                            print(f"[DEBUG] Episode done detected for agent {agent_id} with reward {total_reward}")
 
                                         # If the episode is done, force calculation of the return for this episode
                                         if done and hasattr(trainer.algorithm, 'current_episode_rewards') and len(trainer.algorithm.current_episode_rewards) > 0:
@@ -663,10 +681,100 @@ def run_training(
                                 except Exception as e:
                                     if debug:
                                         print(f"[DEBUG] Error updating StreamAC experience: {e}")
+                    
+                    # For tracking episode rewards, use original extrinsic reward for PPO 
+                    # since we'll update the actual rewards later in batch
+                    if algorithm == "ppo":
+                        reward_for_tracking = extrinsic_reward
+                    else:
+                        # For other algorithms, use the potentially combined reward that was just calculated
+                        reward_for_tracking = total_reward if 'total_reward' in locals() else extrinsic_reward
 
-                    # Accumulate rewards.
-                    episode_rewards[env_idx][agent_id] += reward
+                    # Accumulate rewards for episode tracking
+                    episode_rewards[env_idx][agent_id] += reward_for_tracking
                     exp_idx += 1
+            
+            # Batch intrinsic reward calculation for PPO 
+            if algorithm == "ppo" and trainer.use_intrinsic_rewards and intrinsic_batch_inputs:
+                if debug:
+                    print(f"[DEBUG] Calculating intrinsic rewards in batch for {len(intrinsic_batch_inputs)} experiences")
+                
+                try:
+                    # Extract data into arrays
+                    states = np.stack([item['state'] for item in intrinsic_batch_inputs])
+                    next_states = np.stack([item['next_state'] for item in intrinsic_batch_inputs])
+                    env_ids = [item['env_id'] for item in intrinsic_batch_inputs]
+                    mem_indices = [item['mem_idx'] for item in intrinsic_batch_inputs]
+                    
+                    # Convert actions to appropriate format (this might need adjustment based on action structure)
+                    actions_list = [item['action'] for item in intrinsic_batch_inputs]
+                    extrinsic_rewards = [item['extrinsic_reward'] for item in intrinsic_batch_inputs]
+
+                    # Try to convert actions to a uniform format that can be batched
+                    try:
+                        if all(isinstance(a, np.ndarray) for a in actions_list):
+                            actions = np.stack(actions_list)
+                        elif all(isinstance(a, torch.Tensor) for a in actions_list):
+                            # Convert PyTorch tensors to numpy for consistent batch processing
+                            actions = np.stack([a.cpu().numpy() if a.is_cuda else a.numpy() for a in actions_list])
+                        else:
+                            # For mixed types or single values, try a simple array conversion
+                            actions = np.array(actions_list)
+                    except Exception as e:
+                        if debug:
+                            print(f"[DEBUG] Error converting actions to batch: {e}. Falling back to array conversion.")
+                        # Fallback: convert each action individually then create array
+                        actions = []
+                        for act in actions_list:
+                            if isinstance(act, torch.Tensor):
+                                actions.append(act.cpu().numpy() if act.is_cuda else act.numpy())
+                            elif isinstance(act, np.ndarray):
+                                actions.append(act)
+                            else:
+                                actions.append(np.array([act]))
+                        actions = np.array(actions)
+                    
+                    # Calculate intrinsic rewards in batch
+                    intrinsic_rewards = trainer.calculate_intrinsic_rewards_batch(
+                        states=states,
+                        actions=actions,
+                        next_states=next_states,
+                        env_ids=env_ids
+                    )
+                    
+                    # Update rewards in the PPO memory buffer with combined rewards
+                    for i, mem_idx in enumerate(mem_indices):
+                        # Get the stored extrinsic reward from memory
+                        if hasattr(trainer.algorithm.memory, 'rewards') and trainer.algorithm.memory.rewards is not None:
+                            extrinsic_reward = extrinsic_rewards[i]
+                            intrinsic_reward = intrinsic_rewards[i]
+                            
+                            # Calculate combined reward (extrinsic + intrinsic)
+                            total_reward = extrinsic_reward + intrinsic_reward
+                            
+                            # Update the reward in memory
+                            try:
+                                # Handle different types (tensor or scalar)
+                                if isinstance(trainer.algorithm.memory.rewards, torch.Tensor):
+                                    trainer.algorithm.memory.rewards[mem_idx] = torch.tensor(total_reward, 
+                                                                                         dtype=trainer.algorithm.memory.rewards.dtype,
+                                                                                         device=trainer.algorithm.memory.rewards.device)
+                                else:
+                                    trainer.algorithm.memory.rewards[mem_idx] = total_reward
+                                
+                                if debug and i == 0:  # Log only first update to avoid spam
+                                    print(f"[DEBUG] Updated reward at idx {mem_idx}: extrinsic={extrinsic_reward:.4f} + "
+                                          f"intrinsic={intrinsic_reward:.4f} = {total_reward:.4f}")
+                            except Exception as e:
+                                if debug:
+                                    print(f"[DEBUG] Error updating reward at idx {mem_idx}: {e}")
+                        elif debug:
+                            print("[DEBUG] Could not access memory.rewards for updating")
+                except Exception as e:
+                    if debug:
+                        print(f"[DEBUG] Error in batch intrinsic reward calculation: {e}")
+                        import traceback
+                        traceback.print_exc()
 
             # Check if any episodes have completed.
             newly_completed_episodes = sum(dones)
@@ -781,11 +889,10 @@ def run_training(
                                     "RP_Loss": f"{metrics.get('rp_loss_scalar', 0):.4f}"
                                 })
 
-                        # Update progress bar immediately
-                        progress_bar.set_postfix(stats_dict)
-
                         # Record the step count at which this update happened
                         last_progress_update_step = collected_experiences
+                        
+                        # The progress bar will be updated at the end of the loop iteration
 
                 # Debug mode can show more details
                 if debug and collected_experiences % 100 == 0 and collected_experiences > 0:
@@ -886,8 +993,7 @@ def run_training(
                             # Just make sure the trainer's reference is up to date
                             trainer.curriculum_manager = curriculum_manager
 
-                progress_bar.set_postfix(stats_dict)
-
+                # Stats will be displayed at the end of the loop iteration
                 collected_experiences = 0
                 last_update_time = time.time()
 
@@ -904,12 +1010,7 @@ def run_training(
                 # Add debug logging to track experience collection
                 if debug and (collected_experiences % 100 == 0 or collected_experiences == 1) and collected_experiences > 0:
                     print(f"[DEBUG] PPO has collected {collected_experiences}/{update_interval} experiences")
-                    # Force progress bar update for better visual feedback during debugging
-                    progress_bar.set_postfix(stats_dict)
-                    progress_bar.refresh()
-
-            # Regular update for non-debug mode or other algorithms
-            progress_bar.set_postfix(stats_dict)
+                    # We'll update the progress bar at the end of the loop iteration instead
 
             # Update pretraining progress if enabled
             if use_pretraining:
@@ -939,6 +1040,7 @@ def run_training(
                     if "PT_Progress" in stats_dict:
                         stats_dict.pop("PT_Progress", None)
 
+            # Update progress bar only once per iteration
             progress_bar.set_postfix(stats_dict)
 
     except KeyboardInterrupt:

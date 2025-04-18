@@ -341,11 +341,17 @@ class PPOAlgorithm(BaseAlgorithm):
             self._reset_buffers()
 
     def store_experience(self, obs, action, log_prob, reward, value, done):
-        """Store experience in the buffer"""
+        """
+        Store experience in the buffer
+        
+        Since we no longer compute value during inference, the value parameter here
+        will be a dummy/placeholder (typically zeros). The actual value estimates
+        will be computed in batch during the update step.
+        """
         if self.debug:
             print(f"[DEBUG PPO] Storing experience - reward: {reward}")
 
-        # Forward to memory buffer
+        # Forward to memory buffer - with placeholder value
         self.memory.store(obs, action, log_prob, reward, value, done)
 
         # Track episode rewards for calculating returns
@@ -374,18 +380,17 @@ class PPOAlgorithm(BaseAlgorithm):
         self.memory.store_experience_at_idx(idx, obs, action, log_prob, reward, value, done)
 
     def get_action(self, obs, deterministic=False, return_features=False):
-        """Get action for a given observation"""
+        """Get action for a given observation (using only the actor network)"""
         if not isinstance(obs, torch.Tensor):
             obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
 
         with torch.no_grad():
             if return_features:
                 action_dist, actor_features = self.actor(obs, return_features=True)
-                value, critic_features = self.critic(obs, return_features=True)
-                features = torch.cat([actor_features, critic_features], dim=-1) if hasattr(self, 'hidden_dim') else actor_features
+                features = actor_features  # Only use actor features
             else:
                 action_dist = self.actor(obs)
-                value = self.critic(obs)
+                # No critic call during inference
 
             if deterministic:
                 if self.action_space_type == "discrete":
@@ -412,21 +417,17 @@ class PPOAlgorithm(BaseAlgorithm):
                     action = action_dist.sample()
                     log_prob = action_dist.log_prob(action).sum(dim=-1)
 
-        if value.dim() < action.dim():
-            value = value.unsqueeze(-1)
-
         # Only move to CPU if using MPS (Apple Silicon)
         if self.device == "mps":
             action = action.cpu()
             log_prob = log_prob.cpu()
-            value = value.cpu()
             if return_features:
                 features = features.cpu()
 
         if return_features:
-            return action, log_prob, value, features
+            return action, log_prob, features
         else:
-            return action, log_prob, value
+            return action, log_prob
 
     def reset(self):
         """Reset memory"""
@@ -463,6 +464,11 @@ class PPOAlgorithm(BaseAlgorithm):
         if not isinstance(dones, torch.Tensor):
             dones = torch.tensor(dones, dtype=torch.bool, device=self.device)
 
+        # Since we're using dummy values during get_action, we need to calculate
+        # the actual value estimates in batch here
+        with torch.no_grad():
+            values = self.critic(states).squeeze()
+
         # Compute returns and advantages
         returns, advantages = self._compute_gae(rewards, values, dones)
 
@@ -498,7 +504,7 @@ class PPOAlgorithm(BaseAlgorithm):
 
         Args:
             rewards: rewards tensor [buffer_size]
-            values: value predictions tensor [buffer_size]
+            values: value predictions tensor [buffer_size] (calculated in batch during update)
             dones: done flags tensor [buffer_size]
 
         Returns:

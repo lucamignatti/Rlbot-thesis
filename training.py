@@ -975,7 +975,8 @@ class Trainer:
 
     def get_action(self, obs, deterministic=False, return_features=False):
         """
-        Get an action, log probability, and value for a given observation.
+        Get an action and log probability for a given observation.
+        Value is no longer calculated here for PPO.
 
         Args:
             obs: Observation tensor or array
@@ -983,7 +984,8 @@ class Trainer:
             return_features: If True, also return extracted features (for auxiliary tasks)
 
         Returns:
-            Tuple containing (action, log_prob, value) and features if requested
+            For PPO: Tuple containing (action, log_prob) or (action, log_prob, features)
+            For other algorithms: May still return (action, log_prob, value[, features])
         """
         # Convert observation to tensor if it's not already
         if not isinstance(obs, torch.Tensor):
@@ -994,7 +996,26 @@ class Trainer:
             obs = obs.unsqueeze(0)
 
         # Forward to algorithm's get_action method
-        return self.algorithm.get_action(obs, deterministic, return_features)
+        result = self.algorithm.get_action(obs, deterministic, return_features)
+        
+        # For compatibility with the rest of the codebase, if this is PPO algorithm,
+        # add a dummy value tensor (will be replaced with proper values during update)
+        if self.algorithm_type == "ppo":
+            if return_features:
+                # PPO returns: action, log_prob, features
+                action, log_prob, features = result
+                # Add dummy value tensor
+                dummy_value = torch.zeros_like(log_prob)
+                return action, log_prob, dummy_value, features
+            else:
+                # PPO returns: action, log_prob
+                action, log_prob = result
+                # Add dummy value tensor
+                dummy_value = torch.zeros_like(log_prob)
+                return action, log_prob, dummy_value
+        else:
+            # Other algorithms may still return values directly
+            return result
 
     def update(self, completed_episode_rewards=None, total_env_steps: Optional[int] = None, steps_per_second: Optional[float] = None):
         """Update policy based on collected experiences.
@@ -1862,6 +1883,94 @@ class Trainer:
 
 
         return total_reward
+
+    def calculate_intrinsic_rewards_batch(self, states, actions, next_states, env_ids):
+        """
+        Calculates intrinsic rewards in batch for multiple agents/environments.
+        This reduces redundant computation when multiple agents need intrinsic rewards.
+        
+        Args:
+            states: Batch of states/observations (numpy array or tensor)
+            actions: Batch of actions (numpy array or tensor)
+            next_states: Batch of next states/observations (numpy array or tensor)
+            env_ids: List of environment IDs for each sample
+            
+        Returns:
+            Batch of intrinsic rewards (numpy array)
+        """
+        if not self.use_intrinsic_rewards or self.intrinsic_reward_generator is None:
+            # Return zeros with the right shape
+            return np.zeros(len(states))
+            
+        # Convert inputs to tensors
+        if not isinstance(states, torch.Tensor):
+            states_tensor = torch.FloatTensor(states).to(self.device)
+        else:
+            states_tensor = states.to(self.device)
+            
+        # Handle actions based on action space type
+        if not isinstance(actions, torch.Tensor):
+            if self.action_space_type == "discrete":
+                # Convert to LongTensor for discrete actions
+                # This might need adjustment based on action structure
+                try:
+                    actions_tensor = torch.LongTensor(actions).to(self.device)
+                except:
+                    # Fallback if conversion fails
+                    if self.debug:
+                        print("[DEBUG] Failed to convert actions to LongTensor, using FloatTensor")
+                    actions_tensor = torch.FloatTensor(actions).to(self.device)
+            else:
+                actions_tensor = torch.FloatTensor(actions).to(self.device)
+        else:
+            actions_tensor = actions.to(self.device)
+            
+        if not isinstance(next_states, torch.Tensor):
+            next_states_tensor = torch.FloatTensor(next_states).to(self.device)
+        else:
+            next_states_tensor = next_states.to(self.device)
+        
+        # Ensure batch dimension
+        if states_tensor.dim() == 1:
+            states_tensor = states_tensor.unsqueeze(0)
+        if actions_tensor.dim() == 1:
+            actions_tensor = actions_tensor.unsqueeze(0)
+        if next_states_tensor.dim() == 1:
+            next_states_tensor = next_states_tensor.unsqueeze(0)
+        
+        # Compute batch intrinsic rewards
+        intrinsic_rewards = self.intrinsic_reward_generator.compute_intrinsic_reward(
+            states_tensor, actions_tensor, next_states_tensor
+        )
+        
+        # Initialize array for scaled intrinsic rewards
+        if isinstance(intrinsic_rewards, torch.Tensor):
+            intrinsic_rewards = intrinsic_rewards.detach().cpu().numpy()
+        
+        # Flatten if needed to ensure we have a 1D array
+        if intrinsic_rewards.ndim > 1:
+            intrinsic_rewards = intrinsic_rewards.flatten()
+            
+        # Array to store adaptive scaled rewards
+        adaptive_scaled_rewards = np.zeros_like(intrinsic_rewards)
+        
+        # Apply adaptive scaling based on extrinsic rewards for each environment
+        for i, env_id in enumerate(env_ids):
+            # Get normalization parameters
+            if not hasattr(self, 'extrinsic_reward_normalizer'):
+                from intrinsic_rewards import ExtrinsicRewardNormalizer
+                self.extrinsic_reward_normalizer = ExtrinsicRewardNormalizer()
+                
+            # Use sigmoid adaptive scaling
+            normalized_reward = 0  # Default value when no extrinsic available
+            sigmoid_factor = 1.0 / (1.0 + np.exp(2.0 * normalized_reward))
+            adaptive_scale = self.intrinsic_reward_scale * sigmoid_factor
+            adaptive_scale = max(0.1 * self.intrinsic_reward_scale, adaptive_scale)  # Minimum scale
+            
+            # Apply the scale
+            adaptive_scaled_rewards[i] = intrinsic_rewards[i] * adaptive_scale
+        
+        return adaptive_scaled_rewards
 
     def _cleanup_tensors(self):
         """Clean up any cached tensors to reduce memory usage"""
