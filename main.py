@@ -1335,15 +1335,7 @@ if __name__ == "__main__":
     if sys.platform == 'darwin':
         mp.set_start_method('spawn', force=True)
     elif sys.platform == 'linux':
-        # Using fork can be problematic with CUDA and multiprocessing.
-        # 'spawn' is generally safer, though potentially slower initialization.
-        # Let's default to 'spawn' for safety, but allow 'fork' if needed.
-        start_method = os.environ.get("MP_START_METHOD", "spawn") # Default to spawn
-        try:
-            mp.set_start_method(start_method, force=True)
-            print(f"Using multiprocessing start method: {start_method}")
-        except ValueError:
-            print(f"Warning: Could not set start method to '{start_method}', falling back to default.")
+        mp.set_start_method('fork', force=True)
 
 
     # Set up Ctrl+C handler to exit gracefully.
