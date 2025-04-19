@@ -4,15 +4,16 @@ import multiprocessing as mp
 from multiprocessing import Process, Pipe
 import numpy as np
 import torch  # Add missing torch import for tensor handling
-from typing import List, Tuple, Dict
+from typing import Optional  # Keep only what we use
 from rlgym.rocket_league.rlviser import RLViserRenderer
-from rlgym.rocket_league.state_mutators import FixedTeamSizeMutator
 from .factory import get_env
 from rlgym.rocket_league.done_conditions import TimeoutCondition
 import select
 
-def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacker=None, curriculum_config=None, debug=False):
+def worker(remote, env_fn, render: bool, action_stacker=None, curriculum_config=None, debug=False):
     """Worker process that runs a single environment"""
+    env = None
+    renderer = None
     try:
         # Create environment first
         if debug:
@@ -61,123 +62,167 @@ def worker(remote: mp.connection.Connection, env_fn, render: bool, action_stacke
             set_initial_tick(env.truncation_cond)
 
         curr_config = curriculum_config  # Keep track of current curriculum config
-        while True:
-            try:
-                # Don't use select here - it can cause issues with some platforms
-                cmd, data = remote.recv()
+        
+        try:  # Add a try block around the command loop
+            while True:
+                try:
+                    # Don't use select here - it can cause issues with some platforms
+                    cmd, data = remote.recv()
 
-                if cmd == 'step':
-                    actions_dict = data
-                    # Format actions for RLGym API
-                    formatted_actions = {}
-                    for agent_id, action in actions_dict.items():
-                        # Handle tensor conversion properly
-                        if isinstance(action, torch.Tensor):
-                            # Properly convert tensor to numpy, regardless of dimensions
-                            action_np = action.cpu().detach().numpy()
+                    if cmd == 'step':
+                        actions_dict = data
+                        # Format actions for RLGym API
+                        formatted_actions = {}
+                        for agent_id, action in actions_dict.items():
+                            # Handle tensor conversion properly
+                            if isinstance(action, torch.Tensor):
+                                # Properly convert tensor to numpy, regardless of dimensions
+                                action_np = action.cpu().detach().numpy()
 
-                            # If action is a one-hot vector, convert it to an index
-                            if len(action_np.shape) == 1 and action_np.shape[0] > 1:
-                                # Get the index of the maximum value (one-hot to index)
-                                action_idx = np.argmax(action_np)
-                                formatted_actions[agent_id] = np.array([action_idx])
-                            else:
-                                # Use the numpy array directly
-                                formatted_actions[agent_id] = action_np
-                        elif isinstance(action, np.ndarray):
-                            formatted_actions[agent_id] = action
-                        elif isinstance(action, int):
-                            formatted_actions[agent_id] = np.array([action])
-                        else:
-                            # For any other type, try to convert to numpy array
-                            try:
+                                # If action is a one-hot vector, convert it to an index
+                                if len(action_np.shape) == 1 and action_np.shape[0] > 1:
+                                    # Get the index of the maximum value (one-hot to index)
+                                    action_idx = np.argmax(action_np)
+                                    formatted_actions[agent_id] = np.array([action_idx])
+                                else:
+                                    # Use the numpy array directly
+                                    formatted_actions[agent_id] = action_np
+                            elif isinstance(action, np.ndarray):
+                                formatted_actions[agent_id] = action
+                            elif isinstance(action, int):
                                 formatted_actions[agent_id] = np.array([action])
-                            except:
+                            else:
+                                # For any other type, try to convert to numpy array
+                                try:
+                                    formatted_actions[agent_id] = np.array([action])
+                                except:
+                                    if debug:
+                                        print(f"[DEBUG] Unable to process action of type {type(action)}, using default action")
+                                    formatted_actions[agent_id] = np.array([0])  # Default action
+
+                            # Add action to stacker history
+                            if action_stacker is not None:
+                                action_stacker.add_action(agent_id, formatted_actions[agent_id])
+                        # Step the environment
+                        next_obs_dict, reward_dict, terminated_dict, truncated_dict = env.step(formatted_actions)
+                        remote.send((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
+
+                    elif cmd == 'reset':
+                        if debug:
+                            print(f"[DEBUG] Worker resetting with stage: {curr_config.get('stage_name', 'Unknown') if curr_config else 'Default'}")
+
+                        # Add retry logic for resets
+                        reset_success = False
+                        for reset_attempt in range(3):  # Try up to 3 times
+                            try:
+                                obs = env.reset()
+                                reset_success = True
+                                remote.send(obs)  # Send response immediately after successful reset
+                                break
+                            except Exception as e:
                                 if debug:
-                                    print(f"[DEBUG] Unable to process action of type {type(action)}, using default action")
-                                formatted_actions[agent_id] = np.array([0])  # Default action
+                                    print(f"[DEBUG] Reset attempt {reset_attempt + 1} failed: {e}")
+                                if reset_attempt == 2:  # Last attempt
+                                    raise
+                                time.sleep(0.1)  # Small delay between attempts
 
-                        # Add action to stacker history
-                        if action_stacker is not None:
-                            action_stacker.add_action(agent_id, formatted_actions[agent_id])
-                    # Step the environment
-                    next_obs_dict, reward_dict, terminated_dict, truncated_dict = env.step(formatted_actions)
-                    remote.send((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
+                        if not reset_success:
+                            # If all reset attempts failed, send empty dict
+                            remote.send({})
 
-                elif cmd == 'reset':
-                    if debug:
-                        print(f"[DEBUG] Worker resetting with stage: {curr_config.get('stage_name', 'Unknown') if curr_config else 'Default'}")
+                    elif cmd == 'set_curriculum':
+                        # Update environment with new curriculum configuration
+                        old_config = curr_config
+                        curr_config = data
 
-                    # Add retry logic for resets
-                    reset_success = False
-                    for reset_attempt in range(3):  # Try up to 3 times
+                        if debug:
+                            old_stage = old_config.get('stage_name', 'Unknown') if old_config else 'Default'
+                            new_stage = curr_config.get('stage_name', 'Unknown') if curr_config else 'Default'
+                            print(f"[DEBUG] Changing stage from {old_stage} to {new_stage}")
+
+                        # Safely close and recreate environment
                         try:
-                            obs = env.reset()
-                            reset_success = True
-                            remote.send(obs)  # Send response immediately after successful reset
-                            break
+                            temp_renderer = None
+                            if renderer:
+                                temp_renderer = env.renderer
+                                env.renderer = None  # Prevent renderer from being closed
+                            env.close()
+                            env = env_fn(renderer=renderer, action_stacker=action_stacker, curriculum_config=curr_config, debug=debug)
+                            if temp_renderer:
+                                env.renderer = temp_renderer
+                            remote.send(True)  # Acknowledge the update
                         except Exception as e:
                             if debug:
-                                print(f"[DEBUG] Reset attempt {reset_attempt + 1} failed: {e}")
-                            if reset_attempt == 2:  # Last attempt
-                                raise
-                            time.sleep(0.1)  # Small delay between attempts
+                                print(f"[DEBUG] Error recreating environment: {e}")
+                            raise
 
-                    if not reset_success:
-                        # If all reset attempts failed, send empty dict
-                        remote.send({})
-
-                elif cmd == 'set_curriculum':
-                    # Update environment with new curriculum configuration
-                    old_config = curr_config
-                    curr_config = data
-
-                    if debug:
-                        old_stage = old_config.get('stage_name', 'Unknown') if old_config else 'Default'
-                        new_stage = curr_config.get('stage_name', 'Unknown') if curr_config else 'Default'
-                        print(f"[DEBUG] Changing stage from {old_stage} to {new_stage}")
-
-                    # Safely close and recreate environment
-                    try:
-                        if renderer:
-                            temp_renderer = env.renderer
-                            env.renderer = None  # Prevent renderer from being closed
-                        env.close()
-                        env = env_fn(renderer=renderer, action_stacker=action_stacker, curriculum_config=curr_config, debug=debug)
-                        if renderer:
-                            env.renderer = temp_renderer
-                        remote.send(True)  # Acknowledge the update
-                    except Exception as e:
+                    elif cmd == 'close':
                         if debug:
-                            print(f"[DEBUG] Error recreating environment: {e}")
-                        raise
+                            print("[DEBUG] Worker received close command, exiting gracefully.")
+                        break
 
-                elif cmd == 'close':
-                    if renderer:
-                        renderer.close()
-                    env.close()
-                    remote.close()
+                    elif cmd == 'reset_action_stacker':
+                        agent_id = data
+                        if action_stacker is not None:
+                            action_stacker.reset_agent(agent_id)
+                        remote.send(True)  # Acknowledge
+
+                except EOFError:
+                    # Parent closed the connection, expected during shutdown
+                    if debug: 
+                        print("[DEBUG] Worker received EOFError, exiting.")
                     break
-
-                elif cmd == 'reset_action_stacker':
-                    agent_id = data
-                    if action_stacker is not None:
-                        action_stacker.reset_agent(agent_id)
-                    remote.send(True)  # Acknowledge
-
-            except EOFError:
-                break
-            except Exception as e:
-                import traceback
-                print(f"Error in worker: {str(e)}")
-                print(traceback.format_exc())
-                break
+                except Exception as e:
+                    # Log unexpected errors
+                    import traceback
+                    print(f"Error in worker loop: {str(e)}")
+                    print(traceback.format_exc())
+                    break
+        except Exception as e:
+            # Catch any errors in the command loop
+            import traceback
+            print(f"Error in worker main loop: {str(e)}")
+            print(traceback.format_exc())
 
     except Exception as e:
+        # Catch initialization errors
         import traceback
         print(f"Fatal error in worker initialization: {str(e)}")
         print(traceback.format_exc())
-        raise
+    finally:
+        # Guaranteed cleanup block
+        if debug:
+            print("[DEBUG] Worker entering finally block for cleanup.")
+        
+        try:
+            if renderer:
+                if debug:
+                    print("[DEBUG] Closing renderer.")
+                renderer.close()
+        except Exception as e:
+            if debug:
+                print(f"[DEBUG] Error closing renderer in worker: {e}")
+        
+        try:
+            if env:  # Check if env was successfully created
+                if debug:
+                    print("[DEBUG] Closing environment.")
+                env.close()
+        except Exception as e:
+            if debug:
+                print(f"[DEBUG] Error closing environment in worker: {e}")
+        
+        try:
+            if remote and not remote.closed:
+                if debug:
+                    print("[DEBUG] Closing remote connection.")
+                remote.close()
+        except Exception as e:
+            if debug:
+                print(f"[DEBUG] Error closing remote in worker: {e}")
+        
+        if debug:
+            print("[DEBUG] Worker cleanup finished.")
 
 class VectorizedEnv:
     """
@@ -824,40 +869,56 @@ class VectorizedEnv:
         else:  # multiprocess mode
             # First try sending close command to all workers
             if hasattr(self, 'remotes'):
+                closed_remotes = set() # Keep track of remotes we sent close to
                 for i, remote in enumerate(self.remotes):
                     try:
-                        remote.send(('close', None))
-                        if self.debug:
-                            print(f"[DEBUG] Sent close command to worker {i}")
+                        if remote and not getattr(remote, 'closed', False):  # Check if remote exists and is not already closed
+                            remote.send(('close', None))
+                            closed_remotes.add(i)
+                            if self.debug:
+                                print(f"[DEBUG] Sent close command to worker {i}")
                     except (BrokenPipeError, EOFError) as e:
                         if self.debug:
-                            print(f"[DEBUG] Error sending close to worker {i}: {e}")
+                            print(f"[DEBUG] Error sending close to worker {i} (already closed?): {e}")
+                    except Exception as e:
+                         if self.debug:
+                            print(f"[DEBUG] Unexpected error sending close to worker {i}: {e}")
+            
+            # Wait longer for workers to process the close command - viztracer needs time
+            time.sleep(1.0)
 
-            # Wait a moment for workers to process the close command
-            time.sleep(0.5)
-
-            # Then terminate and clean up processes
+            # Wait for processes to finish gracefully without terminating them
+            # This allows viztracer to properly finish writing its trace files
             if hasattr(self, 'processes'):
                 for i, process in enumerate(self.processes):
                     try:
-                        process.join(timeout=2.0)
                         if process.is_alive():
-                            process.terminate()
-                            process.join(timeout=1.0)
-                            if process.is_alive() and hasattr(process, 'kill'):
+                            if self.debug:
+                                print(f"[DEBUG] Waiting for worker {i} to exit gracefully...")
+                            process.join(timeout=30.0)  # Increased timeout to 30 seconds for viztracer
+                            if process.is_alive():
+                                # If it's still alive after generous timeout, log it but DO NOT kill it
+                                # This is critical for viztracer to work correctly
                                 if self.debug:
-                                    print(f"[DEBUG] Force killing worker {i}")
-                                process.kill()
-                                process.join(timeout=1.0)
+                                    print(f"[DEBUG] Worker {i} still running after 30s. Waiting for natural exit.")
+                            else:
+                                 if self.debug:
+                                     print(f"[DEBUG] Worker {i} exited successfully.")
+                        else:
+                             if self.debug:
+                                 print(f"[DEBUG] Worker {i} was already finished.")
                     except Exception as e:
                         if self.debug:
-                            print(f"[DEBUG] Error terminating process {i}: {e}")
+                            print(f"[DEBUG] Error joining process {i}: {e}")
 
-            # Finally close all pipe connections
+            # Finally close all pipe connections on the main process side
             if hasattr(self, 'remotes'):
                 for i, remote in enumerate(self.remotes):
                     try:
-                        remote.close()
+                        if remote and not getattr(remote, 'closed', False):
+                            remote.close()
+                            if self.debug:
+                                print(f"[DEBUG] Closed remote {i} connection")
                     except Exception as e:
                         if self.debug:
                             print(f"[DEBUG] Error closing pipe for worker {i}: {e}")
@@ -865,14 +926,16 @@ class VectorizedEnv:
             if hasattr(self, 'work_remotes'):
                 for i, work_remote in enumerate(self.work_remotes):
                     try:
-                        if work_remote is not None:
+                        if work_remote is not None and not getattr(work_remote, 'closed', False):
                             work_remote.close()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        if self.debug:
+                            print(f"[DEBUG] Error closing work remote {i}: {e}")
 
         # Force garbage collection to clean up any remaining references
         try:
             import gc
             gc.collect()
         except ImportError:
+            pass
             pass
