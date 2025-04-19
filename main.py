@@ -1004,9 +1004,14 @@ def run_training(
                     "PLoss": f"{stats.get('actor_loss', 0):.4f}",
                     "VLoss": f"{stats.get('critic_loss', 0):.4f}", # Default, SAC overrides below
                     "Entropy": f"{stats.get('entropy_loss', 0):.4f}",
-                    "SR_Loss": f"{stats.get('sr_loss_scalar', 0):.4f}",
-                    "RP_Loss": f"{stats.get('rp_loss_scalar', 0):.4f}"
                 })
+                # Only include Aux stats if enabled
+                if auxiliary:
+                    stats_dict.update({
+                        "SR_Loss": f"{stats.get('sr_loss_scalar', 0):.4f}",
+                        "RP_Loss": f"{stats.get('rp_loss_scalar', 0):.4f}"
+                    })
+
 
                 # Update algorithm-specific metrics if using that algorithm
                 if algorithm == "ppo":
@@ -1206,7 +1211,7 @@ if __name__ == "__main__":
     training_duration.add_argument('-t', '--time', type=str, default=None,
                                   help='Training duration in format: 5m (minutes), 5h (hours), 5d (days)')
 
-    parser.add_argument('-n', '--num_envs', type=int, default=150,
+    parser.add_argument('-n', '--num_envs', type=int, default=120,
                         help='Number of parallel environments to run for faster data collection')
     parser.add_argument('--update_interval', type=int, default=1048576,
                         help='Number of experiences to collect before updating the policy (PPO)')
@@ -1287,12 +1292,13 @@ if __name__ == "__main__":
     # Action stacking parameters
     parser.add_argument('--stack_size', type=int, default=5, help='Number of previous actions to stack')
 
-    # Auxiliary learning parameters
-    parser.add_argument('--auxiliary', action='store_false', dest='auxiliary',
+    # Auxiliary learning parameters - Corrected Logic
+    # By default, auxiliary tasks are enabled (default=True).
+    # Using --no-auxiliary will set args.auxiliary to False.
+    parser.add_argument('--no-auxiliary', action='store_false', dest='auxiliary',
                         help='Disable auxiliary task learning (SR and RP tasks)')
-    parser.add_argument('--no-auxiliary', action='store_true', dest='auxiliary',
-                        help='Disable auxiliary task learning (SR and RP tasks) (for backward compatibility)')
-    parser.set_defaults(auxiliary=True)
+    parser.set_defaults(auxiliary=True) # Keep default as True
+
 
     parser.add_argument('--sr_weight', type=float, default=1.0,
                         help='Weight for the State Representation auxiliary task')
@@ -1546,7 +1552,7 @@ if __name__ == "__main__":
                 "num_blocks": args.num_blocks,
                 "dropout": args.dropout,
                 "action_stack_size": args.stack_size,
-                "auxiliary_tasks": args.auxiliary,
+                "auxiliary_tasks": args.auxiliary, # Log the effective value
                 "sr_weight": args.sr_weight,
                 "rp_weight": args.rp_weight,
 
@@ -1581,6 +1587,7 @@ if __name__ == "__main__":
     if args.debug:
         print(f"[DEBUG] Starting training with {args.num_envs} environments on {device}")
         print(f"[DEBUG] Using {args.algorithm.upper()} algorithm")
+        print(f"[DEBUG] Auxiliary tasks enabled: {args.auxiliary}") # Print effective value
         print(f"[DEBUG] Actor model: {actor}")
         print(f"[DEBUG] Critic model: {critic}")
         print(f"[DEBUG] Action stacking size: {args.stack_size}")
@@ -1671,7 +1678,7 @@ if __name__ == "__main__":
             batch_size=args.batch_size,
             aux_amp=args.aux_amp if args.aux_amp is not None else args.amp,
             aux_scale=args.aux_scale,
-            auxiliary=args.auxiliary,
+            auxiliary=args.auxiliary, # Pass the corrected flag value
             sr_weight=args.sr_weight,
             rp_weight=args.rp_weight,
             test=args.test,
