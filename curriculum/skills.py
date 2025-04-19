@@ -338,3 +338,10 @@ class SkillBasedCurriculumStage(CurriculumStage):
                 skill.rewards_history.clear()
             if hasattr(skill, 'success_history'):
                 skill.success_history.clear()
+                
+        # Break any potential circular references
+        self.selected_skill = None
+        
+        # Force garbage collection
+        import gc
+        gc.collect()

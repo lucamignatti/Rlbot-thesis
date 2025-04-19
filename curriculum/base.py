@@ -202,6 +202,10 @@ class CurriculumStage:
 
         self.moving_success_rate = 0.0
         self.moving_avg_reward = 0.0
+        
+        # Force garbage collection to clean up after clearing large data structures
+        import gc
+        gc.collect()
 
     def get_statistics(self) -> Dict[str, Any]:
         """Get all progress statistics for this stage."""
@@ -602,12 +606,19 @@ class CurriculumManager:
         self.episodes_in_current_stage = 0
 
         # Record transition (append to deque, automatically handles maxlen)
+        # Store only essential data, not the full stats dictionary which may contain large objects
+        essential_stats = {
+            "success_rate": old_stats["success_rate"],
+            "avg_reward": old_stats["avg_reward"],
+            "episodes": old_stats["episodes"]
+        }
+        
         self.completed_stages.append({
             "episode": self.total_episodes, # Use total episodes for tracking transition point
             "from_stage": old_stage_name,
             "to_stage": self.current_stage.name,
             "timestamp": np.datetime64('now'),
-            "final_stats": old_stats
+            "final_stats": essential_stats  # Store minimal stats
         })
 
         # Apply hyperparameter adjustments
@@ -621,13 +632,17 @@ class CurriculumManager:
                 "curriculum/to_stage": self.current_stage.name,
                 "curriculum/from_stage_index": self.current_stage_index - 1,
                 "curriculum/to_stage_index": self.current_stage_index,
-                "curriculum/completed_stage/success_rate": old_stats["success_rate"],
-                "curriculum/completed_stage/avg_reward": old_stats["avg_reward"],
-                "curriculum/completed_stage/episodes": old_stats["episodes"]
+                "curriculum/completed_stage/success_rate": essential_stats["success_rate"],
+                "curriculum/completed_stage/avg_reward": essential_stats["avg_reward"],
+                "curriculum/completed_stage/episodes": essential_stats["episodes"]
             })
 
         # Reset statistics for the new stage to ensure clean tracking
         self.current_stage.reset_statistics()
+        
+        # Force garbage collection after stage transition
+        import gc
+        gc.collect()
 
         if self.debug:
             print(f"Progressed to stage {self.current_stage_index}: {self.current_stage.name}")
@@ -694,20 +709,30 @@ class CurriculumManager:
             # Don't include rewards_history in serialization to reduce memory usage
             stages_data.append(stage_state)
 
-        return {
-            'current_stage_index': self.current_stage_index,
-            'current_difficulty': self.current_difficulty,
-            'total_episodes': self.total_episodes,
-            # Store completed_stages data efficiently (without full state copies)
-            'completed_stages': [
-                {
+        # Convert completed_stages to a minimal format, avoiding potential reference loops
+        completed_stages_data = []
+        for cs in self.completed_stages:
+            if isinstance(cs, dict):
+                minimal_cs = {
                     'episode': cs.get('episode', 0),
                     'from_stage': cs.get('from_stage', ''),
                     'to_stage': cs.get('to_stage', ''),
                     'timestamp': cs.get('timestamp', None)
                 }
-                for cs in self.completed_stages
-            ],
+                # Only include minimal stats data
+                if 'final_stats' in cs:
+                    minimal_cs['final_stats'] = {
+                        'success_rate': cs['final_stats'].get('success_rate', 0.0),
+                        'avg_reward': cs['final_stats'].get('avg_reward', 0.0),
+                        'episodes': cs['final_stats'].get('episodes', 0)
+                    }
+                completed_stages_data.append(minimal_cs)
+
+        return {
+            'current_stage_index': self.current_stage_index,
+            'current_difficulty': self.current_difficulty,
+            'total_episodes': self.total_episodes,
+            'completed_stages': completed_stages_data,
             'stages_data': stages_data # Store stats, not full objects
         }
 

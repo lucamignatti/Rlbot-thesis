@@ -288,12 +288,28 @@ class RLBotSkillStage(CurriculumStage):
         # Use weakref to avoid circular reference memory leaks
         import weakref
         self._trainer = weakref.proxy(trainer) if trainer is not None else None
-
+        
     def cleanup(self) -> None:
         """
         Clean up resources to prevent memory leaks.
         This should be called when the stage is completed or no longer needed.
         """
-        # Clear large data structures
-        self.bot_performance.clear()
-        self.bot_last_used.clear()
+        # Clear performance tracking dictionaries to free memory
+        if hasattr(self, 'bot_performance'):
+            self.bot_performance.clear()
+        
+        if hasattr(self, 'bot_last_used'):
+            self.bot_last_used.clear()
+            
+        # Clear any reference to trainer
+        if hasattr(self, '_trainer'):
+            self._trainer = None
+            
+        # Call parent cleanup if it exists
+        super_cleanup = getattr(super(), 'cleanup', None)
+        if super_cleanup and callable(super_cleanup):
+            super_cleanup()
+            
+        # Force garbage collection
+        import gc
+        gc.collect()
