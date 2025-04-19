@@ -1429,7 +1429,7 @@ if __name__ == "__main__":
                         help='Enable test mode (enables rendering and limits to 1 environment)')
 
 
-    parser.add_argument('--save_interval', type=int, default=200,
+    parser.add_argument('--save_interval', type=int, default=100000,
                        help='Save the model every N episodes')
 
     parser.add_argument('--hidden_dim', type=int, default=512, help='Hidden dimension for the network')
