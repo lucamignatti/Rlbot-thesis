@@ -14,30 +14,22 @@ from queue import Empty as QueueEmpty # Import Empty exception
 import numpy as np
 from collections import Counter
 from collections.abc import Sized, Iterable
-from rlgym.api import RLGym
-from rlgym.rocket_league.action_parsers import LookupTableAction, RepeatAction
-from rlgym.rocket_league.done_conditions import GoalCondition, AnyCondition, TimeoutCondition, NoTouchTimeoutCondition
-from rlgym.rocket_league.obs_builders import DefaultObs
-from rlgym.rocket_league.reward_functions import CombinedReward, GoalReward, TouchReward
-from rlgym.rocket_league.sim import RocketSimEngine
-import RocketSim as rocketsim
-from rlgym.rocket_league.rlviser import RLViserRenderer
-from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
-from rewards import BallProximityReward, BallToGoalDistanceReward, BallVelocityToGoalReward, TouchBallReward, TouchBallToGoalAccelerationReward, AlignBallToGoalReward, PlayerVelocityTowardBallReward, KRCReward
+# Removed unused rlgym imports
 from model_architectures import (
-    BasicModel, SimBa, SimbaV2,
-    fix_compiled_state_dict, extract_model_dimensions, load_partial_state_dict
+    BasicModel, SimBa, SimbaV2
+    # Removed unused functions: fix_compiled_state_dict, extract_model_dimensions, load_partial_state_dict
 )
-from observation import StackedActionsObs, ActionStacker
+from observation import ActionStacker
 from training import Trainer
-from algorithms import PPOAlgorithm, StreamACAlgorithm  # Import from new algorithms package
-import concurrent.futures
+# Removed unused algorithm imports
+# Removed unused concurrent.futures
 from tqdm import tqdm # Keep tqdm for the manager process
-from typing import List, Tuple, Dict, Union, Optional
+from typing import Optional # Keep only Optional
 from envs.factory import get_env
 from envs.vectorized import VectorizedEnv
 from envs.rlbot_vectorized import RLBotVectorizedEnv
 from curriculum import create_curriculum
+from curriculum.manual import ManualCurriculumManager
 
 # --- TQDM Manager Process ---
 class TqdmManager:
@@ -202,6 +194,7 @@ def run_training(
     save_interval: int = 200,
     output_path: Optional[str] = None,
     use_curriculum: bool = False,
+    stage: Optional[int] = None,
     # Hyperparameters
     lr_actor: float = 3e-4,
     lr_critic: float = 1e-3,
@@ -365,14 +358,38 @@ def run_training(
     effective_use_pretraining = trainer.use_pretraining and not trainer.pretraining_completed
     if use_curriculum: # Check the original arg flag first
         try:
-            curriculum_manager = create_curriculum(
-                debug=debug,
-                use_wandb=use_wandb,
-                lr_actor=trainer.lr_actor, # Use potentially loaded LR
-                lr_critic=trainer.lr_critic, # Use potentially loaded LR
-                # IMPORTANT: Use the trainer's state to decide if pretraining is active
-                use_pretraining=effective_use_pretraining
-            )
+            # If a specific stage is requested, use the manual curriculum manager
+            if stage is not None:
+                # Get all stages by temporarily creating the full curriculum
+                temp_curriculum = create_curriculum(
+                    debug=debug,
+                    use_wandb=use_wandb,
+                    lr_actor=trainer.lr_actor,
+                    lr_critic=trainer.lr_critic,
+                    use_pretraining=effective_use_pretraining
+                )
+
+                # Create a manual curriculum with just the selected stage
+                curriculum_manager = ManualCurriculumManager(
+                    stages=temp_curriculum.stages,
+                    stage_index=stage,
+                    debug=debug,
+                    use_wandb=use_wandb
+                )
+
+                if debug:
+                    print(f"[DEBUG] Using manual curriculum with stage {stage}: '{curriculum_manager.current_stage.name}'")
+            else:
+                # Use the automatic curriculum system
+                curriculum_manager = create_curriculum(
+                    debug=debug,
+                    use_wandb=use_wandb,
+                    lr_actor=trainer.lr_actor, # Use potentially loaded LR
+                    lr_critic=trainer.lr_critic, # Use potentially loaded LR
+                    # IMPORTANT: Use the trainer's state to decide if pretraining is active
+                    use_pretraining=effective_use_pretraining
+                )
+
             # Register trainer with curriculum manager
             curriculum_manager.register_trainer(trainer)
             # Assign curriculum manager back to trainer
@@ -1221,6 +1238,10 @@ if __name__ == "__main__":
                     help='Disable curriculum learning')
     parser.set_defaults(curriculum=True)
 
+    # Add single-stage mode argument
+    parser.add_argument('--stage', type=int, default=None,
+                    help='Run a specific curriculum stage indefinitely (0-based index)')
+
     # Algorithm choice
     parser.add_argument('--algorithm', type=str, default='ppo', choices=['ppo', 'streamac', 'sac'],
                        help='Learning algorithm to use: ppo (default) or streamac')
@@ -1262,7 +1283,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--amp', action='store_true', help='Use automatic mixed precision for faster training (requires CUDA)')
     parser.add_argument('--no-amp', action='store_false', dest='amp', help='Disable automatic mixed precision')
-    parser.set_defaults(amp=True)
+    parser.set_defaults(amp=False)
 
     parser.add_argument('-m', '--model', type=str, default=None,
                         help='Path to a pre-trained model file to load')
@@ -1274,7 +1295,7 @@ if __name__ == "__main__":
                         help='Enable test mode (enables rendering and limits to 1 environment)')
 
 
-    parser.add_argument('--save_interval', type=int, default=100000,
+    parser.add_argument('--save_interval', type=int, default=10000,
                        help='Save the model every N episodes')
 
     parser.add_argument('--hidden_dim', type=int, default=512, help='Hidden dimension for the network')
@@ -1653,6 +1674,7 @@ if __name__ == "__main__":
             save_interval=args.save_interval,
             output_path=args.out,
             use_curriculum=args.curriculum,
+            stage=args.stage,
             # Pass model path to run_training
             model_path_to_load=args.model,
             algorithm=args.algorithm,

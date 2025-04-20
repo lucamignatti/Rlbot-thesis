@@ -1,4 +1,5 @@
 from .base import CurriculumManager, ProgressionRequirements
+from copy import deepcopy
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
 from .mutators import (
     BallTowardGoalSpawnMutator, BallPositionMutator, CarBallRelativePositionMutator,

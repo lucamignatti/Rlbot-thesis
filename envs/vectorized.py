@@ -62,7 +62,7 @@ def worker(remote, env_fn, render: bool, action_stacker=None, curriculum_config=
             set_initial_tick(env.truncation_cond)
 
         curr_config = curriculum_config  # Keep track of current curriculum config
-        
+
         try:  # Add a try block around the command loop
             while True:
                 try:
@@ -169,7 +169,7 @@ def worker(remote, env_fn, render: bool, action_stacker=None, curriculum_config=
 
                 except EOFError:
                     # Parent closed the connection, expected during shutdown
-                    if debug: 
+                    if debug:
                         print("[DEBUG] Worker received EOFError, exiting.")
                     break
                 except Exception as e:
@@ -193,7 +193,7 @@ def worker(remote, env_fn, render: bool, action_stacker=None, curriculum_config=
         # Guaranteed cleanup block
         if debug:
             print("[DEBUG] Worker entering finally block for cleanup.")
-        
+
         try:
             if renderer:
                 if debug:
@@ -202,7 +202,7 @@ def worker(remote, env_fn, render: bool, action_stacker=None, curriculum_config=
         except Exception as e:
             if debug:
                 print(f"[DEBUG] Error closing renderer in worker: {e}")
-        
+
         try:
             if env:  # Check if env was successfully created
                 if debug:
@@ -211,7 +211,7 @@ def worker(remote, env_fn, render: bool, action_stacker=None, curriculum_config=
         except Exception as e:
             if debug:
                 print(f"[DEBUG] Error closing environment in worker: {e}")
-        
+
         try:
             if remote and not remote.closed:
                 if debug:
@@ -220,7 +220,7 @@ def worker(remote, env_fn, render: bool, action_stacker=None, curriculum_config=
         except Exception as e:
             if debug:
                 print(f"[DEBUG] Error closing remote in worker: {e}")
-        
+
         if debug:
             print("[DEBUG] Worker cleanup finished.")
 
@@ -236,7 +236,7 @@ class VectorizedEnv:
         self.render = render
         self.action_stacker = action_stacker
         self.curriculum_manager = curriculum_manager
-        self.render_delay = 0.025
+        self.render_delay = 0.0025
         self.debug = debug
 
         # For tracking episode metrics for curriculum
@@ -517,14 +517,23 @@ class VectorizedEnv:
                         # Calculate average reward across all agents
                         avg_reward = sum(self.episode_rewards[env_idx].values()) / max(len(self.episode_rewards[env_idx]), 1)
 
-                        # Submit episode metrics
-                        metrics = {
-                            "success": self.episode_successes[env_idx],
-                            "timeout": self.episode_timeouts[env_idx],
-                            "episode_reward": avg_reward
-                        }
+                        # Submit episode metrics based on curriculum manager type
+                        # ManualCurriculumManager expects positional args, CurriculumManager expects a dict
+                        if type(self.curriculum_manager).__name__ == "ManualCurriculumManager":
+                            self.curriculum_manager.update_progression_stats(
+                                episode_rewards=avg_reward,
+                                success=self.episode_successes[env_idx],
+                                timeout=self.episode_timeouts[env_idx],
+                                env_id=env_idx
+                            )
+                        else: # Assume base CurriculumManager or similar
+                            metrics = {
+                                "success": self.episode_successes[env_idx],
+                                "timeout": self.episode_timeouts[env_idx],
+                                "episode_reward": avg_reward
+                            }
+                            self.curriculum_manager.update_progression_stats(metrics)
 
-                        self.curriculum_manager.update_progression_stats(metrics)
 
                         # Get new curriculum configuration for next episode
                         new_config = self.curriculum_manager.get_environment_config()
@@ -729,12 +738,22 @@ class VectorizedEnv:
                         else:
                             avg_reward = 0.0
 
-                        # Submit episode metrics
-                        self.curriculum_manager.update_progression_stats({
-                            "success": self.episode_successes[i],
-                            "timeout": self.episode_timeouts[i],
-                            "episode_reward": avg_reward
-                        })
+                        # Submit episode metrics based on curriculum manager type
+                        if type(self.curriculum_manager).__name__ == "ManualCurriculumManager":
+                            self.curriculum_manager.update_progression_stats(
+                                episode_rewards=avg_reward,
+                                success=self.episode_successes[i],
+                                timeout=self.episode_timeouts[i],
+                                env_id=i
+                            )
+                        else: # Assume base CurriculumManager or similar
+                            metrics = {
+                                "success": self.episode_successes[i],
+                                "timeout": self.episode_timeouts[i],
+                                "episode_reward": avg_reward
+                            }
+                            self.curriculum_manager.update_progression_stats(metrics)
+
 
                         # Get new curriculum configuration for next episode
                         new_config = self.curriculum_manager.get_environment_config()
@@ -883,7 +902,7 @@ class VectorizedEnv:
                     except Exception as e:
                          if self.debug:
                             print(f"[DEBUG] Unexpected error sending close to worker {i}: {e}")
-            
+
             # Wait longer for workers to process the close command - viztracer needs time
             time.sleep(1.0)
 
