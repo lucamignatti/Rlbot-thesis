@@ -27,7 +27,6 @@ from tqdm import tqdm # Keep tqdm for the manager process
 from typing import Optional # Keep only Optional
 from envs.factory import get_env
 from envs.vectorized import VectorizedEnv
-from envs.rlbot_vectorized import RLBotVectorizedEnv
 from curriculum import create_curriculum
 from curriculum.manual import ManualCurriculumManager
 
@@ -180,8 +179,6 @@ def run_training(
     critic,
     device,
     num_envs: int,
-    # Remove training_step_offset from signature, it's loaded by trainer.load_models
-    # Add model_path_to_load parameter
     model_path_to_load: Optional[str] = None,
     total_episodes: Optional[int] = None,
     training_time: Optional[float] = None,
@@ -210,9 +207,7 @@ def run_training(
     batch_size: int = 64,
     aux_amp: bool = False,
     aux_scale: float = 0.005,
-    # Algorithm selection
     algorithm: str = "ppo",
-    # Additional args
     auxiliary: bool = True,
     sr_weight: float = 1.0,
     rp_weight: float = 1.0,
@@ -418,10 +413,8 @@ def run_training(
     else:
          trainer.curriculum_manager = None # Ensure it's None if not used
 
-    # Use a vectorized environment for parallel data collection.
-    env_class = VectorizedEnv  # Default
-    if curriculum_manager and curriculum_manager.requires_bots():
-        env_class = RLBotVectorizedEnv
+    # Use vectorized environment for parallel data collection
+    env_class = VectorizedEnv
 
     # Create environment constructor arguments based on the class
     env_args = {
@@ -431,10 +424,6 @@ def run_training(
         'curriculum_manager': curriculum_manager,
         'debug': debug
     }
-
-    # Only add rlbotpack_path if using RLBotVectorizedEnv
-    if env_class == RLBotVectorizedEnv:
-        env_args['rlbotpack_path'] = os.path.join(os.path.dirname(__file__), "RLBotPack")
 
     vec_env = env_class(**env_args)
 

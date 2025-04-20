@@ -675,8 +675,9 @@ class CurriculumManager:
             })
 
     def requires_bots(self) -> bool:
-        """Check if any stage requires RLBot opponents."""
-        return any(stage.__class__.__name__ == "RLBotSkillStage" for stage in self.stages)
+        """Check if any stage requires opponents."""
+        # Since RLBot support is removed, this always returns False
+        return False
 
     def get_state(self) -> Dict[str, Any]:
         """Get the current state of the curriculum manager as a dictionary."""

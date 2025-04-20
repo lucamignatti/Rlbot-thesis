@@ -1,35 +1,27 @@
-from .base import CurriculumManager, ProgressionRequirements
-from copy import deepcopy
-from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
+from .base import CurriculumManager, CurriculumStage, ProgressionRequirements
 from .mutators import (
     BallTowardGoalSpawnMutator, BallPositionMutator, CarBallRelativePositionMutator,
     CarBoostMutator, BallVelocityMutator, CarPositionMutator, TouchBallCondition
+    # AugmentMutator, RandomPhysicsMutator removed as they don't exist
 )
 from rlgym.rocket_league.done_conditions import GoalCondition, TimeoutCondition, NoTouchTimeoutCondition
 from rlgym.rocket_league.reward_functions import CombinedReward, GoalReward, TouchReward
+from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
 from rewards import (
     BallProximityReward, BallToGoalDistanceReward, TouchBallReward,
     BallVelocityToGoalReward, AlignBallToGoalReward, SaveBoostReward,
-    KRCReward, DistanceWeightedAlignmentKRC, OffensivePotentialKRC,
-    PlayerVelocityTowardBallReward, TouchBallToGoalAccelerationReward,
+    KRCReward, PlayerVelocityTowardBallReward, TouchBallToGoalAccelerationReward,
     PassCompletionReward, ScoringOpportunityCreationReward, AerialControlReward,
     AerialDirectionalTouchReward, BlockSuccessReward, DefensivePositioningReward,
     BallClearanceReward, TeamSpacingReward, TeamPossessionReward,
     create_distance_weighted_alignment_reward, create_offensive_potential_reward, create_lucy_skg_reward,
-    # New reward functions from rlgym-tools
     AerialDistanceReward, FlipResetReward, WavedashReward
 )
-import numpy as np
-import random
-
-from rlgym_tools.rocket_league.state_mutators.augment_mutator import AugmentMutator
-from rlgym_tools.rocket_league.state_mutators.random_physics_mutator import RandomPhysicsMutator
-from rlgym_tools.rocket_league.state_mutators.weighted_sample_mutator import WeightedSampleMutator
-from rlgym_tools.rocket_league.state_mutators.random_scoreboard_mutator import RandomScoreboardMutator
-from curriculum.rlbot import RLBotSkillStage
 from curriculum.skills import SkillModule, SkillBasedCurriculumStage
 from functools import partial
 from typing import Tuple, List, Dict, Any, Optional
+import numpy as np
+import random
 
 # Define position functions as regular functions instead of lambdas
 def aerial_ball_position():
@@ -520,16 +512,16 @@ def safe_ball_position():
 
 # --- Orientation Functions ---
 
-def get_random_yaw_orientation() -> np.ndarray:
+def get_random_yaw_orientation(*args) -> np.ndarray: # Added *args
     """Returns a random yaw orientation (rotation around Z-axis)."""
     yaw = np.random.uniform(-np.pi, np.pi)
     return np.array([0, yaw, 0]) # Pitch, Yaw, Roll
 
-def get_face_opp_goal_orientation() -> np.ndarray:
+def get_face_opp_goal_orientation(*args) -> np.ndarray: # Added *args
     """Returns orientation facing the opponent's goal (default blue team)."""
     return np.array([0, 0, 0])
 
-def get_face_own_goal_orientation() -> np.ndarray:
+def get_face_own_goal_orientation(*args) -> np.ndarray: # Added *args
     """Returns orientation facing own goal (default blue team)."""
     return np.array([0, np.pi, 0])
 
@@ -641,14 +633,14 @@ class SafePositionWrapper:
 
 def create_car_position_mutator(car_id, position_function, orientation_function=None, debug=False):
     """Helper function to create CarPositionMutator instances with debug flag"""
+    # Removed debug=debug as it's not a valid parameter for CarPositionMutator
     return CarPositionMutator(
         car_id=car_id,
         position_function=position_function,
-        orientation_function=orientation_function,
-        debug=debug
+        orientation_function=orientation_function
     )
 
-def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None, use_pretraining=True): # Added use_pretraining parameter
+def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None, use_pretraining=True):
     """
     Create a curriculum for training.
 
@@ -710,7 +702,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
     )
 
     # ======== STAGE 0: PRE-TRAINING (Keep existing) ========
-    pretraining = RLBotSkillStage(
+    pretraining = SkillBasedCurriculumStage(
         name="Unsupervised Pre-training",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=2, orange_size=2),
@@ -742,12 +734,14 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             min_success_rate=0.0, min_avg_reward=0.0, min_episodes=100,
             max_std_dev=10.0, required_consecutive_successes=1
         ),
-        is_pretraining=True,
         hyperparameter_adjustments={
             "lr_actor": lr_actor,
             "lr_critic": lr_critic,
             "entropy_coef": 0.01
-        }
+        },
+        skill_modules=[],  # Empty list since this is pretraining
+        base_task_prob=1.0, # Added for consistency with SkillBasedCurriculumStage
+        debug=debug
     )
 
     # ======== STAGE 1: MOVEMENT FOUNDATIONS ========
@@ -755,7 +749,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         name="Movement Foundations",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
-            # Add random yaw orientation (Removed SafePositionWrapper)
+            # Add random yaw orientation
             CarPositionMutator(car_id="blue-0",
                                position_function=SafePositionWrapper(get_strategic_car_position),
                                orientation_function=get_random_yaw_orientation), # No wrapper here
@@ -968,8 +962,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
     )
 
     # ======== STAGE 4: SHOOTING FUNDAMENTALS ========
-    # Introduce first RLBot opponent (very basic)
-    shooting_fundamentals = RLBotSkillStage(
+    shooting_fundamentals = SkillBasedCurriculumStage(
         name="Shooting Fundamentals",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=1), # Add opponent
@@ -991,7 +984,6 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         ),
         base_task_termination_condition=goal_condition,
         base_task_truncation_condition=short_timeout,
-        bot_skill_ranges={(0.1, 0.2): 1.0}, # Very low skill bot
         progression_requirements=ProgressionRequirements(
             min_success_rate=0.6, min_avg_reward=0.5, min_episodes=125,
             max_std_dev=1.8, required_consecutive_successes=2
@@ -1000,7 +992,10 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             "lr_actor": lr_actor * 0.9,  # Slightly lower learning rate as complexity increases
             "lr_critic": lr_critic * 0.9,
             "entropy_coef": 0.005
-        }
+        },
+        skill_modules=[],
+        base_task_prob=1.0, # Added for consistency
+        debug=debug
     )
 
     # ======== STAGE 5: WALL & AIR MECHANICS ========
@@ -1008,8 +1003,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         name="Wall & Air Mechanics",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
-            # Add data augmentation to improve generalization
-            AugmentMutator(shuffle_within_teams=False, randomize_front_back=True, randomize_left_right=True),
+            # Add data augmentation to improve generalization (Removed AugmentMutator)
             BallPositionMutator(position_function=SafePositionWrapper(get_basic_aerial_ball_position)), # Low aerials
             CarBoostMutator(boost_amount=50),
             # Add face opponent goal orientation
@@ -1051,7 +1045,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                 name="Jump Aerials",
                 state_mutator=MutatorSequence(
                     FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    AugmentMutator(shuffle_within_teams=False, randomize_front_back=True, randomize_left_right=True),
+                    # AugmentMutator removed
                     BallPositionMutator(position_function=SafePositionWrapper(get_basic_aerial_ball_position)), # Low aerials
                     CarBoostMutator(boost_amount=50),
                     # Add face opponent goal orientation
@@ -1169,7 +1163,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
     )
 
     # ======== STAGE 7: DEFENSE & GOAL-LINE SAVES ========
-    defense = RLBotSkillStage(
+    defense = SkillBasedCurriculumStage( # Changed from RLBotSkillStage
         name="Defense & Goal-line Saves",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=1),
@@ -1182,26 +1176,29 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             # Add face opponent goal orientation (relative to orange, so facing blue goal)
             CarPositionMutator(car_id="orange-0",
                                position_function=SafePositionWrapper(get_orange_attacker_position),
-                               orientation_function=get_face_own_goal_orientation)
+                               orientation_function=get_face_opp_goal_orientation) # Corrected orientation
         ),
         base_task_reward_function=CombinedReward(
             (BlockSuccessReward(), 0.7),
             (DefensivePositioningReward(), 0.5),
             (BallClearanceReward(), 0.4),
-            (GoalReward(), 1.5)
+            (GoalReward(), -1.5) # Penalize goals conceded (Weight moved here)
         ),
-        base_task_termination_condition=goal_condition, # Success is NOT conceding
+        base_task_termination_condition=goal_condition, # Termination on goal (conceded or scored)
         base_task_truncation_condition=TimeoutCondition(10),
-        bot_skill_ranges={(0.2, 0.4): 1.0}, # Slightly better bot
+        # bot_skill_ranges removed
         progression_requirements=ProgressionRequirements(
-            min_success_rate=0.6, min_avg_reward=0.4, min_episodes=150, # Success = save
+            min_success_rate=0.6, min_avg_reward=0.4, min_episodes=150, # Success = save (high reward)
             max_std_dev=2.0, required_consecutive_successes=2
         ),
         hyperparameter_adjustments={
             "lr_actor": 0.0001,
             "lr_critic": 0.0003,
             "entropy_coef": 0.003
-        }
+        },
+        skill_modules=[], # Added for SkillBasedCurriculumStage
+        base_task_prob=1.0, # Added for SkillBasedCurriculumStage
+        debug=debug # Added for SkillBasedCurriculumStage
     )
 
     # ======== STAGE 8: INTERMEDIATE BALL CONTROL ========
@@ -1209,8 +1206,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         name="Intermediate Ball Control",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
-            # Add data augmentation for better generalization
-            AugmentMutator(shuffle_within_teams=False, randomize_front_back=False, randomize_left_right=True),
+            # Add data augmentation for better generalization (Removed AugmentMutator)
             # First position the car with a predictable location
             CarPositionMutator(car_id="blue-0",
                                position_function=SafePositionWrapper(partial(create_position, 0, -2800, 17)),
@@ -1327,7 +1323,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
     )
 
     # ======== STAGE 9: 2v2 DEFENSIVE ROTATION ========
-    defensive_rotation = RLBotSkillStage(
+    defensive_rotation = SkillBasedCurriculumStage(
         name="2v2 Defensive Rotation",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=2, orange_size=2),
@@ -1342,10 +1338,10 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             # Add face opponent goal orientation
             CarPositionMutator(car_id="orange-0",
                                position_function=SafePositionWrapper(get_orange_attacker_position),
-                               orientation_function=get_face_own_goal_orientation),
+                               orientation_function=get_face_opp_goal_orientation), # Corrected orientation
             CarPositionMutator(car_id="orange-1",
                                position_function=SafePositionWrapper(get_orange_support_position),
-                               orientation_function=get_face_own_goal_orientation)
+                               orientation_function=get_face_opp_goal_orientation) # Corrected orientation
         ),
         base_task_reward_function=CombinedReward(
             KRCReward([
@@ -1353,19 +1349,22 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                 (DefensivePositioningReward(), 0.5),
                 (BallClearanceReward(), 0.6)
             ], team_spirit=0.7),
-            (GoalReward(), 1.5),
+            (GoalReward(), -1.5), # Penalize goals conceded (weight applied here)
         ),
         base_task_termination_condition=goal_condition,
         base_task_truncation_condition=long_timeout,
-        bot_skill_ranges={(0.3, 0.5): 1.0}, # Mid-skill bots
         progression_requirements=ProgressionRequirements(
-            min_success_rate=0.55, min_avg_reward=0.4, min_episodes=175, # Success = save/clear
+            min_success_rate=0.55, min_avg_reward=0.4, min_episodes=175,
             max_std_dev=2.0, required_consecutive_successes=2
-        )
+        ),
+        hyperparameter_adjustments=None,
+        skill_modules=[],
+        base_task_prob=1.0, # Added for consistency
+        debug=debug
     )
 
     # ======== STAGE 10: 2v2 OFFENSIVE COORDINATION ========
-    offensive_coordination = RLBotSkillStage(
+    offensive_coordination = SkillBasedCurriculumStage(
         name="2v2 Offensive Coordination",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=2, orange_size=2),
@@ -1394,11 +1393,14 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         ], team_spirit=0.7),
         base_task_termination_condition=goal_condition,
         base_task_truncation_condition=long_timeout,
-        bot_skill_ranges={(0.3, 0.5): 1.0}, # Mid-skill bots
         progression_requirements=ProgressionRequirements(
             min_success_rate=0.5, min_avg_reward=0.4, min_episodes=200,
             max_std_dev=2.0, required_consecutive_successes=2
-        )
+        ),
+        hyperparameter_adjustments=None,
+        skill_modules=[],
+        base_task_prob=1.0, # Added for consistency
+        debug=debug
     )
 
     # ======== STAGE 11: INTERMEDIATE AERIALS & WALL PLAY ========
@@ -1406,7 +1408,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         name="Intermediate Aerials & Wall Play",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
-            AugmentMutator(shuffle_within_teams=False, randomize_front_back=True, randomize_left_right=True),
+            # AugmentMutator removed
             BallPositionMutator(position_function=SafePositionWrapper(get_advanced_aerial_ball_position)), # Higher aerials
             BallVelocityMutator(velocity_function=SafePositionWrapper(get_advanced_aerial_ball_velocity)), # Moving aerials
             # Add face opponent goal orientation
@@ -1430,11 +1432,12 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                 name="Fast Aerials",
                  state_mutator=MutatorSequence(
                     FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    AugmentMutator(shuffle_within_teams=False, randomize_front_back=True, randomize_left_right=True),
+                    # AugmentMutator removed
                     BallPositionMutator(position_function=SafePositionWrapper(get_fast_aerial_ball_position)), # Higher, faster targets
                     # Add face opponent goal orientation
                     CarPositionMutator(car_id="blue-0",
-                                       position_function=SafePositionWrapper(get_advanced_aerial_car_position)),
+                                       position_function=SafePositionWrapper(get_advanced_aerial_car_position),
+                                       orientation_function=get_face_opp_goal_orientation), # Added orientation
                     CarBoostMutator(boost_amount=100)
                 ),
                 reward_function=CombinedReward(
@@ -1451,7 +1454,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                 name="Wall-to-Air",
                  state_mutator=MutatorSequence(
                     FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    AugmentMutator(shuffle_within_teams=False, randomize_front_back=True, randomize_left_right=True),
+                    # AugmentMutator removed
                     BallPositionMutator(position_function=SafePositionWrapper(get_ball_wall_position)), # Ball high on wall
                     # Add random yaw orientation
                     CarPositionMutator(car_id="blue-0",
@@ -1474,8 +1477,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                 name="Flip Reset Training",
                 state_mutator=MutatorSequence(
                     FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    AugmentMutator(shuffle_within_teams=False, randomize_front_back=True, randomize_left_right=True),
-                    RandomPhysicsMutator(), # Add some randomness to make training more robust
+                    # AugmentMutator removed
+                    # RandomPhysicsMutator removed
                     BallPositionMutator(position_function=SafePositionWrapper(
                         lambda: np.array([np.random.uniform(-1000, 1000), np.random.uniform(-1500, 0), np.random.uniform(900, 1500)])
                     )), # Higher ball position for reset opportunities
@@ -1507,25 +1510,23 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
     )
 
     # ======== STAGE 12: FULL 2v2 INTEGRATION ========
-    full_2v2_integration = RLBotSkillStage(
+    full_2v2_integration = SkillBasedCurriculumStage(
         name="Full 2v2 Integration",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=2, orange_size=2),
-            # Add the randomized scoreboard for realistic match scenarios
-            # The correct implementation for RandomScoreboardMutator
-            RandomScoreboardMutator(max_game_length=300.0),
-            # Use field augmentation for better generalization
-            AugmentMutator(shuffle_within_teams=True, randomize_front_back=True, randomize_left_right=True),
             KickoffMutator()
         ),
         base_task_reward_function=lucy_reward,
         base_task_termination_condition=goal_condition,
         base_task_truncation_condition=match_timeout,
-        bot_skill_ranges={(0.4, 0.6): 0.7, (0.6, 0.7): 0.3}, # Higher skill bots
         progression_requirements=ProgressionRequirements(
-            min_success_rate=0.55, min_avg_reward=0.3, min_episodes=250, # Success = win (implicitly via reward)
+            min_success_rate=0.55, min_avg_reward=0.3, min_episodes=250,
             max_std_dev=2.5, required_consecutive_successes=2
-        )
+        ),
+        hyperparameter_adjustments=None,
+        skill_modules=[],
+        base_task_prob=1.0, # Added for consistency
+        debug=debug
     )
 
     # Create the full curriculum list
@@ -1543,7 +1544,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         shooting_fundamentals,
         wall_air_mechanics,
         beginning_team_play,
-        defense,
+        defense, # Now uses SkillBasedCurriculumStage
         intermediate_ball_control,
         defensive_rotation,
         offensive_coordination,
@@ -1553,11 +1554,9 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
 
     curriculum_manager = CurriculumManager(
         stages=stages,
-        # Use default progress thresholds or adjust if needed
-        # progress_thresholds={"success_rate": 0.6, "avg_reward": 0.4},
         max_rehearsal_stages=3,
         rehearsal_decay_factor=0.7,
-        evaluation_window=50, # Evaluate progression every 50 episodes
+        evaluation_window=50,
         debug=debug,
         use_wandb=use_wandb
     )

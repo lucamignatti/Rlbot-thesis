@@ -1,11 +1,12 @@
-"""RLBot curriculum learning package."""
 from .base import CurriculumManager, CurriculumStage, ProgressionRequirements
 from .curriculum import create_curriculum
-from .rlbot import RLBotSkillStage
+from .skills import SkillModule, SkillBasedCurriculumStage
 
 __all__ = [
     'CurriculumManager',
     'CurriculumStage', 
     'ProgressionRequirements',
-    'create_skill_based_curriculum'
+    'create_curriculum',
+    'SkillModule',
+    'SkillBasedCurriculumStage'
 ]
