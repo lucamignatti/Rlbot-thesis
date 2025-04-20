@@ -1203,7 +1203,7 @@ if __name__ == "__main__":
     training_duration.add_argument('-t', '--time', type=str, default=None,
                                   help='Training duration in format: 5m (minutes), 5h (hours), 5d (days)')
 
-    parser.add_argument('-n', '--num_envs', type=int, default=120,
+    parser.add_argument('-n', '--num_envs', type=int, default=300,
                         help='Number of parallel environments to run for faster data collection')
     parser.add_argument('--update_interval', type=int, default=1048576,
                         help='Number of experiences to collect before updating the policy (PPO)')
