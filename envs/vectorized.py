@@ -236,7 +236,7 @@ class VectorizedEnv:
         self.render = render
         self.action_stacker = action_stacker
         self.curriculum_manager = curriculum_manager
-        self.render_delay = 0.0025
+        self.render_delay = 1/60
         self.debug = debug
 
         # For tracking episode metrics for curriculum
