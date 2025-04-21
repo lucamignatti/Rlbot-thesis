@@ -30,6 +30,7 @@ def worker(remote, env_fn, render: bool, action_stacker=None, initial_curriculum
     standby_obs = None
     current_config = initial_curriculum_config
     action_space_cache: Dict[Any, np.ndarray] = {} # Cache action spaces per agent_id
+    last_step_start_time = None # For render delay calculation
 
     def get_dummy_action(agent_id, env_instance):
         """Returns a default zero action based on the agent's action space."""
@@ -175,6 +176,37 @@ def worker(remote, env_fn, render: bool, action_stacker=None, initial_curriculum
                     if active_env is None: # Check if env is usable
                          raise RuntimeError("Worker received 'step' command but active_env is None.")
 
+                    # --- Realtime Render Delay Logic ---
+                    current_time = time.perf_counter()
+                    if render and last_step_start_time is not None and active_env is not None:
+                        try:
+                            # Attempt to get tick_skip, default to 8 if not found or env missing attr
+                            tick_skip = getattr(active_env, '_tick_skip', 8)
+                            if tick_skip <= 0: tick_skip = 8 # Ensure positive tick_skip
+                            target_step_duration = tick_skip / 120.0 # Assuming 120hz physics
+                            expected_start_time = last_step_start_time + target_step_duration
+                            sleep_duration = expected_start_time - current_time
+                            if sleep_duration > 0:
+                                time.sleep(sleep_duration)
+                        except AttributeError:
+                             if debug: print("[DEBUG] Worker render delay: active_env missing '_tick_skip'. Using default.")
+                             # Fallback logic if _tick_skip doesn't exist
+                             target_step_duration = 8 / 120.0
+                             expected_start_time = last_step_start_time + target_step_duration
+                             sleep_duration = expected_start_time - current_time
+                             if sleep_duration > 0: time.sleep(sleep_duration)
+                        except Exception as e:
+                            # Catch other potential errors
+                            if debug: print(f"[DEBUG] Worker render delay calculation error: {e}")
+
+                    # Record actual start time after potential delay
+                    step_start_time = time.perf_counter()
+                    # Update for the next iteration's calculation (only if rendering)
+                    if render:
+                        last_step_start_time = step_start_time
+                    # --- End Realtime Render Delay Logic ---
+
+
                     actions_dict = data
                     formatted_actions = {}
                     for agent_id, action in actions_dict.items():
@@ -258,6 +290,10 @@ def worker(remote, env_fn, render: bool, action_stacker=None, initial_curriculum
                          # This case means the standby_obs was empty/None, which shouldn't happen if check passed.
                          if debug: print("[DEBUG] Worker WARNING: skipping dummy step on new active_env as standby_obs was empty/None.")
 
+                    # Reset render timer after swap and dummy step
+                    last_step_start_time = None
+                    if render and debug: print(f"[DEBUG] Worker reset render timer.")
+
 
                     # 4. Reset the *new* standby environment (old active) and store its observation
                     # Set standby_obs to None *before* reset attempt
@@ -316,6 +352,10 @@ def worker(remote, env_fn, render: bool, action_stacker=None, initial_curriculum
                             if debug: print(f"[DEBUG] Worker performing dummy step on active_env after curriculum change.")
                             _ = active_env.step(dummy_actions)
 
+                        # Reset render timer after successful recreation
+                        last_step_start_time = None
+                        if render and debug: print(f"[DEBUG] Worker reset render timer after curriculum change.")
+
                         ack = True # Signal success
                         if debug: print(f"[DEBUG] Worker curriculum change complete.")
 
@@ -330,6 +370,7 @@ def worker(remote, env_fn, render: bool, action_stacker=None, initial_curriculum
                          active_renderer = None
                          standby_obs = None
                          ack = False # Signal failure
+                         last_step_start_time = None # Also reset timer on failure
                     finally:
                          # Send acknowledgment (True/False) back to main process
                          try:
