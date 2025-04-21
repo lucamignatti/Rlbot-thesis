@@ -58,8 +58,19 @@ class IntrinsicRewardGenerator:
         """Reset the models used for computing intrinsic rewards"""
         raise NotImplementedError("Subclasses must implement reset_models")
 
+    # Add get_state_dict and load_state_dict for saving/loading
+    def get_state_dict(self):
+        """Get state dict for saving generator state"""
+        # Default implementation, subclasses should override if they have more state
+        return {}
 
-class CuriosityReward:
+    def load_state_dict(self, state_dict):
+        """Load state dict for resuming generator state"""
+        # Default implementation, subclasses should override
+        pass
+
+
+class CuriosityReward(IntrinsicRewardGenerator): # Inherit from base class
     """
     Intrinsic curiosity module that rewards agent for exploring novel states.
     Uses a forward model to predict the next state features given the current state and action.
@@ -78,11 +89,9 @@ class CuriosityReward:
         reward_scale=1.0,
         use_amp=False # Add use_amp
     ):
-        self.device = device
+        super().__init__(observation_shape, action_shape, hidden_dim, device, use_amp) # Call base init
         self.normalize_rewards = normalize_rewards
         self.reward_scale = reward_scale
-        # Enable AMP only if flag is true and device is CUDA
-        self.use_amp = use_amp and "cuda" in str(device)
 
         # Create feature encoder for state representation
         self.feature_encoder = nn.Sequential(
@@ -113,7 +122,7 @@ class CuriosityReward:
         # Initialize GradScaler if AMP is enabled
         self.scaler = GradScaler(enabled=self.use_amp)
 
-        # Initialize reward normalization
+        # Initialize reward normalization (for the raw prediction error)
         self.reward_normalizer = RunningMeanStd(shape=())
 
     def compute_features(self, state):
@@ -197,14 +206,15 @@ class CuriosityReward:
             if not isinstance(prediction_error, torch.Tensor):
                 prediction_error = torch.tensor(prediction_error, device=self.device)
 
-            # Normalize reward
+            # Normalize reward (prediction error)
             raw_reward = prediction_error.cpu().numpy()
             if self.normalize_rewards:
                 self.reward_normalizer.update(raw_reward)
                 normalized_reward = raw_reward / (np.sqrt(self.reward_normalizer.var) + 1e-8)
-                clipped_reward = np.clip(normalized_reward, 0, 5) * self.reward_scale
+                # Apply fixed reward scale here (no adaptive logic)
+                clipped_reward = np.clip(normalized_reward, 0, 5) # * self.reward_scale (Scale applied in ensemble/trainer)
             else:
-                clipped_reward = np.clip(raw_reward, 0, 5) * self.reward_scale
+                clipped_reward = np.clip(raw_reward, 0, 5) # * self.reward_scale (Scale applied in ensemble/trainer)
 
         # Switch back to training mode
         self.feature_encoder.train()
@@ -267,7 +277,7 @@ class CuriosityReward:
         self.scaler.step(self.optimizer)
         self.scaler.update()
 
-        return forward_loss.item()
+        return {'curiosity_loss': forward_loss.item()} # Return dict
 
     def reset_models(self):
         """Reset the models used for computing intrinsic rewards"""
@@ -296,11 +306,40 @@ class CuriosityReward:
         # Reset reward normalization
         self.reward_normalizer = RunningMeanStd(shape=())
 
+    def get_state_dict(self):
+        """Get state dict for saving CuriosityReward state"""
+        return {
+            'feature_encoder_state': self.feature_encoder.state_dict(),
+            'forward_model_state': self.forward_model.state_dict(),
+            'optimizer_state': self.optimizer.state_dict(),
+            'scaler_state': self.scaler.state_dict() if self.use_amp else None,
+            'reward_normalizer_mean': self.reward_normalizer.mean,
+            'reward_normalizer_var': self.reward_normalizer.var,
+            'reward_normalizer_count': self.reward_normalizer.count,
+            'reward_scale': self.reward_scale,
+            'normalize_rewards': self.normalize_rewards
+        }
+
+    def load_state_dict(self, state_dict):
+        """Load state dict for resuming CuriosityReward state"""
+        self.feature_encoder.load_state_dict(state_dict['feature_encoder_state'])
+        self.forward_model.load_state_dict(state_dict['forward_model_state'])
+        self.optimizer.load_state_dict(state_dict['optimizer_state'])
+        if self.use_amp and 'scaler_state' in state_dict and state_dict['scaler_state'] is not None:
+            self.scaler.load_state_dict(state_dict['scaler_state'])
+        self.reward_normalizer.mean = state_dict['reward_normalizer_mean']
+        self.reward_normalizer.var = state_dict['reward_normalizer_var']
+        self.reward_normalizer.count = state_dict['reward_normalizer_count']
+        self.reward_scale = state_dict.get('reward_scale', 1.0) # Load reward scale
+        self.normalize_rewards = state_dict.get('normalize_rewards', True)
+
+
 class RNDReward(IntrinsicRewardGenerator):
     """Implementation of Random Network Distillation (RND)"""
 
     def __init__(self, obs_dim: int, action_dim: int, hidden_dim: int = 128,
-                 learning_rate: float = 1e-3, device: str = "cpu", use_amp: bool = False):
+                 learning_rate: float = 1e-3, device: str = "cpu", use_amp: bool = False,
+                 normalize_rewards=True, reward_scale=1.0): # Add normalize and scale
         """Initialize the RND reward generator
 
         Args:
@@ -310,8 +349,12 @@ class RNDReward(IntrinsicRewardGenerator):
             learning_rate: Learning rate for the optimizer
             device: Device to use for computation
             use_amp: Whether to use Automatic Mixed Precision
+            normalize_rewards: Whether to normalize the raw prediction error
+            reward_scale: Fixed scaling factor for the reward
         """
         super().__init__(obs_dim, action_dim, hidden_dim, device, use_amp) # Pass use_amp to base
+        self.normalize_rewards = normalize_rewards
+        self.reward_scale = reward_scale # Fixed scale
 
         # Random target network (fixed)
         self.target_network = nn.Sequential(
@@ -384,13 +427,15 @@ class RNDReward(IntrinsicRewardGenerator):
                 # Compute prediction error (intrinsic reward)
                 prediction_error = F.mse_loss(predicted_features, target_features, reduction='none').mean(dim=1)
 
-            # Normalize reward if we have enough history
+            # Normalize reward if enabled
             reward_np = prediction_error.cpu().numpy()
-            self.reward_normalizer.update(reward_np)
-            normalized_reward = reward_np / (np.sqrt(self.reward_normalizer.var) + 1e-8)
-
-            # Clip rewards to prevent outliers
-            clipped_reward = np.clip(normalized_reward, 0, 5.0)
+            if self.normalize_rewards:
+                self.reward_normalizer.update(reward_np)
+                normalized_reward = reward_np / (np.sqrt(self.reward_normalizer.var) + 1e-8)
+                # Apply fixed reward scale here (no adaptive logic)
+                clipped_reward = np.clip(normalized_reward, 0, 5.0) # * self.reward_scale (Scale applied in ensemble/trainer)
+            else:
+                clipped_reward = np.clip(reward_np, 0, 5.0) # * self.reward_scale (Scale applied in ensemble/trainer)
 
         # Switch back to training mode
         self.predictor_network.train()
@@ -464,6 +509,37 @@ class RNDReward(IntrinsicRewardGenerator):
         # Reset normalizers
         self.obs_normalizer = RunningMeanStd(shape=(self.obs_dim,))
         self.reward_normalizer = RunningMeanStd(shape=())
+
+    def get_state_dict(self):
+        """Get state dict for saving RNDReward state"""
+        return {
+            'predictor_network_state': self.predictor_network.state_dict(),
+            'optimizer_state': self.optimizer.state_dict(),
+            'scaler_state': self.scaler.state_dict() if self.use_amp else None,
+            'obs_normalizer_mean': self.obs_normalizer.mean,
+            'obs_normalizer_var': self.obs_normalizer.var,
+            'obs_normalizer_count': self.obs_normalizer.count,
+            'reward_normalizer_mean': self.reward_normalizer.mean,
+            'reward_normalizer_var': self.reward_normalizer.var,
+            'reward_normalizer_count': self.reward_normalizer.count,
+            'reward_scale': self.reward_scale, # Save fixed scale
+            'normalize_rewards': self.normalize_rewards
+        }
+
+    def load_state_dict(self, state_dict):
+        """Load state dict for resuming RNDReward state"""
+        self.predictor_network.load_state_dict(state_dict['predictor_network_state'])
+        self.optimizer.load_state_dict(state_dict['optimizer_state'])
+        if self.use_amp and 'scaler_state' in state_dict and state_dict['scaler_state'] is not None:
+            self.scaler.load_state_dict(state_dict['scaler_state'])
+        self.obs_normalizer.mean = state_dict['obs_normalizer_mean']
+        self.obs_normalizer.var = state_dict['obs_normalizer_var']
+        self.obs_normalizer.count = state_dict['obs_normalizer_count']
+        self.reward_normalizer.mean = state_dict['reward_normalizer_mean']
+        self.reward_normalizer.var = state_dict['reward_normalizer_var']
+        self.reward_normalizer.count = state_dict['reward_normalizer_count']
+        self.reward_scale = state_dict.get('reward_scale', 1.0) # Load fixed scale
+        self.normalize_rewards = state_dict.get('normalize_rewards', True)
 
 
 class RunningMeanStd:
@@ -632,7 +708,12 @@ class IntrinsicRewardEnsemble:
         losses = {}
         for name, generator in self.reward_generators.items():
             generator_losses = generator.update(state, action, next_state, done)
-            losses[name] = generator_losses
+            # Ensure generator_losses is a dictionary
+            if isinstance(generator_losses, dict):
+                losses.update({f"{name}_{k}": v for k, v in generator_losses.items()})
+            else: # Handle case where generator might return a single loss value
+                losses[f"{name}_loss"] = generator_losses
+
 
         return losses
 
@@ -648,12 +729,7 @@ class IntrinsicRewardEnsemble:
         for name, generator in self.reward_generators.items():
             if hasattr(generator, 'get_state_dict'):
                  state[name] = generator.get_state_dict()
-            else: # Fallback: save model state_dict and optimizer state_dict
-                 state[name] = {
-                     'model_state': generator.state_dict() if hasattr(generator, 'state_dict') else None,
-                     'optimizer_state': generator.optimizer.state_dict() if hasattr(generator, 'optimizer') else None,
-                     'scaler_state': generator.scaler.state_dict() if hasattr(generator, 'scaler') else None, # Save scaler state
-                 }
+            # Removed fallback saving logic as generators should implement get_state_dict
         return state
 
     def load_state_dict(self, state_dict):
@@ -664,22 +740,14 @@ class IntrinsicRewardEnsemble:
                 gen_state = state_dict[name]
                 if hasattr(generator, 'load_state_dict'):
                     generator.load_state_dict(gen_state)
-                else: # Fallback loading
-                    if 'model_state' in gen_state and hasattr(generator, 'load_state_dict'): # Prefer model's load_state_dict if available
-                         generator.load_state_dict(gen_state['model_state'])
-                    elif 'model_state' in gen_state and hasattr(generator, 'state_dict'):
-                         generator.load_state_dict(gen_state['model_state']) # Use nn.Module's method
-
-                    if 'optimizer_state' in gen_state and hasattr(generator, 'optimizer'):
-                        generator.optimizer.load_state_dict(gen_state['optimizer_state'])
-                    if 'scaler_state' in gen_state and hasattr(generator, 'scaler'):
-                        generator.scaler.load_state_dict(gen_state['scaler_state']) # Load scaler state
+                # Removed fallback loading logic
 
 
 def create_intrinsic_reward_generator(obs_dim, action_dim,
                                       use_curiosity=True, use_rnd=True,
                                       curiosity_weight=0.5, rnd_weight=0.5,
-                                      hidden_dim=128, device="cpu", use_amp=False): # Add use_amp
+                                      hidden_dim=128, device="cpu", use_amp=False,
+                                      normalize_rewards=True, reward_scale=1.0): # Add normalize and scale args
     """Create an intrinsic reward generator based on selected options
 
     Args:
@@ -692,6 +760,8 @@ def create_intrinsic_reward_generator(obs_dim, action_dim,
         hidden_dim: Hidden dimension for networks
         device: Device to use for computation
         use_amp: Whether to use Automatic Mixed Precision
+        normalize_rewards: Whether to normalize raw intrinsic rewards (prediction errors)
+        reward_scale: Fixed scaling factor applied AFTER normalization/clipping
 
     Returns:
         IntrinsicRewardGenerator: A single generator or ensemble
@@ -701,11 +771,17 @@ def create_intrinsic_reward_generator(obs_dim, action_dim,
     weights = {}
 
     if use_curiosity:
-        generators['curiosity'] = CuriosityReward(obs_dim, action_dim, hidden_dim, device=device, use_amp=use_amp) # Pass use_amp
+        generators['curiosity'] = CuriosityReward(
+            obs_dim, action_dim, hidden_dim, device=device, use_amp=use_amp,
+            normalize_rewards=normalize_rewards, reward_scale=reward_scale # Pass args
+        )
         weights['curiosity'] = curiosity_weight
 
     if use_rnd:
-        generators['rnd'] = RNDReward(obs_dim, action_dim, hidden_dim, device=device, use_amp=use_amp) # Pass use_amp
+        generators['rnd'] = RNDReward(
+            obs_dim, action_dim, hidden_dim, device=device, use_amp=use_amp,
+            normalize_rewards=normalize_rewards, reward_scale=reward_scale # Pass args
+        )
         weights['rnd'] = rnd_weight
 
     # Normalize weights to sum to 1
@@ -717,116 +793,9 @@ def create_intrinsic_reward_generator(obs_dim, action_dim,
     if len(generators) == 0:
         # Return None if no intrinsic rewards are used
         return None
-        # raise ValueError("At least one intrinsic reward type must be selected") # Or return None
     elif len(generators) == 1:
         # Return the single generator
         return next(iter(generators.values()))
     else:
         # Return an ensemble of generators
         return IntrinsicRewardEnsemble(generators, weights)
-
-
-class ExtrinsicRewardNormalizer:
-    """Tracks statistics of extrinsic rewards for adaptive intrinsic scaling"""
-
-    def __init__(self, epsilon=1e-4, clip_range=(-10.0, 10.0)):
-        """Initialize the reward normalizer
-
-        Args:
-            epsilon: Small constant to avoid numerical instability
-            clip_range: Range for clipping normalized values
-        """
-        self.mean = 0.0
-        self.var = 1.0
-        self.count = epsilon  # Small epsilon to avoid division by zero
-        self.clip_range = clip_range
-
-    def update(self, x):
-        """Update statistics with new reward values
-
-        Args:
-            x: New reward value(s)
-        """
-        if isinstance(x, torch.Tensor):
-            x = x.cpu().numpy()
-
-        if np.isscalar(x):
-            x = np.array([x])
-
-        batch_mean = np.mean(x, axis=0)
-        batch_var = np.var(x, axis=0)
-        batch_count = x.size
-
-        # Update statistics using Welford's online algorithm
-        self.update_from_moments(batch_mean, batch_var, batch_count)
-
-    def update_from_moments(self, batch_mean, batch_var, batch_count):
-        """Update statistics using the batch mean, variance, and count
-
-        Args:
-            batch_mean: Mean of the batch
-            batch_var: Variance of the batch
-            batch_count: Number of samples in the batch
-        """
-        delta = batch_mean - self.mean
-        tot_count = self.count + batch_count
-
-        # Update mean
-        new_mean = self.mean + delta * batch_count / tot_count
-
-        # Update variance
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
-        m2 = m_a + m_b + np.square(delta) * self.count * batch_count / tot_count
-        new_var = m2 / tot_count
-
-        # Update count
-        new_count = tot_count
-
-        # Store updated values
-        self.mean = new_mean
-        self.var = new_var
-        self.count = new_count
-
-    def normalize(self, x):
-        """Normalize values using current statistics
-
-        Args:
-            x: Value(s) to normalize
-
-        Returns:
-            normalized_x: Normalized and clipped value(s)
-        """
-        if isinstance(x, torch.Tensor):
-            x = x.cpu().numpy()
-
-        if np.isscalar(x):
-            x = np.array([x])
-
-        # Avoid division by zero
-        std = np.sqrt(self.var) + 1e-8
-
-        # Normalize and clip
-        normalized_x = np.clip((x - self.mean) / std, self.clip_range[0], self.clip_range[1])
-
-        # Update stats with this reward (helps keep normalizer current)
-        self.update(x)
-
-        if normalized_x.size == 1:
-            return normalized_x[0]
-        return normalized_x
-
-    # Add get_state_dict and load_state_dict for saving/loading
-    def get_state_dict(self):
-        return {
-            'mean': self.mean.tolist() if isinstance(self.mean, np.ndarray) else self.mean,
-            'var': self.var.tolist() if isinstance(self.var, np.ndarray) else self.var,
-            'count': self.count,
-            'clip_range': self.clip_range
-        }
-
-    def load_state_dict(self, state_dict):
-        self.mean = np.array(state_dict.get('mean', 0.0))
-        self.var = np.array(state_dict.get('var', 1.0))
-        self.count = state_dict.get('count', 1e-4)
-        self.clip_range = state_dict.get('clip_range', (-10.0, 10.0))

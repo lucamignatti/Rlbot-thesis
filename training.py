@@ -111,7 +111,7 @@ class Trainer:
         pretraining_fraction: float = 0.1,
         pretraining_sr_weight: float = 10.0,
         pretraining_rp_weight: float = 5.0,
-        pretraining_transition_steps: int = 1000,
+        # Removed pretraining_transition_steps
         total_episode_target: int = None,
         training_step_offset: int = 0,
         # Intrinsic reward parameters
@@ -148,7 +148,7 @@ class Trainer:
         self.test_mode = False  # Initialize test_mode attribute to False by default
 
         # IMPORTANT: Set use_intrinsic_rewards early to avoid attribute access errors
-        self.use_intrinsic_rewards = use_intrinsic_rewards and use_pretraining
+        self.use_intrinsic_rewards = use_intrinsic_rewards # Keep base flag
         self.intrinsic_reward_scale = intrinsic_reward_scale
         self.intrinsic_reward_generator = None
 
@@ -429,7 +429,7 @@ class Trainer:
         self.pretraining_fraction = pretraining_fraction
         self.pretraining_sr_weight = pretraining_sr_weight
         self.pretraining_rp_weight = pretraining_rp_weight
-        self.pretraining_transition_steps = pretraining_transition_steps
+        # Removed pretraining_transition_steps
 
         self.training_steps = 0
         self.training_step_offset = training_step_offset
@@ -437,8 +437,7 @@ class Trainer:
         self.total_episodes_offset = 0
         self.total_env_steps = 0 # Initialize total environment steps counter
         self.pretraining_completed = False
-        self.in_transition_phase = False
-        self.transition_start_step = 0  # Initialize transition_start_step to avoid the attribute error
+        # Removed in_transition_phase and transition_start_step
         self.base_sr_weight = sr_weight
         self.base_rp_weight = rp_weight
 
@@ -450,13 +449,10 @@ class Trainer:
             pretraining_end = int(self.total_episode_target * self.pretraining_fraction)
             if self.debug:
                 print(f"[DEBUG] Pretraining will run for {pretraining_end} episodes")
-                print(f"[DEBUG] Transition phase will last {self.pretraining_transition_steps} steps")
+                # Removed transition phase log
 
-        # Initialize intrinsic reward generator for pre-training if enabled
-        self.use_intrinsic_rewards = use_intrinsic_rewards and use_pretraining
-        self.intrinsic_reward_scale = intrinsic_reward_scale
-        self.intrinsic_reward_generator = None
-
+        # Initialize intrinsic reward generator if enabled
+        # This depends on the flag from args, not the pretraining state itself
         if self.use_intrinsic_rewards:
             obs_dim = getattr(actor, 'obs_shape', action_dim * 2)  # Use action_dim * 2 as fallback
             self.intrinsic_reward_generator = create_intrinsic_reward_generator(
@@ -503,37 +499,20 @@ class Trainer:
         if not self.use_auxiliary_tasks or not hasattr(self, 'aux_task_manager'):
             return
 
+        # Removed transition phase logic
         if not self.use_pretraining or self.pretraining_completed:
             # Use base weights if pretraining is disabled or completed
             self.aux_task_manager.sr_weight = self.base_sr_weight
             self.aux_task_manager.rp_weight = self.base_rp_weight
             self.entropy_coef = self.base_entropy_coef # Also reset entropy
-        elif self.in_transition_phase:
-            # Calculate transition progress (0 to 1)
-            current_step = self._true_training_steps()
-            if self.pretraining_transition_steps > 0:
-                 transition_progress = min(1.0, (current_step - self.transition_start_step) / self.pretraining_transition_steps)
-            else:
-                 transition_progress = 1.0 # Avoid division by zero
-
-            # Interpolate weights during transition
-            sr_weight = self.pretraining_sr_weight + transition_progress * (self.base_sr_weight - self.pretraining_sr_weight)
-            rp_weight = self.pretraining_rp_weight + transition_progress * (self.base_rp_weight - self.pretraining_rp_weight)
-            self.aux_task_manager.sr_weight = sr_weight
-            self.aux_task_manager.rp_weight = rp_weight
-
-            # Interpolate entropy coefficient
-            pretraining_entropy = self.base_entropy_coef * self.pretraining_entropy_scale
-            entropy_coef = pretraining_entropy + transition_progress * (self.base_entropy_coef - pretraining_entropy)
-            self.entropy_coef = max(self.min_entropy_coef, entropy_coef)
-        else:
-            # Use pretraining weights if pretraining is active but not transitioning
+        else: # Pretraining is active
+            # Use pretraining weights if pretraining is active
             self.aux_task_manager.sr_weight = self.pretraining_sr_weight
             self.aux_task_manager.rp_weight = self.pretraining_rp_weight
             # Use higher entropy during active pretraining
             self.entropy_coef = max(self.min_entropy_coef, self.base_entropy_coef * self.pretraining_entropy_scale)
 
-        # Decay entropy coefficient over time (independent of pretraining state after transition)
+        # Decay entropy coefficient over time (independent of pretraining state after completion)
         if self.pretraining_completed:
              self.entropy_coef = max(self.min_entropy_coef, self.entropy_coef * self.entropy_coef_decay)
 
@@ -641,20 +620,6 @@ class Trainer:
             auxiliary_metrics["AUX/sr_weight"] = sr_weight
             auxiliary_metrics["AUX/rp_weight"] = rp_weight
 
-            # # Log actual last values from auxiliary manager if available (already scalars) - Redundant now
-            # if hasattr(self, 'aux_task_manager'): # Check existence on self
-            #     if hasattr(self.aux_task_manager, 'last_sr_loss') and self.aux_task_manager.last_sr_loss > 0:
-            #         sr_value = self.aux_task_manager.last_sr_loss
-            #         auxiliary_metrics["AUX/state_representation_loss"] = sr_value
-
-            #     if hasattr(self.aux_task_manager, 'last_rp_loss') and self.aux_task_manager.last_rp_loss > 0:
-            #         rp_value = self.aux_task_manager.last_rp_loss
-            #         auxiliary_metrics["AUX/reward_prediction_loss"] = rp_value
-
-            #     # Recalculate total if we got updated values
-            #     if auxiliary_metrics["AUX/state_representation_loss"] > 0 or auxiliary_metrics["AUX/reward_prediction_loss"] > 0:
-            #         auxiliary_metrics["AUX/total_loss"] = auxiliary_metrics["AUX/state_representation_loss"] + auxiliary_metrics["AUX/reward_prediction_loss"]
-
         # --- Curriculum metrics ---
         if hasattr(self, 'curriculum_manager') and self.curriculum_manager is not None:
             curriculum_metrics = grouped_metrics['curriculum']
@@ -687,13 +652,7 @@ class Trainer:
         # Pre-training indicators
         if self.use_pretraining:
             system_metrics["SYS/pretraining_active"] = 1 if not self.pretraining_completed else 0
-            system_metrics["SYS/transition_phase"] = 1 if self.in_transition_phase else 0
-
-            # If in transition phase, log progress
-            if self.in_transition_phase:
-                progress = min(1.0, (self.training_steps - self.transition_start_step) /
-                              self.pretraining_transition_steps)
-                system_metrics["SYS/transition_progress"] = progress
+            # Removed transition phase logging
 
         # --- TD Error specific metrics ---
         if self.algorithm_type == "streamac":
@@ -810,23 +769,17 @@ class Trainer:
              if self.debug and self._true_training_steps() % 100 == 0:
                  print(f"[DEBUG Reward Scaling env {env_id}] Orig: {reward_float:.4f}, Scaled: {reward:.4f}, VarG: {variance_G:.4f}, MaxG: {max_G:.4f}")
 
-        # Initialize extrinsic reward normalizer if it doesn't exist
-        if not hasattr(self, 'extrinsic_reward_normalizer'):
-            from intrinsic_rewards import ExtrinsicRewardNormalizer
-            self.extrinsic_reward_normalizer = ExtrinsicRewardNormalizer()
-            if self.debug:
-                print("[DEBUG] Initialized extrinsic reward normalizer for adaptive intrinsic scaling")
-
         # Skip intrinsic reward calculation when reward is 0 (placeholder value)
         # This is to avoid calculating intrinsic rewards before we have the actual reward from the environment
         # Instead, we'll use the update_experience_with_intrinsic_reward method after we have the real reward
-        add_intrinsic = self.use_intrinsic_rewards and self.intrinsic_reward_generator is not None
+        # --- Add pretraining check here ---
+        add_intrinsic = self.use_intrinsic_rewards and not self.pretraining_completed and self.intrinsic_reward_generator is not None
         is_placeholder_reward = isinstance(original_reward, (int, float)) and original_reward == 0 or \
                               hasattr(original_reward, 'item') and original_reward.item() == 0
 
         intrinsic_reward_value = 0.0 # Default value
 
-        if add_intrinsic and not is_placeholder_reward:
+        if add_intrinsic and not is_placeholder_reward: # add_intrinsic now includes the pretraining check
             # Convert inputs to tensor format for intrinsic reward computation
             if not isinstance(state, torch.Tensor):
                 state_tensor = torch.FloatTensor(state).to(self.device)
@@ -889,35 +842,15 @@ class Trainer:
                     state_tensor, action_tensor, next_state
                 )
 
-                if self.debug:
-                    print(f"[DEBUG] Processing reward: {reward}")
-
-                # Extract extrinsic reward value for normalization
-                extrinsic_reward = reward.item() if hasattr(reward, 'item') else reward
-
-                # Normalize extrinsic reward using running statistics
-                normalized_reward = self.extrinsic_reward_normalizer.normalize(extrinsic_reward)
-
-                # Calculate adaptive scale using sigmoid function:
-                # - Higher intrinsic reward when extrinsic reward is low
-                # - Lower intrinsic reward when extrinsic reward is high
-                sigmoid_factor = 1.0 / (1.0 + np.exp(2.0 * normalized_reward))
-                adaptive_scale = self.intrinsic_reward_scale * sigmoid_factor
-
-                # Ensure minimum scale to maintain some exploration
-                adaptive_scale = max(0.1 * self.intrinsic_reward_scale, adaptive_scale)
-
-                # Add scale to metrics for debugging if in debug mode
-                if self.debug and hasattr(self, 'metrics'):
-                    self.metrics['intrinsic_scale'] = adaptive_scale
-                    self.metrics['normalized_extrinsic_reward'] = normalized_reward
+                # Removed adaptive scaling logic
+                # Scale the intrinsic reward using the fixed scale
+                intrinsic_reward_value = intrinsic_reward_value * self.intrinsic_reward_scale
 
                 # Log that we're applying intrinsic rewards in debug mode
                 if self.debug:
-                    print(f"[DEBUG] Adding intrinsic reward: {adaptive_scale * intrinsic_reward_value[0]} to extrinsic: {extrinsic_reward}")
+                    extrinsic_reward_val = reward.item() if hasattr(reward, 'item') else reward
+                    print(f"[DEBUG] Adding intrinsic reward: {intrinsic_reward_value} to scaled extrinsic: {extrinsic_reward_val}")
 
-                # Scale the intrinsic reward
-                intrinsic_reward_value = intrinsic_reward_value * adaptive_scale
 
         # Get the SCALED extrinsic reward
         if self.use_reward_scaling and not getattr(self, 'test_mode', False):
@@ -1000,24 +933,6 @@ class Trainer:
                 observations=state,
                 rewards=total_reward # Use the total reward (scaled extrinsic + scaled intrinsic)
             )
-
-            # For StreamAC, log metrics immediately (if aux manager computes them in update)
-            # This part might need adjustment depending on how StreamAC handles aux updates
-            # if self.algorithm_type == "streamac" and self.use_wandb:
-            #     # Get latest aux metrics if available
-            #     aux_metrics = {
-            #         "sr_loss_scalar": self.aux_task_manager.last_sr_loss,
-            #         "rp_loss_scalar": self.aux_task_manager.last_rp_loss
-            #     }
-            #     if aux_metrics["sr_loss_scalar"] > 0 or aux_metrics["rp_loss_scalar"] > 0:
-            #         try:
-            #             current_step = self._true_training_steps()
-            #             if getattr(self, '_last_aux_log_step', 0) != current_step:
-            #                 if self.debug: print(f"[STEP DEBUG] Logging auxiliary metrics at step {current_step}")
-            #                 self._last_aux_log_step = current_step
-            #                 self._log_to_wandb(aux_metrics, step=current_step, total_env_steps=self.total_env_steps)
-            #         except Exception as e:
-            #             if self.debug: print(f"[STEP DEBUG] Error logging auxiliary metrics: {e}")
 
 
     # Add a new helper method to get a unique wandb step
@@ -1136,19 +1051,6 @@ class Trainer:
              metrics['mean_episode_reward'] = metrics['mean_return']
 
 
-        # --- Auxiliary Task Update (REMOVED FOR PPO) ---
-        # Auxiliary losses for PPO are now computed and included within self.algorithm.update()
-        # if self.use_auxiliary_tasks and hasattr(self, 'aux_task_manager') and not self.test_mode:
-        #     # For Stream mode, auxiliary tasks are already updated during store_experience
-        #     # For PPO batch mode, we compute losses here using the accumulated history
-        #     if self.algorithm_type == "ppo":
-        #         # THIS IS REMOVED - PPO handles aux loss internally now
-        #         pass
-        #     elif self.algorithm_type == "streamac":
-        #         # StreamAC might need separate aux update logic here if not handled in store_experience
-        #         pass
-
-
         # Log metrics (metrics dict should now contain aux losses from PPO update)
         if self.use_wandb:
             try:
@@ -1213,10 +1115,8 @@ class Trainer:
         if self.use_pretraining:
             metadata['pretraining'] = {
                 'completed': self.pretraining_completed,
-                'in_transition': self.in_transition_phase,
-                'transition_start_step': getattr(self, 'transition_start_step', 0),
+                # Removed transition-related state
                 'pretraining_fraction': self.pretraining_fraction,
-                'pretraining_transition_steps': self.pretraining_transition_steps,
                 'base_sr_weight': self.base_sr_weight,
                 'base_rp_weight': self.base_rp_weight,
                 'pretraining_sr_weight': self.pretraining_sr_weight,
@@ -1379,10 +1279,6 @@ class Trainer:
                     # Legacy loading if load_state_dict doesn't exist
                     if self.algorithm_type == "ppo":
                         # PPO optimizer is now handled by algorithm's load_state_dict
-                        # if 'actor_optimizer' in algorithm_state: self.algorithm.actor_optimizer.load_state_dict(algorithm_state['actor_optimizer'])
-                        # if 'critic_optimizer' in algorithm_state: self.algorithm.critic_optimizer.load_state_dict(algorithm_state['critic_optimizer'])
-                        # if 'optimizer' in algorithm_state: self.algorithm.optimizer.load_state_dict(algorithm_state['optimizer'])
-                        # ... other legacy PPO state loading ...
                         if self.debug: print("[DEBUG] Restored algorithm state using legacy PPO method (potential issues).")
                     elif self.algorithm_type == "streamac":
                         # ... legacy StreamAC state loading ...
@@ -1417,41 +1313,12 @@ class Trainer:
                     # Load model parameters
                     if hasattr(self.intrinsic_reward_generator, 'load_state_dict'):
                         try:
-                            # Filter out configuration items and only pass the model state
-                            # model_state = {k: v for k, v in intrinsic_state.items()
-                            #             if k not in ['intrinsic_reward_scale', 'curiosity_weight', 'rnd_weight', 'extrinsic_normalizer']}
-                            # if model_state:
                             self.intrinsic_reward_generator.load_state_dict(intrinsic_state) # Pass the whole dict
                         except Exception as e:
                             print(f"Warning: Could not load intrinsic reward generator state: {e}")
 
                     # Restore configuration values (these might be part of the generator's state dict now)
-                    # if 'intrinsic_reward_scale' in intrinsic_state:
-                    #     self.intrinsic_reward_scale = intrinsic_state['intrinsic_reward_scale']
-
-                    # Set component weights if the generator has those attributes
-                    # if hasattr(self.intrinsic_reward_generator, 'curiosity_weight') and 'curiosity_weight' in intrinsic_state:
-                    #     self.intrinsic_reward_generator.curiosity_weight = intrinsic_state['curiosity_weight']
-                    # if hasattr(self.intrinsic_reward_generator, 'rnd_weight') and 'rnd_weight' in intrinsic_state:
-                    #     self.intrinsic_reward_generator.rnd_weight = intrinsic_state['rnd_weight']
-
-                    # Restore extrinsic reward normalizer if it exists in the checkpoint
-                    if 'extrinsic_normalizer' in intrinsic_state:
-                        normalizer_state = intrinsic_state['extrinsic_normalizer']
-                        if not hasattr(self, 'extrinsic_reward_normalizer'):
-                            from intrinsic_rewards import ExtrinsicRewardNormalizer
-                            self.extrinsic_reward_normalizer = ExtrinsicRewardNormalizer()
-
-                        try:
-                            self.extrinsic_reward_normalizer.load_state_dict(normalizer_state) # Use load_state_dict
-                            # if 'mean' in normalizer_state:
-                            #     self.extrinsic_reward_normalizer.mean = np.array(normalizer_state['mean'])
-                            # if 'var' in normalizer_state:
-                            #     self.extrinsic_reward_normalizer.var = np.array(normalizer_state['var'])
-                            # if 'count' in normalizer_state:
-                            #     self.extrinsic_reward_normalizer.count = normalizer_state['count']
-                        except Exception as e:
-                            print(f"Warning: Could not restore extrinsic reward normalizer: {e}")
+                    # Removed extrinsic normalizer loading
 
                     if self.debug:
                         print(f"[DEBUG] Restored intrinsic reward generator with scale {self.intrinsic_reward_scale}")
@@ -1542,14 +1409,11 @@ class Trainer:
             if 'metadata' in checkpoint and 'pretraining' in metadata: # Check metadata first
                 pretraining_state = metadata['pretraining']
                 self.pretraining_completed = pretraining_state.get('completed', self.pretraining_completed)
-                self.in_transition_phase = pretraining_state.get('in_transition', self.in_transition_phase)
-
-                if 'transition_start_step' in pretraining_state:
-                    self.transition_start_step = pretraining_state['transition_start_step']
+                # Removed loading of transition-related state
 
                 # Restore weight configurations
                 self.pretraining_fraction = pretraining_state.get('pretraining_fraction', self.pretraining_fraction)
-                self.pretraining_transition_steps = pretraining_state.get('pretraining_transition_steps', self.pretraining_transition_steps)
+                # Removed loading of pretraining_transition_steps
                 self.base_sr_weight = pretraining_state.get('base_sr_weight', self.base_sr_weight)
                 self.base_rp_weight = pretraining_state.get('base_rp_weight', self.base_rp_weight)
                 self.pretraining_sr_weight = pretraining_state.get('pretraining_sr_weight', self.pretraining_sr_weight)
@@ -1557,7 +1421,7 @@ class Trainer:
 
                 # Explicitly check and print the pretraining_completed flag
                 if self.debug:
-                    pretraining_status = "completed" if self.pretraining_completed else ("transitioning" if self.in_transition_phase else "active")
+                    pretraining_status = "completed" if self.pretraining_completed else "active"
                     print(f"[DEBUG] Restored pretraining state from metadata: {pretraining_status}")
                     print(f"[DEBUG] pretraining_completed = {self.pretraining_completed}")
             # If we explicitly find the 'pretraining_completed' at the top level (older format), use it
@@ -1606,80 +1470,30 @@ class Trainer:
 
     def _update_pretraining_state(self):
         """Update pretraining state and manage transition to regular training."""
-        # Skip if pretraining is not enabled
-        if not self.use_pretraining:
-            return
-
-        # If pretraining is already completed, nothing to do
-        if self.pretraining_completed and not self.in_transition_phase:
+        # Skip if pretraining is not enabled or already completed
+        if not self.use_pretraining or self.pretraining_completed:
             return
 
         # Calculate when pretraining should end based on episodes or steps
         pretraining_end_step = self._get_pretraining_end_step()
         current_step = self._true_training_steps()
 
-        # Determine if we're in regular pretraining mode, transition phase, or fully completed
-        if not self.pretraining_completed:
-            # Check if we've reached the end of the pretraining phase
-            if current_step >= pretraining_end_step:
-                self.pretraining_completed = True
-                self.in_transition_phase = True
-                self.transition_start_step = current_step
+        # Check if we've reached the end of the pretraining phase
+        if current_step >= pretraining_end_step:
+            self.pretraining_completed = True
+            print(f"Pretraining phase completed at step {current_step}. Switching to regular training.")
 
-                # Only print transition message when we just entered transition phase
-                print(f"Transitioning from pretraining to regular training over next {self.pretraining_transition_steps} steps.")
-
-                if self.use_wandb:
-                    wandb.log({
-                        'training/pretraining_completed': True,
-                        'training/transition_started': True
-                    }, step=current_step)
-
-        # Handle transition phase
-        elif self.in_transition_phase:
-            # Check if transition phase is complete
-            if self.pretraining_transition_steps <= 0: # Handle case where transition is immediate
-                transition_progress = 1.0
-            else:
-                transition_progress = min(1.0, (current_step - self.transition_start_step) / self.pretraining_transition_steps)
-
-
-            if transition_progress >= 1.0:
-                # Mark pretraining as fully completed
-                self.pretraining_completed = True
-                self.in_transition_phase = False
-                print("Pretraining phase completed. Switching to regular training.")
-
-                # Reset auxiliary task weights to regular values
-                if self.use_auxiliary_tasks and self.aux_task_manager:
-                    self.aux_task_manager.sr_weight = self.base_sr_weight
-                    self.aux_task_manager.rp_weight = self.base_rp_weight
-
-                # Reset entropy coefficient to base value
-                self.entropy_coef = self.base_entropy_coef
-
-            else:
-                # Gradually transition auxiliary task weights
-                if self.use_auxiliary_tasks and self.aux_task_manager:
-                    sr_weight = self.pretraining_sr_weight + transition_progress * (self.base_sr_weight - self.pretraining_sr_weight)
-                    rp_weight = self.pretraining_rp_weight + transition_progress * (self.base_rp_weight - self.pretraining_rp_weight)
-                    self.aux_task_manager.sr_weight = sr_weight
-                    self.aux_task_manager.rp_weight = rp_weight
-
-                # Gradually transition entropy coefficient
-                pretraining_entropy = self.base_entropy_coef * self.pretraining_entropy_scale
-                entropy_coef = pretraining_entropy + transition_progress * (self.base_entropy_coef - pretraining_entropy)
-                self.entropy_coef = max(self.min_entropy_coef, entropy_coef)
-
-        # During early pretraining, use higher values for auxiliary tasks and entropy
-        # This block was slightly misplaced, should only apply when pretraining active *and not* transitioning
-        elif not self.in_transition_phase and not self.pretraining_completed: # Redundant condition, handled by first if
+            # Reset auxiliary task weights to regular values immediately
             if self.use_auxiliary_tasks and self.aux_task_manager:
-                self.aux_task_manager.sr_weight = self.pretraining_sr_weight
-                self.aux_task_manager.rp_weight = self.pretraining_rp_weight
+                self.aux_task_manager.sr_weight = self.base_sr_weight
+                self.aux_task_manager.rp_weight = self.base_rp_weight
 
-            # Higher entropy during pretraining
-            self.entropy_coef = max(self.min_entropy_coef, self.base_entropy_coef * self.pretraining_entropy_scale)
+            # Reset entropy coefficient to base value immediately
+            self.entropy_coef = self.base_entropy_coef
+
+            if self.use_wandb:
+                wandb.log({'training/pretraining_completed': True}, step=current_step)
+        # Removed transition phase logic
 
     def _initialize_reward_scaling_stats(self, env_id):
         """Initialize reward scaling stats for a new environment ID."""
@@ -1700,12 +1514,6 @@ class Trainer:
         count_prev = self.running_G_count[env_id]
 
         # Update running discounted return G_t (Eq 17)
-        # Note: Paper uses (1-gamma)*G_{t-1} + r_t. This seemslike an error,
-        # typically it's r_t + gamma * V(s_{t+1}) or similar.
-        # Let's try the paper's formula first. If it fails, consider alternatives.
-        # G_t = (1 - self.gamma) * G_prev + reward_t # Paper's formula
-        # Alternative: Simple discounted sum (might be more stable)
-        # G_t = reward_t + self.gamma * G_prev # More standard update? Let's stick to paper for now.
         G_t = (1 - self.gamma) * G_prev + reward_t # Sticking to paper Eq 17
 
         # Update running variance of G_t using Welford's online algorithm
@@ -1748,7 +1556,7 @@ class Trainer:
     def update_experience_with_intrinsic_reward(self, state=None, action=None, next_state=None, done=None, reward=None, store_idx=None, env_id=None):
         """
         Calculate intrinsic reward and update stored experience.
-        Uses the ORIGINAL extrinsic reward for normalization context.
+        Uses the fixed intrinsic reward scale.
         Combines intrinsic reward with the SCALED extrinsic reward.
 
         Args:
@@ -1763,8 +1571,9 @@ class Trainer:
         Returns:
             Total reward (scaled extrinsic + scaled intrinsic)
         """
-        # If intrinsic rewards are disabled or generator is not initialized, return original reward
-        if not self.use_intrinsic_rewards or self.intrinsic_reward_generator is None:
+        # If intrinsic rewards are disabled, pretraining is completed, or generator is not initialized, return scaled/original reward
+        # --- Add pretraining check here ---
+        if not self.use_intrinsic_rewards or self.pretraining_completed or self.intrinsic_reward_generator is None:
             # Return the SCALED reward if scaling is enabled, otherwise original
             if self.use_reward_scaling and not getattr(self, 'test_mode', False):
                  # Recalculate scaled reward if needed (e.g., for PPO where only original might be available here)
@@ -1788,17 +1597,12 @@ class Trainer:
             if not isinstance(state, torch.Tensor): obs_tensor = torch.tensor(state, dtype=torch.float32, device=self.device)
             else: obs_tensor = state.to(self.device)
             if not isinstance(action, torch.Tensor):
-                 # Handle discrete vs continuous action conversion
                  if self.action_space_type == "discrete":
-                     # Assume action is index or one-hot, convert to LongTensor index
-                     if isinstance(action, np.ndarray) and action.shape == (self.action_dim,): # One-hot
-                         action_idx = np.argmax(action)
-                     elif isinstance(action, (int, float, np.number)):
-                         action_idx = int(action)
-                     else:
-                         action_idx = 0 # Fallback
+                     if isinstance(action, np.ndarray) and action.shape == (self.action_dim,): action_idx = np.argmax(action)
+                     elif isinstance(action, (int, float, np.number)): action_idx = int(action)
+                     else: action_idx = 0
                      action_tensor = torch.tensor([action_idx], dtype=torch.long, device=self.device)
-                 else: # Continuous
+                 else:
                      action_tensor = torch.tensor(action, dtype=torch.float32, device=self.device)
             else: action_tensor = action.to(self.device)
 
@@ -1807,8 +1611,8 @@ class Trainer:
 
             # Ensure batch dimension
             if obs_tensor.dim() == 1: obs_tensor = obs_tensor.unsqueeze(0)
-            if action_tensor.dim() == 0: action_tensor = action_tensor.unsqueeze(0) # Handle scalar action index
-            elif action_tensor.dim() == 1 and self.action_space_type != "discrete": action_tensor = action_tensor.unsqueeze(0) # Handle vector continuous action
+            if action_tensor.dim() == 0: action_tensor = action_tensor.unsqueeze(0)
+            elif action_tensor.dim() == 1 and self.action_space_type != "discrete": action_tensor = action_tensor.unsqueeze(0)
             if next_obs_tensor.dim() == 1: next_obs_tensor = next_obs_tensor.unsqueeze(0)
 
 
@@ -1825,24 +1629,9 @@ class Trainer:
             if isinstance(intrinsic_reward_value, torch.Tensor):
                 intrinsic_reward_value = intrinsic_reward_value.item()
 
-            # --- Adaptive Scaling based on ORIGINAL reward ---
-            if not hasattr(self, 'extrinsic_reward_normalizer'):
-                 from intrinsic_rewards import ExtrinsicRewardNormalizer
-                 self.extrinsic_reward_normalizer = ExtrinsicRewardNormalizer()
-
-            # Ensure original reward is float
-            if isinstance(reward, torch.Tensor): original_reward_float = reward.item()
-            elif isinstance(reward, np.ndarray): original_reward_float = reward.item() if reward.size == 1 else float(reward[0])
-            else: original_reward_float = float(reward)
-
-            normalized_reward = self.extrinsic_reward_normalizer.normalize(original_reward_float)
-            sigmoid_factor = 1.0 / (1.0 + np.exp(2.0 * normalized_reward))
-            adaptive_scale = self.intrinsic_reward_scale * sigmoid_factor
-            adaptive_scale = max(0.1 * self.intrinsic_reward_scale, adaptive_scale) # Min scale
-
-            # Scale the intrinsic reward
-            scaled_intrinsic_reward = intrinsic_reward_value * adaptive_scale
-            # --- End Adaptive Scaling ---
+            # --- Apply FIXED intrinsic scale ---
+            scaled_intrinsic_reward = intrinsic_reward_value * self.intrinsic_reward_scale
+            # --- End Fixed Scaling ---
 
         except Exception as e:
             if self.debug:
@@ -1856,13 +1645,11 @@ class Trainer:
             self._initialize_reward_scaling_stats(env_id)
             variance_G = self.running_G_var[env_id]
             max_G = self.running_G_max[env_id]
-            # Ensure original reward is float for scaling calculation
             if isinstance(reward, torch.Tensor): original_reward_float = reward.item()
             elif isinstance(reward, np.ndarray): original_reward_float = reward.item() if reward.size == 1 else float(reward[0])
             else: original_reward_float = float(reward)
             scaled_extrinsic_reward = self._scale_reward(env_id, original_reward_float, variance_G, max_G)
         else:
-            # If scaling is off or in test mode, use the original reward directly
             if isinstance(reward, torch.Tensor): scaled_extrinsic_reward = reward.item()
             elif isinstance(reward, np.ndarray): scaled_extrinsic_reward = reward.item() if reward.size == 1 else float(reward[0])
             else: scaled_extrinsic_reward = float(reward)
@@ -1881,18 +1668,19 @@ class Trainer:
     def calculate_intrinsic_rewards_batch(self, states, actions, next_states, env_ids):
         """
         Calculates intrinsic rewards in batch for multiple agents/environments.
-        This reduces redundant computation when multiple agents need intrinsic rewards.
+        Applies the fixed intrinsic reward scale.
 
         Args:
             states: Batch of states/observations (numpy array or tensor)
             actions: Batch of actions (numpy array or tensor) - Can be indices or one-hot for discrete
             next_states: Batch of next states/observations (numpy array or tensor)
-            env_ids: List of environment IDs for each sample
+            env_ids: List of environment IDs for each sample (not used for fixed scaling)
 
         Returns:
-            Batch of intrinsic rewards (numpy array)
+            Batch of scaled intrinsic rewards (numpy array)
         """
-        if not self.use_intrinsic_rewards or self.intrinsic_reward_generator is None:
+        # --- Add pretraining check here ---
+        if not self.use_intrinsic_rewards or self.pretraining_completed or self.intrinsic_reward_generator is None:
             # Return zeros with the right shape
             return np.zeros(len(states))
 
@@ -1905,12 +1693,10 @@ class Trainer:
         # Handle actions based on action space type
         if not isinstance(actions, torch.Tensor):
             if self.action_space_type == "discrete":
-                # Convert to LongTensor indices for discrete actions
                 try:
-                    # Check if actions are one-hot encoded
                     if isinstance(actions, np.ndarray) and actions.ndim == 2 and actions.shape[1] == self.action_dim:
                         actions_indices = np.argmax(actions, axis=1)
-                    else: # Assume already indices
+                    else:
                         actions_indices = np.array(actions, dtype=int)
                     actions_tensor = torch.LongTensor(actions_indices).to(self.device)
                 except Exception as e:
@@ -1921,11 +1707,10 @@ class Trainer:
                 actions_tensor = torch.FloatTensor(actions).to(self.device)
         else:
             actions_tensor = actions.to(self.device)
-            # Ensure correct type for discrete actions if tensor is provided
             if self.action_space_type == "discrete" and actions_tensor.dtype != torch.long:
-                 if actions_tensor.ndim == 2 and actions_tensor.shape[1] == self.action_dim: # One-hot float tensor
+                 if actions_tensor.ndim == 2 and actions_tensor.shape[1] == self.action_dim:
                      actions_tensor = torch.argmax(actions_tensor, dim=1).long()
-                 else: # Assume indices, cast to long
+                 else:
                      actions_tensor = actions_tensor.long()
 
 
@@ -1934,37 +1719,29 @@ class Trainer:
         else:
             next_states_tensor = next_states.to(self.device)
 
-        # Ensure batch dimension (should already be batched, but double-check)
+        # Ensure batch dimension
         if states_tensor.dim() == 1: states_tensor = states_tensor.unsqueeze(0)
         if next_states_tensor.dim() == 1: next_states_tensor = next_states_tensor.unsqueeze(0)
 
-        # Get the batch size from states for consistent dimensions
         batch_size = states_tensor.size(0)
 
         # Properly handle actions tensor based on action space type
         if self.action_space_type == "discrete":
-            if actions_tensor.dim() == 0:  # Single scalar
+            if actions_tensor.dim() == 0:
                 actions_tensor = actions_tensor.unsqueeze(0)
-            elif actions_tensor.dim() == 1:  # Vector of indices
-                # Ensure it matches batch size
+            elif actions_tensor.dim() == 1:
                 if actions_tensor.size(0) != batch_size:
                     if self.debug:
                         print(f"[DEBUG] Reshaping actions_tensor from shape {actions_tensor.shape} to match batch size {batch_size}")
-                    # If it's a single action being applied to all states, repeat it
                     if actions_tensor.size(0) == 1:
                         actions_tensor = actions_tensor.repeat(batch_size)
-
-            # For discrete actions, we might need to convert to one-hot for the forward model
-            # This depends on how the intrinsic_reward_generator expects actions
-            # If one-hot is needed, will be handled in the generator
         else:  # Continuous action space
-            if actions_tensor.dim() == 1:  # Single vector action
-                if actions_tensor.size(0) == self.action_dim:  # If it's a single action vector
+            if actions_tensor.dim() == 1:
+                if actions_tensor.size(0) == self.action_dim:
                     actions_tensor = actions_tensor.unsqueeze(0).repeat(batch_size, 1)
-                else:  # It's already a batch of scalar actions
+                else:
                     actions_tensor = actions_tensor.unsqueeze(1) if actions_tensor.size(0) == batch_size else actions_tensor.unsqueeze(0)
             elif actions_tensor.dim() == 2 and actions_tensor.size(0) != batch_size:
-                # If we have a 2D tensor but wrong batch size
                 if actions_tensor.size(0) == 1:
                     actions_tensor = actions_tensor.repeat(batch_size, 1)
 
@@ -1984,48 +1761,41 @@ class Trainer:
                 print(f"[DEBUG] Error in compute_intrinsic_reward: {e}")
                 print(f"Falling back to single item processing")
 
-            # Fallback: process one by one
             intrinsic_rewards_list = []
             for i in range(batch_size):
                 single_reward = self.intrinsic_reward_generator.compute_intrinsic_reward(
-                    states_tensor[i:i+1],  # Keep batch dimension
+                    states_tensor[i:i+1],
                     actions_tensor[i:i+1] if actions_tensor.dim() > 0 and actions_tensor.size(0) >= i+1 else actions_tensor,
-                    next_states_tensor[i:i+1]  # Keep batch dimension
+                    next_states_tensor[i:i+1]
                 )
                 if isinstance(single_reward, torch.Tensor):
                     intrinsic_rewards_list.append(single_reward.item())
                 else:
                     intrinsic_rewards_list.append(single_reward)
-
-            # Convert to numpy array for consistency
             intrinsic_rewards = np.array(intrinsic_rewards_list)
 
         # Handle different types of intrinsic rewards output
         if isinstance(intrinsic_rewards, torch.Tensor):
             intrinsic_rewards = intrinsic_rewards.detach().cpu().numpy()
         elif isinstance(intrinsic_rewards, (float, int)):
-            # If we got a single value, repeat it for each item in the batch
             intrinsic_rewards = np.array([float(intrinsic_rewards)] * batch_size)
         elif isinstance(intrinsic_rewards, (list, tuple)):
             intrinsic_rewards = np.array(intrinsic_rewards)
         elif not isinstance(intrinsic_rewards, np.ndarray):
             if self.debug:
                 print(f"[DEBUG] Unexpected intrinsic rewards type: {type(intrinsic_rewards)}")
-            # Fallback to zeros if we got an unexpected type
             intrinsic_rewards = np.zeros(batch_size)
 
         # Ensure we have a 1D array of the correct size
         if isinstance(intrinsic_rewards, np.ndarray):
             if intrinsic_rewards.ndim > 1:
                 intrinsic_rewards = intrinsic_rewards.flatten()
-            # Ensure length matches batch size
             if len(intrinsic_rewards) != batch_size:
                 if len(intrinsic_rewards) == 1:
                     intrinsic_rewards = np.repeat(intrinsic_rewards, batch_size)
                 else:
                     if self.debug:
                         print(f"[DEBUG] Intrinsic rewards length {len(intrinsic_rewards)} doesn't match batch size {batch_size}")
-                    # Truncate or pad with zeros as needed
                     if len(intrinsic_rewards) > batch_size:
                         intrinsic_rewards = intrinsic_rewards[:batch_size]
                     else:
@@ -2033,30 +1803,10 @@ class Trainer:
                                                  (0, batch_size - len(intrinsic_rewards)),
                                                  'constant', constant_values=0)
 
-        # Array to store adaptive scaled rewards
-        adaptive_scaled_rewards = np.zeros_like(intrinsic_rewards)
+        # Apply the fixed intrinsic reward scale
+        scaled_intrinsic_rewards = intrinsic_rewards * self.intrinsic_reward_scale
 
-        # Apply adaptive scaling based on extrinsic rewards for each environment
-        # NOTE: This scaling uses a default normalized reward of 0 because we don't
-        # have the extrinsic rewards readily available here. A more accurate scaling
-        # would require passing the extrinsic rewards to this function.
-        # For now, we use a simplified scaling based only on the intrinsic scale factor.
-        for i, env_id in enumerate(env_ids):
-            # Get normalization parameters
-            if not hasattr(self, 'extrinsic_reward_normalizer'):
-                from intrinsic_rewards import ExtrinsicRewardNormalizer
-                self.extrinsic_reward_normalizer = ExtrinsicRewardNormalizer()
-
-            # Use sigmoid adaptive scaling (simplified: assumes normalized_reward=0)
-            normalized_reward = 0
-            sigmoid_factor = 1.0 / (1.0 + np.exp(2.0 * normalized_reward))
-            adaptive_scale = self.intrinsic_reward_scale * sigmoid_factor
-            adaptive_scale = max(0.1 * self.intrinsic_reward_scale, adaptive_scale)  # Minimum scale
-
-            # Apply the scale
-            adaptive_scaled_rewards[i] = intrinsic_rewards[i] * adaptive_scale
-
-        return adaptive_scaled_rewards
+        return scaled_intrinsic_rewards
 
     def _cleanup_tensors(self):
         """Clean up any cached tensors to reduce memory usage"""

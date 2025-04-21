@@ -1,3 +1,4 @@
+# Rlbot-thesis/main.py
 import sys
 import gc
 import psutil
@@ -217,7 +218,7 @@ def run_training(
     pretraining_fraction: float = 0.1,
     pretraining_sr_weight: float = 10.0,
     pretraining_rp_weight: float = 5.0,
-    pretraining_transition_steps: int = 1000,
+    # Removed pretraining_transition_steps
     # Intrinsic rewards parameters
     use_intrinsic_rewards: bool = True,
     intrinsic_reward_scale: float = 0.1,
@@ -295,7 +296,7 @@ def run_training(
         pretraining_fraction=pretraining_fraction,
         pretraining_sr_weight=pretraining_sr_weight,
         pretraining_rp_weight=pretraining_rp_weight,
-        pretraining_transition_steps=pretraining_transition_steps,
+        # Removed pretraining_transition_steps
         # New intrinsic reward parameters
         use_intrinsic_rewards=use_intrinsic_rewards,
         intrinsic_reward_scale=intrinsic_reward_scale,
@@ -485,7 +486,7 @@ def run_training(
 
     # Add pretraining info if enabled
     if use_pretraining:
-        pretraining_end_step = int(total_episodes * pretraining_fraction) if total_episodes else int(5000 * pretraining_fraction)
+        pretraining_end_step = trainer._get_pretraining_end_step() # Use trainer's method
         stats_dict.update({
             "Mode": "PreTraining",
             "PT_Progress": f"0/{pretraining_end_step}"
@@ -693,7 +694,7 @@ def run_training(
                             done = terminated_dict[agent_id] or truncated_dict[agent_id]
                             next_obs = next_obs_dict.get(agent_id, None)
 
-                            batch_rewards.append(extrinsic_reward)
+                            batch_rewards.append(extrinsic_reward) # Store ORIGINAL extrinsic reward
                             batch_dones.append(done)
                             if next_obs is not None: batch_next_obs.append(next_obs)
                             batch_env_ids_for_intrinsic.append(env_idx)
@@ -702,7 +703,7 @@ def run_training(
                             if buffer_idx is not None:
                                 batch_store_indices_for_update.append(buffer_idx)
 
-                            # Accumulate rewards for episode tracking (using extrinsic for now)
+                            # Accumulate rewards for episode tracking (using ORIGINAL extrinsic for now)
                             # Defensive check/initialization before accumulating
                             if agent_id not in episode_rewards[env_idx]:
                                 episode_rewards[env_idx][agent_id] = 0.0
@@ -732,7 +733,18 @@ def run_training(
                     batch_dones_np = np.array(batch_dones, dtype=bool)
                     batch_store_indices_tensor = torch.tensor(batch_store_indices_for_update, dtype=torch.long, device=device)
 
-                    final_rewards = batch_rewards_np
+                    # --- Reward Scaling (SimbaV2) ---
+                    scaled_extrinsic_rewards = np.zeros_like(batch_rewards_np)
+                    if trainer.use_reward_scaling:
+                        for i in range(min_len):
+                            env_id = batch_env_ids_for_intrinsic[i]
+                            done_flag = batch_dones_np[i]
+                            variance_G, max_G = trainer._update_reward_scaling_stats(env_id, batch_rewards_np[i], done_flag)
+                            scaled_extrinsic_rewards[i] = trainer._scale_reward(env_id, batch_rewards_np[i], variance_G, max_G)
+                    else:
+                        scaled_extrinsic_rewards = batch_rewards_np # Use original if scaling disabled
+
+                    final_rewards = scaled_extrinsic_rewards # Start with scaled extrinsic
 
                     # --- Batch Intrinsic Reward Calculation (PPO) ---
                     if trainer.use_intrinsic_rewards and len(batch_next_obs) == min_len:
@@ -744,28 +756,29 @@ def run_training(
                             intrinsic_next_states = np.stack(batch_next_obs)
                             intrinsic_env_ids = batch_env_ids_for_intrinsic[:min_len]
 
+                            # calculate_intrinsic_rewards_batch now applies the fixed scale internally
                             intrinsic_rewards = trainer.calculate_intrinsic_rewards_batch(
                                 states=intrinsic_states,
                                 actions=intrinsic_actions,
                                 next_states=intrinsic_next_states,
                                 env_ids=intrinsic_env_ids
                             )
-                            # Add intrinsic rewards to extrinsic rewards
-                            final_rewards = batch_rewards_np + intrinsic_rewards
+                            # Add intrinsic rewards to scaled extrinsic rewards
+                            final_rewards = scaled_extrinsic_rewards + intrinsic_rewards
                             if debug and min_len > 0:
-                                print(f"[DEBUG PPO] Intrinsic reward example: Extrinsic={batch_rewards_np[0]:.4f}, Intrinsic={intrinsic_rewards[0]:.4f}, Total={final_rewards[0]:.4f}")
+                                print(f"[DEBUG PPO] Intrinsic reward example: Scaled Extrinsic={scaled_extrinsic_rewards[0]:.4f}, Intrinsic={intrinsic_rewards[0]:.4f}, Total={final_rewards[0]:.4f}")
 
                         except Exception as e:
                             if debug:
                                 print(f"[DEBUG PPO] Error calculating batch intrinsic rewards: {e}")
                                 traceback.print_exc()
-                            # Use only extrinsic rewards if intrinsic calculation fails
-                            final_rewards = batch_rewards_np
+                            # Use only scaled extrinsic rewards if intrinsic calculation fails
+                            final_rewards = scaled_extrinsic_rewards
 
                     # --- Update Rewards and Dones in Buffer (PPO) ---
                     trainer.update_rewards_dones_batch(
                         batch_store_indices_tensor,
-                        torch.tensor(final_rewards, dtype=torch.float32, device=device),
+                        torch.tensor(final_rewards, dtype=torch.float32, device=device), # Use final combined reward
                         torch.tensor(batch_dones_np, dtype=torch.bool, device=device)
                     )
                 elif debug:
@@ -787,29 +800,25 @@ def run_training(
 
                     for agent_id in reward_dict.keys():
                         if exp_idx < len(all_obs_list): # Check bounds
-                            extrinsic_reward = reward_dict[agent_id]
+                            extrinsic_reward = reward_dict[agent_id] # ORIGINAL extrinsic reward
                             done = terminated_dict[agent_id] or truncated_dict[agent_id]
                             next_obs = next_obs_dict.get(agent_id, None)
 
                             # For StreamAC/SAC, update the stored experience with actual reward/done
-                            # This part remains similar, but uses the single store_experience_at_idx
-                            # or relies on StreamAC's internal buffer update mechanism.
                             if not test: # Only update if not testing
                                 if algorithm == "streamac":
                                      # StreamAC updates happen within store_experience, called earlier
-                                     # We might need to update the *last* stored reward/done if store_experience
+                                     # We need to update the *last* stored reward/done if store_experience
                                      # doesn't handle the next_state logic correctly.
-                                     # Let's assume StreamAC's store_experience handles this for now.
-                                     # We still need to track episode rewards.
-                                     # Calculate total reward (extrinsic + intrinsic) if needed for tracking
-                                     total_reward_for_tracking = extrinsic_reward
-                                     if next_obs is not None and trainer.use_intrinsic_rewards:
+                                     # update_experience_with_intrinsic_reward handles scaling and intrinsic addition
+                                     total_reward_for_tracking = extrinsic_reward # Default to original
+                                     if next_obs is not None:
                                          # Use the single update method to get the combined reward
                                          total_reward_for_tracking = trainer.update_experience_with_intrinsic_reward(
                                              state=all_obs_list[exp_idx],
                                              action=action_batch[exp_idx], # Original action
                                              next_state=next_obs,
-                                             reward=extrinsic_reward, # Original extrinsic
+                                             reward=extrinsic_reward, # Pass ORIGINAL extrinsic
                                              env_id=env_idx,
                                              done=done # Pass done flag
                                              # store_idx is None for StreamAC here
@@ -818,7 +827,8 @@ def run_training(
                                      if agent_id not in episode_rewards[env_idx]:
                                          episode_rewards[env_idx][agent_id] = 0.0
                                          if debug: print(f"[DEBUG] Initialized episode_rewards for {agent_id} in env {env_idx} (during {algorithm} result processing)")
-                                     episode_rewards[env_idx][agent_id] += total_reward_for_tracking
+                                     # Accumulate the ORIGINAL extrinsic reward for episode tracking
+                                     episode_rewards[env_idx][agent_id] += extrinsic_reward
 
                                 elif algorithm == "sac":
                                      # SAC uses a replay buffer, update the last stored experience
@@ -831,7 +841,8 @@ def run_training(
                                      if agent_id not in episode_rewards[env_idx]:
                                          episode_rewards[env_idx][agent_id] = 0.0
                                          if debug: print(f"[DEBUG] Initialized episode_rewards for {agent_id} in env {env_idx} (during {algorithm} result processing)")
-                                     episode_rewards[env_idx][agent_id] += extrinsic_reward # Track extrinsic for now
+                                     # Accumulate the ORIGINAL extrinsic reward for episode tracking
+                                     episode_rewards[env_idx][agent_id] += extrinsic_reward
 
                             if done:
                                 action_stacker.reset_agent(agent_id)
@@ -884,6 +895,7 @@ def run_training(
                     if done_flag:
                         # Only calculate average reward if the dict is not empty
                         if env_idx in episode_rewards and episode_rewards[env_idx]:
+                            # Use the accumulated ORIGINAL extrinsic rewards for average calculation
                             avg_reward = sum(episode_rewards[env_idx].values()) / len(episode_rewards[env_idx])
                             if debug:
                                 print(f"Episode {episode_counts[env_idx]} in env {env_idx} completed with avg reward: {avg_reward:.2f}")
@@ -1079,16 +1091,15 @@ def run_training(
             if use_pretraining:
                 pretraining_end_step = trainer._get_pretraining_end_step()
                 in_pretraining = not trainer.pretraining_completed
-                in_transition = trainer.in_transition_phase
                 needs_postfix_update = False # Flag if pretraining status changed
 
                 # Check pretraining completion status based on current step count
                 current_step = trainer._true_training_steps() # Use trainer's step counter
-                if current_step >= pretraining_end_step and not trainer.pretraining_completed and not trainer.in_transition_phase:
-                    print(f"Triggering pretraining transition at step {current_step}/{pretraining_end_step}")
-                    trainer.in_transition_phase = True
-                    trainer.transition_start_step = current_step # Use trainer step
-                    needs_postfix_update = True
+                # Transition is now immediate, no separate phase
+                if current_step >= pretraining_end_step and not trainer.pretraining_completed:
+                    print(f"Pretraining completed at step {current_step}/{pretraining_end_step}")
+                    # trainer.pretraining_completed is set inside trainer.update() -> _update_pretraining_state()
+                    needs_postfix_update = True # Trigger postfix update
 
                 if in_pretraining:
                     new_mode = "PreTraining"
@@ -1097,16 +1108,8 @@ def run_training(
                         stats_dict["Mode"] = new_mode
                         stats_dict["PT_Progress"] = new_progress
                         needs_postfix_update = True
-                elif in_transition:
-                    new_mode = "PT_Transition"
-                    transition_progress = min(100, int(100 * (current_step - trainer.transition_start_step) /
-                                              max(1, trainer.pretraining_transition_steps))) # Avoid div by zero
-                    new_progress = f"{transition_progress}%"
-                    if stats_dict.get("Mode") != new_mode or stats_dict.get("PT_Progress") != new_progress:
-                        stats_dict["Mode"] = new_mode
-                        stats_dict["PT_Progress"] = new_progress
-                        needs_postfix_update = True
-                else:
+                # Removed transition phase logic
+                else: # Pretraining completed
                     # Remove pretraining info from stats once completed
                     if "Mode" in stats_dict:
                         stats_dict.pop("Mode", None)
@@ -1333,7 +1336,7 @@ if __name__ == "__main__":
     parser.add_argument('--pretraining-fraction', type=float, default=0.1, help='Fraction of total training time/episodes to use for pre-training (default: 0.1)')
     parser.add_argument('--pretraining-sr-weight', type=float, default=10.0, help='Weight for State Representation task during pre-training (default: 10.0)')
     parser.add_argument('--pretraining-rp-weight', type=float, default=5.0, help='Weight for Reward Prediction task during pre-training (default: 5.0)')
-    parser.add_argument('--pretraining-transition-steps', type=int, default=5000, help='Number of steps for smooth transition from pre-training to RL training (default: 1000)')
+    # Removed --pretraining-transition-steps argument
 
     # Intrinsic reward parameters
     parser.add_argument('--use-intrinsic', action='store_true', help='Use intrinsic rewards during pre-training')
@@ -1411,7 +1414,7 @@ if __name__ == "__main__":
                         help='Legacy parameter; use --num_envs instead')
 
     # Model architecture argument
-    parser.add_argument('--model-arch', type=str, default='simbav2', choices=['basic', 'simba', 'simbav2', 'simbav2-shared'], # Add simbav2-shared
+    parser.add_argument('--model-arch', type=str, default='simbav2-shared', choices=['basic', 'simba', 'simbav2', 'simbav2-shared'], # Add simbav2-shared
                        help='Model architecture to use (basic, simba, simbav2, simbav2-shared)')
 
     # Add reward scaling args here, before parse_args()
@@ -1709,7 +1712,7 @@ if __name__ == "__main__":
             pretraining_fraction=args.pretraining_fraction,
             pretraining_sr_weight=args.pretraining_sr_weight,
             pretraining_rp_weight=args.pretraining_rp_weight,
-            pretraining_transition_steps=args.pretraining_transition_steps,
+            # Removed pretraining_transition_steps argument
             use_intrinsic_rewards=args.use_intrinsic,
             intrinsic_reward_scale=args.intrinsic_scale,
             curiosity_weight=args.curiosity_weight,
