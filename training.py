@@ -173,7 +173,9 @@ class Trainer:
         self.action_bounds = action_bounds
 
         self.actor = actor.to(self.device)
+        # Critic might be the same instance as actor
         self.critic = critic.to(self.device)
+        self.shared_model = (self.actor is self.critic)
 
         # We'll decay the entropy coefficient over time to encourage exploration, then exploitation
         self.entropy_coef = entropy_coef if entropy_coef else 0.01
@@ -187,7 +189,8 @@ class Trainer:
 
         # Set to training mode
         self.actor.train()
-        self.critic.train()
+        if not self.shared_model:
+            self.critic.train()
 
         # Store hyperparameters
         self.gamma = gamma
@@ -210,7 +213,7 @@ class Trainer:
             obs_dim = getattr(actor, 'obs_shape', action_dim * 2)  # Use action_dim * 2 as fallback
 
             self.aux_task_manager = AuxiliaryTaskManager(
-                actor=self.actor, # Pass the actor model
+                actor=self.actor, # Pass the actor model (or shared model)
                 obs_dim=obs_dim,
                 sr_weight=sr_weight,
                 rp_weight=rp_weight,
@@ -234,7 +237,7 @@ class Trainer:
         if self.algorithm_type == "ppo":
             self.algorithm = PPOAlgorithm(
                 actor=self.actor,
-                critic=self.critic,
+                critic=self.critic, # Pass potentially shared instance
                 # Pass the aux_task_manager to PPO
                 aux_task_manager=self.aux_task_manager if self.use_auxiliary_tasks else None,
                 action_space_type=action_space_type,
@@ -269,7 +272,7 @@ class Trainer:
             # Create StreamAC algorithm
             algorithm = StreamACAlgorithm(
                 actor=self.actor,
-                critic=self.critic,
+                critic=self.critic, # Pass potentially shared instance
                 action_space_type=action_space_type,
                 action_dim=action_dim,
                 action_bounds=action_bounds,
@@ -298,6 +301,10 @@ class Trainer:
             self.algorithm = algorithm
         elif self.algorithm_type == "sac":
             # Create a second critic network for SAC's twin Q-function
+            # If using shared model, SAC needs modification or cannot use shared.
+            # For now, assume SAC requires separate critics.
+            if self.shared_model:
+                raise ValueError("SAC algorithm currently does not support shared actor-critic models.")
             critic2 = copy.deepcopy(critic)
 
             # Create SAC algorithm
@@ -341,7 +348,7 @@ class Trainer:
 
         if self.debug:
             print(f"[DEBUG] Initialized {self.algorithm_type.upper()} algorithm on {self.device}")
-            print(f"[DEBUG] Actor: {actor.__class__.__name__}, Critic: {critic.__class__.__name__}")
+            print(f"[DEBUG] Actor: {actor.__class__.__name__}, Critic: {critic.__class__.__name__} (Shared: {self.shared_model})")
 
         if self.use_wandb:
             wandb.config.update({
@@ -368,23 +375,32 @@ class Trainer:
         if self.use_compile:
             try:
                 # Apply RSNorm fix before compiling if necessary
-                # Check if models contain RSNorm before applying fix
-                # This requires RSNorm to be imported or defined
                 try:
                     from model_architectures.utils import RSNorm
-                    if any(isinstance(m, RSNorm) for m in actor.modules()) or \
-                       any(isinstance(m, RSNorm) for m in critic.modules()):
+                    # Check actor (covers shared case)
+                    if any(isinstance(m, RSNorm) for m in self.actor.modules()):
                         print("Applying RSNorm CUDA graphs fix before compiling...")
                         self.actor = fix_rsnorm_cuda_graphs(self.actor)
-                        self.critic = fix_rsnorm_cuda_graphs(self.critic)
+                        # If not shared, fix critic separately
+                        if not self.shared_model and any(isinstance(m, RSNorm) for m in self.critic.modules()):
+                            self.critic = fix_rsnorm_cuda_graphs(self.critic)
+                        # If shared, critic is already fixed via actor
+                        elif self.shared_model:
+                            self.critic = self.actor
                 except ImportError:
                     print("Warning: RSNorm not found, skipping CUDA graphs fix.")
 
 
                 print("Compiling models with torch.compile...")
-                # Compile actor and critic
+                # Compile actor (covers shared case)
                 self.actor = torch.compile(self.actor)
-                self.critic = torch.compile(self.critic)
+                # If not shared, compile critic separately
+                if not self.shared_model:
+                    self.critic = torch.compile(self.critic)
+                # If shared, critic is already compiled via actor
+                elif self.shared_model:
+                    self.critic = self.actor
+
                 # Compile auxiliary models if they exist
                 if self.aux_task_manager:
                     if hasattr(self.aux_task_manager, 'sr_task'):
@@ -398,8 +414,9 @@ class Trainer:
                 self.use_compile = False # Disable compile if it fails
 
         # Print model info
-        print_model_info(self.actor, model_name="Actor", print_amp=self.use_amp, debug=self.debug)
-        print_model_info(self.critic, model_name="Critic", print_amp=self.use_amp, debug=self.debug)
+        print_model_info(self.actor, model_name="Actor/Shared Model", print_amp=self.use_amp, debug=self.debug)
+        if not self.shared_model:
+            print_model_info(self.critic, model_name="Critic", print_amp=self.use_amp, debug=self.debug)
         if self.aux_task_manager:
             if hasattr(self.aux_task_manager, 'sr_task'):
                 print_model_info(self.aux_task_manager.sr_task, model_name="SR Task", print_amp=self.aux_amp, debug=self.debug) # Use aux_amp
@@ -1188,7 +1205,8 @@ class Trainer:
             'total_episodes': self.total_episodes + self.total_episodes_offset,
             'total_env_steps': self.total_env_steps, # Add total env steps to metadata
             'timestamp': current_timestamp,
-            'version': '2.0'  # Checkpoint format version
+            'version': '2.1',  # Checkpoint format version (updated for shared model)
+            'shared_model': self.shared_model # Indicate if the model was shared
         })
 
         # Save pretraining state if enabled
@@ -1207,10 +1225,18 @@ class Trainer:
 
         # Prepare the main checkpoint dictionary
         checkpoint = {
-            'actor': self.actor.state_dict(),
-            'critic': self.critic.state_dict(),
             'metadata': metadata # Include updated metadata
         }
+
+        # Save model state dict(s)
+        if self.shared_model:
+            checkpoint['shared_model_state'] = self.actor.state_dict()
+            if self.debug: print("[DEBUG Trainer Save] Saved shared model state.")
+        else:
+            checkpoint['actor_state'] = self.actor.state_dict()
+            checkpoint['critic_state'] = self.critic.state_dict()
+            if self.debug: print("[DEBUG Trainer Save] Saved separate actor and critic states.")
+
 
         # Include algorithm state if available
         if hasattr(self, 'algorithm') and hasattr(self.algorithm, 'get_state_dict'):
@@ -1274,6 +1300,7 @@ class Trainer:
     def load_models(self, model_path):
         """
         Load a comprehensive checkpoint to resume training from the exact state.
+        Handles both shared and separate model architectures based on checkpoint metadata.
 
         Args:
             model_path: Path to the saved checkpoint file
@@ -1289,33 +1316,51 @@ class Trainer:
             # Load the saved state with CPU mapping to allow loading on any device
             checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
 
-            # Check for checkpoint version to handle different formats
+            # Check for checkpoint version and shared model status
             metadata = checkpoint.get('metadata', {})
             version = metadata.get('version', '1.0')
+            checkpoint_shared_model = metadata.get('shared_model', False) # Check if checkpoint used shared model
 
             # Log loading info
             if self.debug:
                 print(f"[DEBUG] Loading checkpoint version {version} from {model_path}")
+                print(f"[DEBUG] Checkpoint shared_model: {checkpoint_shared_model}, Trainer shared_model: {self.shared_model}")
+
+            # Check for architecture mismatch (shared vs separate)
+            if checkpoint_shared_model != self.shared_model:
+                print(f"Warning: Architecture mismatch! Checkpoint shared_model={checkpoint_shared_model}, but current Trainer shared_model={self.shared_model}.")
+                # Fail loading if architectures mismatch to prevent unexpected errors
+                print("Loading aborted due to architecture mismatch.")
+                return False
+                # print("Attempting to load parameters anyway, but this might lead to errors or unexpected behavior.")
+                # Decide how to handle mismatch - e.g., prioritize current setup or fail?
+                # For now, we'll attempt to load what we can.
 
             # ===== Restore Model Parameters =====
-            if 'actor' in checkpoint and 'critic' in checkpoint:
-                # Fix state dicts for compiled models
-                actor_state = fix_compiled_state_dict(checkpoint['actor'])
-                critic_state = fix_compiled_state_dict(checkpoint['critic'])
+            if checkpoint_shared_model:
+                if 'shared_model_state' in checkpoint:
+                    # Should already match self.shared_model due to check above
+                    model_state = fix_compiled_state_dict(checkpoint['shared_model_state'])
+                    mismatches = load_partial_state_dict(self.actor, model_state)
+                    # Critic is the same instance, already loaded.
+                    if self.debug:
+                        print(f"[DEBUG] Loaded shared model state ({mismatches} mismatches)")
+                else:
+                    print("Warning: Checkpoint indicates shared model, but 'shared_model_state' key not found.")
+                    return False
+            else: # Checkpoint has separate actor/critic states
+                if 'actor_state' in checkpoint and 'critic_state' in checkpoint:
+                     # Should already match self.shared_model == False due to check above
+                    actor_state = fix_compiled_state_dict(checkpoint['actor_state'])
+                    critic_state = fix_compiled_state_dict(checkpoint['critic_state'])
+                    actor_mismatches = load_partial_state_dict(self.actor, actor_state)
+                    critic_mismatches = load_partial_state_dict(self.critic, critic_state)
+                    if self.debug:
+                        print(f"[DEBUG] Loaded separate actor ({actor_mismatches} mismatches) and critic ({critic_mismatches} mismatches) states")
+                else:
+                    print("Warning: Checkpoint indicates separate models, but 'actor_state' or 'critic_state' key not found.")
+                    return False
 
-                # Load models with error handling for architecture mismatches
-                actor_mismatches = load_partial_state_dict(self.actor, actor_state)
-                critic_mismatches = load_partial_state_dict(self.critic, critic_state)
-
-                if self.debug:
-                    print(f"[DEBUG] Loaded actor and critic models")
-                    if actor_mismatches > 0:
-                        print(f"[DEBUG] {actor_mismatches} actor parameters could not be loaded")
-                    if critic_mismatches > 0:
-                        print(f"[DEBUG] {critic_mismatches} critic parameters could not be loaded")
-            else:
-                print(f"Warning: Checkpoint does not contain expected model parameters")
-                return False
 
             # ===== Restore Algorithm State =====
             if 'algorithm_state' in checkpoint and checkpoint['algorithm_state']:
@@ -1333,10 +1378,12 @@ class Trainer:
                 else:
                     # Legacy loading if load_state_dict doesn't exist
                     if self.algorithm_type == "ppo":
-                        if 'actor_optimizer' in algorithm_state: self.algorithm.actor_optimizer.load_state_dict(algorithm_state['actor_optimizer'])
-                        if 'critic_optimizer' in algorithm_state: self.algorithm.critic_optimizer.load_state_dict(algorithm_state['critic_optimizer'])
-                        if 'optimizer' in algorithm_state: self.algorithm.optimizer.load_state_dict(algorithm_state['optimizer'])
+                        # PPO optimizer is now handled by algorithm's load_state_dict
+                        # if 'actor_optimizer' in algorithm_state: self.algorithm.actor_optimizer.load_state_dict(algorithm_state['actor_optimizer'])
+                        # if 'critic_optimizer' in algorithm_state: self.algorithm.critic_optimizer.load_state_dict(algorithm_state['critic_optimizer'])
+                        # if 'optimizer' in algorithm_state: self.algorithm.optimizer.load_state_dict(algorithm_state['optimizer'])
                         # ... other legacy PPO state loading ...
+                        if self.debug: print("[DEBUG] Restored algorithm state using legacy PPO method (potential issues).")
                     elif self.algorithm_type == "streamac":
                         # ... legacy StreamAC state loading ...
                         pass
@@ -1591,7 +1638,11 @@ class Trainer:
         # Handle transition phase
         elif self.in_transition_phase:
             # Check if transition phase is complete
-            transition_progress = min(1.0, (current_step - self.transition_start_step) / self.pretraining_transition_steps)
+            if self.pretraining_transition_steps <= 0: # Handle case where transition is immediate
+                transition_progress = 1.0
+            else:
+                transition_progress = min(1.0, (current_step - self.transition_start_step) / self.pretraining_transition_steps)
+
 
             if transition_progress >= 1.0:
                 # Mark pretraining as fully completed
@@ -1600,7 +1651,7 @@ class Trainer:
                 print("Pretraining phase completed. Switching to regular training.")
 
                 # Reset auxiliary task weights to regular values
-                if self.use_auxiliary_tasks:
+                if self.use_auxiliary_tasks and self.aux_task_manager:
                     self.aux_task_manager.sr_weight = self.base_sr_weight
                     self.aux_task_manager.rp_weight = self.base_rp_weight
 
@@ -1609,25 +1660,26 @@ class Trainer:
 
             else:
                 # Gradually transition auxiliary task weights
-                if self.use_auxiliary_tasks:
+                if self.use_auxiliary_tasks and self.aux_task_manager:
                     sr_weight = self.pretraining_sr_weight + transition_progress * (self.base_sr_weight - self.pretraining_sr_weight)
                     rp_weight = self.pretraining_rp_weight + transition_progress * (self.base_rp_weight - self.pretraining_rp_weight)
                     self.aux_task_manager.sr_weight = sr_weight
                     self.aux_task_manager.rp_weight = rp_weight
 
-                    # Gradually transition entropy coefficient
-                    pretraining_entropy = self.base_entropy_coef * self.pretraining_entropy_scale
-                    entropy_coef = pretraining_entropy + transition_progress * (self.base_entropy_coef - pretraining_entropy)
-                    self.entropy_coef = max(self.min_entropy_coef, entropy_coef)
+                # Gradually transition entropy coefficient
+                pretraining_entropy = self.base_entropy_coef * self.pretraining_entropy_scale
+                entropy_coef = pretraining_entropy + transition_progress * (self.base_entropy_coef - pretraining_entropy)
+                self.entropy_coef = max(self.min_entropy_coef, entropy_coef)
 
-                # During early pretraining, use higher values for auxiliary tasks and entropy
-                elif not self.in_transition_phase and not self.pretraining_completed:
-                    if self.use_auxiliary_tasks:
-                        self.aux_task_manager.sr_weight = self.pretraining_sr_weight
-                        self.aux_task_manager.rp_weight = self.pretraining_rp_weight
+        # During early pretraining, use higher values for auxiliary tasks and entropy
+        # This block was slightly misplaced, should only apply when pretraining active *and not* transitioning
+        elif not self.in_transition_phase and not self.pretraining_completed: # Redundant condition, handled by first if
+            if self.use_auxiliary_tasks and self.aux_task_manager:
+                self.aux_task_manager.sr_weight = self.pretraining_sr_weight
+                self.aux_task_manager.rp_weight = self.pretraining_rp_weight
 
-                    # Higher entropy during pretraining
-                    self.entropy_coef = max(self.min_entropy_coef, self.base_entropy_coef * self.pretraining_entropy_scale)
+            # Higher entropy during pretraining
+            self.entropy_coef = max(self.min_entropy_coef, self.base_entropy_coef * self.pretraining_entropy_scale)
 
     def _initialize_reward_scaling_stats(self, env_id):
         """Initialize reward scaling stats for a new environment ID."""

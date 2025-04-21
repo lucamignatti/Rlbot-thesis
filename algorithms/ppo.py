@@ -73,6 +73,11 @@ class PPOAlgorithm(BaseAlgorithm):
 
         # Store the auxiliary task manager
         self.aux_task_manager = aux_task_manager
+        # Check if actor and critic are the same instance
+        self.shared_model = (actor is critic)
+        if self.debug and self.shared_model:
+            print("[DEBUG PPO] Actor and Critic are the same instance (shared model).")
+
 
         # Weight clipping parameters
         self.use_weight_clipping = use_weight_clipping
@@ -100,19 +105,23 @@ class PPOAlgorithm(BaseAlgorithm):
         )
 
         # Initialize optimizer
-        # These individual optimizers might not be strictly necessary if using the combined one
-        # self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr_actor)
-        # self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
-
         # Combine parameters for a single optimizer step
-        combined_params = list(self.actor.parameters()) + list(self.critic.parameters())
+        # If shared model, actor parameters cover everything.
+        # If separate, combine actor and critic parameters.
+        if self.shared_model:
+            combined_params = list(self.actor.parameters())
+        else:
+            combined_params = list(self.actor.parameters()) + list(self.critic.parameters())
+
+        # Add auxiliary task parameters if they exist
         if self.aux_task_manager:
             if hasattr(self.aux_task_manager, 'sr_task') and self.aux_task_manager.sr_task is not None:
                 combined_params += list(self.aux_task_manager.sr_task.parameters())
             if hasattr(self.aux_task_manager, 'rp_task') and self.aux_task_manager.rp_task is not None:
                 combined_params += list(self.aux_task_manager.rp_task.parameters())
 
-        self.optimizer = torch.optim.Adam(combined_params, lr=lr_actor) # Use actor LR for combined
+        # Use actor LR for the combined optimizer (or a separate LR if needed)
+        self.optimizer = torch.optim.Adam(combined_params, lr=lr_actor)
 
         # Initialize GradScaler if AMP is enabled
         self.scaler = GradScaler(enabled=self.use_amp)
@@ -514,22 +523,37 @@ class PPOAlgorithm(BaseAlgorithm):
         self.memory.store_experience_at_idx(idx, obs, action, log_prob, reward, value, done)
 
     def get_action(self, obs, deterministic=False, return_features=False):
-        """Get action for a given observation (using only the actor network)"""
+        """Get action for a given observation (using only the actor network/head)"""
         if not isinstance(obs, torch.Tensor):
             obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
 
-        # Use autocast only if AMP is enabled and device is CUDA
-        # Inference should generally not use autocast unless specifically needed
         with torch.no_grad():
-            if return_features:
-                # Request features from the actor
-                # Assume actor returns (action_dist_output, features)
-                actor_output, actor_features = self.actor(obs, return_features=True)
-                features = actor_features
+            # Call the actor model's forward method
+            # Conditionally handle shared vs separate model forward call
+            if self.shared_model:
+                model_output = self.actor(obs, return_actor=True, return_critic=False, return_features=return_features)
+                actor_output = model_output.get('actor_out')
+                features = model_output.get('features')
             else:
-                # Assume actor returns only action_dist_output
-                actor_output = self.actor(obs, return_features=False) # Explicitly set return_features=False
-                features = None # Ensure features is defined
+                # Call separate actor model
+                actor_result = self.actor(obs, return_features=return_features)
+                if return_features:
+                    actor_output, features = actor_result
+                else:
+                    actor_output = actor_result
+                    features = None # Explicitly set features to None
+
+
+            if actor_output is None:
+                # Handle error: actor output wasn't returned
+                if self.debug: print("[DEBUG PPO get_action] Error: Actor output not found in model return.")
+                # Fallback or raise error? For now, return dummy values
+                dummy_action = torch.zeros(obs.shape[0], dtype=torch.long if self.action_space_type == "discrete" else torch.float, device=self.device)
+                dummy_log_prob = torch.zeros(obs.shape[0], device=self.device)
+                dummy_value = torch.zeros_like(dummy_log_prob)
+                if return_features: return dummy_action, dummy_log_prob, dummy_value, features
+                else: return dummy_action, dummy_log_prob, dummy_value
+
 
             if deterministic:
                 if self.action_space_type == "discrete":
@@ -567,9 +591,6 @@ class PPOAlgorithm(BaseAlgorithm):
 
         # Create dummy value tensor (zeros) with the same batch size and device
         dummy_value = torch.zeros_like(log_prob)
-
-        # No need to move to CPU unless specifically required by environment later
-        # The main loop handles CPU conversion for vec_env.step
 
         if return_features:
             return action, log_prob, dummy_value, features
@@ -615,7 +636,12 @@ class PPOAlgorithm(BaseAlgorithm):
                  chunk_states = states[i:min(i + self.batch_size, buffer_size)]
                  # Use autocast for critic evaluation if AMP is enabled
                  with autocast("cuda", enabled=self.use_amp):
-                     chunk_values = self.critic(chunk_states).squeeze()
+                     # Request critic output - handles shared vs separate
+                     if self.shared_model:
+                         model_output = self.critic(chunk_states, return_actor=False, return_critic=True, return_features=False)
+                         chunk_values = model_output.get('critic_out', torch.zeros(chunk_states.shape[0], 1, device=self.device)).squeeze() # Default to zeros if critic_out missing
+                     else:
+                         chunk_values = self.critic(chunk_states).squeeze()
                  values.append(chunk_values)
             values = torch.cat(values)
 
@@ -734,7 +760,7 @@ class PPOAlgorithm(BaseAlgorithm):
         self.actor_base_bounds = {}
         self.critic_base_bounds = {}
 
-        # Store base bounds for actor network weights
+        # Store base bounds for actor network weights (or shared model)
         for name, param in self.actor.named_parameters():
             if param.requires_grad:
                 # Use the He initialization range for the parameter (kappa=1)
@@ -747,16 +773,17 @@ class PPOAlgorithm(BaseAlgorithm):
                     bound = 0.01 # Base bound (kappa=1)
                     self.actor_base_bounds[name] = (-bound, bound)
 
-        # Store base bounds for critic network weights
-        for name, param in self.critic.named_parameters():
-            if param.requires_grad:
-                if 'weight' in name:
-                    fan_in = param.shape[1] * (param.shape[2] if len(param.shape) > 2 else 1)
-                    bound = (6 / fan_in) ** 0.5 # Base bound (kappa=1)
-                    self.critic_base_bounds[name] = (-bound, bound)
-                else:
-                    bound = 0.01 # Base bound (kappa=1)
-                    self.critic_base_bounds[name] = (-bound, bound)
+        # Store base bounds for critic network weights only if not shared
+        if not self.shared_model:
+            for name, param in self.critic.named_parameters():
+                if param.requires_grad:
+                    if 'weight' in name:
+                        fan_in = param.shape[1] * (param.shape[2] if len(param.shape) > 2 else 1)
+                        bound = (6 / fan_in) ** 0.5 # Base bound (kappa=1)
+                        self.critic_base_bounds[name] = (-bound, bound)
+                    else:
+                        bound = 0.01 # Base bound (kappa=1)
+                        self.critic_base_bounds[name] = (-bound, bound)
 
     def clip_weights(self):
         """Clip weights based on current kappa and return clipped fraction."""
@@ -767,7 +794,7 @@ class PPOAlgorithm(BaseAlgorithm):
         clipped_params = 0
         current_kappa = self.weight_clip_kappa # Use the current kappa value
 
-        # Clip actor network weights
+        # Clip actor network weights (or shared model)
         for name, param in self.actor.named_parameters():
             if name in self.actor_base_bounds and param.requires_grad:
                 base_lower, base_upper = self.actor_base_bounds[name]
@@ -784,22 +811,23 @@ class PPOAlgorithm(BaseAlgorithm):
                 # Use .item() here as it's summing over potentially many parameters
                 clipped_params += torch.sum(param.data != original_param).item()
 
-        # Clip critic network weights
-        for name, param in self.critic.named_parameters():
-            if name in self.critic_base_bounds and param.requires_grad:
-                base_lower, base_upper = self.critic_base_bounds[name]
-                lower_bound = base_lower * current_kappa
-                upper_bound = base_upper * current_kappa
+        # Clip critic network weights only if not shared
+        if not self.shared_model:
+            for name, param in self.critic.named_parameters():
+                if name in self.critic_base_bounds and param.requires_grad:
+                    base_lower, base_upper = self.critic_base_bounds[name]
+                    lower_bound = base_lower * current_kappa
+                    upper_bound = base_upper * current_kappa
 
-                # Store original values to check for clipping
-                original_param = param.data.clone()
-                param.data.clamp_(lower_bound, upper_bound)
+                    # Store original values to check for clipping
+                    original_param = param.data.clone()
+                    param.data.clamp_(lower_bound, upper_bound)
 
-                # Count clipped parameters
-                num_params = param.numel()
-                total_params += num_params
-                # Use .item() here
-                clipped_params += torch.sum(param.data != original_param).item()
+                    # Count clipped parameters
+                    num_params = param.numel()
+                    total_params += num_params
+                    # Use .item() here
+                    clipped_params += torch.sum(param.data != original_param).item()
 
         # Return the fraction of clipped parameters
         return float(clipped_params) / total_params if total_params > 0 else 0.0
@@ -808,6 +836,7 @@ class PPOAlgorithm(BaseAlgorithm):
     def _update_policy(self, states, actions, old_log_probs, returns, advantages, rewards):
         """
         Update policy and value networks using PPO algorithm, including auxiliary losses.
+        Handles both shared and separate actor/critic models.
 
         Args:
             states: batch of states [buffer_size, state_dim]
@@ -848,7 +877,12 @@ class PPOAlgorithm(BaseAlgorithm):
                  chunk_states = states[i:min(i + self.batch_size, buffer_size)]
                  # Use autocast for critic evaluation if AMP is enabled
                  with autocast("cuda", enabled=self.use_amp):
-                     chunk_values = self.critic(chunk_states).squeeze()
+                    # Request critic output - handles shared vs separate
+                    if self.shared_model:
+                         model_output = self.critic(chunk_states, return_actor=False, return_critic=True, return_features=False)
+                         chunk_values = model_output.get('critic_out', torch.zeros(chunk_states.shape[0], 1, device=self.device)).squeeze()
+                    else:
+                         chunk_values = self.critic(chunk_states).squeeze()
                  y_pred.append(chunk_values)
             y_pred = torch.cat(y_pred)
 
@@ -894,14 +928,31 @@ class PPOAlgorithm(BaseAlgorithm):
                 # Use autocast context manager for forward passes and loss calculations if AMP is enabled
                 with autocast("cuda", enabled=self.use_amp):
                     # Get current policy distribution, features, and values
-                    # Call actor ONCE to get action distribution and features
                     try:
-                        actor_output, current_features = self.actor(batch_states, return_features=True)
-                        if self.debug and current_features is None:
-                             print("[DEBUG PPO _update_policy] Warning: Actor did not return features when requested.")
+                        # Handle shared vs separate model calls
+                        if self.shared_model:
+                            model_output = self.actor(batch_states, return_actor=True, return_critic=True, return_features=True)
+                            actor_output = model_output.get('actor_out')
+                            values = model_output.get('critic_out', torch.zeros(batch_states.shape[0], 1, device=self.device)).squeeze()
+                            current_features = model_output.get('features')
+                        else:
+                            # Call separate models
+                            actor_result = self.actor(batch_states, return_features=True)
+                            values = self.critic(batch_states).squeeze()
+                            # Handle tuple/non-tuple return from actor
+                            if isinstance(actor_result, tuple):
+                                actor_output, current_features = actor_result
+                            else:
+                                actor_output = actor_result
+                                current_features = None # Features not returned by separate actor
+
+                        if actor_output is None: raise ValueError("Actor output missing from model")
+
+                        if self.debug and current_features is None and self.aux_task_manager:
+                             print("[DEBUG PPO _update_policy] Warning: Features not returned by actor, cannot compute aux loss.")
                     except Exception as e:
-                        if self.debug: print(f"[DEBUG PPO _update_policy] Error getting actor output/features: {e}")
-                        continue # Skip batch if actor fails
+                        if self.debug: print(f"[DEBUG PPO _update_policy] Error getting model output/features: {e}")
+                        continue # Skip batch if model fails
 
                     # Calculate log probabilities and entropy based on action space type
                     if self.action_space_type == "discrete":
@@ -950,16 +1001,13 @@ class PPOAlgorithm(BaseAlgorithm):
                         curr_log_probs = action_dist.log_prob(batch_actions).sum(dim=-1)
                         entropy = action_dist.entropy().mean()
 
-                    # Calculate critic values
-                    values = self.critic(batch_states).squeeze()
-
                     # Calculate ratio and surrogates for PPO
                     ratio = torch.exp(curr_log_probs - batch_old_log_probs)
                     surr1 = ratio * batch_advantages
                     surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * batch_advantages
                     actor_loss = -torch.min(surr1, surr2).mean()
 
-                    # Calculate critic loss (MSE)
+                    # Calculate critic loss (MSE) using values obtained earlier
                     critic_loss = F.mse_loss(values, batch_returns)
 
                     # Calculate entropy loss
@@ -1003,7 +1051,7 @@ class PPOAlgorithm(BaseAlgorithm):
                             sr_loss_scalar = 0.0
                             rp_loss_scalar = 0.0
                     elif self.debug and self.aux_task_manager is not None and current_features is None:
-                         print("[DEBUG PPO Aux] Skipping aux loss calculation as features were not obtained from actor.")
+                         print("[DEBUG PPO Aux] Skipping aux loss calculation as features were not obtained.")
 
 
                     # --- Total Loss ---
@@ -1138,7 +1186,27 @@ class PPOAlgorithm(BaseAlgorithm):
         # if 'critic_optimizer' in state_dict: # Removed individual optimizers
         #     self.critic_optimizer.load_state_dict(state_dict['critic_optimizer'])
         if 'optimizer' in state_dict:
-            self.optimizer.load_state_dict(state_dict['optimizer']) # Load combined optimizer
+            # Need to handle optimizer loading carefully if parameter lists changed
+            # (e.g., due to shared vs separate model)
+            # A common approach is to re-initialize the optimizer after loading model params
+            # For now, we'll attempt to load, but it might fail if params don't match.
+            try:
+                self.optimizer.load_state_dict(state_dict['optimizer']) # Load combined optimizer
+            except ValueError as e:
+                print(f"Warning: Could not load optimizer state, likely due to parameter mismatch (e.g., shared vs separate models). Optimizer state reset. Error: {e}")
+                # Re-initialize optimizer with current parameters
+                if self.shared_model:
+                    current_params = list(self.actor.parameters())
+                else:
+                    current_params = list(self.actor.parameters()) + list(self.critic.parameters())
+                if self.aux_task_manager:
+                    if hasattr(self.aux_task_manager, 'sr_task') and self.aux_task_manager.sr_task is not None:
+                        current_params += list(self.aux_task_manager.sr_task.parameters())
+                    if hasattr(self.aux_task_manager, 'rp_task') and self.aux_task_manager.rp_task is not None:
+                        current_params += list(self.aux_task_manager.rp_task.parameters())
+                self.optimizer = torch.optim.Adam(current_params, lr=self.lr_actor)
+
+
         if 'scaler' in state_dict:
             self.scaler.load_state_dict(state_dict['scaler']) # Load GradScaler state
         if 'memory_state' in state_dict and hasattr(self.memory, 'load_state_dict'):

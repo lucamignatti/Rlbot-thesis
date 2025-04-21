@@ -16,7 +16,7 @@ from collections import Counter
 from collections.abc import Sized, Iterable
 # Removed unused rlgym imports
 from model_architectures import (
-    BasicModel, SimBa, SimbaV2
+    BasicModel, SimBa, SimbaV2, SimbaV2Shared # Add SimbaV2Shared
     # Removed unused functions: fix_compiled_state_dict, extract_model_dimensions, load_partial_state_dict
 )
 from observation import ActionStacker
@@ -254,7 +254,9 @@ def run_training(
         print("No episodes or time limit provided - training will continue indefinitely until interrupted")
 
     actor.to(device)
-    critic.to(device)
+    # If critic is a separate instance, move it too
+    if actor is not critic:
+        critic.to(device)
 
     # Initialize action stacker for keeping track of previous actions
     action_stacker = ActionStacker(stack_size=5, action_size=actor.action_shape)
@@ -338,10 +340,13 @@ def run_training(
     #  Use train mode for training and eval for testing
     if test:
         trainer.actor.eval()
-        trainer.critic.eval()
+        # Only set critic to eval if it's a separate instance
+        if trainer.actor is not trainer.critic:
+            trainer.critic.eval()
     else:
         trainer.actor.train()
-        trainer.critic.train()
+        if trainer.actor is not trainer.critic:
+            trainer.critic.train()
 
     # Add test mode flag to trainer
     if test:
@@ -592,6 +597,7 @@ def run_training(
                 obs_batch = torch.FloatTensor(np.stack(all_obs_list)).to(device)
                 with torch.no_grad():
                     # Get actions from the networks - now returns dummy values for PPO
+                    # For shared model, get_action in algorithm handles requesting only actor output
                     action_batch, log_prob_batch, value_batch, features_batch = trainer.get_action(obs_batch, return_features=True)
 
                 # --- Batch Store Initial Experience (PPO) ---
@@ -1026,7 +1032,7 @@ def run_training(
                     stats_dict.update({
                         "StepSize": f"{stats.get('effective_step_size', 0)::.4f}",
                         "ActorLR": f"{getattr(trainer.algorithm, 'lr_actor', lr_actor):.6f}",
-                        "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic)::.6f}",
+                        "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic):.6f}",
                         "Updates": getattr(trainer.algorithm, "update_count", 0) # Use update_count
                     })
                 elif algorithm == "sac":
@@ -1405,8 +1411,8 @@ if __name__ == "__main__":
                         help='Legacy parameter; use --num_envs instead')
 
     # Model architecture argument
-    parser.add_argument('--model-arch', type=str, default='simbav2', choices=['basic', 'simba', 'simbav2'],
-                       help='Model architecture to use (basic, simba, simbav2)')
+    parser.add_argument('--model-arch', type=str, default='simbav2', choices=['basic', 'simba', 'simbav2', 'simbav2-shared'], # Add simbav2-shared
+                       help='Model architecture to use (basic, simba, simbav2, simbav2-shared)')
 
     # Add reward scaling args here, before parse_args()
     parser.add_argument('--use-reward-scaling', action='store_true', dest='use_reward_scaling', help='Enable SimbaV2 reward scaling')
@@ -1464,33 +1470,43 @@ if __name__ == "__main__":
         else:
             device = "cpu"
 
-    ModelClassActor = None
-    ModelClassCritic = None
+    # --- Model Instantiation ---
+    actor = None
+    critic = None
     model_kwargs = {
         'hidden_dim': args.hidden_dim,
         'num_blocks': args.num_blocks,
         'device': device
     }
+
     if args.model_arch == 'basic':
-        ModelClassActor = BasicModel
-        ModelClassCritic = BasicModel
-        model_kwargs['dropout_rate'] = args.dropout # BasicModel uses dropout
+        ModelClass = BasicModel
+        model_kwargs['dropout_rate'] = args.dropout
+        actor = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, **model_kwargs)
+        critic = ModelClass(obs_shape=obs_space_dims, action_shape=1, **model_kwargs)
     elif args.model_arch == 'simba':
-        ModelClassActor = SimBa
-        ModelClassCritic = SimBa
-        model_kwargs['dropout_rate'] = args.dropout # SimBa uses dropout
+        ModelClass = SimBa
+        model_kwargs['dropout_rate'] = args.dropout
+        actor = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, **model_kwargs)
+        critic = ModelClass(obs_shape=obs_space_dims, action_shape=1, **model_kwargs)
     elif args.model_arch == 'simbav2':
-        ModelClassActor = SimbaV2
-        ModelClassCritic = SimbaV2
-        # SimbaV2 does not use dropout_rate, but might have other specific args
-        # model_kwargs['shift_constant'] = 3.0 # Example if needed
+        ModelClass = SimbaV2
+        # SimbaV2 does not use dropout_rate
+        actor = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, **model_kwargs)
+        critic = ModelClass(obs_shape=obs_space_dims, action_shape=1, **model_kwargs)
+    elif args.model_arch == 'simbav2-shared':
+        ModelClass = SimbaV2Shared
+        # SimbaV2Shared does not use dropout_rate
+        # Instantiate ONE model and use it for both actor and critic
+        shared_model = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, **model_kwargs)
+        actor = shared_model
+        critic = shared_model # Assign the same instance
+        if args.debug:
+            print("[DEBUG] Using SimbaV2Shared architecture (actor and critic share the same instance)")
     else:
         raise ValueError(f"Unknown model architecture: {args.model_arch}")
+    # --- End Model Instantiation ---
 
-
-    actor = ModelClassActor(obs_shape=obs_space_dims, action_shape=action_space_dims, **model_kwargs)
-    # Critic always outputs 1 value
-    critic = ModelClassCritic(obs_shape=obs_space_dims, action_shape=1, **model_kwargs)
 
     torch.set_printoptions(precision=10)
 
@@ -1550,9 +1566,10 @@ if __name__ == "__main__":
                 "batch_size": args.batch_size,
 
                 # Model Details
+                "model_arch": args.model_arch, # Log model architecture
                 "hidden_dim": args.hidden_dim,
                 "num_blocks": args.num_blocks,
-                "dropout": args.dropout,
+                "dropout": args.dropout if 'dropout_rate' in model_kwargs else None, # Log dropout if applicable
                 "action_stack_size": args.stack_size,
                 "auxiliary_tasks": args.auxiliary, # Log the effective value
                 "sr_weight": args.sr_weight,
@@ -1569,7 +1586,7 @@ if __name__ == "__main__":
                 "update_interval": args.update_interval,
                 "device": device,
             },
-            name=f"{args.algorithm.upper()}_{time.strftime('%Y%m%d-%H%M%S')}",
+            name=f"{args.algorithm.upper()}_{args.model_arch}_{time.strftime('%Y%m%d-%H%M%S')}", # Include model arch in name
             monitor_gym=False,  # Don't use wandb's default gym monitoring
         )
 
@@ -1589,9 +1606,12 @@ if __name__ == "__main__":
     if args.debug:
         print(f"[DEBUG] Starting training with {args.num_envs} environments on {device}")
         print(f"[DEBUG] Using {args.algorithm.upper()} algorithm")
+        print(f"[DEBUG] Using model architecture: {args.model_arch}")
         print(f"[DEBUG] Auxiliary tasks enabled: {args.auxiliary}") # Print effective value
         print(f"[DEBUG] Actor model: {actor}")
-        print(f"[DEBUG] Critic model: {critic}")
+        # Only print critic separately if it's a different instance
+        if actor is not critic:
+            print(f"[DEBUG] Critic model: {critic}")
         print(f"[DEBUG] Action stacking size: {args.stack_size}")
         if args.time:
             print(f"[DEBUG] Training for {args.time} ({training_time_seconds} seconds)")
@@ -1645,7 +1665,7 @@ if __name__ == "__main__":
         # Pass args.model path to run_training
         trainer = run_training(
             actor=actor,
-            critic=critic,
+            critic=critic, # Pass the potentially shared instance
             # Pass reward scaling args
             use_reward_scaling=args.use_reward_scaling,
             reward_scaling_G_max=args.reward_scaling_gmax,
@@ -1716,7 +1736,8 @@ if __name__ == "__main__":
                 'training_step': getattr(trainer, 'training_steps', 0) + getattr(trainer, 'training_step_offset', 0),
                 'total_env_steps': getattr(trainer, 'total_env_steps', 0), # Add total env steps to metadata
                 'wandb_run_id': wandb.run.id if args.wandb and wandb.run else None,
-                'algorithm': args.algorithm  # Save which algorithm was used
+                'algorithm': args.algorithm,  # Save which algorithm was used
+                'model_arch': args.model_arch # Save model architecture used
             }
             saved_path = trainer.save_models(output_path, metadata)  # Capture the returned path
             print(f"Training complete - Model saved to {saved_path} at step {metadata['training_step']} (Total Env Steps: {metadata['total_env_steps']})")
@@ -1737,7 +1758,7 @@ if __name__ == "__main__":
             try:
                 # Handle WandB run ID safely for artifact naming
                 run_id = getattr(wandb.run, 'id', 'unknown') if wandb.run else 'unknown'
-                artifact_name = f"{args.algorithm}_{run_id}"
+                artifact_name = f"{args.algorithm}_{args.model_arch}_{run_id}" # Include model arch
                 if args.time is not None:
                     time_seconds = 0
                     if args.time:
@@ -1755,7 +1776,7 @@ if __name__ == "__main__":
                 artifact = wandb.Artifact(
                     name=artifact_name,
                     type="model",
-                    description=f"RL model trained with {args.algorithm.upper()} for {args.episodes if args.time is None else args.time}"
+                    description=f"RL model trained with {args.algorithm.upper()} ({args.model_arch}) for {args.episodes if args.time is None else args.time}"
                 )
 
                 # Add the model file
@@ -1764,6 +1785,7 @@ if __name__ == "__main__":
                 # Add metadata
                 metadata = {
                     "algorithm": args.algorithm,
+                    "model_arch": args.model_arch, # Add model arch to artifact metadata
                     "episodes": args.episodes if args.episodes is not None else "indefinite" if args.time is None else None,
                     "training_time": args.time if args.time is not None else "indefinite" if args.episodes is None else None,
                     "device": str(device),
@@ -1781,7 +1803,7 @@ if __name__ == "__main__":
                     'model_config': {
                         'hidden_dim': args.hidden_dim,
                         'num_blocks': args.num_blocks,
-                        'dropout': args.dropout
+                        'dropout': args.dropout if 'dropout_rate' in model_kwargs else None # Log dropout if applicable
                     },
                     # Add total env steps to artifact metadata
                     'total_env_steps': getattr(trainer, 'total_env_steps', 0) if trainer else 0
