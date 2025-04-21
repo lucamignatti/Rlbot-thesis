@@ -7,7 +7,7 @@ from .mutators import (
 from rlgym.rocket_league.done_conditions import GoalCondition, TimeoutCondition, NoTouchTimeoutCondition
 from rlgym.rocket_league.reward_functions import CombinedReward, GoalReward, TouchReward
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
-from rewards import (
+from .rewards import (
     BallProximityReward, BallToGoalDistanceReward, TouchBallReward,
     BallVelocityToGoalReward, AlignBallToGoalReward, SaveBoostReward,
     KRCReward, PlayerVelocityTowardBallReward, TouchBallToGoalAccelerationReward,
@@ -15,7 +15,7 @@ from rewards import (
     AerialDirectionalTouchReward, BlockSuccessReward, DefensivePositioningReward,
     BallClearanceReward, TeamSpacingReward, TeamPossessionReward,
     create_distance_weighted_alignment_reward, create_offensive_potential_reward, create_lucy_skg_reward,
-    AerialDistanceReward, FlipResetReward, WavedashReward
+    AerialDistanceReward, FlipResetReward, WavedashReward, FirstTouchSpeedReward, SpeedflipReward
 )
 from curriculum.skills import SkillModule, SkillBasedCurriculumStage
 from functools import partial
@@ -744,788 +744,597 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         debug=debug
     )
 
-    # ======== STAGE 1: MOVEMENT FOUNDATIONS ========
-    movement_foundations = SkillBasedCurriculumStage(
-        name="Movement Foundations",
+    # ======== STAGE 1: BALL TOUCHES (1v0) ========
+    ball_touches_stage = SkillBasedCurriculumStage(
+        name="Ball Touches",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=0),
-            # Add random yaw orientation
+            BallPositionMutator(position_function=SafePositionWrapper(get_varied_ground_ball_position)),
             CarPositionMutator(car_id="blue-0",
-                               position_function=SafePositionWrapper(get_strategic_car_position),
-                               orientation_function=get_random_yaw_orientation), # No wrapper here
-            BallPositionMutator(position_function=SafePositionWrapper(safe_ball_position)) # Ball present but not focus
+                               position_function=SafePositionWrapper(get_varied_approach_car_position),
+                               orientation_function=get_random_yaw_orientation)
         ),
         base_task_reward_function=CombinedReward(
-            (GoalReward(), 5.0),
-            (goal_accel_reward, 3.0),
-            (touch_ball_reward, 1.2),
-            (ball_proximity_reward, 1.0), # Reward moving towards general area
-            (velocity_to_ball_reward, 0.5),
-            (save_boost_reward, 0.3),
-            (alignment_reward, 0.1),
+            (ball_proximity_reward, 0.7),
+            (touch_ball_reward, 1.0),
+            (velocity_to_ball_reward, 0.3)
         ),
-        base_task_termination_condition=goal_condition, # Unlikely, acts as fallback
+        base_task_termination_condition=TouchBallCondition(),
         base_task_truncation_condition=short_timeout,
         skill_modules=[
             SkillModule(
-                name="Basic Driving",
+                name="Moving Ball",
                 state_mutator=MutatorSequence(
                     FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    # Add random yaw orientation
+                    BallPositionMutator(position_function=SafePositionWrapper(get_varied_ground_ball_position)),
+                    BallVelocityMutator(velocity_function=SafePositionWrapper(
+                        partial(get_ball_rolling_velocity, speed_range=(300, 700))
+                    )),
                     CarPositionMutator(car_id="blue-0",
-                                       position_function=SafePositionWrapper(get_strategic_car_position),
-                                       orientation_function=get_random_yaw_orientation),
-                    BallPositionMutator(position_function=SafePositionWrapper(get_ball_ground_position)) # Target ball
+                                      position_function=SafePositionWrapper(get_varied_approach_car_position),
+                                      orientation_function=get_random_yaw_orientation)
                 ),
                 reward_function=CombinedReward(
-                    (touch_ball_reward, 1.5),
-                    (ball_proximity_reward, 1.0),
-                    (velocity_to_ball_reward, 0.5)
+                    (ball_proximity_reward, 0.7),
+                    (touch_ball_reward, 1.0),
+                    (velocity_to_ball_reward, 0.3)
                 ),
-                termination_condition=TouchBallCondition(), # Terminate on touch
+                termination_condition=TouchBallCondition(),
                 truncation_condition=short_timeout,
-                difficulty_params={}, # No difficulty scaling needed here
-                success_threshold=0.9
+                difficulty_params={},
+                success_threshold=0.7
             ),
             SkillModule(
-                name="Boost Collection",
+                name="Bouncing Ball",
                 state_mutator=MutatorSequence(
                     FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    # Add random yaw orientation
+                    BallPositionMutator(position_function=SafePositionWrapper(
+                        lambda: np.array([np.random.uniform(-2000, 2000), np.random.uniform(-2000, 2000), 600])
+                    )),
+                    BallVelocityMutator(velocity_function=SafePositionWrapper(
+                        lambda: np.array([0, 0, -500]) # Falling ball
+                    )),
                     CarPositionMutator(car_id="blue-0",
-                                       position_function=SafePositionWrapper(get_strategic_car_position),
-                                       orientation_function=get_random_yaw_orientation),
-                    CarBoostMutator(boost_amount=10, car_id="blue-0"), # Start with low boost
-                    BallPositionMutator(position_function=SafePositionWrapper(safe_ball_position)) # Ball irrelevant
+                                      position_function=SafePositionWrapper(get_varied_approach_car_position),
+                                      orientation_function=get_random_yaw_orientation)
                 ),
                 reward_function=CombinedReward(
-                    (SaveBoostReward(weight=-1.0), 1.0), # Reward *gaining* boost
-                    (PlayerVelocityTowardBallReward(), 0.2) # General direction
+                    (ball_proximity_reward, 0.7),
+                    (touch_ball_reward, 1.0),
+                    (velocity_to_ball_reward, 0.3)
                 ),
-                termination_condition=TimeoutCondition(5), # Short time to grab boost
-                truncation_condition=TimeoutCondition(5),
+                termination_condition=TouchBallCondition(),
+                truncation_condition=short_timeout,
                 difficulty_params={},
-                success_threshold=0.8
-            ),
+                success_threshold=0.6
+            )
         ],
-        base_task_prob=0.6, # Focus more on skills initially
+        base_task_prob=0.7,
         progression_requirements=ProgressionRequirements(
-            min_success_rate=0.85, min_avg_reward=0.5, min_episodes=50,
+            min_success_rate=0.8, min_avg_reward=0.5, min_episodes=100,
             max_std_dev=1.0, required_consecutive_successes=3
         ),
         hyperparameter_adjustments={
-            "lr_actor": lr_actor * 1.25,  # Slightly higher learning rate for early stages
+            "lr_actor": lr_actor * 1.2,
             "lr_critic": lr_critic * 1.2,
+            "entropy_coef": 0.01
+        },
+        debug=debug
+    )
+
+    # ======== STAGE 2: SCORING (1v0) ========
+    scoring_stage = SkillBasedCurriculumStage(
+        name="Scoring",
+        base_task_state_mutator=MutatorSequence(
+            FixedTeamSizeMutator(blue_size=1, orange_size=0),
+            BallPositionMutator(position_function=SafePositionWrapper(
+                lambda: np.array([np.random.uniform(-2000, 2000), np.random.uniform(0, 3000), 93])
+            )),
+            CarPositionMutator(car_id="blue-0",
+                              position_function=SafePositionWrapper(get_directional_shooting_car_position),
+                              orientation_function=get_face_opp_goal_orientation)
+        ),
+        base_task_reward_function=CombinedReward(
+            (GoalReward(), 2.0),
+            (goal_velocity_reward, 0.5),
+            (touch_ball_reward, 0.3),
+            (ball_proximity_reward, 0.2)
+        ),
+        base_task_termination_condition=goal_condition,
+        base_task_truncation_condition=med_timeout,
+        skill_modules=[
+            SkillModule(
+                name="Moving Ball Scoring",
+                state_mutator=MutatorSequence(
+                    FixedTeamSizeMutator(blue_size=1, orange_size=0),
+                    BallPositionMutator(position_function=SafePositionWrapper(
+                        lambda: np.array([np.random.uniform(-2000, 2000), np.random.uniform(0, 2500), 93])
+                    )),
+                    BallVelocityMutator(velocity_function=SafePositionWrapper(
+                        partial(get_ball_rolling_velocity, speed_range=(300, 600))
+                    )),
+                    CarPositionMutator(car_id="blue-0",
+                                      position_function=SafePositionWrapper(get_directional_shooting_car_position),
+                                      orientation_function=get_face_opp_goal_orientation)
+                ),
+                reward_function=CombinedReward(
+                    (GoalReward(), 2.0),
+                    (goal_velocity_reward, 0.5),
+                    (touch_ball_reward, 0.3)
+                ),
+                termination_condition=goal_condition,
+                truncation_condition=med_timeout,
+                difficulty_params={},
+                success_threshold=0.6
+            ),
+            SkillModule(
+                name="Bouncing Ball Scoring",
+                state_mutator=MutatorSequence(
+                    FixedTeamSizeMutator(blue_size=1, orange_size=0),
+                    BallPositionMutator(position_function=SafePositionWrapper(
+                        lambda: np.array([np.random.uniform(-2000, 2000), np.random.uniform(0, 2500), 600])
+                    )),
+                    BallVelocityMutator(velocity_function=SafePositionWrapper(
+                        lambda: np.array([0, 0, np.random.uniform(-300, -500)]) # Falling ball
+                    )),
+                    CarPositionMutator(car_id="blue-0",
+                                      position_function=SafePositionWrapper(get_directional_shooting_car_position),
+                                      orientation_function=get_face_opp_goal_orientation)
+                ),
+                reward_function=CombinedReward(
+                    (GoalReward(), 2.0),
+                    (goal_velocity_reward, 0.5),
+                    (touch_ball_reward, 0.3)
+                ),
+                termination_condition=goal_condition,
+                truncation_condition=med_timeout,
+                difficulty_params={},
+                success_threshold=0.55
+            )
+        ],
+        base_task_prob=0.7,
+        progression_requirements=ProgressionRequirements(
+            min_success_rate=0.65, min_avg_reward=0.4, min_episodes=125,
+            max_std_dev=1.5, required_consecutive_successes=3
+        ),
+        hyperparameter_adjustments={
+            "lr_actor": lr_actor,
+            "lr_critic": lr_critic,
             "entropy_coef": 0.008
         },
         debug=debug
     )
 
-    # ======== STAGE 2: BALL ENGAGEMENT ========
-    ball_engagement = SkillBasedCurriculumStage(
-        name="Ball Engagement",
-        base_task_state_mutator=MutatorSequence(
-            FixedTeamSizeMutator(blue_size=1, orange_size=0),
-            BallPositionMutator(position_function=SafePositionWrapper(get_varied_ground_ball_position)),
-            CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(get_varied_approach_car_position))
-        ),
-        base_task_reward_function=CombinedReward(
-            (goal_velocity_reward, 1.0),
-            (ball_proximity_reward, 0.8),
-            (touch_ball_reward, 0.3),
-            (goal_accel_reward, 0.5), # Reward touching towards goal
-            (GoalReward(), 5.0),
-        ),
-        base_task_termination_condition=goal_condition,
-        base_task_truncation_condition=no_touch_timeout_short,
-        skill_modules=[
-            SkillModule(
-                name="Approach Paths",
-                state_mutator=MutatorSequence(
-                    FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    BallPositionMutator(position_function=SafePositionWrapper(get_varied_ground_ball_position)),
-                    CarBallRelativePositionMutator(car_id="blue-0", position_function=SafePositionWrapper(get_varied_approach_car_position)) # Varied angles
-                ),
-                reward_function=CombinedReward(
-                    (ball_proximity_reward, 1.0),
-                    (touch_ball_reward, 0.5)
-                ),
-                termination_condition=TouchBallCondition(),
-                truncation_condition=short_timeout,
-                difficulty_params={},
-                success_threshold=0.85
-            ),
-            SkillModule(
-                name="Moving Ball Intercepts",
-                state_mutator=MutatorSequence(
-                    FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    BallPositionMutator(position_function=SafePositionWrapper(get_varied_ground_ball_position)),
-                    BallVelocityMutator(velocity_function=SafePositionWrapper(partial(get_ball_rolling_velocity, speed_range=(100, 600)))), # Slow roll
-                    CarBallRelativePositionMutator(car_id="blue-0", position_function=SafePositionWrapper(get_varied_approach_car_position))
-                ),
-                reward_function=CombinedReward(
-                    (ball_proximity_reward, 0.7),
-                    (touch_ball_reward, 1.0)
-                ),
-                termination_condition=TouchBallCondition(),
-                truncation_condition=short_timeout,
-                difficulty_params={},
-                success_threshold=0.75
-            ),
-        ],
-        base_task_prob=0.7,
-        progression_requirements=ProgressionRequirements(
-            min_success_rate=0.8, min_avg_reward=0.6, min_episodes=75,
-            max_std_dev=1.5, required_consecutive_successes=3
-        ),
-        hyperparameter_adjustments={
-            "lr_actor": lr_actor * 1.1,  # Slightly higher than base but less than movement stage
-            "lr_critic": lr_critic * 1.1,
-            "entropy_coef": 0.007
-        },
-        debug=debug
-    )
-
-    # ======== STAGE 3: BALL CONTROL & DIRECTION ========
-    ball_control = SkillBasedCurriculumStage(
-        name="Ball Control & Direction",
-        base_task_state_mutator=MutatorSequence(
-            FixedTeamSizeMutator(blue_size=1, orange_size=0),
-            BallPositionMutator(position_function=SafePositionWrapper(get_ground_ball_position)), # Ball slightly ahead
-            # Add face opponent goal orientation
-            CarPositionMutator(car_id="blue-0",
-                               position_function=SafePositionWrapper(partial(create_position, 0, -2500, 17)),
-                               orientation_function=get_face_opp_goal_orientation)
-        ),
-        base_task_reward_function=CombinedReward(
-            (touch_ball_reward, 0.2),
-            (goal_velocity_reward, 0.6),
-            (goal_accel_reward, 0.3),
-            (GoalReward(), 1.0),
-        ),
-        base_task_termination_condition=goal_condition,
-        base_task_truncation_condition=TimeoutCondition(10),
-        skill_modules=[
-            SkillModule(
-                name="Consecutive Touches",
-                 state_mutator=MutatorSequence(
-                    FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    BallPositionMutator(position_function=SafePositionWrapper(get_ground_ball_position)),
-                    # Add face opponent goal orientation
-                    CarPositionMutator(car_id="blue-0",
-                                       position_function=SafePositionWrapper(partial(create_position, 0, -2500, 17)),
-                                       orientation_function=get_face_opp_goal_orientation)
-                ),
-                # Reward structure needs to encourage multiple touches
-                reward_function=CombinedReward(
-                    (GoalReward(), 1.5),
-                    (TouchBallReward(weight=1.0), 1.0), # High reward per touch
-                    (BallProximityReward(dispersion=0.6), 0.5) # Keep it close between touches
-                ),
-                termination_condition=goal_condition,
-                truncation_condition=TimeoutCondition(12),
-                difficulty_params={},
-                success_threshold=0.6 # Lower threshold for harder skill
-            ),
-             SkillModule(
-                name="Ball Stopping",
-                 state_mutator=MutatorSequence(
-                    FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    BallPositionMutator(position_function=SafePositionWrapper(get_varied_ground_ball_position)),
-                    BallVelocityMutator(velocity_function=SafePositionWrapper(partial(get_ball_rolling_velocity, speed_range=(500, 1200)))), # Faster roll
-                    # Add face own goal orientation
-                    CarPositionMutator(car_id="blue-0",
-                                       position_function=SafePositionWrapper(get_car_defensive_position),
-                                       orientation_function=get_face_own_goal_orientation) # Start defensively
-                ),
-                reward_function=CombinedReward(
-                    (BallVelocityToGoalReward(team_goal_y=5120, weight=-1.0), 1.0), # Penalize velocity towards own goal (stop it)
-                    (TouchBallReward(), 0.5)
-                ),
-                termination_condition=TimeoutCondition(8), # Short time to stop
-                truncation_condition=TimeoutCondition(8),
-                difficulty_params={},
-                success_threshold=0.7
-            ),
-        ],
-        base_task_prob=0.7,
-        progression_requirements=ProgressionRequirements(
-            min_success_rate=0.65, min_avg_reward=0.4, min_episodes=100,
-            max_std_dev=1.8, required_consecutive_successes=2
-        ),
-        hyperparameter_adjustments={
-            "lr_actor": lr_actor,  # Base learning rate for this stage
-            "lr_critic": lr_critic,
-            "entropy_coef": 0.006
-        },
-        debug=debug
-    )
-
-    # ======== STAGE 4: SHOOTING FUNDAMENTALS ========
-    shooting_fundamentals = SkillBasedCurriculumStage(
-        name="Shooting Fundamentals",
-        base_task_state_mutator=MutatorSequence(
-            FixedTeamSizeMutator(blue_size=1, orange_size=1), # Add opponent
-            BallTowardGoalSpawnMutator(offensive_team=0, distance_from_goal=0.75),
-            # Add face opponent goal orientation
-            CarPositionMutator(car_id="blue-0",
-                               position_function=SafePositionWrapper(get_directional_shooting_car_position),
-                               orientation_function=get_face_opp_goal_orientation),
-            # Add face own goal orientation (relative to orange, so facing blue goal)
-            CarPositionMutator(car_id="orange-0",
-                               position_function=SafePositionWrapper(get_car_position_near_goal(team=1)),
-                               orientation_function=get_face_own_goal_orientation)
-        ),
-        base_task_reward_function=CombinedReward(
-            (GoalReward(), 1.0),
-            (goal_velocity_reward, 0.7),
-            (goal_accel_reward, 0.3),
-            (alignment_reward, 1.0)
-        ),
-        base_task_termination_condition=goal_condition,
-        base_task_truncation_condition=short_timeout,
-        progression_requirements=ProgressionRequirements(
-            min_success_rate=0.6, min_avg_reward=0.5, min_episodes=125,
-            max_std_dev=1.8, required_consecutive_successes=2
-        ),
-        hyperparameter_adjustments={
-            "lr_actor": lr_actor * 0.9,  # Slightly lower learning rate as complexity increases
-            "lr_critic": lr_critic * 0.9,
-            "entropy_coef": 0.005
-        },
-        skill_modules=[],
-        base_task_prob=1.0, # Added for consistency
-        debug=debug
-    )
-
-    # ======== STAGE 5: WALL & AIR MECHANICS ========
-    wall_air_mechanics = SkillBasedCurriculumStage(
-        name="Wall & Air Mechanics",
-        base_task_state_mutator=MutatorSequence(
-            FixedTeamSizeMutator(blue_size=1, orange_size=0),
-            # Add data augmentation to improve generalization (Removed AugmentMutator)
-            BallPositionMutator(position_function=SafePositionWrapper(get_basic_aerial_ball_position)), # Low aerials
-            CarBoostMutator(boost_amount=50),
-            # Add face opponent goal orientation
-            CarPositionMutator(car_id="blue-0",
-                               position_function=SafePositionWrapper(get_basic_aerial_car_position),
-                               orientation_function=get_face_opp_goal_orientation)
-        ),
-        base_task_reward_function=CombinedReward(
-            (touch_ball_reward, 0.2),
-            (save_boost_reward, 0.3),
-            (goal_velocity_reward, 0.3), # Reward hitting towards goal even from air
-            (AerialDistanceReward(touch_height_weight=1.0, car_distance_weight=0.5, ball_distance_weight=0.5), 0.5),
-            (AerialDirectionalTouchReward(), 0.4),
-            (GoalReward(), 1.0),
-        ),
-        base_task_termination_condition=goal_condition,
-        base_task_truncation_condition=short_timeout,
-        skill_modules=[
-            SkillModule(
-                name="Wall Driving",
-                state_mutator=MutatorSequence(
-                    FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    # Add random yaw orientation
-                    CarPositionMutator(car_id="blue-0",
-                                       position_function=SafePositionWrapper(get_car_wall_position),
-                                       orientation_function=get_random_yaw_orientation),
-                    BallPositionMutator(position_function=SafePositionWrapper(get_ball_wall_position)) # Ball near wall
-                ),
-                reward_function=CombinedReward(
-                    (touch_ball_reward, 1.0),
-                    (ball_proximity_reward, 0.5)
-                ),
-                termination_condition=TouchBallCondition(),
-                truncation_condition=short_timeout,
-                difficulty_params={},
-                success_threshold=0.7
-            ),
-            SkillModule(
-                name="Jump Aerials",
-                state_mutator=MutatorSequence(
-                    FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    # AugmentMutator removed
-                    BallPositionMutator(position_function=SafePositionWrapper(get_basic_aerial_ball_position)), # Low aerials
-                    CarBoostMutator(boost_amount=50),
-                    # Add face opponent goal orientation
-                    CarPositionMutator(car_id="blue-0",
-                                       position_function=SafePositionWrapper(get_basic_aerial_car_position),
-                                       orientation_function=get_face_opp_goal_orientation)
-                ),
-                reward_function=CombinedReward(
-                    (touch_ball_reward, 0.7),
-                    (AerialControlReward(), 0.3), # Basic stability reward
-                    (AerialDistanceReward(touch_height_weight=1.0, car_distance_weight=0.5, ball_distance_weight=0.5), 0.5)
-                ),
-                termination_condition=TouchBallCondition(),
-                truncation_condition=short_timeout,
-                difficulty_params={},
-                success_threshold=0.6
-            ),
-        ],
-        base_task_prob=0.6,
-        progression_requirements=ProgressionRequirements(
-            min_success_rate=0.55, min_avg_reward=0.4, min_episodes=150,
-            max_std_dev=2.0, required_consecutive_successes=2
-        ),
-        hyperparameter_adjustments={
-            "lr_actor": lr_actor * 0.75,  # Lower learning rate for complex mechanics
-            "lr_critic": lr_critic * 0.8,
-            "entropy_coef": 0.004
-        },
-        debug=debug
-    )
-
-    # ======== STAGE 6: BEGINNING TEAM PLAY (2v0) ========
-    beginning_team_play = SkillBasedCurriculumStage( # Changed to SkillBased to add modules
-        name="Beginning Team Play",
-        base_task_state_mutator=MutatorSequence(
-            FixedTeamSizeMutator(blue_size=2, orange_size=0),
-            BallPositionMutator(position_function=SafePositionWrapper(get_strategic_ball_position)),
-            # Add random yaw orientation
-            CarPositionMutator(car_id="blue-0",
-                               position_function=SafePositionWrapper(get_blue_defender_position),
-                               orientation_function=get_random_yaw_orientation),
-            CarPositionMutator(car_id="blue-1",
-                               position_function=SafePositionWrapper(get_blue_attacker_position),
-                               orientation_function=get_random_yaw_orientation)
-        ),
-        base_task_reward_function=CombinedReward(
-            KRCReward([
-                (offensive_potential_reward, 0.7),
-                (touch_ball_reward, 0.5),
-                (goal_velocity_reward, 0.5)
-            ], team_spirit=0.7),
-            (GoalReward(), 2.0),
-        ),
-        base_task_termination_condition=goal_condition,
-        base_task_truncation_condition=med_timeout,
-        skill_modules=[
-             SkillModule(
-                name="Spacing Awareness",
-                state_mutator=MutatorSequence(
-                    FixedTeamSizeMutator(blue_size=2, orange_size=0),
-                    BallPositionMutator(position_function=SafePositionWrapper(get_strategic_ball_position)),
-                    # Add random yaw orientation
-                    CarPositionMutator(car_id="blue-0",
-                                       position_function=SafePositionWrapper(get_blue_defender_position),
-                                       orientation_function=get_random_yaw_orientation),
-                    CarPositionMutator(car_id="blue-1",
-                                       position_function=SafePositionWrapper(get_blue_attacker_position),
-                                       orientation_function=get_random_yaw_orientation)
-                ),
-                reward_function=CombinedReward(
-                    (GoalReward(), 1.5),
-                    (TeamSpacingReward(), 1.0), # Focus solely on spacing
-                    (TeamPossessionReward(), 0.3) # Encourage keeping ball
-                ),
-                termination_condition=goal_condition,
-                truncation_condition=med_timeout,
-                difficulty_params={},
-                success_threshold=0.7
-            ),
-            SkillModule(
-                name="Basic Passing Lanes",
-                state_mutator=MutatorSequence(
-                    FixedTeamSizeMutator(blue_size=2, orange_size=0),
-                    BallPositionMutator(position_function=SafePositionWrapper(get_ball_passing_position)), # Ball set up for pass
-                    # Add random yaw orientation
-                    CarPositionMutator(car_id="blue-0",
-                                       position_function=SafePositionWrapper(get_blue_attacker_position),
-                                       orientation_function=get_random_yaw_orientation), # Passer
-                    CarPositionMutator(car_id="blue-1",
-                                       position_function=SafePositionWrapper(get_blue_support_offensive_position),
-                                       orientation_function=get_random_yaw_orientation) # Receiver
-                ),
-                reward_function=CombinedReward(
-                    (PassCompletionReward(), 1.0), # Focus on completing pass
-                    (ScoringOpportunityCreationReward(), 0.5),
-                    (GoalReward(), 1.5),
-                ),
-                termination_condition=goal_condition,
-                truncation_condition=med_timeout,
-                difficulty_params={},
-                success_threshold=0.6
-            ),
-        ],
-        base_task_prob=0.7,
-        progression_requirements=ProgressionRequirements(
-            min_success_rate=0.55, min_avg_reward=0.4, min_episodes=125,
-            max_std_dev=2.0, required_consecutive_successes=2
-        ),
-        hyperparameter_adjustments={
-            "lr_actor": 0.00012,
-            "lr_critic": 0.00035,
-            "entropy_coef": 0.004
-        },
-        debug=debug
-    )
-
-    # ======== STAGE 7: DEFENSE & GOAL-LINE SAVES ========
-    defense = SkillBasedCurriculumStage( # Changed from RLBotSkillStage
-        name="Defense & Goal-line Saves",
+    # ======== STAGE 3: BASIC 1v1 ========
+    basic_1v1_stage = SkillBasedCurriculumStage(
+        name="Basic 1v1",
         base_task_state_mutator=MutatorSequence(
             FixedTeamSizeMutator(blue_size=1, orange_size=1),
-            BallPositionMutator(position_function=SafePositionWrapper(get_defensive_save_ball_position)),
-            BallVelocityMutator(velocity_function=SafePositionWrapper(get_defensive_save_ball_velocity)),
-            # Add face own goal orientation
-            CarPositionMutator(car_id="blue-0",
-                               position_function=SafePositionWrapper(get_defensive_save_car_position),
-                               orientation_function=get_face_own_goal_orientation),
-            # Add face opponent goal orientation (relative to orange, so facing blue goal)
-            CarPositionMutator(car_id="orange-0",
-                               position_function=SafePositionWrapper(get_orange_attacker_position),
-                               orientation_function=get_face_opp_goal_orientation) # Corrected orientation
-        ),
-        base_task_reward_function=CombinedReward(
-            (BlockSuccessReward(), 0.7),
-            (DefensivePositioningReward(), 0.5),
-            (BallClearanceReward(), 0.4),
-            (GoalReward(), -1.5) # Penalize goals conceded (Weight moved here)
-        ),
-        base_task_termination_condition=goal_condition, # Termination on goal (conceded or scored)
-        base_task_truncation_condition=TimeoutCondition(10),
-        # bot_skill_ranges removed
-        progression_requirements=ProgressionRequirements(
-            min_success_rate=0.6, min_avg_reward=0.4, min_episodes=150, # Success = save (high reward)
-            max_std_dev=2.0, required_consecutive_successes=2
-        ),
-        hyperparameter_adjustments={
-            "lr_actor": 0.0001,
-            "lr_critic": 0.0003,
-            "entropy_coef": 0.003
-        },
-        skill_modules=[], # Added for SkillBasedCurriculumStage
-        base_task_prob=1.0, # Added for SkillBasedCurriculumStage
-        debug=debug # Added for SkillBasedCurriculumStage
-    )
-
-    # ======== STAGE 8: INTERMEDIATE BALL CONTROL ========
-    intermediate_ball_control = SkillBasedCurriculumStage(
-        name="Intermediate Ball Control",
-        base_task_state_mutator=MutatorSequence(
-            FixedTeamSizeMutator(blue_size=1, orange_size=0),
-            # Add data augmentation for better generalization (Removed AugmentMutator)
-            # First position the car with a predictable location
-            CarPositionMutator(car_id="blue-0",
-                               position_function=SafePositionWrapper(partial(create_position, 0, -2800, 17)),
-                               orientation_function=get_face_opp_goal_orientation),
-            # Then place ball in absolute coordinates (more reliable than relative)
-            BallPositionMutator(position_function=SafePositionWrapper(
-                # Ball slightly in front of car's expected position
-                partial(create_position, 0, -2500, 93)
-            )),
-            BallVelocityMutator(velocity_function=SafePositionWrapper(get_ground_dribbling_ball_velocity)),
-            CarBoostMutator(boost_amount=50)
-        ),
-        base_task_reward_function=CombinedReward(
-            (ball_proximity_reward, 0.5),
-            (velocity_to_ball_reward, 0.3), # Keep moving with ball
-            (goal_velocity_reward, 0.4),
-            (WavedashReward(scale_by_acceleration=True, weight=0.8), 0.3), # Add wavedash reward
-            (GoalReward(), 1.5)
-        ),
-        base_task_termination_condition=goal_condition,
-        base_task_truncation_condition=TimeoutCondition(12),
-        skill_modules=[
-            SkillModule(
-                name="Close Following",
-                state_mutator=MutatorSequence(
-                    FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    # First position the car
-                    CarPositionMutator(car_id="blue-0",
-                                       position_function=SafePositionWrapper(partial(create_position, 0, -2800, 17)),
-                                       orientation_function=get_face_opp_goal_orientation),
-                    # Then place ball in absolute coordinates near the car
-                    BallPositionMutator(position_function=SafePositionWrapper(
-                        partial(create_position, 0, -2500, 93)
-                    )),
-                    BallVelocityMutator(velocity_function=SafePositionWrapper(
-                        partial(get_ball_rolling_velocity, speed_range=(300, 600))
-                    )),
-                    CarBoostMutator(boost_amount=50)
-                ),
-                reward_function=CombinedReward(
-                    (ball_proximity_reward, 0.8),
-                    (velocity_to_ball_reward, 0.5), # Reward moving with ball
-                    (GoalReward(), 1.5)
-                ),
-                termination_condition=goal_condition,
-                truncation_condition=TimeoutCondition(15),
-                difficulty_params={},
-                success_threshold=0.5
-            ),
-            SkillModule(
-                name="Cut Control",
-                state_mutator=MutatorSequence(
-                    FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    # First position the car
-                    CarPositionMutator(car_id="blue-0",
-                                       position_function=SafePositionWrapper(partial(create_position, 0, -2800, 17)),
-                                       orientation_function=get_face_opp_goal_orientation),
-                    # Then place ball in absolute coordinates offset from car
-                    BallPositionMutator(position_function=SafePositionWrapper(
-                        partial(create_position, 100, -2500, 93)
-                    )),
-                    BallVelocityMutator(velocity_function=SafePositionWrapper(
-                        partial(get_ball_rolling_velocity, speed_range=(200, 500))
-                    )),
-                    CarBoostMutator(boost_amount=50)
-                ),
-                reward_function=CombinedReward(
-                    (ball_proximity_reward, 0.8),
-                    # Reward for changing direction while maintaining proximity
-                    (touch_ball_reward, 0.3),
-                    (goal_velocity_reward, 0.3),
-                    (GoalReward(), 1.5)
-                ),
-                termination_condition=goal_condition,
-                truncation_condition=TimeoutCondition(15),
-                difficulty_params={},
-                success_threshold=0.5
-            ),
-            SkillModule(
-                name="Wavedash Training",
-                state_mutator=MutatorSequence(
-                    FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    CarPositionMutator(car_id="blue-0",
-                                    position_function=SafePositionWrapper(
-                                        lambda: np.array([np.random.uniform(-1000, 1000),
-                                                          np.random.uniform(-4000, -3000),
-                                                          800])  # Start in the air
-                                    ),
-                                    orientation_function=get_random_yaw_orientation),
-                    BallPositionMutator(position_function=SafePositionWrapper(
-                        lambda: np.array([np.random.uniform(-2000, 2000),
-                                          np.random.uniform(1000, 3000),
-                                          93])
-                    )),
-                    CarBoostMutator(boost_amount=30)
-                ),
-                reward_function=CombinedReward(
-                    (WavedashReward(scale_by_acceleration=True, weight=1.0), 1.0),
-                    (velocity_to_ball_reward, 0.5),
-                    (GoalReward(), 2.0)
-                ),
-                termination_condition=TimeoutCondition(8),
-                truncation_condition=TimeoutCondition(8),
-                difficulty_params={},
-                success_threshold=0.5
-            ),
-        ],
-        base_task_prob=0.7, # Focus more on base dribbling and close following
-        progression_requirements=ProgressionRequirements(
-            min_success_rate=0.5, min_avg_reward=0.4, min_episodes=175,
-            max_std_dev=2.0, required_consecutive_successes=2
-        ),
-        debug=debug
-    )
-
-    # ======== STAGE 9: 2v2 DEFENSIVE ROTATION ========
-    defensive_rotation = SkillBasedCurriculumStage(
-        name="2v2 Defensive Rotation",
-        base_task_state_mutator=MutatorSequence(
-            FixedTeamSizeMutator(blue_size=2, orange_size=2),
-            BallPositionMutator(position_function=SafePositionWrapper(get_defensive_ball_position)),
-            # Add face own goal orientation
-            CarPositionMutator(car_id="blue-0",
-                               position_function=SafePositionWrapper(get_blue_primary_defender_position),
-                               orientation_function=get_face_own_goal_orientation),
-            CarPositionMutator(car_id="blue-1",
-                               position_function=SafePositionWrapper(get_blue_secondary_defender_position),
-                               orientation_function=get_face_own_goal_orientation),
-            # Add face opponent goal orientation
-            CarPositionMutator(car_id="orange-0",
-                               position_function=SafePositionWrapper(get_orange_attacker_position),
-                               orientation_function=get_face_opp_goal_orientation), # Corrected orientation
-            CarPositionMutator(car_id="orange-1",
-                               position_function=SafePositionWrapper(get_orange_support_position),
-                               orientation_function=get_face_opp_goal_orientation) # Corrected orientation
-        ),
-        base_task_reward_function=CombinedReward(
-            KRCReward([
-                (BlockSuccessReward(), 0.7),
-                (DefensivePositioningReward(), 0.5),
-                (BallClearanceReward(), 0.6)
-            ], team_spirit=0.7),
-            (GoalReward(), -1.5), # Penalize goals conceded (weight applied here)
-        ),
-        base_task_termination_condition=goal_condition,
-        base_task_truncation_condition=long_timeout,
-        progression_requirements=ProgressionRequirements(
-            min_success_rate=0.55, min_avg_reward=0.4, min_episodes=175,
-            max_std_dev=2.0, required_consecutive_successes=2
-        ),
-        hyperparameter_adjustments=None,
-        skill_modules=[],
-        base_task_prob=1.0, # Added for consistency
-        debug=debug
-    )
-
-    # ======== STAGE 10: 2v2 OFFENSIVE COORDINATION ========
-    offensive_coordination = SkillBasedCurriculumStage(
-        name="2v2 Offensive Coordination",
-        base_task_state_mutator=MutatorSequence(
-            FixedTeamSizeMutator(blue_size=2, orange_size=2),
-            BallPositionMutator(position_function=SafePositionWrapper(get_offensive_ball_position)),
-            # Add face opponent goal orientation
-            CarPositionMutator(car_id="blue-0",
-                               position_function=SafePositionWrapper(get_blue_attacker_offensive_position),
-                               orientation_function=get_face_opp_goal_orientation),
-            CarPositionMutator(car_id="blue-1",
-                               position_function=SafePositionWrapper(get_blue_support_offensive_position),
-                               orientation_function=get_face_opp_goal_orientation),
-            # Add face own goal orientation
-            CarPositionMutator(car_id="orange-0",
-                               position_function=SafePositionWrapper(get_orange_primary_defender_position),
-                               orientation_function=get_face_own_goal_orientation),
-            CarPositionMutator(car_id="orange-1",
-                               position_function=SafePositionWrapper(get_orange_secondary_defender_position),
-                               orientation_function=get_face_own_goal_orientation)
-        ),
-        base_task_reward_function=KRCReward([
-            (GoalReward(), 2.0),
-            (goal_velocity_reward, 0.7),
-            (offensive_potential_reward, 0.6),
-            (PassCompletionReward(), 0.5),
-            (ScoringOpportunityCreationReward(), 0.6)
-        ], team_spirit=0.7),
-        base_task_termination_condition=goal_condition,
-        base_task_truncation_condition=long_timeout,
-        progression_requirements=ProgressionRequirements(
-            min_success_rate=0.5, min_avg_reward=0.4, min_episodes=200,
-            max_std_dev=2.0, required_consecutive_successes=2
-        ),
-        hyperparameter_adjustments=None,
-        skill_modules=[],
-        base_task_prob=1.0, # Added for consistency
-        debug=debug
-    )
-
-    # ======== STAGE 11: INTERMEDIATE AERIALS & WALL PLAY ========
-    intermediate_aerials = SkillBasedCurriculumStage(
-        name="Intermediate Aerials & Wall Play",
-        base_task_state_mutator=MutatorSequence(
-            FixedTeamSizeMutator(blue_size=1, orange_size=0),
-            # AugmentMutator removed
-            BallPositionMutator(position_function=SafePositionWrapper(get_advanced_aerial_ball_position)), # Higher aerials
-            BallVelocityMutator(velocity_function=SafePositionWrapper(get_advanced_aerial_ball_velocity)), # Moving aerials
-            # Add face opponent goal orientation
-            CarPositionMutator(car_id="blue-0",
-                               position_function=SafePositionWrapper(get_advanced_aerial_car_position),
-                               orientation_function=get_face_opp_goal_orientation),
-            CarBoostMutator(boost_amount=75)
-        ),
-        base_task_reward_function=CombinedReward(
-            (touch_ball_reward, 0.2),
-            (AerialControlReward(), 0.3), # More emphasis on control
-            (AerialDirectionalTouchReward(), 0.5), # Reward controlled aerial hits
-            (AerialDistanceReward(touch_height_weight=1.0, car_distance_weight=0.7, ball_distance_weight=0.7), 0.4),
-            (FlipResetReward(obtain_flip_weight=0.8, hit_ball_weight=1.2), 0.6), # Advanced aerial mechanic
-            (GoalReward(), 2.0),
-        ),
-        base_task_termination_condition=goal_condition,
-        base_task_truncation_condition=TimeoutCondition(10),
-        skill_modules=[
-            SkillModule(
-                name="Fast Aerials",
-                 state_mutator=MutatorSequence(
-                    FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    # AugmentMutator removed
-                    BallPositionMutator(position_function=SafePositionWrapper(get_fast_aerial_ball_position)), # Higher, faster targets
-                    # Add face opponent goal orientation
-                    CarPositionMutator(car_id="blue-0",
-                                       position_function=SafePositionWrapper(get_advanced_aerial_car_position),
-                                       orientation_function=get_face_opp_goal_orientation), # Added orientation
-                    CarBoostMutator(boost_amount=100)
-                ),
-                reward_function=CombinedReward(
-                    (touch_ball_reward, 0.6),
-                    (AerialControlReward(), 0.5),
-                    (AerialDistanceReward(touch_height_weight=1.0, car_distance_weight=0.7, ball_distance_weight=0.7), 0.6)
-                ),
-                termination_condition=TouchBallCondition(),
-                truncation_condition=short_timeout,
-                difficulty_params={},
-                success_threshold=0.5
-            ),
-            SkillModule(
-                name="Wall-to-Air",
-                 state_mutator=MutatorSequence(
-                    FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    # AugmentMutator removed
-                    BallPositionMutator(position_function=SafePositionWrapper(get_ball_wall_position)), # Ball high on wall
-                    # Add random yaw orientation
-                    CarPositionMutator(car_id="blue-0",
-                                       position_function=SafePositionWrapper(get_car_wall_position),
-                                       orientation_function=get_random_yaw_orientation),
-                    CarBoostMutator(boost_amount=60)
-                ),
-                reward_function=CombinedReward(
-                    (touch_ball_reward, 0.7),
-                    (AerialDirectionalTouchReward(), 0.6),
-                    (AerialDistanceReward(touch_height_weight=0.8, car_distance_weight=0.6, ball_distance_weight=0.6), 0.5)
-                ),
-                termination_condition=TouchBallCondition(),
-                truncation_condition=med_timeout,
-                difficulty_params={},
-                success_threshold=0.55
-            ),
-            # New flip reset training skill module
-            SkillModule(
-                name="Flip Reset Training",
-                state_mutator=MutatorSequence(
-                    FixedTeamSizeMutator(blue_size=1, orange_size=0),
-                    # AugmentMutator removed
-                    # RandomPhysicsMutator removed
-                    BallPositionMutator(position_function=SafePositionWrapper(
-                        lambda: np.array([np.random.uniform(-1000, 1000), np.random.uniform(-1500, 0), np.random.uniform(900, 1500)])
-                    )), # Higher ball position for reset opportunities
-                    CarPositionMutator(car_id="blue-0",
-                                     position_function=SafePositionWrapper(
-                                         lambda: np.array([np.random.uniform(-300, 300), np.random.uniform(-3500, -2500), 17])
-                                     ),
-                                     orientation_function=get_face_opp_goal_orientation),
-                    CarBoostMutator(boost_amount=100) # Full boost for aerial maneuvers
-                ),
-                reward_function=CombinedReward(
-                    (touch_ball_reward, 0.2),
-                    (AerialControlReward(), 0.3),
-                    (FlipResetReward(obtain_flip_weight=1.0, hit_ball_weight=1.5), 1.0),
-                    (GoalReward(), 1.0) # Extra reward for scoring after reset
-                ),
-                termination_condition=goal_condition,
-                truncation_condition=med_timeout,
-                difficulty_params={},
-                success_threshold=0.4 # Lower threshold as this is more difficult
-            ),
-        ],
-        base_task_prob=0.7,
-        progression_requirements=ProgressionRequirements(
-            min_success_rate=0.45, min_avg_reward=0.3, min_episodes=200,
-            max_std_dev=2.5, required_consecutive_successes=2
-        ),
-        debug=debug
-    )
-
-    # ======== STAGE 12: FULL 2v2 INTEGRATION ========
-    full_2v2_integration = SkillBasedCurriculumStage(
-        name="Full 2v2 Integration",
-        base_task_state_mutator=MutatorSequence(
-            FixedTeamSizeMutator(blue_size=2, orange_size=2),
             KickoffMutator()
         ),
         base_task_reward_function=lucy_reward,
         base_task_termination_condition=goal_condition,
         base_task_truncation_condition=match_timeout,
+        skill_modules=[
+            SkillModule(
+                name="Offensive Spawns",
+                state_mutator=MutatorSequence(
+                    FixedTeamSizeMutator(blue_size=1, orange_size=1),
+                    BallPositionMutator(position_function=SafePositionWrapper(
+                        lambda: np.array([np.random.uniform(-2000, 2000), 2000, 93]) # Ball in orange half
+                    )),
+                    CarPositionMutator(car_id="blue-0",
+                                      position_function=SafePositionWrapper(get_directional_shooting_car_position),
+                                      orientation_function=get_face_opp_goal_orientation),
+                    CarPositionMutator(car_id="orange-0",
+                                      position_function=SafePositionWrapper(get_orange_primary_defender_position),
+                                      orientation_function=get_face_own_goal_orientation)
+                ),
+                reward_function=lucy_reward,
+                termination_condition=goal_condition,
+                truncation_condition=med_timeout,
+                difficulty_params={},
+                success_threshold=0.6
+            ),
+            SkillModule(
+                name="Defensive Spawns",
+                state_mutator=MutatorSequence(
+                    FixedTeamSizeMutator(blue_size=1, orange_size=1),
+                    BallPositionMutator(position_function=SafePositionWrapper(
+                        lambda: np.array([np.random.uniform(-2000, 2000), -2000, 93]) # Ball in blue half
+                    )),
+                    CarPositionMutator(car_id="blue-0",
+                                      position_function=SafePositionWrapper(get_blue_primary_defender_position),
+                                      orientation_function=get_face_own_goal_orientation),
+                    CarPositionMutator(car_id="orange-0",
+                                      position_function=SafePositionWrapper(get_orange_attacker_position),
+                                      orientation_function=get_face_opp_goal_orientation)
+                ),
+                reward_function=lucy_reward,
+                termination_condition=goal_condition,
+                truncation_condition=med_timeout,
+                difficulty_params={},
+                success_threshold=0.6
+            ),
+            SkillModule(
+                name="Random Spawns",
+                state_mutator=MutatorSequence(
+                    FixedTeamSizeMutator(blue_size=1, orange_size=1),
+                    BallPositionMutator(position_function=SafePositionWrapper(
+                        lambda: np.array([np.random.uniform(-3000, 3000), np.random.uniform(-3000, 3000), 93])
+                    )),
+                    CarPositionMutator(car_id="blue-0",
+                                      position_function=SafePositionWrapper(get_strategic_car_position),
+                                      orientation_function=get_random_yaw_orientation),
+                    CarPositionMutator(car_id="orange-0",
+                                      position_function=SafePositionWrapper(
+                                          lambda: np.array([np.random.uniform(-3000, 3000), np.random.uniform(0, 4000), 17])
+                                      ),
+                                      orientation_function=get_random_yaw_orientation)
+                ),
+                reward_function=lucy_reward,
+                termination_condition=goal_condition,
+                truncation_condition=med_timeout,
+                difficulty_params={},
+                success_threshold=0.55
+            )
+        ],
+        base_task_prob=0.7,
         progression_requirements=ProgressionRequirements(
-            min_success_rate=0.55, min_avg_reward=0.3, min_episodes=250,
+            min_success_rate=0.55, min_avg_reward=0.3, min_episodes=150,
+            max_std_dev=2.0, required_consecutive_successes=2
+        ),
+        hyperparameter_adjustments={
+            "lr_actor": lr_actor * 0.9,
+            "lr_critic": lr_critic * 0.9,
+            "entropy_coef": 0.007
+        },
+        debug=debug
+    )
+
+    # ======== STAGE 4: ADVANCED MECHANICS & KICKOFFS (1v1) ========
+    # Create the custom advanced kickoff reward
+    advanced_kickoff_reward_1v1 = CombinedReward(
+        (FirstTouchSpeedReward(weight=2.0, team_spirit=0.0), 1.0),  # Individual first touch reward
+        (SpeedflipReward(weight=1.0), 0.7),                         # Speedflip mechanic reward
+        (lucy_reward, 0.6),                                         # Base game reward
+        (FlipResetReward(obtain_flip_weight=0.5, hit_ball_weight=1.0), 0.4),
+        (WavedashReward(scale_by_acceleration=True), 0.4),
+        (AerialDistanceReward(), 0.3),
+        (AerialDirectionalTouchReward(), 0.3)
+    )
+
+    advanced_kickoffs_1v1_stage = SkillBasedCurriculumStage(
+        name="Advanced Mechanics & Kickoffs (1v1)",
+        base_task_state_mutator=MutatorSequence(
+            FixedTeamSizeMutator(blue_size=1, orange_size=1),
+            KickoffMutator()
+        ),
+        base_task_reward_function=advanced_kickoff_reward_1v1,
+        base_task_termination_condition=goal_condition,
+        base_task_truncation_condition=match_timeout,
+        skill_modules=[
+            SkillModule(
+                name="Aerial Setups",
+                state_mutator=MutatorSequence(
+                    FixedTeamSizeMutator(blue_size=1, orange_size=1),
+                    BallPositionMutator(position_function=SafePositionWrapper(get_ball_aerial_position)),
+                    CarPositionMutator(car_id="blue-0",
+                                      position_function=SafePositionWrapper(get_aerial_car_position),
+                                      orientation_function=get_face_opp_goal_orientation),
+                    CarBoostMutator(boost_amount=80, car_id="blue-0"),
+                    CarPositionMutator(car_id="orange-0",
+                                      position_function=SafePositionWrapper(get_orange_primary_defender_position),
+                                      orientation_function=get_face_own_goal_orientation)
+                ),
+                reward_function=CombinedReward(
+                    (lucy_reward, 0.6),
+                    (AerialControlReward(), 0.5),
+                    (AerialDistanceReward(), 0.5),
+                    (AerialDirectionalTouchReward(), 0.4),
+                    (touch_ball_reward, 0.2)
+                ),
+                termination_condition=goal_condition,
+                truncation_condition=med_timeout,
+                difficulty_params={},
+                success_threshold=0.5
+            ),
+            SkillModule(
+                name="Wall Play Setups",
+                state_mutator=MutatorSequence(
+                    FixedTeamSizeMutator(blue_size=1, orange_size=1),
+                    BallPositionMutator(position_function=SafePositionWrapper(get_ball_wall_position)),
+                    CarPositionMutator(car_id="blue-0",
+                                      position_function=SafePositionWrapper(get_car_wall_position),
+                                      orientation_function=get_random_yaw_orientation),
+                    CarBoostMutator(boost_amount=60, car_id="blue-0"),
+                    CarPositionMutator(car_id="orange-0",
+                                      position_function=SafePositionWrapper(get_orange_primary_defender_position),
+                                      orientation_function=get_face_own_goal_orientation)
+                ),
+                reward_function=CombinedReward(
+                    (lucy_reward, 0.6),
+                    (touch_ball_reward, 0.4),
+                    (goal_velocity_reward, 0.3),
+                    (AerialDirectionalTouchReward(), 0.2)
+                ),
+                termination_condition=goal_condition,
+                truncation_condition=med_timeout,
+                difficulty_params={},
+                success_threshold=0.5
+            ),
+            SkillModule(
+                name="Flip Reset Setups",
+                state_mutator=MutatorSequence(
+                    FixedTeamSizeMutator(blue_size=1, orange_size=1),
+                    BallPositionMutator(position_function=SafePositionWrapper(
+                        lambda: np.array([np.random.uniform(-1000, 1000), 2500, np.random.uniform(900, 1200)])
+                    )),
+                    CarPositionMutator(car_id="blue-0",
+                                      position_function=SafePositionWrapper(
+                                          lambda: np.array([np.random.uniform(-500, 500), 1500, 17])
+                                      ),
+                                      orientation_function=get_face_opp_goal_orientation),
+                    CarBoostMutator(boost_amount=100, car_id="blue-0"),
+                    CarPositionMutator(car_id="orange-0",
+                                      position_function=SafePositionWrapper(get_orange_primary_defender_position),
+                                      orientation_function=get_face_own_goal_orientation)
+                ),
+                reward_function=CombinedReward(
+                    (lucy_reward, 0.6),
+                    (FlipResetReward(obtain_flip_weight=0.6, hit_ball_weight=1.0), 0.8),
+                    (AerialControlReward(), 0.3),
+                    (AerialDirectionalTouchReward(), 0.3)
+                ),
+                termination_condition=goal_condition,
+                truncation_condition=med_timeout,
+                difficulty_params={},
+                success_threshold=0.4
+            )
+        ],
+        base_task_prob=0.6,
+        progression_requirements=ProgressionRequirements(
+            min_success_rate=0.5, min_avg_reward=0.3, min_episodes=200,
             max_std_dev=2.5, required_consecutive_successes=2
         ),
-        hyperparameter_adjustments=None,
-        skill_modules=[],
-        base_task_prob=1.0, # Added for consistency
+        hyperparameter_adjustments={
+            "lr_actor": lr_actor * 0.8,
+            "lr_critic": lr_critic * 0.8,
+            "entropy_coef": 0.006
+        },
+        debug=debug
+    )
+
+    # ======== STAGE 5: BASIC 2v2 ========
+    basic_2v2_stage = SkillBasedCurriculumStage(
+        name="Basic 2v2",
+        base_task_state_mutator=MutatorSequence(
+            FixedTeamSizeMutator(blue_size=2, orange_size=2),
+            KickoffMutator()
+        ),
+        base_task_reward_function=CombinedReward(
+            (lucy_reward, 1.0),
+            (TeamSpacingReward(), 0.3),
+            (TeamPossessionReward(), 0.3)
+        ),
+        base_task_termination_condition=goal_condition,
+        base_task_truncation_condition=match_timeout,
+        skill_modules=[
+            SkillModule(
+                name="Teammate Passing",
+                state_mutator=MutatorSequence(
+                    FixedTeamSizeMutator(blue_size=2, orange_size=2),
+                    BallPositionMutator(position_function=SafePositionWrapper(get_ball_passing_position)),
+                    CarPositionMutator(car_id="blue-0",
+                                      position_function=SafePositionWrapper(get_blue_attacker_position),
+                                      orientation_function=get_face_opp_goal_orientation),
+                    CarPositionMutator(car_id="blue-1",
+                                      position_function=SafePositionWrapper(get_blue_support_offensive_position),
+                                      orientation_function=get_face_opp_goal_orientation),
+                    CarPositionMutator(car_id="orange-0",
+                                      position_function=SafePositionWrapper(get_orange_primary_defender_position),
+                                      orientation_function=get_face_own_goal_orientation),
+                    CarPositionMutator(car_id="orange-1",
+                                      position_function=SafePositionWrapper(get_orange_secondary_defender_position),
+                                      orientation_function=get_face_own_goal_orientation)
+                ),
+                reward_function=CombinedReward(
+                    (lucy_reward, 0.7),
+                    (TeamSpacingReward(), 0.3),
+                    (TeamPossessionReward(), 0.3),
+                    (PassCompletionReward(), 0.5),
+                    (ScoringOpportunityCreationReward(), 0.4)
+                ),
+                termination_condition=goal_condition,
+                truncation_condition=med_timeout,
+                difficulty_params={},
+                success_threshold=0.5
+            ),
+            SkillModule(
+                name="Team Defense",
+                state_mutator=MutatorSequence(
+                    FixedTeamSizeMutator(blue_size=2, orange_size=2),
+                    BallPositionMutator(position_function=SafePositionWrapper(get_defensive_ball_position)),
+                    CarPositionMutator(car_id="blue-0",
+                                      position_function=SafePositionWrapper(get_blue_primary_defender_position),
+                                      orientation_function=get_face_own_goal_orientation),
+                    CarPositionMutator(car_id="blue-1",
+                                      position_function=SafePositionWrapper(get_blue_secondary_defender_position),
+                                      orientation_function=get_face_own_goal_orientation),
+                    CarPositionMutator(car_id="orange-0",
+                                      position_function=SafePositionWrapper(get_orange_attacker_position),
+                                      orientation_function=get_face_opp_goal_orientation),
+                    CarPositionMutator(car_id="orange-1",
+                                      position_function=SafePositionWrapper(get_orange_support_position),
+                                      orientation_function=get_face_opp_goal_orientation)
+                ),
+                reward_function=CombinedReward(
+                    (lucy_reward, 0.7),
+                    (BlockSuccessReward(), 0.5),
+                    (DefensivePositioningReward(), 0.4),
+                    (BallClearanceReward(), 0.4),
+                    (TeamSpacingReward(), 0.2)
+                ),
+                termination_condition=goal_condition,
+                truncation_condition=med_timeout,
+                difficulty_params={},
+                success_threshold=0.5
+            )
+        ],
+        base_task_prob=0.7,
+        progression_requirements=ProgressionRequirements(
+            min_success_rate=0.55, min_avg_reward=0.3, min_episodes=200,
+            max_std_dev=2.0, required_consecutive_successes=2
+        ),
+        hyperparameter_adjustments={
+            "lr_actor": lr_actor * 0.7,
+            "lr_critic": lr_critic * 0.7,
+            "entropy_coef": 0.005
+        },
+        debug=debug
+    )
+
+    # ======== STAGE 6: ADVANCED TEAM PLAY & KICKOFFS (2v2) ========
+    # Create custom advanced team kickoff reward
+    advanced_kickoff_reward_2v2 = CombinedReward(
+        (FirstTouchSpeedReward(weight=2.0, team_spirit=1.0), 1.0),  # Team-based first touch reward
+        (SpeedflipReward(weight=1.0), 0.5),                         # Speedflip mechanic reward
+        (lucy_reward, 0.7),                                         # Base game reward
+        (TeamSpacingReward(), 0.4),                                # Team spacing
+        (PassCompletionReward(), 0.4),                              # Passing
+        (ScoringOpportunityCreationReward(), 0.4),                  # Creating scoring opportunities
+        (FlipResetReward(obtain_flip_weight=0.4, hit_ball_weight=0.8), 0.3),
+        (WavedashReward(scale_by_acceleration=True), 0.3),
+        (AerialDistanceReward(), 0.2),
+        (AerialDirectionalTouchReward(), 0.2)
+    )
+
+    advanced_kickoffs_2v2_stage = SkillBasedCurriculumStage(
+        name="Advanced Team Play & Kickoffs (2v2)",
+        base_task_state_mutator=MutatorSequence(
+            FixedTeamSizeMutator(blue_size=2, orange_size=2),
+            KickoffMutator()
+        ),
+        base_task_reward_function=advanced_kickoff_reward_2v2,
+        base_task_termination_condition=goal_condition,
+        base_task_truncation_condition=match_timeout,
+        skill_modules=[
+            SkillModule(
+                name="Aerial Passing Setups",
+                state_mutator=MutatorSequence(
+                    FixedTeamSizeMutator(blue_size=2, orange_size=2),
+                    BallPositionMutator(position_function=SafePositionWrapper(
+                        lambda: np.array([np.random.uniform(-1500, 1500), np.random.uniform(1500, 2500), np.random.uniform(600, 1000)])
+                    )),
+                    CarPositionMutator(car_id="blue-0",
+                                      position_function=SafePositionWrapper(get_blue_attacker_position),
+                                      orientation_function=get_face_opp_goal_orientation),
+                    CarBoostMutator(boost_amount=80, car_id="blue-0"),
+                    CarPositionMutator(car_id="blue-1",
+                                      position_function=SafePositionWrapper(get_blue_support_offensive_position),
+                                      orientation_function=get_face_opp_goal_orientation),
+                    CarPositionMutator(car_id="orange-0",
+                                      position_function=SafePositionWrapper(get_orange_primary_defender_position),
+                                      orientation_function=get_face_own_goal_orientation),
+                    CarPositionMutator(car_id="orange-1",
+                                      position_function=SafePositionWrapper(get_orange_secondary_defender_position),
+                                      orientation_function=get_face_own_goal_orientation)
+                ),
+                reward_function=CombinedReward(
+                    (lucy_reward, 0.6),
+                    (PassCompletionReward(), 0.6),
+                    (ScoringOpportunityCreationReward(), 0.5),
+                    (AerialControlReward(), 0.4),
+                    (AerialDirectionalTouchReward(), 0.3),
+                    (TeamSpacingReward(), 0.3)
+                ),
+                termination_condition=goal_condition,
+                truncation_condition=med_timeout,
+                difficulty_params={},
+                success_threshold=0.5
+            ),
+            SkillModule(
+                name="Coordinated Defense Setups",
+                state_mutator=MutatorSequence(
+                    FixedTeamSizeMutator(blue_size=2, orange_size=2),
+                    BallPositionMutator(position_function=SafePositionWrapper(get_defensive_save_ball_position)),
+                    BallVelocityMutator(velocity_function=SafePositionWrapper(get_defensive_save_ball_velocity)),
+                    CarPositionMutator(car_id="blue-0",
+                                      position_function=SafePositionWrapper(get_blue_primary_defender_position),
+                                      orientation_function=get_face_own_goal_orientation),
+                    CarPositionMutator(car_id="blue-1",
+                                      position_function=SafePositionWrapper(get_blue_secondary_defender_position),
+                                      orientation_function=get_face_own_goal_orientation),
+                    CarPositionMutator(car_id="orange-0",
+                                      position_function=SafePositionWrapper(get_orange_attacker_position),
+                                      orientation_function=get_face_opp_goal_orientation),
+                    CarPositionMutator(car_id="orange-1",
+                                      position_function=SafePositionWrapper(get_orange_support_position),
+                                      orientation_function=get_face_opp_goal_orientation)
+                ),
+                reward_function=CombinedReward(
+                    (lucy_reward, 0.6),
+                    (BlockSuccessReward(), 0.6),
+                    (DefensivePositioningReward(), 0.5),
+                    (BallClearanceReward(), 0.5),
+                    (TeamSpacingReward(), 0.4)
+                ),
+                termination_condition=goal_condition,
+                truncation_condition=med_timeout,
+                difficulty_params={},
+                success_threshold=0.5
+            ),
+            SkillModule(
+                name="Complex Random Spawns",
+                state_mutator=MutatorSequence(
+                    FixedTeamSizeMutator(blue_size=2, orange_size=2),
+                    BallPositionMutator(position_function=SafePositionWrapper(
+                        lambda: np.array([np.random.uniform(-3000, 3000), np.random.uniform(-3000, 3000), np.random.uniform(93, 800)])
+                    )),
+                    BallVelocityMutator(velocity_function=SafePositionWrapper(
+                        lambda: np.array([np.random.uniform(-500, 500), np.random.uniform(-500, 500), np.random.uniform(-100, 300)])
+                    )),
+                    CarPositionMutator(car_id="blue-0",
+                                      position_function=SafePositionWrapper(get_strategic_car_position),
+                                      orientation_function=get_random_yaw_orientation),
+                    CarPositionMutator(car_id="blue-1",
+                                      position_function=SafePositionWrapper(get_strategic_car_position),
+                                      orientation_function=get_random_yaw_orientation),
+                    CarPositionMutator(car_id="orange-0",
+                                      position_function=SafePositionWrapper(
+                                          lambda: np.array([np.random.uniform(-3000, 3000), np.random.uniform(0, 4000), 17])
+                                      ),
+                                      orientation_function=get_random_yaw_orientation),
+                    CarPositionMutator(car_id="orange-1",
+                                      position_function=SafePositionWrapper(
+                                          lambda: np.array([np.random.uniform(-3000, 3000), np.random.uniform(0, 4000), 17])
+                                      ),
+                                      orientation_function=get_random_yaw_orientation)
+                ),
+                reward_function=CombinedReward(
+                    (lucy_reward, 0.7),
+                    (PassCompletionReward(), 0.4),
+                    (TeamSpacingReward(), 0.4),
+                    (AerialControlReward(), 0.2),
+                    (FlipResetReward(obtain_flip_weight=0.3, hit_ball_weight=0.7), 0.2),
+                    (DefensivePositioningReward(), 0.2)
+                ),
+                termination_condition=goal_condition,
+                truncation_condition=long_timeout,
+                difficulty_params={},
+                success_threshold=0.45
+            )
+        ],
+        base_task_prob=0.6,
+        progression_requirements=ProgressionRequirements(
+            min_success_rate=0.5, min_avg_reward=0.3, min_episodes=250,
+            max_std_dev=2.5, required_consecutive_successes=2
+        ),
+        hyperparameter_adjustments={
+            "lr_actor": lr_actor * 0.6,
+            "lr_critic": lr_critic * 0.6,
+            "entropy_coef": 0.004
+        },
         debug=debug
     )
 
@@ -1536,20 +1345,14 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
     if use_pretraining:
         stages.append(pretraining)
 
-    # Add all other stages
+    # Add all stages based on revised progression path
     stages.extend([
-        movement_foundations,
-        ball_engagement,
-        ball_control,
-        shooting_fundamentals,
-        wall_air_mechanics,
-        beginning_team_play,
-        defense, # Now uses SkillBasedCurriculumStage
-        intermediate_ball_control,
-        defensive_rotation,
-        offensive_coordination,
-        intermediate_aerials,
-        full_2v2_integration
+        ball_touches_stage,              # Stage 1: Ball Touches (1v0)
+        scoring_stage,                   # Stage 2: Scoring (1v0)
+        basic_1v1_stage,                 # Stage 3: Basic 1v1
+        advanced_kickoffs_1v1_stage,     # Stage 4: Advanced Mechanics & Kickoffs (1v1)
+        basic_2v2_stage,                 # Stage 5: Basic 2v2
+        advanced_kickoffs_2v2_stage      # Stage 6: Advanced Team Play & Kickoffs (2v2)
     ])
 
     curriculum_manager = CurriculumManager(

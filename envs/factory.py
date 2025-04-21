@@ -7,7 +7,7 @@ from rlgym.rocket_league.sim import RocketSimEngine
 import RocketSim as rsim
 from rlgym.rocket_league.rlviser import RLViserRenderer
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
-from rewards import BallProximityReward, BallToGoalDistanceReward, BallVelocityToGoalReward, TouchBallReward, TouchBallToGoalAccelerationReward, AlignBallToGoalReward, PlayerVelocityTowardBallReward, KRCReward, create_lucy_skg_reward
+from curriculum.rewards import BallProximityReward, BallToGoalDistanceReward, BallVelocityToGoalReward, TouchBallReward, TouchBallToGoalAccelerationReward, AlignBallToGoalReward, PlayerVelocityTowardBallReward, KRCReward, create_lucy_skg_reward
 from observation import StackedActionsObs
 import numpy as np
 
@@ -15,27 +15,27 @@ import numpy as np
 def quaternion_to_rotation_matrix(quat: np.ndarray) -> np.ndarray:
     """Converts a quaternion (x, y, z, w) to a 3x3 rotation matrix."""
     x, y, z, w = quat
-    
+
     # Precompute squares
     x2, y2, z2 = x*x, y*y, z*z
-    
+
     # Precompute products
     xy, xz, yz = x*y, x*z, y*z
     wx, wy, wz = w*x, w*y, w*z
-    
+
     # Rotation matrix elements
     m00 = 1.0 - 2.0 * (y2 + z2)
     m01 = 2.0 * (xy - wz)
     m02 = 2.0 * (xz + wy)
-    
+
     m10 = 2.0 * (xy + wz)
     m11 = 1.0 - 2.0 * (x2 + z2)
     m12 = 2.0 * (yz - wx)
-    
+
     m20 = 2.0 * (xz - wy)
     m21 = 2.0 * (yz + wx)
     m22 = 1.0 - 2.0 * (x2 + y2)
-    
+
     # Return as 3x3 numpy array (transposed for RocketSim's expected format if needed)
     # RocketSim expects RotMat(m00, m01, m02, m10, m11, m12, m20, m21, m22)
     # which corresponds to row-major flattened matrix. Numpy creates row-major by default.
@@ -48,25 +48,25 @@ def quaternion_to_rotation_matrix(quat: np.ndarray) -> np.ndarray:
 def euler_to_rotation_matrix(euler: np.ndarray) -> np.ndarray:
     """Converts Euler angles (roll, pitch, yaw) to a 3x3 rotation matrix."""
     roll, pitch, yaw = euler
-    
+
     # Precompute cosines and sines of Euler angles
     cr, sr = np.cos(roll), np.sin(roll)
     cp, sp = np.cos(pitch), np.sin(pitch)
     cy, sy = np.cos(yaw), np.sin(yaw)
-    
+
     # Rotation matrix elements
     m00 = cy * cp
     m01 = cy * sp * sr - sy * cr
     m02 = cy * sp * cr + sy * sr
-    
+
     m10 = sy * cp
     m11 = sy * sp * sr + cy * cr
     m12 = sy * sp * cr - cy * sr
-    
+
     m20 = -sp
     m21 = cp * sr
     m22 = cp * cr
-    
+
     return np.array([
         [m00, m01, m02],
         [m10, m11, m12],
@@ -77,12 +77,12 @@ def euler_to_rotation_matrix(euler: np.ndarray) -> np.ndarray:
 # Patched RocketSim engine to handle None car positions and prioritize quat
 class PatchedRocketSimEngine(RocketSimEngine):
     """A patched version of RocketSimEngine that ensures car positions are never None"""
-    
+
     def __init__(self, debug=False):
         # The parent class no longer accepts rlbot_delay parameter
         super().__init__()
         self.debug = debug
-    
+
     def _set_car_state(self, car: rsim.Car, desired_car: any):
         """
         Sets the state of a RocketSim car to match a given car state.
@@ -93,7 +93,7 @@ class PatchedRocketSimEngine(RocketSimEngine):
             if not hasattr(desired_car, 'physics') or desired_car.physics is None:
                 from rlgym.rocket_league.api import PhysicsObject
                 desired_car.physics = PhysicsObject()
-            
+
             if not hasattr(desired_car.physics, 'position') or desired_car.physics.position is None:
                 desired_car.physics.position = np.array([0, 0, 17])
             if not hasattr(desired_car.physics, 'linear_velocity') or desired_car.physics.linear_velocity is None:
@@ -103,7 +103,7 @@ class PatchedRocketSimEngine(RocketSimEngine):
             # --- End basic physics validation ---
             # Create a new car state
             car_state = rsim.CarState()
-            
+
             # --- Set Position (Added Debugging) ---
             position_to_set = np.array([0, 0, 17]) # Default
             if hasattr(desired_car.physics, 'position') and desired_car.physics.position is not None:
@@ -114,7 +114,7 @@ class PatchedRocketSimEngine(RocketSimEngine):
                     else:
                         # Convert if it's a list/tuple
                         pos_read = np.array(desired_car.physics.position)
-                    
+
                     if pos_read.shape == (3,) and not np.isnan(pos_read).any():
                         position_to_set = pos_read
                         if self.debug:
@@ -128,7 +128,7 @@ class PatchedRocketSimEngine(RocketSimEngine):
             else:
                 if self.debug:
                     print(f"[DEBUG _set_car_state] No position attribute found, using default.")
-            
+
             car_state.pos = rsim.Vec(*position_to_set)
             # --- End Position Setting ---
 
@@ -137,12 +137,12 @@ class PatchedRocketSimEngine(RocketSimEngine):
             if hasattr(desired_car.physics, 'linear_velocity') and desired_car.physics.linear_velocity is not None:
                  vel_to_set = np.asarray(desired_car.physics.linear_velocity)
             car_state.vel = rsim.Vec(*vel_to_set)
-            
+
             ang_vel_to_set = np.zeros(3)
             if hasattr(desired_car.physics, 'angular_velocity') and desired_car.physics.angular_velocity is not None:
                  ang_vel_to_set = np.asarray(desired_car.physics.angular_velocity)
             car_state.ang_vel = rsim.Vec(*ang_vel_to_set)
-            
+
             # --- Set Rotation (Read Euler from desired_car._temp_euler_rotation) ---
             rotation_matrix_to_set = None
             read_euler = None # Debug variable
@@ -150,7 +150,7 @@ class PatchedRocketSimEngine(RocketSimEngine):
                 # Check if temporary Euler rotation exists and is valid
                 if hasattr(desired_car, '_temp_euler_rotation') and desired_car._temp_euler_rotation is not None:
                     # Read the temporary Euler angles
-                    euler_angles = desired_car._temp_euler_rotation 
+                    euler_angles = desired_car._temp_euler_rotation
                     read_euler = euler_angles # Store for debugging
                     if isinstance(euler_angles, (np.ndarray, list, tuple)) and len(euler_angles) == 3:
                         euler_angles_np = np.asarray(euler_angles)
@@ -168,7 +168,7 @@ class PatchedRocketSimEngine(RocketSimEngine):
             except Exception as e:
                 # Print the actual exception
                 if self.debug:
-                    print(f"[DEBUG _set_car_state] Error processing _temp_euler_rotation: {repr(e)}") 
+                    print(f"[DEBUG _set_car_state] Error processing _temp_euler_rotation: {repr(e)}")
                 rotation_matrix_to_set = None # Fallback if conversion fails
 
             # If still no valid rotation, use identity matrix
@@ -189,13 +189,13 @@ class PatchedRocketSimEngine(RocketSimEngine):
                 print(f"[DEBUG _set_car_state] Flattened rot_elements: {rot_elements}") # Debug print
             car_state.rot_mat = rsim.RotMat(*rot_elements)
             # --- End Rotation Setting ---
-            
+
             # --- Set Other Car State Attributes (Simplified) ---
             # Use getattr with defaults to avoid errors if attributes are missing
             car_state.boost = float(getattr(desired_car, 'boost_amount', 33.3))
             car_state.is_demoed = bool(getattr(desired_car, 'is_demoed', False))
             car_state.demo_respawn_timer = float(getattr(desired_car, 'demo_respawn_timer', 0.0))
-            
+
             # Jump/Flip related attributes (ensure boolean/float types)
             car_state.has_jumped = bool(getattr(desired_car, 'has_jumped', False))
             car_state.has_double_jumped = bool(getattr(desired_car, 'has_double_jumped', False))
@@ -205,16 +205,16 @@ class PatchedRocketSimEngine(RocketSimEngine):
             car_state.air_time_since_jump = float(getattr(desired_car, 'air_time_since_jump', 0.0))
             car_state.jump_time = float(getattr(desired_car, 'jump_time', 0.0))
             car_state.flip_time = float(getattr(desired_car, 'flip_time', 0.0))
-            
+
             # Flip torque (needs to be Vec)
             flip_torque_val = getattr(desired_car, 'flip_torque', np.zeros(3))
             if flip_torque_val is None: flip_torque_val = np.zeros(3)
             car_state.flip_rel_torque = rsim.Vec(*np.asarray(flip_torque_val))
-            
+
             # Supersonic state
             car_state.is_supersonic = bool(getattr(desired_car, 'is_supersonic', False))
             car_state.supersonic_time = float(getattr(desired_car, 'supersonic_time', 0.0))
-            
+
             # Handbrake
             car_state.handbrake_val = float(getattr(desired_car, 'handbrake', 0.0)) # RocketSim uses float for handbrake value
 
@@ -273,7 +273,7 @@ def get_env(renderer=None, action_stacker=None, curriculum_config=None, debug=Fa
     if curriculum_config is not None:
         if debug:
             print(f"[DEBUG] Creating environment with curriculum config: {curriculum_config['stage_name']}")
-            
+
             # Debug the state mutator to check for car position initialization
             state_mutator = curriculum_config["state_mutator"]
             if hasattr(state_mutator, 'mutators'):
@@ -284,7 +284,7 @@ def get_env(renderer=None, action_stacker=None, curriculum_config=None, debug=Fa
                         print(f"[DEBUG]     Found CarPositionMutator in position {i}")
             else:
                 print(f"[DEBUG] State mutator is a single mutator: {state_mutator.__class__.__name__}")
-        
+
         # Create the environment with the provided configuration
         env = RLGym(
             state_mutator=curriculum_config["state_mutator"],
@@ -297,7 +297,7 @@ def get_env(renderer=None, action_stacker=None, curriculum_config=None, debug=Fa
             transition_engine=PatchedRocketSimEngine(debug=debug),
             renderer=renderer
         )
-        
+
         # Add debugging during environment reset/step if needed
         if debug:
             orig_reset = env.reset
@@ -313,9 +313,9 @@ def get_env(renderer=None, action_stacker=None, curriculum_config=None, debug=Fa
                         # Inspect the car physics problem
                         print("[DEBUG] Car position is None! This is likely from missing CarPositionMutator")
                     raise
-            
+
             env.reset = debug_reset
-        
+
         return env
 
     # Otherwise use the default configuration
