@@ -411,12 +411,17 @@ class TouchBallCondition(DoneCondition[AgentID, GameState]):
 
     def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
         """Reset the touch tracking for all agents, safely handling missing last_touch."""
+        # Clear previous touch time dictionary to ensure no stale references
+        if hasattr(self, 'last_touch_time') and self.last_touch_time:
+            self.last_touch_time.clear()
+        
         # Safely check if initial_state has last_touch and if it's not None
         last_touch_time = 0.0
         if hasattr(initial_state, 'last_touch') and initial_state.last_touch:
             if hasattr(initial_state.last_touch, 'time_seconds'):
                  last_touch_time = initial_state.last_touch.time_seconds
 
+        # Create a fresh dictionary with only current agents
         self.last_touch_time = {agent: last_touch_time for agent in agents}
 
 
@@ -433,13 +438,21 @@ class TouchBallCondition(DoneCondition[AgentID, GameState]):
              if hasattr(state.last_touch, 'player_index'):
                  touching_player_index = state.last_touch.player_index
 
+        # Periodic cleanup: Remove any agents that aren't in the current list
+        # This prevents the dictionary from growing indefinitely
+        if hasattr(self, 'last_touch_time'):
+            agent_ids_to_remove = [agent_id for agent_id in self.last_touch_time.keys() 
+                                  if agent_id not in agents]
+            for agent_id in agent_ids_to_remove:
+                self.last_touch_time.pop(agent_id, None)
+
         for agent in agents:
-            # Initialize to the reset time if this agent hasn't been seen before
-            if agent not in self.last_touch_time:
-                self.last_touch_time[agent] = self.last_touch_time.get(agent, 0.0) # Use the initial reset time
+            # Use a default value if agent not in dictionary rather than adding it
+            # This prevents the dictionary from growing if agents are temporary
+            last_touch = self.last_touch_time.get(agent, 0.0)
 
             # Check if there is a touch and it's more recent than what we've stored
-            if current_touch_time > self.last_touch_time[agent]:
+            if current_touch_time > last_touch:
                 # Check if this agent was the one who touched the ball
                 if touching_player_index == agent:
                     is_done[agent] = True

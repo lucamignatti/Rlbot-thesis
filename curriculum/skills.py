@@ -151,7 +151,24 @@ class SkillBasedCurriculumStage(CurriculumStage):
         """Returns the stage configuration with parameters adjusted for difficulty level."""
         # Determine if we should use a base task or a specialized skill module
         is_base_task, selected_skill = self._select_task_for_training()
+        
+        # Free previous selected_skill reference to avoid potential memory issues
+        prev_selected_skill = self.selected_skill
         self.selected_skill = selected_skill
+        
+        # Force immediate cleanup of previous skill if changed
+        if prev_selected_skill is not None and prev_selected_skill is not self.selected_skill:
+            prev_selected_skill = None
+            
+            # Run an immediate cleanup every 10 configuration changes
+            if hasattr(self, '_config_counter'):
+                self._config_counter += 1
+                if self._config_counter >= 10:
+                    self._config_counter = 0
+                    import gc
+                    gc.collect()
+            else:
+                self._config_counter = 0
 
         if is_base_task:
             # Use base task
@@ -162,32 +179,15 @@ class SkillBasedCurriculumStage(CurriculumStage):
             if self.debug:
                 print(f"[DEBUG] Stage: {self.name} - Using base task with difficulty {difficulty_level}")
 
-                # Check for car position mutator
-                mutators = []
-                if isinstance(self.state_mutator, MutatorSequence):
-                    mutators = self.state_mutator.mutators
-                else:
-                    mutators = [self.state_mutator]
-
-                has_car_pos = False
-                for mutator in mutators:
-                    if isinstance(mutator, CarPositionMutator):
-                        has_car_pos = True
-                        print(f"[DEBUG] Base task has CarPositionMutator: {mutator}")
-
-                if not has_car_pos:
-                    print(f"[DEBUG] WARNING: Base task for '{self.name}' does not have a CarPositionMutator!")
-
             return config
         else:
             # Use the selected skill module
             skill_config = self.selected_skill.get_config(difficulty_level)
-
+            
             if self.debug:
                 print(f"[DEBUG] Stage: {self.name} - Using skill module: {self.selected_skill.name}")
-                print(f"[DEBUG] Skill mutator: {self.selected_skill.state_mutator}")
-                print(f"[DEBUG] Skill config: {skill_config}")
 
+            # Create a minimal config dictionary to reduce memory usage
             return {
                 "stage_name": f"{self.name} - {self.selected_skill.name}",
                 "state_mutator": self.selected_skill.state_mutator,
@@ -328,19 +328,40 @@ class SkillBasedCurriculumStage(CurriculumStage):
         Clean up resources to prevent memory leaks.
         This should be called when the stage is completed or no longer needed.
         """
+        if self.debug:
+            print(f"[DEBUG] Cleaning up SkillBasedCurriculumStage: {self.name}")
+            
         # Clear dictionaries that track skill statistics
         self.skill_episodes.clear()
         self.skill_successes.clear()
         
         # Clean up each skill module's large data structures
         for skill in self.skill_modules:
-            if hasattr(skill, 'rewards_history'):
+            if hasattr(skill, 'rewards_history') and skill.rewards_history:
                 skill.rewards_history.clear()
-            if hasattr(skill, 'success_history'):
+            if hasattr(skill, 'success_history') and skill.success_history:
                 skill.success_history.clear()
+            
+            # Reset counters to reduce memory impact of large numbers
+            skill.episode_count = 0
+            skill.success_count = 0
+            skill.success_rate = 0.0
                 
         # Break any potential circular references
         self.selected_skill = None
+        
+        # Also clean the parent class's collections
+        if hasattr(self, 'rewards_history') and self.rewards_history:
+            self.rewards_history.clear()
+            
+        # Reset base tracking counters
+        self.episode_count = 0
+        self.success_count = 0
+        self.failure_count = 0
+        self.moving_success_rate = 0.0
+        self.moving_avg_reward = 0.0
+        self.base_task_episodes = 0
+        self.base_task_successes = 0
         
         # Force garbage collection
         import gc

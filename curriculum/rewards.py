@@ -292,10 +292,17 @@ class TouchBallReward(BaseRewardFunction):
         super().__init__()
         self.last_touched = {}
         self.weight = weight
+        self._cleanup_counter = 0
 
     def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
         """Reset last touched status for all agents"""
+        # Clear previous state to prevent memory leaks
+        if hasattr(self, 'last_touched') and self.last_touched:
+            self.last_touched.clear()
+            
+        # Create fresh dictionary with only current agents
         self.last_touched = {str(agent): False for agent in agents}
+        self._cleanup_counter = 0
 
     def calculate(self, agent_id, state: GameState, previous_state: Optional[GameState] = None) -> float:
         if not state or not hasattr(state, 'last_touch') or not state.last_touch:
@@ -310,19 +317,30 @@ class TouchBallReward(BaseRewardFunction):
             except AttributeError:
                 car_id = str(agent_id)
 
-        # Initialize for this player if not already present
-        if car_id not in self.last_touched:
-            self.last_touched[car_id] = False
+        # Periodically clean up stale entries
+        self._cleanup_counter += 1
+        if self._cleanup_counter >= 100:
+            self._cleanup_counter = 0
+            # Remove entries for agents not in current state
+            if hasattr(state, 'cars'):
+                car_ids_to_keep = set(str(car_id) for car_id in state.cars.keys())
+                keys_to_remove = [key for key in self.last_touched.keys() 
+                                 if key not in car_ids_to_keep]
+                for key in keys_to_remove:
+                    self.last_touched.pop(key, None)
+
+        # Use get() with default instead of modifying dictionary
+        was_touched = self.last_touched.get(car_id, False)
 
         # Check if this player touched the ball
         player_touched = state.last_touch.player_index == car_id
-        if player_touched and not self.last_touched[car_id]:
+        if player_touched and not was_touched:
             self.last_touched[car_id] = True
             # Weight as per paper's "Touch" function (weight = 0.05)
             return self.weight
 
         # Reset touch status if not currently touching
-        if not player_touched:
+        if not player_touched and car_id in self.last_touched:
             self.last_touched[car_id] = False
 
         return 0.0
@@ -341,7 +359,15 @@ class TouchBallToGoalAccelerationReward(BaseRewardFunction):
 
     def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
         """Reset last velocity for all agents"""
+        # Clear previous velocity dictionary to prevent memory leaks
+        if hasattr(self, 'last_velocity') and self.last_velocity:
+            self.last_velocity.clear()
+            
+        # Create fresh dictionary with only current agents
         self.last_velocity = {str(agent): None for agent in agents}
+        
+        # Initialize cleanup counter
+        self._cleanup_counter = 0
 
     def calculate(self, agent_id, state: GameState, previous_state: Optional[GameState] = None) -> float:
         if (not state or not hasattr(state, 'ball') or not state.ball or
@@ -357,16 +383,30 @@ class TouchBallToGoalAccelerationReward(BaseRewardFunction):
             except AttributeError:
                 car_id = str(agent_id)
 
-        # Initialize for this player if not already present
-        if car_id not in self.last_velocity:
-            self.last_velocity[car_id] = None
+        # Periodically clean up stale entries
+        if hasattr(self, '_cleanup_counter'):
+            self._cleanup_counter += 1
+            if self._cleanup_counter >= 100:
+                self._cleanup_counter = 0
+                # Remove entries for agents not in current state
+                if hasattr(state, 'cars'):
+                    car_ids_to_keep = set(str(car_id) for car_id in state.cars.keys())
+                    keys_to_remove = [key for key in self.last_velocity.keys() 
+                                     if key not in car_ids_to_keep]
+                    for key in keys_to_remove:
+                        self.last_velocity.pop(key, None)
+        else:
+            self._cleanup_counter = 0
 
+        # Get previous velocity with default of None
+        prev_velocity = self.last_velocity.get(car_id, None)
         current_vel = np.array(state.ball.linear_velocity)
 
         # If no previous velocity or no touch, update and return 0
         player_touched = hasattr(state, 'last_touch') and state.last_touch and state.last_touch.player_index == car_id
-        if self.last_velocity[car_id] is None or not player_touched:
-            self.last_velocity[car_id] = current_vel
+        if prev_velocity is None or not player_touched:
+            if player_touched:  # Only add to dictionary if player touched
+                self.last_velocity[car_id] = current_vel
             return 0.0
 
         # Calculate acceleration towards goal
@@ -379,11 +419,13 @@ class TouchBallToGoalAccelerationReward(BaseRewardFunction):
         to_goal = to_goal / to_goal_dist
 
         # Get change in velocity towards goal
-        prev_vel_to_goal = np.dot(self.last_velocity[car_id], to_goal)
+        prev_vel_to_goal = np.dot(prev_velocity, to_goal)
         curr_vel_to_goal = np.dot(current_vel, to_goal)
         acceleration = curr_vel_to_goal - prev_vel_to_goal
 
-        self.last_velocity[car_id] = current_vel
+        # Update last velocity only if player touched
+        if player_touched:
+            self.last_velocity[car_id] = current_vel
 
         # Per paper "Touch Ball-to-Goal Acceleration" with weight 0.25
         # This doubles function range by introducing direction and penalizes for hitting the ball toward team goal
