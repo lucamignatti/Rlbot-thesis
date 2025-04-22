@@ -181,13 +181,8 @@ def _parse_observation(obs_array: np.ndarray) -> Dict[str, np.ndarray]:
 
 def _calculate_stats_from_obs(obs_dict: Dict[str, np.ndarray]) -> Dict[str, float]:
     """
-    Calculate environment statistics from a single environment's observation dict.
-
-    Args:
-        obs_dict: Dictionary mapping agent IDs to observation arrays
-
-    Returns:
-        Dictionary of calculated statistics
+    Calculate streamlined environment statistics from a single environment's observation dict.
+    Focuses on key metrics that indicate play speed, aerial mechanics, and positioning.
     """
     if not obs_dict:
         return {}
@@ -197,157 +192,90 @@ def _calculate_stats_from_obs(obs_dict: Dict[str, np.ndarray]) -> Dict[str, floa
 
     # Process each agent's observation
     for agent_id, obs_array in obs_dict.items():
-        agent_data = _parse_observation(obs_array)
-        if agent_data:  # Only include if parsing was successful
-            agent_stats.append(agent_data)
+        if not isinstance(obs_array, np.ndarray) or obs_array.size == 0:
+            continue
 
-    # If no valid agent data was parsed, return empty dict
+        # Single agent stats dictionary
+        stats = {}
+        try:
+            # Extract basic positional and velocity information
+            stats['ball_pos'] = obs_array[0:3] if len(obs_array) > 3 else np.zeros(3)
+            stats['ball_lin_vel'] = obs_array[3:6] if len(obs_array) > 6 else np.zeros(3)
+            stats['car_pos'] = obs_array[13:16] if len(obs_array) > 16 else np.zeros(3)
+            stats['car_lin_vel'] = obs_array[16:19] if len(obs_array) > 19 else np.zeros(3)
+
+            # Car boost amount (typically index 31)
+            stats['car_boost'] = float(obs_array[31]) if len(obs_array) > 31 else 0.0
+
+            # Car ground state (typically index 32)
+            stats['car_on_ground'] = bool(obs_array[32]) if len(obs_array) > 32 else True
+
+            # Calculate derived metrics
+            stats['ball_height'] = stats['ball_pos'][2]  # z-coordinate
+            stats['ball_speed'] = np.linalg.norm(stats['ball_lin_vel'])
+            stats['car_height'] = stats['car_pos'][2]  # z-coordinate
+            stats['car_speed'] = np.linalg.norm(stats['car_lin_vel'])
+
+            # Positional metrics
+            blue_goal = np.array([0, -50, 0])
+            orange_goal = np.array([0, 50, 0])
+            stats['ball_blue_goal_dist'] = np.linalg.norm(stats['ball_pos'] - blue_goal)
+            stats['ball_orange_goal_dist'] = np.linalg.norm(stats['ball_pos'] - orange_goal)
+            stats['car_blue_goal_dist'] = np.linalg.norm(stats['car_pos'] - blue_goal)
+            stats['car_orange_goal_dist'] = np.linalg.norm(stats['car_pos'] - orange_goal)
+
+            # Distance between car and ball
+            ball_car_vector = stats['ball_pos'] - stats['car_pos']
+            stats['ball_car_distance'] = np.linalg.norm(ball_car_vector)
+
+            # Binary state calculations
+            stats['car_in_air'] = not stats['car_on_ground']
+            stats['ball_in_air'] = stats['ball_height'] > 20  # ~20 units is car height
+            stats['car_supersonic'] = stats['car_speed'] >= (0.95 * 2300)  # 95% of max speed
+            stats['close_to_ball'] = stats['ball_car_distance'] < 200  # Within touch range
+
+            agent_stats.append(stats)
+        except Exception as e:
+            if len(obs_array) > 0:
+                print(f"Error parsing observation (len={len(obs_array)}): {str(e)}")
+            continue
+
     if not agent_stats:
         return {}
 
-    # ------ Ball Control & Touch Metrics ------
-    # Ball heights
-    ball_heights = [agent['ball_height'] for agent in agent_stats if 'ball_height' in agent]
-    if ball_heights:
-        env_stats['ball_height_avg'] = float(np.mean(ball_heights))
-        env_stats['ball_height_max'] = float(np.max(ball_heights))
+    # Calculate environment-wide averages
+    try:
+        # Core metrics about ball
+        env_stats['ball_height_mean'] = float(np.mean([s['ball_height'] for s in agent_stats]))
+        env_stats['ball_speed_mean'] = float(np.mean([s['ball_speed'] for s in agent_stats]))
 
-    # Ball in air percentage across agents
-    ball_in_air = [agent['ball_in_air'] for agent in agent_stats if 'ball_in_air' in agent]
-    if ball_in_air:
-        env_stats['ball_in_air_pct'] = float(np.mean([float(x) for x in ball_in_air]))
+        # Core metrics about cars
+        env_stats['car_height_mean'] = float(np.mean([s['car_height'] for s in agent_stats]))
+        env_stats['car_speed_mean'] = float(np.mean([s['car_speed'] for s in agent_stats]))
+        env_stats['boost_amount_mean'] = float(np.mean([s['car_boost'] for s in agent_stats]))
 
-    # Ball speeds
-    ball_speeds = [agent['ball_speed'] for agent in agent_stats if 'ball_speed' in agent]
-    if ball_speeds:
-        env_stats['ball_speed_avg'] = float(np.mean(ball_speeds))
-        env_stats['ball_speed_max'] = float(np.max(ball_speeds))
+        # Distance metrics
+        env_stats['ball_car_dist_mean'] = float(np.mean([s['ball_car_distance'] for s in agent_stats]))
+        env_stats['ball_blue_goal_dist_mean'] = float(np.mean([s['ball_blue_goal_dist'] for s in agent_stats]))
+        env_stats['ball_orange_goal_dist_mean'] = float(np.mean([s['ball_orange_goal_dist'] for s in agent_stats]))
+        env_stats['car_blue_goal_dist_mean'] = float(np.mean([s['car_blue_goal_dist'] for s in agent_stats]))
+        env_stats['car_orange_goal_dist_mean'] = float(np.mean([s['car_orange_goal_dist'] for s in agent_stats]))
 
-        # Fast ball percentage (above 40 speed)
-        fast_ball_threshold = 40
-        env_stats['fast_ball_pct'] = float(np.mean([float(x > fast_ball_threshold) for x in ball_speeds]))
+        # Percentage metrics (already averages)
+        env_stats['supersonic_pct_mean'] = float(np.mean([float(s['car_supersonic']) for s in agent_stats]))
+        env_stats['car_in_air_pct_mean'] = float(np.mean([float(s['car_in_air']) for s in agent_stats]))
+        env_stats['ball_in_air_pct_mean'] = float(np.mean([float(s['ball_in_air']) for s in agent_stats]))
+        env_stats['close_to_ball_pct_mean'] = float(np.mean([float(s['close_to_ball']) for s in agent_stats]))
 
-    # Ball angular speed (rotation/spin)
-    ball_ang_speeds = [agent['ball_ang_speed'] for agent in agent_stats if 'ball_ang_speed' in agent]
-    if ball_ang_speeds:
-        env_stats['ball_spin_avg'] = float(np.mean(ball_ang_speeds))
-
-    # Ball goal proximity
-    blue_goal_dists = [agent['ball_dist_to_blue_goal'] for agent in agent_stats if 'ball_dist_to_blue_goal' in agent]
-    orange_goal_dists = [agent['ball_dist_to_orange_goal'] for agent in agent_stats if 'ball_dist_to_orange_goal' in agent]
-
-    if blue_goal_dists and orange_goal_dists:
-        env_stats['ball_blue_goal_dist_avg'] = float(np.mean(blue_goal_dists))
-        env_stats['ball_orange_goal_dist_avg'] = float(np.mean(orange_goal_dists))
-
-        # Calculate if ball is in dangerous zone (close to either goal)
-        danger_threshold = 2000  # Closer than X units to goal is "danger zone"
-        env_stats['ball_in_blue_danger'] = float(np.mean([float(d < danger_threshold) for d in blue_goal_dists]))
-        env_stats['ball_in_orange_danger'] = float(np.mean([float(d < danger_threshold) for d in orange_goal_dists]))
-
-    # ------ Car Movement & Mechanics ------
-    # Car heights
-    car_heights = [agent['car_height'] for agent in agent_stats if 'car_height' in agent]
-    if car_heights:
-        env_stats['car_height_avg'] = float(np.mean(car_heights))
-        env_stats['car_height_max'] = float(np.max(car_heights))
-
-    # Car in air percentage
-    car_in_air = [agent['car_in_air'] for agent in agent_stats if 'car_in_air' in agent]
-    if car_in_air:
-        env_stats['car_in_air_pct'] = float(np.mean([float(x) for x in car_in_air]))
-
-    # Boost metrics
-    boost_levels = [agent['car_boost'] for agent in agent_stats if 'car_boost' in agent]
-    if boost_levels:
-        env_stats['boost_amount_avg'] = float(np.mean(boost_levels))
-        env_stats['boost_amount_min'] = float(np.min(boost_levels))
-
-        # Low boost percentage (less than 25%)
-        low_boost_threshold = 0.25
-        env_stats['low_boost_pct'] = float(np.mean([float(b < low_boost_threshold) for b in boost_levels]))
-
-    # Car speeds
-    car_speeds = [agent['car_speed'] for agent in agent_stats if 'car_speed' in agent]
-    if car_speeds:
-        env_stats['car_speed_avg'] = float(np.mean(car_speeds))
-        env_stats['car_speed_max'] = float(np.max(car_speeds))
-
-    # Supersonic percentage
-    car_supersonic = [agent['car_supersonic'] for agent in agent_stats if 'car_supersonic' in agent]
-    if car_supersonic:
-        env_stats['supersonic_pct'] = float(np.mean([float(x) for x in car_supersonic]))
-
-    # ------ Positioning & Strategy ------
-    # Ball-car distance metrics
-    ball_car_distances = [agent['ball_car_distance'] for agent in agent_stats if 'ball_car_distance' in agent]
-    if ball_car_distances:
-        env_stats['ball_car_dist_avg'] = float(np.mean(ball_car_distances))
-        env_stats['ball_car_dist_min'] = float(np.min(ball_car_distances))
-
-        # Close to ball percentage (within 200 units)
-        close_threshold = 200
-        env_stats['close_to_ball_pct'] = float(np.mean([float(d < close_threshold) for d in ball_car_distances]))
-
-    # Height difference between car and ball
-    height_diffs = [agent['height_diff_car_ball'] for agent in agent_stats if 'height_diff_car_ball' in agent]
-    if height_diffs:
-        env_stats['height_diff_car_ball_avg'] = float(np.mean(height_diffs))
-
-        # Car above ball percentage
-        env_stats['car_above_ball_pct'] = float(np.mean([float(h > 0) for h in height_diffs]))
-
-    # Car goal distances
-    car_blue_dists = [agent['car_dist_to_blue_goal'] for agent in agent_stats if 'car_dist_to_blue_goal' in agent]
-    car_orange_dists = [agent['car_dist_to_orange_goal'] for agent in agent_stats if 'car_dist_to_orange_goal' in agent]
-
-    if car_blue_dists:
-        env_stats['car_blue_goal_dist_avg'] = float(np.mean(car_blue_dists))
-
-    if car_orange_dists:
-        env_stats['car_orange_goal_dist_avg'] = float(np.mean(car_orange_dists))
-
-    # Field positioning
-    car_in_blue = [agent['car_in_blue_half'] for agent in agent_stats if 'car_in_blue_half' in agent]
-    car_in_orange = [agent['car_in_orange_half'] for agent in agent_stats if 'car_in_orange_half' in agent]
-
-    if car_in_blue:
-        env_stats['car_in_blue_half_pct'] = float(np.mean([float(x) for x in car_in_blue]))
-
-    if car_in_orange:
-        env_stats['car_in_orange_half_pct'] = float(np.mean([float(x) for x in car_in_orange]))
-
-    # ------ Advanced Metrics ------
-    # Aerial hit potential percentage
-    aerial_potentials = [agent['aerial_hit_potential'] for agent in agent_stats if 'aerial_hit_potential' in agent]
-    if aerial_potentials:
-        env_stats['aerial_potential_pct'] = float(np.mean([float(x) for x in aerial_potentials]))
-
-    # Car facing ball ratio (how directly the car is facing the ball)
-    facing_ball_values = [agent['facing_ball'] for agent in agent_stats if 'facing_ball' in agent]
-    if facing_ball_values:
-        env_stats['facing_ball_avg'] = float(np.mean(facing_ball_values))
-
-        # Directly facing ball percentage (cos angle > 0.7, which is ~45 degrees)
-        direct_threshold = 0.7
-        env_stats['direct_facing_ball_pct'] = float(np.mean([float(v > direct_threshold) for v in facing_ball_values]))
-
-    # Touch potential percentage
-    potential_touches = [agent['potential_touch'] for agent in agent_stats if 'potential_touch' in agent]
-    if potential_touches:
-        env_stats['touch_potential_pct'] = float(np.mean([float(x) for x in potential_touches]))
+    except Exception as e:
+        print(f"Error calculating environment averages: {str(e)}")
+        return {}
 
     return env_stats
 
 def _aggregate_env_stats(env_stats_list: List[Dict[str, float]]) -> Dict[str, float]:
     """
-    Aggregate statistics across multiple environments.
-
-    Args:
-        env_stats_list: List of environment stats dictionaries
-
-    Returns:
-        Aggregated statistics with mean, std, min, max for each metric
+    Aggregate statistics across multiple environments, focusing only on means.
     """
     if not env_stats_list:
         return {}
@@ -358,33 +286,39 @@ def _aggregate_env_stats(env_stats_list: List[Dict[str, float]]) -> Dict[str, fl
     if not valid_env_stats:
         return {}
 
-    # Get all unique keys across all environment stats
-    all_keys = set()
-    for env_stats in valid_env_stats:
-        all_keys.update(env_stats.keys())
-
     aggregated_stats = {}
 
-    # For each stat, calculate aggregate metrics
-    for key in all_keys:
-        # Get all values for this stat across environments
+    # List of metrics we want to track
+    tracked_metrics = [
+        'ball_height_mean',
+        'ball_speed_mean',
+        'car_height_mean',
+        'car_speed_mean',
+        'boost_amount_mean',
+        'ball_car_dist_mean',
+        'supersonic_pct_mean',
+        'car_in_air_pct_mean',
+        'ball_in_air_pct_mean',
+        'close_to_ball_pct_mean',
+        'ball_blue_goal_dist_mean',
+        'ball_orange_goal_dist_mean',
+        'car_blue_goal_dist_mean',
+        'car_orange_goal_dist_mean'
+    ]
+
+    # Calculate the mean across environments for each metric
+    for metric in tracked_metrics:
         values = [
-            env_stats[key] for env_stats in valid_env_stats
-            if key in env_stats and not (
-                np.isnan(env_stats[key]) or
-                np.isinf(env_stats[key])
+            env_stats[metric] for env_stats in valid_env_stats
+            if metric in env_stats and not (
+                np.isnan(env_stats[metric]) or
+                np.isinf(env_stats[metric])
             )
         ]
 
-        # Only calculate if we have valid values
         if values:
-            aggregated_stats[f"env_{key}_mean"] = float(np.mean(values))
-
-            # Only calculate std, min, max if we have multiple values
-            if len(values) > 1:
-                aggregated_stats[f"env_{key}_std"] = float(np.std(values))
-                aggregated_stats[f"env_{key}_min"] = float(np.min(values))
-                aggregated_stats[f"env_{key}_max"] = float(np.max(values))
+            # Add env_ prefix for WandB logging
+            aggregated_stats[f"env_{metric}"] = float(np.mean(values))
 
     # Add count of environments that contributed to stats
     aggregated_stats["env_count"] = len(valid_env_stats)
