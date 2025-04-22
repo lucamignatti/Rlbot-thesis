@@ -345,6 +345,7 @@ class Trainer:
         self.total_losses = collections.deque(maxlen=history_len)
         self.aux_sr_losses = collections.deque(maxlen=history_len)
         self.aux_rp_losses = collections.deque(maxlen=history_len)
+        self.episode_rewards = collections.deque(maxlen=history_len)  # Track episode rewards
 
         if self.debug:
             print(f"[DEBUG] Initialized {self.algorithm_type.upper()} algorithm on {self.device}")
@@ -540,7 +541,8 @@ class Trainer:
             'curriculum': {},
             'auxiliary': {},
             'system': {},
-            'environment': {}  # New group for environment statistics
+            'environment': {},  # Group for environment statistics
+            'rewards': {}       # New group specifically for reward metrics
         }
 
         # --- Algorithm metrics ---
@@ -652,6 +654,49 @@ class Trainer:
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
                     curriculum_metrics[f"CURR/stage_stats/{key}"] = value
 
+        # --- Reward metrics ---
+        reward_metrics = grouped_metrics['rewards']
+        
+        # Add per-update reward statistics
+        if 'mean_episode_reward' in metrics:
+            reward_metrics["REWARD/mean"] = metrics['mean_episode_reward']
+        if 'min_episode_reward' in metrics:
+            reward_metrics["REWARD/min"] = metrics['min_episode_reward']
+        if 'max_episode_reward' in metrics:
+            reward_metrics["REWARD/max"] = metrics['max_episode_reward']
+        if 'std_episode_reward' in metrics:
+            reward_metrics["REWARD/std"] = metrics['std_episode_reward']
+            
+        # Calculate and add historical reward statistics if we have enough data
+        if hasattr(self, 'episode_rewards') and len(self.episode_rewards) > 0:
+            reward_array = np.array(list(self.episode_rewards))
+            reward_metrics["REWARD/historical_mean"] = np.mean(reward_array)
+            
+            # Add percentiles for better understanding of reward distribution
+            if len(reward_array) >= 5:  # Only calculate percentiles if we have enough data
+                reward_metrics["REWARD/median"] = np.median(reward_array)
+                reward_metrics["REWARD/percentile_25"] = np.percentile(reward_array, 25)
+                reward_metrics["REWARD/percentile_75"] = np.percentile(reward_array, 75)
+                
+                # Calculate rolling statistics if we have enough data
+                if len(reward_array) >= 10:
+                    recent_rewards = reward_array[-10:]  # Last 10 episodes
+                    reward_metrics["REWARD/recent_mean"] = np.mean(recent_rewards)
+                    reward_metrics["REWARD/recent_median"] = np.median(recent_rewards)
+                    
+                    # Calculate improvement rate (comparing recent to historical)
+                    if len(reward_array) > 20:
+                        previous_rewards = reward_array[-20:-10]  # 10 episodes before the most recent 10
+                        recent_mean = np.mean(recent_rewards)
+                        previous_mean = np.mean(previous_rewards)
+                        if previous_mean != 0:  # Avoid division by zero
+                            improvement = (recent_mean - previous_mean) / abs(previous_mean) * 100
+                            reward_metrics["REWARD/improvement_percent"] = improvement
+            
+            # Add reward histogram (optional but useful)
+            if len(reward_array) >= 20:
+                reward_metrics["REWARD/distribution"] = wandb.Histogram(reward_array)
+                
         # --- System metrics ---
         system_metrics = grouped_metrics['system']
         system_metrics["SYS/training_step"] = current_step
@@ -1073,19 +1118,41 @@ class Trainer:
 
         # Use completed episode rewards from main.py if provided (for PPO)
         if completed_episode_rewards is not None and len(completed_episode_rewards) > 0:
+            # Add all completed episode rewards to our tracking deque
+            for reward in completed_episode_rewards:
+                self.episode_rewards.append(reward)
+            
+            # Calculate reward statistics
             metrics['mean_episode_reward'] = np.mean(completed_episode_rewards)
+            metrics['min_episode_reward'] = np.min(completed_episode_rewards)
+            metrics['max_episode_reward'] = np.max(completed_episode_rewards)
+            metrics['std_episode_reward'] = np.std(completed_episode_rewards)
+            
             if self.debug:
                 print(f"[DEBUG] Using {len(completed_episode_rewards)} completed episode rewards, mean: {metrics['mean_episode_reward']:.4f}")
         # Otherwise check internal episode returns (fallback, mainly for PPO)
         elif self.algorithm_type == "ppo" and hasattr(self.algorithm, 'episode_returns') and len(self.algorithm.episode_returns) > 0:
             episode_returns = list(self.algorithm.episode_returns)
             if episode_returns:
+                # Add all completed episode returns to our tracking deque
+                for reward in episode_returns:
+                    self.episode_rewards.append(reward)
+                
+                # Calculate reward statistics
                 metrics['mean_episode_reward'] = np.mean(episode_returns)
+                metrics['min_episode_reward'] = np.min(episode_returns)
+                metrics['max_episode_reward'] = np.max(episode_returns)
+                metrics['std_episode_reward'] = np.std(episode_returns)
+                
                 if self.debug:
                     print(f"[DEBUG] Using internal PPO episode returns, mean: {metrics['mean_episode_reward']:.4f}")
         # For StreamAC, mean_return is often calculated internally
         elif self.algorithm_type == "streamac" and 'mean_return' in metrics:
              metrics['mean_episode_reward'] = metrics['mean_return']
+             
+             # If there's a return value but no completed episodes, we still want to track it
+             if 'mean_return' in metrics:
+                 self.episode_rewards.append(metrics['mean_return'])
 
 
         # Log metrics (metrics dict should now contain aux losses from PPO update)
@@ -1208,6 +1275,12 @@ class Trainer:
             'numpy': np.random.get_state(),
             'random': random.getstate()
         }
+        
+        # Save episode rewards history
+        if hasattr(self, 'episode_rewards') and len(self.episode_rewards) > 0:
+            checkpoint['episode_rewards'] = list(self.episode_rewards)
+            if self.debug:
+                print(f"[DEBUG Trainer Save] Saved episode rewards history ({len(self.episode_rewards)} entries)")
 
         # Include entropy settings
         checkpoint['entropy'] = {
@@ -1425,6 +1498,33 @@ class Trainer:
                 if self.debug:
                     print(f"[DEBUG] Restored training counters: steps={self.training_step_offset}, episodes={self.total_episodes_offset}, env_steps={self.total_env_steps}")
 
+            # ===== Restore Episode Rewards History =====
+            if 'episode_rewards' in checkpoint:
+                rewards_history = checkpoint['episode_rewards']
+                # Ensure episode_rewards deque exists with correct maxlen
+                if not hasattr(self, 'episode_rewards') or self.episode_rewards is None:
+                    # Need history_len, assume 1000 as default from init if not easily accessible
+                    # A more robust way would be to store history_len in the checkpoint too
+                    history_len = getattr(self, 'history_len', 1000)
+                    self.episode_rewards = collections.deque(maxlen=history_len)
+                
+                # Clear existing deque before loading
+                self.episode_rewards.clear()
+                # Add loaded rewards
+                for reward in rewards_history:
+                    self.episode_rewards.append(reward)
+                
+                if self.debug:
+                    print(f"[DEBUG] Restored episode rewards history ({len(self.episode_rewards)} entries)")
+            else:
+                # If not in checkpoint, ensure the deque exists but is empty
+                if not hasattr(self, 'episode_rewards') or self.episode_rewards is None:
+                    history_len = getattr(self, 'history_len', 1000)
+                    self.episode_rewards = collections.deque(maxlen=history_len)
+                else:
+                    self.episode_rewards.clear() # Ensure it's empty if not loaded
+                if self.debug:
+                    print("[DEBUG] No episode rewards history found in checkpoint. Initializing empty deque.")
 
             # ===== Auto-detect models trained without pretraining =====
             if 'pretraining_completed' not in checkpoint:
