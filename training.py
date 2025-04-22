@@ -539,7 +539,8 @@ class Trainer:
             'algorithm': {},
             'curriculum': {},
             'auxiliary': {},
-            'system': {}
+            'system': {},
+            'environment': {}  # New group for environment statistics
         }
 
         # --- Algorithm metrics ---
@@ -590,6 +591,22 @@ class Trainer:
         # Add buffer size for SAC
         if self.algorithm_type == "sac":
             algorithm_metrics[f"{alg_prefix}/buffer_size"] = len(self.algorithm.memory) if hasattr(self.algorithm, 'memory') else 0
+
+
+        # --- Environment metrics (NEW) ---
+        environment_metrics = grouped_metrics['environment']
+        env_stat_count = 0
+        
+        # Extract environment statistics that were passed via metrics
+        for key, value in metrics.items():
+            # Identify environment metrics by their prefix
+            if key.startswith('env_'):
+                # Add to environment metrics group with ENV/ prefix for WandB organization
+                environment_metrics[f"ENV/{key}"] = value
+                env_stat_count += 1
+        
+        if self.debug and env_stat_count > 0:
+            print(f"[WANDB DEBUG] Adding {env_stat_count} environment metrics to WandB")
 
 
         # --- Auxiliary metrics ---
@@ -681,6 +698,8 @@ class Trainer:
         if self.debug:
             flat_metrics["_DEBUG/step_source"] = "explicit" if step is not None else "calculated"
             flat_metrics["_DEBUG/logging_timestamp"] = time.time()
+            if env_stat_count > 0:
+                flat_metrics["_DEBUG/env_stat_count"] = env_stat_count
 
         if self.debug:
             print(f"[STEP DEBUG] About to log to wandb with step={current_step}, algorithm={self.algorithm_type}")
@@ -988,9 +1007,17 @@ class Trainer:
         return result
 
 
-    def update(self, completed_episode_rewards=None, total_env_steps: Optional[int] = None, steps_per_second: Optional[float] = None):
+    def update(self, completed_episode_rewards=None, total_env_steps: Optional[int] = None, 
+              steps_per_second: Optional[float] = None, env_stats: Optional[Dict[str, float]] = None):
         """Update policy based on collected experiences.
-        Different implementations for PPO vs StreamAC."""
+        Different implementations for PPO vs StreamAC.
+        
+        Args:
+            completed_episode_rewards: List of episode rewards for completed episodes since last update
+            total_env_steps: Total environment steps (across all environments)
+            steps_per_second: Environment steps per second (for performance tracking)
+            env_stats: Dictionary of environment statistics collected from observations
+        """
         metrics = {}
 
         if not self.algorithm:
@@ -1011,11 +1038,21 @@ class Trainer:
         # Store steps_per_second if provided
         if steps_per_second is not None:
             metrics['steps_per_second'] = steps_per_second
+            
+        # Store environment stats if provided
+        if env_stats:
+            if self.debug and len(env_stats) > 0:
+                print(f"[DEBUG] Received {len(env_stats)} environment stats for logging")
+            # Add env_stats to metrics dictionary
+            metrics.update(env_stats)
 
         # --- Algorithm Update ---
         # Forward to specific algorithm implementation
         # PPO's update now handles auxiliary loss internally and returns all metrics
-        metrics = self.algorithm.update()
+        algorithm_metrics = self.algorithm.update()
+        
+        # Merge algorithm metrics with our metrics
+        metrics.update(algorithm_metrics)
 
         # Record update time
         update_time = time.time() - update_start_time
