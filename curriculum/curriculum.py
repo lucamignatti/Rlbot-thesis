@@ -722,11 +722,14 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             BallPositionMutator(position_function=SafePositionWrapper(safe_ball_position))
         ),
         base_task_reward_function=CombinedReward(
-            (ball_proximity_reward, 0.3),
-            (touch_ball_reward, 0.3),
-            (velocity_to_ball_reward, 0.2),
-            (save_boost_reward, 0.1),
-            (BallToGoalDistanceReward(team_goal_y=5120), 0.1), # Single goal orientation
+            (touch_ball_reward, 0.5),                         # Increased reward for touching ball
+            (goal_velocity_reward, 0.4),                      # Reward for hitting ball toward goal
+            (velocity_to_ball_reward, 0.3),                   # Reward for moving toward ball
+            (goal_accel_reward, 0.3),                         # Reward for accelerating ball toward goal
+            (ball_proximity_reward, 0.2),                     # Reduced proximity reward
+            (alignment_reward, 0.2),                          # Reward for aligning car with ball-to-goal
+            (save_boost_reward, 0.1),                         # Keep boost conservation
+            (BallToGoalDistanceReward(team_goal_y=5120), 0.1) # Keep ball to goal reward
         ),
         base_task_termination_condition=goal_condition,
         base_task_truncation_condition=short_timeout,
