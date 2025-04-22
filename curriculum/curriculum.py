@@ -758,7 +758,6 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                                orientation_function=get_random_yaw_orientation)
         ),
         base_task_reward_function=CombinedReward(
-            (BallToGoalDistanceReward(team_goal_y=5120), 1.2),
             (touch_ball_reward, 1.0),
             (ball_proximity_reward, 0.7),
             (velocity_to_ball_reward, 0.3)
@@ -779,9 +778,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                                       orientation_function=get_random_yaw_orientation)
                 ),
                 reward_function=CombinedReward(
-                    (BallToGoalDistanceReward(team_goal_y=5120), 1.2),
-                    (touch_ball_reward, 1.0),
                     (ball_proximity_reward, 0.7),
+                    (touch_ball_reward, 1.0),
                     (velocity_to_ball_reward, 0.3)
                 ),
                 termination_condition=TouchBallCondition(),
@@ -804,9 +802,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
                                       orientation_function=get_random_yaw_orientation)
                 ),
                 reward_function=CombinedReward(
-                    (BallToGoalDistanceReward(team_goal_y=5120), 1.2),
-                    (touch_ball_reward, 1.0),
                     (ball_proximity_reward, 0.7),
+                    (touch_ball_reward, 1.0),
                     (velocity_to_ball_reward, 0.3)
                 ),
                 termination_condition=TouchBallCondition(),
