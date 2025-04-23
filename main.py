@@ -1668,7 +1668,6 @@ if __name__ == "__main__":
     parser.add_argument('--pretraining-fraction', type=float, default=0.1, help='Fraction of total training time/episodes to use for pre-training (default: 0.1)')
     parser.add_argument('--pretraining-sr-weight', type=float, default=10.0, help='Weight for State Representation task during pre-training (default: 10.0)')
     parser.add_argument('--pretraining-rp-weight', type=float, default=5.0, help='Weight for Reward Prediction task during pre-training (default: 5.0)')
-    # Removed --pretraining-transition-steps argument
 
     # Intrinsic reward parameters
     parser.add_argument('--use-intrinsic', action='store_true', help='Use intrinsic rewards during pre-training')
