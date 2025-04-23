@@ -1587,7 +1587,7 @@ if __name__ == "__main__":
 
     # Training loop parameters
     parser.add_argument('--ppo_epochs', type=int, default=10, help='Number of PPO epochs per update')
-    parser.add_argument('--batch_size', type=int, default=24576, help='Batch size for PPO updates')
+    parser.add_argument('--batch_size', type=int, default=16384, help='Batch size for PPO updates')
 
     parser.add_argument('--weight_clip_kappa', type=float, default=1.0, help='Weight clipping factor for PPO')
     parser.add_argument('--weight_clipping', type=bool, default=False, help='Enable weight clipping for PPO')
@@ -1623,9 +1623,14 @@ if __name__ == "__main__":
     parser.add_argument('--save_interval', type=int, default=10000,
                        help='Save the model every N episodes')
 
-    parser.add_argument('--hidden_dim', type=int, default=512, help='Hidden dimension for the network')
-    parser.add_argument('--num_blocks', type=int, default=4, help='Number of residual blocks in the network')
-    parser.add_argument('--dropout', type=float, default=0.05, help='Dropout rate for regularization')
+    # Actor/Shared Network Config (Defaults from SimbaV2 Actor)
+    parser.add_argument('--hidden_dim', type=int, default=384, help='Hidden dimension for the ACTOR network (or shared network if using simbav2-shared)')
+    parser.add_argument('--num_blocks', type=int, default=4, help='Number of residual blocks in the ACTOR network (or shared network if using simbav2-shared)')
+    parser.add_argument('--dropout', type=float, default=0.05, help='Dropout rate for regularization (only used by basic/simba architectures)')
+
+    # Critic Network Config (Defaults from SimbaV2 Critic)
+    parser.add_argument('--hidden_dim_critic', type=int, default=1024, help='Hidden dimension for the CRITIC network (only used if model-arch is not shared)')
+    parser.add_argument('--num_blocks_critic', type=int, default=4, help='Number of residual blocks in the CRITIC network (only used if model-arch is not shared)')
 
     # Action stacking parameters
     parser.add_argument('--stack_size', type=int, default=5, help='Number of previous actions to stack')
@@ -1741,7 +1746,7 @@ if __name__ == "__main__":
                         help='Legacy parameter; use --num_envs instead')
 
     # Model architecture argument
-    parser.add_argument('--model-arch', type=str, default='simbav2-shared', choices=['basic', 'simba', 'simbav2', 'simbav2-shared'], # Add simbav2-shared
+    parser.add_argument('--model-arch', type=str, default='simbav2', choices=['basic', 'simba', 'simbav2', 'simbav2-shared'], # Changed default to simbav2
                        help='Model architecture to use (basic, simba, simbav2, simbav2-shared)')
 
     # Add reward scaling args here, before parse_args()
@@ -1803,32 +1808,47 @@ if __name__ == "__main__":
     # --- Model Instantiation ---
     actor = None
     critic = None
-    model_kwargs = {
-        'hidden_dim': args.hidden_dim,
-        'num_blocks': args.num_blocks,
+    # Common args for all models
+    common_kwargs = {
         'device': device
     }
+    # Actor/Shared args (use actor defaults)
+    actor_kwargs = {
+        'hidden_dim': args.hidden_dim,
+        'num_blocks': args.num_blocks,
+        **common_kwargs
+    }
+    # Critic args (use critic defaults, only relevant for separate architectures)
+    critic_kwargs = {
+        'hidden_dim': args.hidden_dim_critic,
+        'num_blocks': args.num_blocks_critic,
+        **common_kwargs
+    }
+
 
     if args.model_arch == 'basic':
         ModelClass = BasicModel
-        model_kwargs['dropout_rate'] = args.dropout
-        actor = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, **model_kwargs)
-        critic = ModelClass(obs_shape=obs_space_dims, action_shape=1, **model_kwargs)
+        actor_kwargs['dropout_rate'] = args.dropout
+        critic_kwargs['dropout_rate'] = args.dropout # Use same dropout for basic critic
+        actor = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, **actor_kwargs)
+        critic = ModelClass(obs_shape=obs_space_dims, action_shape=1, **critic_kwargs)
     elif args.model_arch == 'simba':
         ModelClass = SimBa
-        model_kwargs['dropout_rate'] = args.dropout
-        actor = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, **model_kwargs)
-        critic = ModelClass(obs_shape=obs_space_dims, action_shape=1, **model_kwargs)
+        actor_kwargs['dropout_rate'] = args.dropout
+        critic_kwargs['dropout_rate'] = args.dropout # Use same dropout for simba critic
+        actor = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, **actor_kwargs)
+        critic = ModelClass(obs_shape=obs_space_dims, action_shape=1, **critic_kwargs)
     elif args.model_arch == 'simbav2':
         ModelClass = SimbaV2
         # SimbaV2 does not use dropout_rate
-        actor = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, **model_kwargs)
-        critic = ModelClass(obs_shape=obs_space_dims, action_shape=1, **model_kwargs)
+        actor = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, **actor_kwargs)
+        critic = ModelClass(obs_shape=obs_space_dims, action_shape=1, **critic_kwargs) # Use critic_kwargs
     elif args.model_arch == 'simbav2-shared':
         ModelClass = SimbaV2Shared
         # SimbaV2Shared does not use dropout_rate
         # Instantiate ONE model and use it for both actor and critic
-        shared_model = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, **model_kwargs)
+        # Use actor_kwargs for shared model config
+        shared_model = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, **actor_kwargs)
         actor = shared_model
         critic = shared_model # Assign the same instance
         if args.debug:
@@ -1897,9 +1917,14 @@ if __name__ == "__main__":
 
                 # Model Details
                 "model_arch": args.model_arch, # Log model architecture
-                "hidden_dim": args.hidden_dim,
-                "num_blocks": args.num_blocks,
-                "dropout": args.dropout if 'dropout_rate' in model_kwargs else None, # Log dropout if applicable
+                # Actor/Shared config
+                "hidden_dim_actor": args.hidden_dim,
+                "num_blocks_actor": args.num_blocks,
+                # Critic config (only relevant if not shared)
+                "hidden_dim_critic": args.hidden_dim_critic if args.model_arch != 'simbav2-shared' else None,
+                "num_blocks_critic": args.num_blocks_critic if args.model_arch != 'simbav2-shared' else None,
+                # Dropout (only relevant for basic/simba)
+                "dropout": args.dropout if args.model_arch in ['basic', 'simba'] else None,
                 "action_stack_size": args.stack_size,
                 "auxiliary_tasks": args.auxiliary, # Log the effective value
                 "sr_weight": args.sr_weight,
@@ -1938,9 +1963,13 @@ if __name__ == "__main__":
         print(f"[DEBUG] Using {args.algorithm.upper()} algorithm")
         print(f"[DEBUG] Using model architecture: {args.model_arch}")
         print(f"[DEBUG] Auxiliary tasks enabled: {args.auxiliary}") # Print effective value
-        print(f"[DEBUG] Actor model: {actor}")
-        # Only print critic separately if it's a different instance
-        if actor is not critic:
+        if args.model_arch == 'simbav2-shared':
+            print(f"[DEBUG] Shared Model Config: hidden_dim={args.hidden_dim}, num_blocks={args.num_blocks}")
+            print(f"[DEBUG] Shared model instance: {actor}")
+        else:
+            print(f"[DEBUG] Actor Model Config: hidden_dim={args.hidden_dim}, num_blocks={args.num_blocks}")
+            print(f"[DEBUG] Actor model: {actor}")
+            print(f"[DEBUG] Critic Model Config: hidden_dim={args.hidden_dim_critic}, num_blocks={args.num_blocks_critic}")
             print(f"[DEBUG] Critic model: {critic}")
         print(f"[DEBUG] Action stacking size: {args.stack_size}")
         if args.time:
@@ -2131,9 +2160,11 @@ if __name__ == "__main__":
                     "update_interval": args.update_interval,
                     "saved_path": saved_path,
                     'model_config': {
-                        'hidden_dim': args.hidden_dim,
-                        'num_blocks': args.num_blocks,
-                        'dropout': args.dropout if 'dropout_rate' in model_kwargs else None # Log dropout if applicable
+                        'hidden_dim_actor': args.hidden_dim,
+                        'num_blocks_actor': args.num_blocks,
+                        'hidden_dim_critic': args.hidden_dim_critic if args.model_arch != 'simbav2-shared' else None,
+                        'num_blocks_critic': args.num_blocks_critic if args.model_arch != 'simbav2-shared' else None,
+                        'dropout': args.dropout if args.model_arch in ['basic', 'simba'] else None
                     },
                     # Add total env steps to artifact metadata
                     'total_env_steps': getattr(trainer, 'total_env_steps', 0) if trainer else 0
