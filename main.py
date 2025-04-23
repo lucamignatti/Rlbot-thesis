@@ -1664,7 +1664,7 @@ if __name__ == "__main__":
     # Pre-training parameters
     parser.add_argument('--pretraining', action='store_true', help='Enable unsupervised pre-training phase at the start')
     parser.add_argument('--no-pretraining', action='store_false', dest='pretraining', help='Disable unsupervised pre-training')
-    parser.set_defaults(pretraining=True)  # Changed default to True so --no-pretraining has an effect
+    parser.set_defaults(pretraining=False)  # Changed default to True so --no-pretraining has an effect
     parser.add_argument('--pretraining-fraction', type=float, default=0.1, help='Fraction of total training time/episodes to use for pre-training (default: 0.1)')
     parser.add_argument('--pretraining-sr-weight', type=float, default=10.0, help='Weight for State Representation task during pre-training (default: 10.0)')
     parser.add_argument('--pretraining-rp-weight', type=float, default=5.0, help='Weight for Reward Prediction task during pre-training (default: 5.0)')
