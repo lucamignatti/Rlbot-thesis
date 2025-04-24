@@ -1672,7 +1672,7 @@ if __name__ == "__main__":
     # Intrinsic reward parameters
     parser.add_argument('--use-intrinsic', action='store_true', help='Use intrinsic rewards during pre-training')
     parser.add_argument('--no-intrinsic', action='store_false', dest='use_intrinsic', help='Disable intrinsic rewards during pre-training')
-    parser.set_defaults(use_intrinsic=True)
+    parser.set_defaults(use_intrinsic=False)
 
     parser.add_argument('--intrinsic-scale', type=float, default=0.7,
                        help='Scaling factor for intrinsic rewards (default: 0.7)')
