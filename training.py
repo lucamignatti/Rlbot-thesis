@@ -1130,6 +1130,17 @@ class Trainer:
             
             if self.debug:
                 print(f"[DEBUG] Using {len(completed_episode_rewards)} completed episode rewards, mean: {metrics['mean_episode_reward']:.4f}")
+        # Check if mean_return was provided directly in metrics (new preferred method)
+        elif 'mean_return' in metrics and metrics['mean_return'] != 0:
+            # Use mean_return directly from algorithm metrics (works for any algorithm)
+            metrics['mean_episode_reward'] = metrics['mean_return']
+            
+            if self.debug:
+                print(f"[DEBUG] Using algorithm-provided mean_return: {metrics['mean_return']:.4f}")
+            
+            # Add to our episode_rewards tracking for historical stats
+            self.episode_rewards.append(metrics['mean_return'])
+            
         # Otherwise check internal episode returns (fallback, mainly for PPO)
         elif self.algorithm_type == "ppo" and hasattr(self.algorithm, 'episode_returns') and len(self.algorithm.episode_returns) > 0:
             episode_returns = list(self.algorithm.episode_returns)
@@ -1146,7 +1157,7 @@ class Trainer:
                 
                 if self.debug:
                     print(f"[DEBUG] Using internal PPO episode returns, mean: {metrics['mean_episode_reward']:.4f}")
-        # For StreamAC, mean_return is often calculated internally
+        # For StreamAC, fallback to standard mean_return in metrics
         elif self.algorithm_type == "streamac" and 'mean_return' in metrics:
              metrics['mean_episode_reward'] = metrics['mean_return']
              

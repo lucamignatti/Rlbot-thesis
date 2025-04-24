@@ -475,12 +475,29 @@ class PPOAlgorithm(BaseAlgorithm):
         # Track episode returns when dones are received
         done_indices_local = torch.where(dones_batch.cpu())[0] # Find dones on CPU
         if len(done_indices_local) > 0:
-            # This part is tricky with batching, as we don't have the full episode rewards easily accessible here.
-            # We rely on the main loop's tracking for mean episode reward calculation.
-            # We can still track the number of completed episodes within this update cycle if needed.
+            # Process each completed episode in the batch
+            for i in done_indices_local:
+                # Get the reward for this episode completion
+                if isinstance(rewards_batch, torch.Tensor):
+                    reward_value = rewards_batch[i].item()
+                else:
+                    reward_value = float(rewards_batch[i])
+                
+                # Add to current episode's rewards
+                self.current_episode_rewards.append(reward_value)
+                
+                # Calculate episode return and add to tracking deque
+                episode_return = sum(self.current_episode_rewards)
+                self.episode_returns.append(episode_return)
+                
+                if self.debug:
+                    print(f"[DEBUG PPO] Episode completed with return: {episode_return:.4f}")
+                
+                # Reset for next episode
+                self.current_episode_rewards = []
+            
             if self.debug:
-                 print(f"[DEBUG PPO] {len(done_indices_local)} episodes ended in this batch update.")
-            pass
+                print(f"[DEBUG PPO] {len(done_indices_local)} episodes ended in this batch update.")
 
 
     def store_experience(self, obs, action, log_prob, reward, value, done):
