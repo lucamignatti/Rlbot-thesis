@@ -91,7 +91,7 @@ class SimbaV2(nn.Module):
             return output, features
         return output
 
-# SimbaV2 Residual Block - Needs update for LERP init
+# SimbaV2 Residual Block
 class SimbaV2Block(nn.Module):
     def __init__(self, hidden_dim: int, expansion_factor: int = 4, num_total_blocks: int = 4): # Add num_total_blocks
         super().__init__()
@@ -101,15 +101,15 @@ class SimbaV2Block(nn.Module):
         self.linear1 = OrthogonalLinear(hidden_dim, bottleneck_dim)
         # Use decoupled Scaler initialization (Appendix A.2, adapted for bottleneck dim)
         # Note: Paper init s_init=s_scale=sqrt(2/d_h). Here d_h corresponds to bottleneck_dim for the scaler.
-        mlp_scaler_init_scale = math.sqrt(2.0 / bottleneck_dim)
+        mlp_scaler_init_scale = math.sqrt(2.0 / bottleneck_dim) if bottleneck_dim > 0 else 1.0 # Avoid division by zero
         self.scaler1 = Scaler(bottleneck_dim, init=mlp_scaler_init_scale, scale=mlp_scaler_init_scale)
         self.activation = nn.ReLU() # Paper uses ReLU here (Eq 11)
         self.linear2 = OrthogonalLinear(bottleneck_dim, hidden_dim)
 
         # Second part: LERP + L2 Norm
-        # Use decoupled LERP initialization (Appendix A.4)
-        lerp_init = 1.0 / (num_total_blocks + 1)
-        lerp_scale = 1.0 / math.sqrt(hidden_dim) if hidden_dim > 0 else 1.0
+        # Use decoupled LERP initialization based on total blocks (Appendix C / A.4)
+        lerp_init = 1.0 / (num_total_blocks + 1) if num_total_blocks > -1 else 0.5 # Avoid div by zero if blocks= -1
+        lerp_scale = 1.0 / math.sqrt(hidden_dim) if hidden_dim > 0 else 1.0 # Avoid sqrt(0)
         self.lerp = LERP(hidden_dim, init=lerp_init, scale=lerp_scale)
 
     def forward(self, h_in: torch.Tensor) -> torch.Tensor:
@@ -124,4 +124,3 @@ class SimbaV2Block(nn.Module):
         h_out = self.lerp(h_in, h_tilde) # LERP handles the final L2 norm
 
         return h_out
-
