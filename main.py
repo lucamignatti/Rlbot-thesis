@@ -607,6 +607,9 @@ def run_training(
         stream_buffer_size=stream_buffer_size,
         use_sparse_init=use_sparse_init,
         update_freq=update_freq,
+        v_min=args.v_min,
+        v_max=args.v_max,
+        num_atoms=args.num_atoms,
         # Pass reward scaling parameters to Trainer
         use_reward_scaling=use_reward_scaling,
         reward_scaling_G_max=reward_scaling_G_max,
@@ -1585,6 +1588,12 @@ if __name__ == "__main__":
     parser.add_argument('--entropy_coef', type=float, default=0.005, help='Weight of the entropy bonus (encourages exploration)')
     parser.add_argument('--max_grad_norm', type=float, default=0.5, help='Maximum gradient norm for clipping')
 
+    # --- ADD DISTRIBUTIONAL CRITIC ARGS ---
+    parser.add_argument('--v_min', type=float, default=-10.0, help='Minimum value for distributional critic support')
+    parser.add_argument('--v_max', type=float, default=10.0, help='Maximum value for distributional critic support')
+    parser.add_argument('--num_atoms', type=int, default=51, help='Number of atoms for distributional critic support')
+    # ------------------------------------
+
     # Training loop parameters
     parser.add_argument('--ppo_epochs', type=int, default=10, help='Number of PPO epochs per update')
     parser.add_argument('--batch_size', type=int, default=16384, help='Batch size for PPO updates')
@@ -1841,7 +1850,7 @@ if __name__ == "__main__":
         ModelClass = SimbaV2
         # SimbaV2 does not use dropout_rate
         actor = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, **actor_kwargs)
-        critic = ModelClass(obs_shape=obs_space_dims, action_shape=1, **critic_kwargs) # Use critic_kwargs
+        critic = ModelClass(obs_shape=obs_space_dims, action_shape=args.num_atoms, **critic_kwargs)
     elif args.model_arch == 'simbav2-shared':
         ModelClass = SimbaV2Shared
         # SimbaV2Shared does not use dropout_rate

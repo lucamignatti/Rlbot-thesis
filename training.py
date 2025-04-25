@@ -142,6 +142,9 @@ class Trainer:
         use_reward_scaling: bool = True,
         reward_scaling_G_max: float = 10.0,
         reward_scaling_eps: float = 1e-5,
+        v_min: float = -10.0,
+        v_max: float = 10.0,
+        num_atoms: int = 51,
     ):
         self.use_wandb = use_wandb
         self.debug = debug
@@ -257,6 +260,9 @@ class Trainer:
                 use_amp=self.use_amp, # Pass the trainer's use_amp flag
                 debug=debug,
                 use_wandb=use_wandb,
+                v_min=v_min,
+                v_max=v_max,
+                num_atoms=num_atoms,
                 use_weight_clipping=use_weight_clipping,
                 weight_clip_kappa=weight_clip_kappa,
                 adaptive_kappa=adaptive_kappa,
@@ -598,7 +604,7 @@ class Trainer:
         # --- Environment metrics (NEW) ---
         environment_metrics = grouped_metrics['environment']
         env_stat_count = 0
-        
+
         # Extract environment statistics that were passed via metrics
         for key, value in metrics.items():
             # Identify environment metrics by their prefix
@@ -606,7 +612,7 @@ class Trainer:
                 # Add to environment metrics group with ENV/ prefix for WandB organization
                 environment_metrics[f"ENV/{key}"] = value
                 env_stat_count += 1
-        
+
         if self.debug and env_stat_count > 0:
             print(f"[WANDB DEBUG] Adding {env_stat_count} environment metrics to WandB")
 
@@ -656,7 +662,7 @@ class Trainer:
 
         # --- Reward metrics ---
         reward_metrics = grouped_metrics['rewards']
-        
+
         # Add per-update reward statistics
         if 'mean_episode_reward' in metrics:
             reward_metrics["REWARD/mean"] = metrics['mean_episode_reward']
@@ -666,24 +672,24 @@ class Trainer:
             reward_metrics["REWARD/max"] = metrics['max_episode_reward']
         if 'std_episode_reward' in metrics:
             reward_metrics["REWARD/std"] = metrics['std_episode_reward']
-            
+
         # Calculate and add historical reward statistics if we have enough data
         if hasattr(self, 'episode_rewards') and len(self.episode_rewards) > 0:
             reward_array = np.array(list(self.episode_rewards))
             reward_metrics["REWARD/historical_mean"] = np.mean(reward_array)
-            
+
             # Add percentiles for better understanding of reward distribution
             if len(reward_array) >= 5:  # Only calculate percentiles if we have enough data
                 reward_metrics["REWARD/median"] = np.median(reward_array)
                 reward_metrics["REWARD/percentile_25"] = np.percentile(reward_array, 25)
                 reward_metrics["REWARD/percentile_75"] = np.percentile(reward_array, 75)
-                
+
                 # Calculate rolling statistics if we have enough data
                 if len(reward_array) >= 10:
                     recent_rewards = reward_array[-10:]  # Last 10 episodes
                     reward_metrics["REWARD/recent_mean"] = np.mean(recent_rewards)
                     reward_metrics["REWARD/recent_median"] = np.median(recent_rewards)
-                    
+
                     # Calculate improvement rate (comparing recent to historical)
                     if len(reward_array) > 20:
                         previous_rewards = reward_array[-20:-10]  # 10 episodes before the most recent 10
@@ -692,11 +698,11 @@ class Trainer:
                         if previous_mean != 0:  # Avoid division by zero
                             improvement = (recent_mean - previous_mean) / abs(previous_mean) * 100
                             reward_metrics["REWARD/improvement_percent"] = improvement
-            
+
             # Add reward histogram (optional but useful)
             if len(reward_array) >= 20:
                 reward_metrics["REWARD/distribution"] = wandb.Histogram(reward_array)
-                
+
         # --- System metrics ---
         system_metrics = grouped_metrics['system']
         system_metrics["SYS/training_step"] = current_step
@@ -1052,11 +1058,11 @@ class Trainer:
         return result
 
 
-    def update(self, completed_episode_rewards=None, total_env_steps: Optional[int] = None, 
+    def update(self, completed_episode_rewards=None, total_env_steps: Optional[int] = None,
               steps_per_second: Optional[float] = None, env_stats: Optional[Dict[str, float]] = None):
         """Update policy based on collected experiences.
         Different implementations for PPO vs StreamAC.
-        
+
         Args:
             completed_episode_rewards: List of episode rewards for completed episodes since last update
             total_env_steps: Total environment steps (across all environments)
@@ -1083,7 +1089,7 @@ class Trainer:
         # Store steps_per_second if provided
         if steps_per_second is not None:
             metrics['steps_per_second'] = steps_per_second
-            
+
         # Store environment stats if provided
         if env_stats:
             if self.debug and len(env_stats) > 0:
@@ -1095,7 +1101,7 @@ class Trainer:
         # Forward to specific algorithm implementation
         # PPO's update now handles auxiliary loss internally and returns all metrics
         algorithm_metrics = self.algorithm.update()
-        
+
         # Merge algorithm metrics with our metrics
         metrics.update(algorithm_metrics)
 
@@ -1121,26 +1127,26 @@ class Trainer:
             # Add all completed episode rewards to our tracking deque
             for reward in completed_episode_rewards:
                 self.episode_rewards.append(reward)
-            
+
             # Calculate reward statistics
             metrics['mean_episode_reward'] = np.mean(completed_episode_rewards)
             metrics['min_episode_reward'] = np.min(completed_episode_rewards)
             metrics['max_episode_reward'] = np.max(completed_episode_rewards)
             metrics['std_episode_reward'] = np.std(completed_episode_rewards)
-            
+
             if self.debug:
                 print(f"[DEBUG] Using {len(completed_episode_rewards)} completed episode rewards, mean: {metrics['mean_episode_reward']:.4f}")
         # Check if mean_return was provided directly in metrics (new preferred method)
         elif 'mean_return' in metrics and metrics['mean_return'] != 0:
             # Use mean_return directly from algorithm metrics (works for any algorithm)
             metrics['mean_episode_reward'] = metrics['mean_return']
-            
+
             if self.debug:
                 print(f"[DEBUG] Using algorithm-provided mean_return: {metrics['mean_return']:.4f}")
-            
+
             # Add to our episode_rewards tracking for historical stats
             self.episode_rewards.append(metrics['mean_return'])
-            
+
         # Otherwise check internal episode returns (fallback, mainly for PPO)
         elif self.algorithm_type == "ppo" and hasattr(self.algorithm, 'episode_returns') and len(self.algorithm.episode_returns) > 0:
             episode_returns = list(self.algorithm.episode_returns)
@@ -1148,19 +1154,19 @@ class Trainer:
                 # Add all completed episode returns to our tracking deque
                 for reward in episode_returns:
                     self.episode_rewards.append(reward)
-                
+
                 # Calculate reward statistics
                 metrics['mean_episode_reward'] = np.mean(episode_returns)
                 metrics['min_episode_reward'] = np.min(episode_returns)
                 metrics['max_episode_reward'] = np.max(episode_returns)
                 metrics['std_episode_reward'] = np.std(episode_returns)
-                
+
                 if self.debug:
                     print(f"[DEBUG] Using internal PPO episode returns, mean: {metrics['mean_episode_reward']:.4f}")
         # For StreamAC, fallback to standard mean_return in metrics
         elif self.algorithm_type == "streamac" and 'mean_return' in metrics:
              metrics['mean_episode_reward'] = metrics['mean_return']
-             
+
              # If there's a return value but no completed episodes, we still want to track it
              if 'mean_return' in metrics:
                  self.episode_rewards.append(metrics['mean_return'])
@@ -1286,7 +1292,7 @@ class Trainer:
             'numpy': np.random.get_state(),
             'random': random.getstate()
         }
-        
+
         # Save episode rewards history
         if hasattr(self, 'episode_rewards') and len(self.episode_rewards) > 0:
             checkpoint['episode_rewards'] = list(self.episode_rewards)
@@ -1518,13 +1524,13 @@ class Trainer:
                     # A more robust way would be to store history_len in the checkpoint too
                     history_len = getattr(self, 'history_len', 1000)
                     self.episode_rewards = collections.deque(maxlen=history_len)
-                
+
                 # Clear existing deque before loading
                 self.episode_rewards.clear()
                 # Add loaded rewards
                 for reward in rewards_history:
                     self.episode_rewards.append(reward)
-                
+
                 if self.debug:
                     print(f"[DEBUG] Restored episode rewards history ({len(self.episode_rewards)} entries)")
             else:
@@ -1693,8 +1699,12 @@ class Trainer:
 
     def _scale_reward(self, env_id, reward_t, variance_G, max_G):
         """Scale reward according to paper Eq 19."""
-        # Denominator calculation
-        denom = max(variance_G + self.reward_scaling_eps, max_G / self.reward_scaling_G_max)
+        # Denominator calculation - apply sqrt to variance term
+        # Ensure variance_G is non-negative before sqrt
+        variance_term = math.sqrt(max(0.0, variance_G) + self.reward_scaling_eps)
+        # Avoid division by zero for max_term calculation
+        max_term = (max_G / self.reward_scaling_G_max) if self.reward_scaling_G_max > 0 else float('inf')
+        denom = max(variance_term, max_term)
         # Add small epsilon to prevent division by zero if denom is somehow zero
         denom = max(denom, self.reward_scaling_eps)
 

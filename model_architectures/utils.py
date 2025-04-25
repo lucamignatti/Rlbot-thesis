@@ -247,15 +247,21 @@ def l2_norm(t, eps=1e-5):
     return t / (torch.norm(t, p=2, dim=-1, keepdim=True) + eps)
 
 # Scaler module from SimbaV2 paper (Appendix B, Listing 1 adaptation)
+# Updated to use decoupled init/scale (Section 4.4, Appendix A.2)
 class Scaler(nn.Module):
-    def __init__(self, dim: int, init_scale: float = 1.0):
+    def __init__(self, dim: int, init: float = 1.0, scale: float = 1.0):
         super().__init__()
         self.dim = dim
-        # Initialize scaler parameter close to 1
-        self.scaler = nn.Parameter(torch.ones(dim) * init_scale)
+        # Store init and scale factors
+        self.init_val = init
+        self.scale_val = scale
+        # Initialize the learnable parameter based on scale
+        self.scaler_param = nn.Parameter(torch.ones(dim) * scale)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.scaler * x # Element-wise scaling
+        # Apply decoupled scaling (Eq 21)
+        effective_scaler = self.scaler_param * (self.init_val / self.scale_val) if self.scale_val != 0 else self.scaler_param
+        return effective_scaler * x # Element-wise scaling
 
 # Linear layer with orthogonal initialization and weight projection
 class OrthogonalLinear(nn.Module):
@@ -268,24 +274,27 @@ class OrthogonalLinear(nn.Module):
         nn.init.orthogonal_(self.weight, gain=scale) # Use specified scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Project weights onto unit hypersphere before forward pass
-        # Note: Paper projects *after* gradient update. Doing it here approximates.
-        # A more accurate implementation would involve a custom optimizer step or hook.
-        # Reverted: Projection should happen during optimization, not forward pass.
-        # with torch.no_grad():
-        #      self.weight.copy_(l2_norm(self.weight))
+        # Projection happens during optimization, not here
         return F.linear(x, self.weight)
 
 # Learnable Linear Interpolation (LERP) module
+# Updated to use decoupled init/scale (Section 4.4, Appendix A.4)
 class LERP(nn.Module):
-    def __init__(self, dim: int, init_val: float = 0.5):
+    def __init__(self, dim: int, init: float = 0.5, scale: float = 1.0):
         super().__init__()
-        # Initialize interpolation factor close to 0.5
-        self.alpha = nn.Parameter(torch.full((dim,), init_val))
+        self.dim = dim
+        self.init_val = init
+        self.scale_val = scale
+        # Initialize learnable parameter based on scale
+        self.alpha_param = nn.Parameter(torch.full((dim,), scale))
 
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
-        # Ensure alpha is between 0 and 1
-        alpha_clamped = torch.sigmoid(self.alpha)
+        # Apply decoupled scaling for alpha (similar to Scaler's Eq 21)
+        effective_alpha = self.alpha_param * (self.init_val / self.scale_val) if self.scale_val != 0 else self.alpha_param
+        # Ensure effective alpha is between 0 and 1 using sigmoid
+        # Note: Paper doesn't explicitly mention sigmoid for LERP alpha, but it's common for interpolation factors.
+        # Clamping might be an alternative, but sigmoid is smoother.
+        alpha_clamped = torch.sigmoid(effective_alpha)
         # Interpolate and normalize
         interpolated = (1.0 - alpha_clamped) * x1 + alpha_clamped * x2
         return l2_norm(interpolated)
