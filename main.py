@@ -1575,15 +1575,15 @@ if __name__ == "__main__":
                        help='Learning algorithm to use: ppo (default) or streamac')
 
     # Learning rates
-    parser.add_argument('--lra', type=float, default=3e-5, help='Learning rate for actor network')
-    parser.add_argument('--lrc', type=float, default=1e-4, help='Learning rate for critic network')
+    parser.add_argument('--lra', type=float, default=1e-5, help='Learning rate for actor network')
+    parser.add_argument('--lrc', type=float, default=5e-5, help='Learning rate for critic network')
 
     # Discount factors
     parser.add_argument('--gamma', type=float, default=0.997, help='Discount factor for future rewards')
     parser.add_argument('--gae_lambda', type=float, default=0.95, help='Lambda parameter for Generalized Advantage Estimation')
 
     # PPO parameters
-    parser.add_argument('--clip_epsilon', type=float, default=0.2, help='PPO clipping parameter')
+    parser.add_argument('--clip_epsilon', type=float, default=0.15, help='PPO clipping parameter')
     parser.add_argument('--critic_coef', type=float, default=0.5, help='Weight of the critic loss')
     parser.add_argument('--entropy_coef', type=float, default=0.005, help='Weight of the entropy bonus (encourages exploration)')
     parser.add_argument('--max_grad_norm', type=float, default=0.5, help='Maximum gradient norm for clipping')
