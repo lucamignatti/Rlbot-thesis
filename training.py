@@ -352,6 +352,12 @@ class Trainer:
         self.aux_sr_losses = collections.deque(maxlen=history_len)
         self.aux_rp_losses = collections.deque(maxlen=history_len)
         self.episode_rewards = collections.deque(maxlen=history_len)  # Track episode rewards
+        
+        # Environment statistics tracking
+        # Environment statistics tracking - accumulate values between updates
+        self.env_stats_buffer = {}  # Dictionary to accumulate environment statistics between updates
+        self.env_stats_counts = {}  # Counter for each statistic to calculate averages
+        self.env_stats_metrics = {}  # Averaged metrics to report in WandB
 
         if self.debug:
             print(f"[DEBUG] Initialized {self.algorithm_type.upper()} algorithm on {self.device}")
@@ -601,20 +607,23 @@ class Trainer:
             algorithm_metrics[f"{alg_prefix}/buffer_size"] = len(self.algorithm.memory) if hasattr(self.algorithm, 'memory') else 0
 
 
-        # --- Environment metrics (NEW) ---
+        # --- Environment metrics (AVERAGED) ---
         environment_metrics = grouped_metrics['environment']
         env_stat_count = 0
 
         # Extract environment statistics that were passed via metrics
+        # These should now be averaged values from _compute_avg_env_stats()
         for key, value in metrics.items():
             # Identify environment metrics by their prefix
             if key.startswith('env_'):
+                # Strip 'env_' prefix for the display name to keep it clean
+                display_key = key[4:] if key.startswith('env_') else key
                 # Add to environment metrics group with ENV/ prefix for WandB organization
-                environment_metrics[f"ENV/{key}"] = value
+                environment_metrics[f"ENV/{display_key}"] = value
                 env_stat_count += 1
 
         if self.debug and env_stat_count > 0:
-            print(f"[WANDB DEBUG] Adding {env_stat_count} environment metrics to WandB")
+            print(f"[WANDB DEBUG] Adding {env_stat_count} averaged environment metrics to WandB")
 
 
         # --- Auxiliary metrics ---
@@ -774,12 +783,25 @@ class Trainer:
                 import traceback
                 traceback.print_exc()
 
-    def store_initial_batch(self, obs_batch, action_batch, log_prob_batch, value_batch):
+    def store_initial_batch(self, obs_batch, action_batch, log_prob_batch, value_batch, env_stats_batch=None):
         """
         Store the initial part of experiences (obs, action, log_prob, value) in batch.
         Delegates to the algorithm's implementation.
         Returns the indices where the experiences were stored.
+        
+        Args:
+            obs_batch: Batch of observations
+            action_batch: Batch of actions
+            log_prob_batch: Batch of log probabilities
+            value_batch: Batch of values
+            env_stats_batch: Optional batch of environment statistics
         """
+        # Accumulate environment statistics if provided
+        if env_stats_batch:
+            for env_stats in env_stats_batch:
+                if env_stats:
+                    self.accumulate_env_stats(env_stats)
+        
         if hasattr(self.algorithm, 'store_initial_batch'):
             return self.algorithm.store_initial_batch(obs_batch, action_batch, log_prob_batch, value_batch)
         else:
@@ -791,7 +813,9 @@ class Trainer:
             start_pos = self.algorithm.memory.pos if hasattr(self.algorithm, 'memory') else 0
             buffer_size = self.algorithm.memory.buffer_size if hasattr(self.algorithm, 'memory') else 0
             for i in range(len(obs_batch)):
-                self.store_experience(obs_batch[i], action_batch[i], log_prob_batch[i], 0, value_batch[i], False)
+                # Get env_stats for this item if available
+                env_stats = env_stats_batch[i] if env_stats_batch and i < len(env_stats_batch) else None
+                self.store_experience(obs_batch[i], action_batch[i], log_prob_batch[i], 0, value_batch[i], False, env_stats=env_stats)
                 # Calculate index (handle wrap around)
                 idx = (start_pos + i) % buffer_size
                 indices.append(idx)
@@ -814,10 +838,14 @@ class Trainer:
                 self.store_experience_at_idx(idx, reward=rewards_batch[i], done=dones_batch[i])
 
 
-    def store_experience(self, state, action, log_prob, reward, value, done, env_id=0):
+    def store_experience(self, state, action, log_prob, reward, value, done, env_id=0, env_stats=None):
         """Store experience in the buffer with environment ID."""
         # Get whether we're in test mode
         test_mode = getattr(self, 'test_mode', False)
+        
+        # Accumulate environment statistics if provided
+        if env_stats and not test_mode:
+            self.accumulate_env_stats(env_stats)
 
         # Reward Scaling (SimbaV2)
         original_reward = reward # Keep original for potential intrinsic calculation later
@@ -1090,12 +1118,27 @@ class Trainer:
         if steps_per_second is not None:
             metrics['steps_per_second'] = steps_per_second
 
-        # Store environment stats if provided
+        # Accumulate environment stats if provided instead of directly logging them
         if env_stats:
             if self.debug and len(env_stats) > 0:
-                print(f"[DEBUG] Received {len(env_stats)} environment stats for logging")
-            # Add env_stats to metrics dictionary
-            metrics.update(env_stats)
+                print(f"[DEBUG] Received {len(env_stats)} environment stats for accumulation")
+            # Accumulate stats for averaging at log time
+            self.accumulate_env_stats(env_stats)
+            
+        # Compute averages from accumulated environment stats 
+        # and add them to metrics dictionary
+        avg_env_stats = self._compute_avg_env_stats()
+        if avg_env_stats:
+            if self.debug: 
+                print(f"[DEBUG] Adding {len(avg_env_stats)} averaged environment stats to metrics")
+            
+            # Add the averaged stats to the metrics dictionary with 'env_' prefix
+            for key, value in avg_env_stats.items():
+                # Ensure all env stats have the 'env_' prefix
+                if not key.startswith('env_'):
+                    metrics[f'env_{key}'] = value
+                else:
+                    metrics[key] = value
 
         # --- Algorithm Update ---
         # Forward to specific algorithm implementation
@@ -1621,6 +1664,48 @@ class Trainer:
                 import traceback
                 traceback.print_exc()
             return False
+
+    def accumulate_env_stats(self, env_stats):
+        """
+        Accumulate environment statistics between updates for averaging.
+        
+        Args:
+            env_stats (dict): Dictionary of environment statistics from observations
+        """
+        if not env_stats:
+            return
+            
+        for key, value in env_stats.items():
+            # Only process numerical values
+            if isinstance(value, (int, float, np.number)) and not isinstance(value, bool):
+                if key not in self.env_stats_buffer:
+                    self.env_stats_buffer[key] = 0.0
+                    self.env_stats_counts[key] = 0
+                
+                self.env_stats_buffer[key] += float(value)
+                self.env_stats_counts[key] += 1
+                
+        if self.debug and len(env_stats) > 0 and self._true_training_steps() % 500 == 0:
+            print(f"[DEBUG] Accumulated env stats for {len(env_stats)} metrics. Total accumulated metrics: {len(self.env_stats_buffer)}")
+
+    def _compute_avg_env_stats(self):
+        """
+        Compute average environment statistics from accumulated values.
+        Returns a dictionary of averaged statistics.
+        """
+        avg_stats = {}
+        for key, total_value in self.env_stats_buffer.items():
+            count = max(1, self.env_stats_counts.get(key, 1))  # Avoid division by zero
+            avg_stats[key] = total_value / count
+            
+        # Clear the buffers for next accumulation period
+        self.env_stats_buffer = {}
+        self.env_stats_counts = {}
+        
+        # Store the computed averages
+        self.env_stats_metrics = avg_stats
+        
+        return avg_stats
 
     def _update_pretraining_state(self):
         """Update pretraining state and manage transition to regular training."""
