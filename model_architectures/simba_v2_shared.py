@@ -3,7 +3,8 @@ import torch.nn as nn
 import numpy as np
 import math
 from typing import Union, Tuple, Dict, Optional
-from .utils import RSNorm, Scaler, OrthogonalLinear, SimbaV2Block, l2_norm
+from .utils import RSNorm, Scaler, OrthogonalLinear, l2_norm
+from .simba_v2 import SimbaV2Block
 
 # SimbaV2 Shared Body Model Implementation
 class SimbaV2Shared(nn.Module):

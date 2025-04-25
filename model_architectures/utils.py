@@ -298,31 +298,3 @@ class LERP(nn.Module):
         # Interpolate and normalize
         interpolated = (1.0 - alpha_clamped) * x1 + alpha_clamped * x2
         return l2_norm(interpolated)
-
-# SimbaV2 Residual Block
-class SimbaV2Block(nn.Module):
-    def __init__(self, hidden_dim: int, expansion_factor: int = 4):
-        super().__init__()
-        bottleneck_dim = hidden_dim * expansion_factor
-
-        # First part: MLP + L2 Norm
-        self.linear1 = OrthogonalLinear(hidden_dim, bottleneck_dim)
-        self.scaler1 = Scaler(bottleneck_dim)
-        self.activation = nn.ReLU() # Paper uses ReLU here (Eq 11)
-        self.linear2 = OrthogonalLinear(bottleneck_dim, hidden_dim)
-
-        # Second part: LERP + L2 Norm
-        self.lerp = LERP(hidden_dim)
-
-    def forward(self, h_in: torch.Tensor) -> torch.Tensor:
-        # MLP + L2 Norm part (Eq 11)
-        h_mlp = self.linear1(h_in)
-        h_mlp_scaled = self.scaler1(h_mlp)
-        h_mlp_activated = self.activation(h_mlp_scaled)
-        h_mlp_out = self.linear2(h_mlp_activated)
-        h_tilde = l2_norm(h_mlp_out) # Project MLP output
-
-        # LERP + L2 Norm part (Eq 12)
-        h_out = self.lerp(h_in, h_tilde) # LERP handles the final L2 norm
-
-        return h_out

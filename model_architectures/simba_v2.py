@@ -4,7 +4,7 @@ import numpy as np
 import math
 from typing import Union, Tuple
 # Add LERP to the import list
-from .utils import RSNorm, Scaler, OrthogonalLinear, SimbaV2Block, l2_norm, LERP
+from .utils import RSNorm, Scaler, OrthogonalLinear, l2_norm, LERP
 
 # SimbaV2 Model Implementation
 class SimbaV2(nn.Module):
