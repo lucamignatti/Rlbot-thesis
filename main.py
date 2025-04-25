@@ -1575,7 +1575,7 @@ if __name__ == "__main__":
                        help='Learning algorithm to use: ppo (default) or streamac')
 
     # Learning rates
-    parser.add_argument('--lra', type=float, default=5e-5, help='Learning rate for actor network')
+    parser.add_argument('--lra', type=float, default=3e-5, help='Learning rate for actor network')
     parser.add_argument('--lrc', type=float, default=1e-4, help='Learning rate for critic network')
 
     # Discount factors
