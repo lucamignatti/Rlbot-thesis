@@ -34,3 +34,5 @@ runnable_bots.txt
 # Profiling
 result.json
 trace_processor
+
+pause.flag

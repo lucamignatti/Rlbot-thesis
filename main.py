@@ -838,8 +838,31 @@ def run_training(
     should_continue = True  # Initialize the control variable
 
     try:
+        # Define pause file path for the pause/resume functionality
+        pause_file_path = "pause.flag"  # Flag file to check for pausing
+        
         # Let's keep training until it's time to stop
         while should_continue:
+            # --- PAUSE CHECK ---
+            if os.path.exists(pause_file_path):
+                if not stats_dict.get("Status") == "[PAUSED]":  # Avoid spamming logs/queue
+                    print("\nPause signal file found. Pausing training...")
+                    stats_dict["Status"] = "[PAUSED]"
+                    if tqdm_q:
+                        tqdm_q.put(stats_dict.copy())  # Update TQDM postfix
+
+                # Loop while the pause file exists
+                while os.path.exists(pause_file_path):
+                    time.sleep(1)  # Check every second
+
+                # Pause file has been removed
+                print("Resume signal detected. Resuming training...")
+                if "Status" in stats_dict:  # Remove pause status
+                    stats_dict.pop("Status")
+                if tqdm_q:
+                    tqdm_q.put(stats_dict.copy())  # Update TQDM postfix
+            # --- END PAUSE CHECK ---
+
             current_time = time.time()
             elapsed = current_time - start_time
 
@@ -1465,6 +1488,14 @@ def run_training(
         print(f"Error during training: {str(e)}")
         traceback.print_exc()
     finally:
+        # Clean up the pause file if it exists on exit
+        if os.path.exists(pause_file_path):
+            try:
+                os.remove(pause_file_path)
+                print(f"Removed '{pause_file_path}' on exit.")
+            except OSError as e:
+                print(f"Error removing '{pause_file_path}' on exit: {e}")
+        
         # Always clean up the environments.
         vec_env.close()
 
