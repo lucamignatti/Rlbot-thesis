@@ -299,7 +299,7 @@ class TouchBallReward(BaseRewardFunction):
         # Clear previous state to prevent memory leaks
         if hasattr(self, 'last_touched') and self.last_touched:
             self.last_touched.clear()
-            
+
         # Create fresh dictionary with only current agents
         self.last_touched = {str(agent): False for agent in agents}
         self._cleanup_counter = 0
@@ -324,7 +324,7 @@ class TouchBallReward(BaseRewardFunction):
             # Remove entries for agents not in current state
             if hasattr(state, 'cars'):
                 car_ids_to_keep = set(str(car_id) for car_id in state.cars.keys())
-                keys_to_remove = [key for key in self.last_touched.keys() 
+                keys_to_remove = [key for key in self.last_touched.keys()
                                  if key not in car_ids_to_keep]
                 for key in keys_to_remove:
                     self.last_touched.pop(key, None)
@@ -362,10 +362,10 @@ class TouchBallToGoalAccelerationReward(BaseRewardFunction):
         # Clear previous velocity dictionary to prevent memory leaks
         if hasattr(self, 'last_velocity') and self.last_velocity:
             self.last_velocity.clear()
-            
+
         # Create fresh dictionary with only current agents
         self.last_velocity = {str(agent): None for agent in agents}
-        
+
         # Initialize cleanup counter
         self._cleanup_counter = 0
 
@@ -391,7 +391,7 @@ class TouchBallToGoalAccelerationReward(BaseRewardFunction):
                 # Remove entries for agents not in current state
                 if hasattr(state, 'cars'):
                     car_ids_to_keep = set(str(car_id) for car_id in state.cars.keys())
-                    keys_to_remove = [key for key in self.last_velocity.keys() 
+                    keys_to_remove = [key for key in self.last_velocity.keys()
                                      if key not in car_ids_to_keep]
                     for key in keys_to_remove:
                         self.last_velocity.pop(key, None)
@@ -2232,4 +2232,85 @@ class SpeedflipReward(RewardFunction):
 
         # Store the current state for next time
         shared_info["previous_state"] = state
+        return rewards
+
+class AirReward(BaseRewardFunction):
+    """
+    Reward function that encourages the agent to be airborne.
+    Gives a reward of 1 when the agent is not on the ground, 0 otherwise.
+    Can be weighted.
+    """
+    def __init__(self, weight: float = 1.0):
+        """
+        Initialize the reward function.
+        Args:
+            weight: The factor to scale the reward by.
+        """
+        super().__init__() # Call parent __init__ without arguments
+        self.weight = weight
+
+    def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
+        """
+        Called at the beginning of each episode. No state needed for this reward.
+        """
+        pass # Matches BaseRewardFunction signature
+
+    def calculate(self, agent_id: AgentID, state: GameState, previous_state: Optional[GameState] = None) -> float:
+        """
+        Calculate the reward for a single agent.
+
+        Args:
+            agent_id: The ID of the agent to calculate the reward for.
+            state: The current state of the game.
+            previous_state: The previous state of the game (not used here).
+
+
+        Returns:
+            Weighted reward: 1.0 * weight if airborne, 0.0 otherwise.
+        """
+        # Use the helper method from BaseRewardFunction
+        player = self._get_car_data_from_state(agent_id, state)
+
+        if player is None:
+            # print(f"Warning: Could not get car data for agent {agent_id} in AirReward.")
+            return 0.0
+
+        # Check if the player is on the ground
+        on_ground = True # Default to true if attribute missing
+        if hasattr(player, 'on_ground'):
+            on_ground = player.on_ground
+        elif hasattr(player, 'physics') and hasattr(player.physics, 'on_ground'):
+             # Fallback to physics object if available
+             on_ground = player.physics.on_ground
+
+        # Reward is 1 if the player is NOT on the ground, 0 otherwise
+        reward = 1.0 if not on_ground else 0.0
+
+        return reward * self.weight
+
+    def get_rewards(self, agents: List[AgentID], state: GameState,
+                    is_terminated: Dict[AgentID, bool],
+                    is_truncated: Dict[AgentID, bool],
+                    shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
+        """
+        Calculates the rewards for all agents using the standard RLGym API signature.
+
+        Args:
+            agents: List of agent IDs to calculate rewards for.
+            state: The current state of the game.
+            is_terminated: Dict indicating if agents are terminated.
+            is_truncated: Dict indicating if agents are truncated.
+            shared_info: Shared information dictionary.
+
+
+        Returns:
+            A dictionary mapping agent_id to the calculated reward.
+        """
+        # Use the default implementation from BaseRewardFunction which calls calculate for each agent
+        # Or explicitly implement it like this:
+        rewards = {}
+        # We don't have access to previous_state here directly, but calculate doesn't need it
+        previous_state = shared_info.get("previous_state")
+        for agent_id in agents:
+            rewards[agent_id] = self.calculate(agent_id, state, previous_state)
         return rewards

@@ -13,7 +13,7 @@ from .rewards import (
     KRCReward, PlayerVelocityTowardBallReward, TouchBallToGoalAccelerationReward,
     PassCompletionReward, ScoringOpportunityCreationReward, AerialControlReward,
     AerialDirectionalTouchReward, BlockSuccessReward, DefensivePositioningReward,
-    BallClearanceReward, TeamSpacingReward, TeamPossessionReward,
+    BallClearanceReward, TeamSpacingReward, TeamPossessionReward, AirReward,
     create_distance_weighted_alignment_reward, create_offensive_potential_reward, create_lucy_skg_reward,
     AerialDistanceReward, FlipResetReward, WavedashReward, FirstTouchSpeedReward, SpeedflipReward
 )
@@ -108,13 +108,13 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         CurriculumManager: The created curriculum manager
     """
     # Use provided learning rates or fall back to defaults
-    default_lr_actor = 0.0002
-    default_lr_critic = 0.0003 # Slightly higher default critic LR
+    default_lr_actor = 0.0002 # Guide suggestion for early stages
+    default_lr_critic = 0.0002 # Guide suggestion for early stages (matching actor)
     lr_actor = lr_actor if lr_actor is not None else default_lr_actor
     lr_critic = lr_critic if lr_critic is not None else default_lr_critic
 
     if debug:
-        print(f"[DEBUG Curriculum] Creating 2v2 curriculum. LR Actor: {lr_actor}, LR Critic: {lr_critic}")
+        print(f"[DEBUG Curriculum] Creating 2v2 curriculum. Initial LR Actor: {lr_actor}, Initial LR Critic: {lr_critic}")
         if use_pretraining:
             print("[DEBUG Curriculum] Note: use_pretraining=True flag ignored, starting directly with 2v2 stages.")
 
@@ -139,7 +139,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
     ball_proximity_reward = BallProximityReward(negative_slope=True) # Reward closer proximity more
     save_boost_reward = SaveBoostReward()
     velocity_ball_to_goal_reward = BallVelocityToGoalReward(team_goal_y=5120)
-    goal_reward = GoalReward() # Default goal reward/penalty
+    goal_reward_base = GoalReward() # Base goal reward instance
     touch_accel_reward = TouchBallToGoalAccelerationReward(team_goal_y=5120)
     offensive_potential_krc = create_offensive_potential_reward(team_goal_y=5120)
     block_success_reward = BlockSuccessReward(goal_y=5120)
@@ -149,13 +149,20 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
     team_possession_reward = TeamPossessionReward()
     aerial_control_reward = AerialControlReward()
     aerial_touch_reward = AerialDirectionalTouchReward(goal_y=5120)
-    lucy_skg_reward = create_lucy_skg_reward(team_goal_y=5120) # Base full game reward
+    lucy_skg_reward = create_lucy_skg_reward(team_goal_y=5120) # Base full game reward (may include goal logic)
     pass_completion_reward = PassCompletionReward()
     opportunity_creation_reward = ScoringOpportunityCreationReward(goal_y=5120)
+    air_reward = AirReward(weight=0.2) # Instantiate AirReward with weight
+
+    # Aggression bias for final stage
+    aggression_bias = 0.2
+    final_goal_weight = 5.0 # Moderate goal weight for final stage
+    final_concede_weight = -final_goal_weight * (1 - aggression_bias) # Reduced penalty for being scored on
+
     # Optional advanced mechanics
-    # flip_reset_reward = FlipResetReward()
-    # wavedash_reward = WavedashReward()
-    # speedflip_reward = SpeedflipReward()
+    flip_reset_reward = FlipResetReward()
+    wavedash_reward = WavedashReward()
+    speedflip_reward = SpeedflipReward()
 
     # --- Mutators ---
     kickoff_mutator = KickoffMutator()
@@ -208,17 +215,18 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
 
     # --- Stage Definitions ---
 
-    # STAGE 1: 2v2 Basic Interaction & Movement
+    # STAGE 1: 2v2 Basic Interaction & Movement (Following Guide's Early Stage)
     stage1 = CurriculumStage(
         name="2v2 Basic Interaction",
         state_mutator=MutatorSequence(fixed_2v2_mutator, kickoff_mutator),
         reward_function=CombinedReward(
-            (touch_ball_reward, 1.5),          # High weight for touching
-            (velocity_to_ball_reward, 0.5),
-            (ball_proximity_reward, 0.3),
-            (save_boost_reward, 0.1)
+            (touch_ball_reward, 50.0),          # Giant reward for touching (Guide: ~50)
+            (velocity_to_ball_reward, 5.0),     # Strong incentive to move towards ball (Guide: ~5)
+            (ball_proximity_reward, 1.0),       # Smaller proximity reward (Guide: FaceBall ~1)
+            (air_reward, 0.2),                  # Don't forget to jump (Guide: AirReward ~0.15, scaled up)
+            (save_boost_reward, 1.0)            # Small boost saving incentive
         ),
-        termination_condition=timeout_s, # End quickly after kickoff phase
+        termination_condition=timeout_s, # End quickly after kickoff phase (Guide: Short timeout)
         truncation_condition=timeout_s,
         progression_requirements=ProgressionRequirements(
             min_success_rate=0.0, # Not applicable here
@@ -228,7 +236,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             required_consecutive_successes=1 # Not applicable
         ),
         hyperparameter_adjustments={
-            "lr_actor": lr_actor,       # Start with base LR
+            "lr_actor": lr_actor,       # Start with base LR (Guide: ~2e-4)
             "lr_critic": lr_critic,
             "entropy_coef": 0.01      # Higher entropy for exploration
         }
@@ -240,7 +248,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         state_mutator=MutatorSequence(fixed_2v2_mutator, kickoff_mutator),
         reward_function=CombinedReward(
             (velocity_ball_to_goal_reward, 0.8), # Start encouraging direction
-            (touch_ball_reward, 0.5),          # Lower touch reward
+            (touch_ball_reward, 5.0),          # Lower touch reward significantly (Guide: Decrease a lot)
             (velocity_to_ball_reward, 0.2),
             (ball_proximity_reward, 0.1),
             (save_boost_reward, 0.3)           # Increase boost saving importance
@@ -255,8 +263,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             required_consecutive_successes=2
         ),
         hyperparameter_adjustments={
-            "lr_actor": lr_actor * 0.9,
-            "lr_critic": lr_critic * 0.9,
+            "lr_actor": lr_actor * 0.7, # Guide: Decrease LR to ~1e-4 (adjust multiplier if needed)
+            "lr_critic": lr_critic * 0.7,
             "entropy_coef": 0.008
         }
     )
@@ -266,7 +274,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         name="2v2 Basic Offense",
         state_mutator=offensive_spawn, # Use offensive scenarios
         reward_function=CombinedReward(
-            (goal_reward, 5.0),                  # Moderate goal reward (as per guide)
+            (goal_reward_base, 5.0),             # Base goal reward weighted (Guide: ~20 relative weight, here 5 absolute)
             (velocity_ball_to_goal_reward, 1.0), # Stronger push to goal
             (touch_accel_reward, 0.5),           # Reward accelerating ball to goal
             (offensive_potential_krc, 0.3),      # Basic offensive positioning
@@ -282,8 +290,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             required_consecutive_successes=3
         ),
         hyperparameter_adjustments={
-            "lr_actor": lr_actor * 0.8,
-            "lr_critic": lr_critic * 0.8,
+            "lr_actor": lr_actor * 0.6, # Continue decreasing LR
+            "lr_critic": lr_critic * 0.6,
             "entropy_coef": 0.007
         }
     )
@@ -297,7 +305,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             (defensive_positioning_reward, 1.0), # Reward staying between ball and goal
             (ball_clearance_reward, 0.7),        # Reward clearing the ball
             (save_boost_reward, 0.3)
-            # Goal reward is implicitly negative via termination
+            # Goal reward is implicitly negative via termination (opponent scoring)
         ),
         termination_condition=goal_condition, # Opponent scoring ends episode
         truncation_condition=timeout_l,       # Longer timeout for defensive practice
@@ -309,8 +317,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             required_consecutive_successes=3
         ),
         hyperparameter_adjustments={
-            "lr_actor": lr_actor * 0.7,
-            "lr_critic": lr_critic * 0.7,
+            "lr_actor": lr_actor * 0.5,
+            "lr_critic": lr_critic * 0.5,
             "entropy_coef": 0.006
         }
     )
@@ -334,8 +342,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             required_consecutive_successes=2
         ),
         hyperparameter_adjustments={
-            "lr_actor": lr_actor * 0.6,
-            "lr_critic": lr_critic * 0.6,
+            "lr_actor": lr_actor * 0.4,
+            "lr_critic": lr_critic * 0.4,
             "entropy_coef": 0.005
         }
     )
@@ -348,7 +356,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             (lucy_skg_reward, 0.5),              # Base reward
             (aerial_touch_reward, 1.0),          # Reward touching ball in air towards goal
             (aerial_control_reward, 0.7),        # Reward stable aerial control
-            # Optional: Add AerialDistanceReward if complex aerials are desired later
+            # AerialDistanceReward removed as it wasn't instantiated
         ),
         termination_condition=goal_condition,
         truncation_condition=timeout_l,
@@ -360,23 +368,26 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             required_consecutive_successes=2
         ),
         hyperparameter_adjustments={
-            "lr_actor": lr_actor * 0.5,
-            "lr_critic": lr_critic * 0.5,
+            "lr_actor": lr_actor * 0.3, # Further decrease LR
+            "lr_critic": lr_critic * 0.3,
             "entropy_coef": 0.004
         }
     )
 
-    # STAGE 7: 2v2 Full Game & Advanced Play
+    # STAGE 7: 2v2 Full Game & Advanced Play (with Aggression Bias)
     stage7 = CurriculumStage(
         name="2v2 Full Game",
         state_mutator=MutatorSequence(fixed_2v2_mutator, kickoff_mutator),
         reward_function=CombinedReward(
-             (lucy_skg_reward, 1.0),              # Primary reward function
-             (pass_completion_reward, 0.3),       # Add small pass incentive
-             (opportunity_creation_reward, 0.2)   # Add small opportunity incentive
-             # Optional: Add advanced mechanics rewards here if needed
-             # (speedflip_reward, 0.1),
-             # (wavedash_reward, 0.1),
+             (goal_reward_base, final_goal_weight),  # Use base GoalReward with final stage weight (includes aggression bias)
+             (lucy_skg_reward, 0.8),                 # Slightly reduced weight if it overlaps with goal logic
+             (pass_completion_reward, 0.3),          # Add small pass incentive
+             (aerial_control_reward, 0.3),           # Use instantiated reward
+             (opportunity_creation_reward, 0.2),      # Add small opportunity incentive
+             # Optional advanced mechanics
+             (speedflip_reward, 0.1),
+             (wavedash_reward, 0.1),
+             (flip_reset_reward, 0.1)
         ),
         termination_condition=goal_condition,
         truncation_condition=timeout_match,
@@ -388,8 +399,8 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             required_consecutive_successes=2
         ),
         hyperparameter_adjustments={
-            "lr_actor": lr_actor * 0.4, # Lowest LR
-            "lr_critic": lr_critic * 0.4,
+            "lr_actor": lr_actor * 0.2, # Lowest LR
+            "lr_critic": lr_critic * 0.2,
             "entropy_coef": 0.003      # Lowest entropy
         }
     )

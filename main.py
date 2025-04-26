@@ -1632,7 +1632,7 @@ if __name__ == "__main__":
                         help='Enable test mode (enables rendering and limits to 1 environment)')
 
 
-    parser.add_argument('--save_interval', type=int, default=10000,
+    parser.add_argument('--save_interval', type=int, default=1000,
                        help='Save the model every N episodes')
 
     # Actor/Shared Network Config (Defaults from SimbaV2 Actor)
