@@ -538,13 +538,16 @@ class Trainer:
         if not self.use_wandb or wandb.run is None:
             return
 
-        # Get current step if not explicitly provided
+        # Get current training step if not explicitly provided
         current_step = step if step is not None else self._true_training_steps()
-
-        # Skip logging if we've already logged this step
-        if hasattr(self, '_last_wandb_step') and current_step <= self._last_wandb_step:
+        
+        # Use environment steps as our primary x-axis for logging
+        current_env_steps = total_env_steps if total_env_steps is not None else self.total_env_steps
+        
+        # Skip logging if we've already logged this environment step
+        if hasattr(self, '_last_wandb_env_step') and current_env_steps <= self._last_wandb_env_step:
             if self.debug:
-                print(f"[STEP DEBUG] Skipping wandb log for step {current_step} (≤ {self._last_wandb_step})")
+                print(f"[STEP DEBUG] Skipping wandb log for env_step {current_env_steps} (≤ {self._last_wandb_env_step})")
             return
 
         # Organize metrics into logical groups
@@ -718,8 +721,8 @@ class Trainer:
         system_metrics["SYS/total_episodes"] = self.total_episodes + self.total_episodes_offset
         system_metrics["SYS/update_time"] = metrics.get("update_time", 0)
 
-        # Add total environment steps
-        log_total_env_steps = total_env_steps if total_env_steps is not None else self.total_env_steps
+        # Use environment steps as primary counter
+        log_total_env_steps = current_env_steps  # Use the already determined env steps
         system_metrics["SYS/total_env_steps"] = log_total_env_steps
 
         # Add steps per second if provided in metrics
@@ -765,17 +768,18 @@ class Trainer:
             print(f"[STEP DEBUG] About to log to wandb with step={current_step}, algorithm={self.algorithm_type}")
 
         try:
-            # Log to wandb
-            wandb.log(flat_metrics, step=current_step)
+            # Log to wandb using environment steps as the x-axis
+            wandb.log(flat_metrics, step=current_env_steps)
 
             if self.debug:
-                print(f"[STEP DEBUG] Successfully logged to wandb at step {current_step}")
+                print(f"[STEP DEBUG] Successfully logged to wandb at env_step {current_env_steps} (training step {current_step})")
 
-            # Remember this step for next time
+            # Remember both steps for next time
             self._last_wandb_step = current_step
+            self._last_wandb_env_step = current_env_steps
 
             if self.debug:
-                print(f"[STEP DEBUG] Updated _last_wandb_step to {self._last_wandb_step}")
+                print(f"[STEP DEBUG] Updated tracking: _last_wandb_env_step={self._last_wandb_env_step}, _last_wandb_step={self._last_wandb_step}")
 
         except Exception as e:
             if self.debug:
@@ -985,15 +989,16 @@ class Trainer:
                         # Increment training steps counter BEFORE logging
                         self.training_steps += 1
 
-                        # Get a unique step value for this update (avoid duplicate steps)
-                        unique_step = self._get_unique_wandb_step()
+                        # Get a unique environment step value for this update
+                        unique_env_step = self._get_unique_wandb_step()
 
                         if self.debug:
                             print(f"[STEP DEBUG] StreamAC performed update, incrementing step to {self._true_training_steps()}")
-                            print(f"[STEP DEBUG] About to log to wandb with unique_step={unique_step}")
+                            print(f"[STEP DEBUG] About to log to wandb with env_step={unique_env_step}")
 
-                        # Log metrics using our centralized logging function
-                        self._log_to_wandb(metrics, step=unique_step, total_env_steps=self.total_env_steps)
+                        # Log metrics using our centralized logging function - no need to pass step parameter
+                        # as it will use total_env_steps (which we pass) by default
+                        self._log_to_wandb(metrics, total_env_steps=unique_env_step)
                     except Exception as e:
                         if self.debug:
                             print(f"[STEP DEBUG] Error logging to wandb: {e}")
@@ -1033,16 +1038,16 @@ class Trainer:
             )
 
 
-    # Add a new helper method to get a unique wandb step
+    # Helper method to get a unique wandb step based on environment steps
     def _get_unique_wandb_step(self):
-        """Get a unique step value that hasn't been used for wandb logging yet"""
-        base_step = self._true_training_steps()
+        """Get a unique environment step value that hasn't been used for wandb logging yet"""
+        base_env_step = self.total_env_steps
 
-        # If we've already used this step, increment by 1 to make it unique
-        if hasattr(self, '_last_wandb_step') and base_step <= self._last_wandb_step:
-            return self._last_wandb_step + 1
+        # If we've already used this environment step, increment by 1 to make it unique
+        if hasattr(self, '_last_wandb_env_step') and base_env_step <= self._last_wandb_env_step:
+            return self._last_wandb_env_step + 1
 
-        return base_step
+        return base_env_step
 
     def store_experience_at_idx(self, idx, state=None, action=None, log_prob=None, reward=None, value=None, done=None):
         """Forward to algorithm's store_experience_at_idx method if it exists"""

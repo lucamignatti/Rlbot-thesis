@@ -1575,8 +1575,8 @@ if __name__ == "__main__":
                        help='Learning algorithm to use: ppo (default) or streamac')
 
     # Learning rates
-    parser.add_argument('--lra', type=float, default=1e-5, help='Learning rate for actor network')
-    parser.add_argument('--lrc', type=float, default=5e-5, help='Learning rate for critic network')
+    parser.add_argument('--lra', type=float, default=1e-4, help='Learning rate for actor network')
+    parser.add_argument('--lrc', type=float, default=3e-4, help='Learning rate for critic network')
 
     # Discount factors
     parser.add_argument('--gamma', type=float, default=0.997, help='Discount factor for future rewards')
@@ -1589,9 +1589,9 @@ if __name__ == "__main__":
     parser.add_argument('--max_grad_norm', type=float, default=0.5, help='Maximum gradient norm for clipping')
 
     # --- ADD DISTRIBUTIONAL CRITIC ARGS ---
-    parser.add_argument('--v_min', type=float, default=-10.0, help='Minimum value for distributional critic support')
-    parser.add_argument('--v_max', type=float, default=10.0, help='Maximum value for distributional critic support')
-    parser.add_argument('--num_atoms', type=int, default=51, help='Number of atoms for distributional critic support')
+    parser.add_argument('--v_min', type=float, default=-5.0, help='Minimum value for distributional critic support')
+    parser.add_argument('--v_max', type=float, default=5.0, help='Maximum value for distributional critic support')
+    parser.add_argument('--num_atoms', type=int, default=101, help='Number of atoms for distributional critic support')
     # ------------------------------------
 
     # Training loop parameters
@@ -1761,7 +1761,7 @@ if __name__ == "__main__":
     parser.add_argument('--use-reward-scaling', action='store_true', dest='use_reward_scaling', help='Enable SimbaV2 reward scaling')
     parser.add_argument('--no-reward-scaling', action='store_false', dest='use_reward_scaling', help='Disable SimbaV2 reward scaling')
     parser.set_defaults(use_reward_scaling=True)
-    parser.add_argument('--reward-scaling-gmax', type=float, default=10.0, help='G_max hyperparameter for reward scaling')
+    parser.add_argument('--reward-scaling-gmax', type=float, default=5.0, help='G_max hyperparameter for reward scaling')
 
     args = parser.parse_args()
 
