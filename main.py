@@ -514,7 +514,7 @@ def run_training(
     pretraining_rp_weight: float = 5.0,
     # Removed pretraining_transition_steps
     # Intrinsic rewards parameters
-    use_intrinsic_rewards: bool = True,
+    use_intrinsic_rewards: bool = False,  # Changed default to match CLI default (False)
     intrinsic_reward_scale: float = 0.1,
     curiosity_weight: float = 0.5,
     rnd_weight: float = 0.5,
@@ -1110,16 +1110,19 @@ def run_training(
                                      # update_experience_with_intrinsic_reward handles scaling and intrinsic addition
                                      total_reward_for_tracking = extrinsic_reward # Default to original
                                      if next_obs is not None:
-                                         # Use the single update method to get the combined reward
-                                         total_reward_for_tracking = trainer.update_experience_with_intrinsic_reward(
-                                             state=all_obs_list[exp_idx],
-                                             action=action_batch[exp_idx], # Original action
-                                             next_state=next_obs,
-                                             reward=extrinsic_reward, # Pass ORIGINAL extrinsic
-                                             env_id=env_idx,
-                                             done=done # Pass done flag
-                                             # store_idx is None for StreamAC here
-                                         )
+                                         # Only call intrinsic reward calculation if enabled
+                                         if trainer.use_intrinsic_rewards:
+                                             # Use the single update method to get the combined reward
+                                             total_reward_for_tracking = trainer.update_experience_with_intrinsic_reward(
+                                                 state=all_obs_list[exp_idx],
+                                                 action=action_batch[exp_idx], # Original action
+                                                 next_state=next_obs,
+                                                 reward=extrinsic_reward, # Pass ORIGINAL extrinsic
+                                                 env_id=env_idx,
+                                                 done=done # Pass done flag
+                                                 # store_idx is None for StreamAC here
+                                             )
+                                         # Otherwise just use extrinsic reward - no need to call the intrinsic method
                                      # Defensive check/initialization before accumulating reward
                                      if agent_id not in episode_rewards[env_idx]:
                                          episode_rewards[env_idx][agent_id] = 0.0
@@ -1280,7 +1283,7 @@ def run_training(
 
 
             # Check if intrinsic reward models should be reset
-            if use_pretraining and not trainer.pretraining_completed and \
+            if trainer.use_intrinsic_rewards and use_pretraining and not trainer.pretraining_completed and \
                total_episodes_so_far > 0 and \
                total_episodes_so_far % 50 == 0 and \
                total_episodes_so_far > last_intrinsic_reset_episode and \
@@ -1971,6 +1974,7 @@ if __name__ == "__main__":
         print(f"[DEBUG] Using {args.algorithm.upper()} algorithm")
         print(f"[DEBUG] Using model architecture: {args.model_arch}")
         print(f"[DEBUG] Auxiliary tasks enabled: {args.auxiliary}") # Print effective value
+        print(f"[DEBUG] Intrinsic rewards enabled: {args.use_intrinsic}") # Print intrinsic rewards state
         if args.model_arch == 'simbav2-shared':
             print(f"[DEBUG] Shared Model Config: hidden_dim={args.hidden_dim}, num_blocks={args.num_blocks}")
             print(f"[DEBUG] Shared model instance: {actor}")
