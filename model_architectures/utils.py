@@ -116,7 +116,7 @@ class RSNorm(nn.Module):
 
     Standardizes input features using running estimates of mean and variance.
     """
-    def __init__(self, num_features, momentum=0.1, eps=1e-5):
+    def __init__(self, num_features, momentum=None, eps=1e-5):
         super(RSNorm, self).__init__()
         self.num_features = num_features
         self.momentum = momentum
@@ -137,12 +137,12 @@ class RSNorm(nn.Module):
         Returns:
             Normalized tensor of same shape
         """
-        # Don't modify original input if not training or fixed
-        if not self.training or self._cuda_graphs_fixed:
-            # Use running stats directly in eval or fixed mode
-            mean = self.running_mean
-            var = self.running_var
-        else:
+        # Use running stats directly
+        mean = self.running_mean
+        var = self.running_var
+
+        # Update running statistics during training if not fixed
+        if self.training and not self._cuda_graphs_fixed:
             # Calculate batch statistics
             batch_mean = x.mean(dim=0, keepdim=False)
             batch_var = x.var(dim=0, unbiased=False, keepdim=False)
@@ -159,10 +159,7 @@ class RSNorm(nn.Module):
                 self.running_mean.copy_(self.running_mean * (1 - momentum) + batch_mean * momentum)
                 self.running_var.copy_(self.running_var * (1 - momentum) + batch_var * momentum)
 
-            # Use batch stats for normalization during training (as in BatchNorm)
-            mean = batch_mean
-            var = batch_var
-
+        # --- End Stat Update ---
 
         # Ensure stats are on the same device as input
         if mean.device != x.device:
@@ -243,7 +240,7 @@ class ResidualFFBlock(nn.Module):
 # --- SimbaV2 Specific Components ---
 
 # Helper function for L2 normalization
-def l2_norm(t, eps=1e-5):
+def l2_norm(t, eps=1e-8):
     return t / (torch.norm(t, p=2, dim=-1, keepdim=True) + eps)
 
 # Scaler module from SimbaV2 paper (Appendix B, Listing 1 adaptation)
@@ -291,10 +288,9 @@ class LERP(nn.Module):
     def forward(self, x1: torch.Tensor, x2: torch.Tensor) -> torch.Tensor:
         # Apply decoupled scaling for alpha (similar to Scaler's Eq 21)
         effective_alpha = self.alpha_param * (self.init_val / self.scale_val) if self.scale_val != 0 else self.alpha_param
-        # Ensure effective alpha is between 0 and 1 using sigmoid
-        # Note: Paper doesn't explicitly mention sigmoid for LERP alpha, but it's common for interpolation factors.
-        # Clamping might be an alternative, but sigmoid is smoother.
-        alpha_clamped = torch.sigmoid(effective_alpha)
-        # Interpolate and normalize
-        interpolated = (1.0 - alpha_clamped) * x1 + alpha_clamped * x2
+        # Interpolate directly using effective_alpha (matches JAX reference code structure)
+        # Reference: residual + alpha * (h_tilde - residual)
+        # Equivalent: (1 - alpha) * residual + alpha * h_tilde
+        interpolated = (1.0 - effective_alpha) * x1 + effective_alpha * x2
+        # Apply final L2 normalization as per Eq 12 and reference code
         return l2_norm(interpolated)

@@ -1128,10 +1128,16 @@ class PPOAlgorithm(BaseAlgorithm):
                     # Get predicted log probabilities from critic logits
                     predicted_log_probs = F.log_softmax(critic_logits, dim=1)
 
-                    # Calculate cross-entropy loss
-                    # Minimize the negative log likelihood of the target distribution under the predicted distribution
-                    critic_loss = -(target_p * predicted_log_probs).sum(dim=1).mean()
+                    predicted_probs = F.softmax(critic_logits, dim=1) # Need probs for KL
 
+                    # Ensure target_p is detached and non-negative, add small epsilon for stability
+                    target_p_stable = target_p.detach() + 1e-8
+
+                    # Calculate KL Divergence: KL(target || predicted) = sum(target * log(target / predicted))
+                    # Simplifies to: sum(target * (log(target) - log(predicted)))
+                    # Note: predicted_log_probs = log(predicted)
+                    kl_div = (target_p_stable * (torch.log(target_p_stable) - predicted_log_probs)).sum(dim=1)
+                    critic_loss = kl_div.mean() # Minimize KL divergence
 
                     # --- Auxiliary Loss Calculation ---
                     sr_loss = torch.tensor(0.0, device=self.device) # Ensure tensor type
