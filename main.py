@@ -1578,8 +1578,8 @@ if __name__ == "__main__":
                        help='Learning algorithm to use: ppo (default) or streamac')
 
     # Learning rates
-    parser.add_argument('--lra', type=float, default=1e-4, help='Learning rate for actor network')
-    parser.add_argument('--lrc', type=float, default=3e-4, help='Learning rate for critic network')
+    parser.add_argument('--lra', type=float, default=2e-4, help='Learning rate for actor network')
+    parser.add_argument('--lrc', type=float, default=6e-4, help='Learning rate for critic network')
 
     # Discount factors
     parser.add_argument('--gamma', type=float, default=0.997, help='Discount factor for future rewards')
@@ -1642,7 +1642,7 @@ if __name__ == "__main__":
 
     # Critic Network Config (Defaults from SimbaV2 Critic)
     parser.add_argument('--hidden_dim_critic', type=int, default=768, help='Hidden dimension for the CRITIC network (only used if model-arch is not shared)')
-    parser.add_argument('--num_blocks_critic', type=int, default=3, help='Number of residual blocks in the CRITIC network (only used if model-arch is not shared)')
+    parser.add_argument('--num_blocks_critic', type=int, default=4, help='Number of residual blocks in the CRITIC network (only used if model-arch is not shared)')
 
     # Action stacking parameters
     parser.add_argument('--stack_size', type=int, default=5, help='Number of previous actions to stack')
