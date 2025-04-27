@@ -8,7 +8,7 @@ from rlgym.rocket_league.done_conditions import GoalCondition, TimeoutCondition,
 from rlgym.rocket_league.reward_functions import CombinedReward, GoalReward, TouchReward
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
 from .rewards import (
-    BallProximityReward, BallToGoalDistanceReward, TouchBallReward,
+    ZeroSumRewardWrapper, BallProximityReward, BallToGoalDistanceReward, TouchBallReward,
     BallVelocityToGoalReward, AlignBallToGoalReward, SaveBoostReward,
     KRCReward, PlayerVelocityTowardBallReward, TouchBallToGoalAccelerationReward,
     PassCompletionReward, ScoringOpportunityCreationReward, AerialControlReward,
@@ -313,12 +313,37 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
     wavedash_reward = WavedashReward()
     speedflip_reward = SpeedflipReward()
     
-    # Create zero-sum versions of certain rewards as recommended by the guide
-    # These should be rewards where it's beneficial for opponents to prevent
-    zero_sum_block = ZeroSumReward(block_success_reward, team_spirit=team_spirit_values["stage7"])
-    zero_sum_clearance = ZeroSumReward(ball_clearance_reward, team_spirit=team_spirit_values["stage7"])
-    zero_sum_pass = ZeroSumReward(pass_completion_reward, team_spirit=team_spirit_values["stage7"]) 
-    zero_sum_aerial = ZeroSumReward(enhanced_aerial_reward, team_spirit=team_spirit_values["stage7"])
+    # Create zero-sum versions of rewards as recommended by the guide
+    # These should be rewards where it's beneficial for opponents to prevent the action
+    
+    # Team spirit values for different stages - start with low values and increase
+    team_spirit_values = {
+        "stage1": 0.0,  # No team spirit in early stages (pure individual rewards)
+        "stage2": 0.0,
+        "stage3": 0.1,  # Start introducing slight team spirit
+        "stage4": 0.2,
+        "stage5": 0.3,  # Medium team spirit for team positioning stage
+        "stage6": 0.5,  # Higher team spirit for aerial foundations
+        "stage7": 0.7   # Highest team spirit for full game
+    }
+    
+    # Zero-sum wrappers for rewards where opponents want to prevent the action
+    zero_sum_velocity_to_ball = ZeroSumRewardWrapper(velocity_to_ball_reward)
+    zero_sum_ball_velocity_to_goal = ZeroSumRewardWrapper(velocity_ball_to_goal_reward) 
+    zero_sum_touch_accel = ZeroSumRewardWrapper(touch_accel_reward)
+    zero_sum_block = ZeroSumRewardWrapper(block_success_reward)
+    zero_sum_clearance = ZeroSumRewardWrapper(ball_clearance_reward)
+    zero_sum_team_possession = ZeroSumRewardWrapper(team_possession_reward)
+    zero_sum_aerial_touch = ZeroSumRewardWrapper(aerial_touch_reward)
+    zero_sum_pass = ZeroSumRewardWrapper(pass_completion_reward)
+    zero_sum_opportunity = ZeroSumRewardWrapper(opportunity_creation_reward)
+    zero_sum_flip_reset = ZeroSumRewardWrapper(flip_reset_reward)
+    
+    # Higher team spirit for later stages
+    zero_sum_team_possession_late = ZeroSumRewardWrapper(team_possession_reward, team_spirit=team_spirit_values["stage5"])
+    zero_sum_pass_late = ZeroSumRewardWrapper(pass_completion_reward, team_spirit=team_spirit_values["stage7"])
+    zero_sum_opportunity_late = ZeroSumRewardWrapper(opportunity_creation_reward, team_spirit=team_spirit_values["stage7"])
+    zero_sum_aerial = ZeroSumRewardWrapper(enhanced_aerial_reward, team_spirit=team_spirit_values["stage7"])
 
     # --- Mutators ---
     kickoff_mutator = KickoffMutator()
@@ -377,10 +402,10 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         state_mutator=MutatorSequence(fixed_2v2_mutator, kickoff_mutator),
         reward_function=CombinedReward(
             (touch_ball_reward, 50.0),          # Giant reward for touching (Guide: ~50)
-            (velocity_to_ball_reward, 5.0),     # Strong incentive to move towards ball (Guide: ~5)
+            (zero_sum_velocity_to_ball, 5.0),   # Zero-sum version of velocity to ball (competition for speed)
             (ball_proximity_reward, 1.0),       # Smaller proximity reward (Guide: FaceBall ~1)
             (air_reward, 0.2),                  # Don't forget to jump (Guide: AirReward ~0.15, scaled up)
-            (save_boost_reward, 0.1)            # Small boost saving incentive
+            (ZeroSumRewardWrapper(save_boost_reward), 0.1)  # Zero-sum boost saving (competition for boost)
         ),
         termination_condition=timeout_s, # End quickly after kickoff phase (Guide: Short timeout)
         truncation_condition=timeout_s,
@@ -403,11 +428,11 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         name="2v2 Directional Control",
         state_mutator=MutatorSequence(fixed_2v2_mutator, kickoff_mutator),
         reward_function=CombinedReward(
-            (velocity_ball_to_goal_reward, 1.2), # Start encouraging direction
+            (zero_sum_ball_velocity_to_goal, 1.2), # Zero-sum for powershots toward goal
             (touch_ball_reward, 5.0),          # Lower touch reward significantly (Guide: Decrease a lot)
-            (velocity_to_ball_reward, 0.2),
+            (zero_sum_velocity_to_ball, 0.2),  # Zero-sum for ball approach speed
             (ball_proximity_reward, 0.1),
-            (save_boost_reward, 0.3)           # Increase boost saving importance
+            (ZeroSumRewardWrapper(save_boost_reward), 0.3) # Zero-sum boost saving with increased importance
         ),
         termination_condition=goal_condition, # End on goal or timeout
         truncation_condition=timeout_m,
@@ -431,11 +456,11 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         state_mutator=offensive_spawn, # Use offensive scenarios
         reward_function=CombinedReward(
             (goal_reward_base, 5.0),                # Base goal reward weighted (Guide: ~20 relative weight, here 5 absolute)
-            (velocity_ball_to_goal_reward, 1.0),    # Stronger push to goal
+            (zero_sum_ball_velocity_to_goal, 1.0),  # Zero-sum for powershots toward goal
             (touch_ball_velocity_reward, 0.5),      # Using the enhanced touch reward that scales with velocity
-            (touch_accel_reward, 0.5),              # Reward accelerating ball to goal
+            (zero_sum_touch_accel, 0.5),            # Zero-sum for accelerating ball to goal
             (offensive_potential_krc, 0.3),         # Basic offensive positioning
-            (save_boost_reward, 0.2)
+            (ZeroSumRewardWrapper(save_boost_reward, team_spirit=team_spirit_values["stage3"]), 0.2)
         ),
         termination_condition=goal_condition,
         truncation_condition=timeout_m,
@@ -488,11 +513,11 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         name="2v2 Team Positioning",
         state_mutator=MutatorSequence(fixed_2v2_mutator, kickoff_mutator),
         reward_function=CombinedReward(
-            (lucy_skg_reward, 0.6),             # Base reward for general play
-            (team_spacing_reward, 0.8),         # Strongly reward good spacing
-            (team_possession_reward, 0.5),      # Reward keeping ball near team
+            (lucy_skg_reward, 0.6),                     # Base reward for general play
+            (team_spacing_reward, 0.8),                 # Strongly reward good spacing
+            (zero_sum_team_possession_late, 0.5),       # Reward keeping ball near team (with team spirit)
             # Add a small pass completion reward using zero-sum
-            (zero_sum_pass, 0.3)                # Reward successful passes (zero-sum)
+            (zero_sum_pass_late, 0.3)                   # Reward successful passes (zero-sum with team spirit)
         ),
         termination_condition=goal_condition,
         truncation_condition=timeout_match,     # Full match length
@@ -549,14 +574,14 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
              # We've configured final_concede_weight with aggression_bias of 0.2 as the guide recommends
              # This makes conceding less punishing, encouraging aggressive play
              (lucy_skg_reward, 0.8),                  # Slightly reduced weight if it overlaps with goal logic
-             (zero_sum_pass, 0.3),                    # Using zero-sum version for passes
+             (zero_sum_pass_late, 0.3),               # Using zero-sum version for passes with team spirit
              (zero_sum_aerial, 0.3),                  # Using zero-sum enhanced aerial reward
-             (opportunity_creation_reward, 0.2),      # Add small opportunity incentive
-             (touch_ball_velocity_reward, 0.2),       # Include velocity-based touch reward
-             # Optional advanced mechanics
-             (speedflip_reward, 0.1),
-             (wavedash_reward, 0.1),
-             (flip_reset_reward, 0.1)
+             (zero_sum_opportunity_late, 0.2),        # Zero-sum reward for creating opportunities (with team spirit)
+             (ZeroSumRewardWrapper(touch_ball_velocity_reward), 0.2),  # Zero-sum velocity-based touch reward
+             # Optional advanced mechanics - only flip reset as zero-sum
+             (speedflip_reward, 0.1),                 # Keep non-zero sum (movement mechanics)
+             (wavedash_reward, 0.1),                  # Keep non-zero sum (movement mechanics)
+             (zero_sum_flip_reset, 0.1)               # Zero-sum for reset advantage
         ),
         termination_condition=goal_condition,
         truncation_condition=timeout_match,

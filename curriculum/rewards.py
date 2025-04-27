@@ -2234,6 +2234,133 @@ class SpeedflipReward(RewardFunction):
         shared_info["previous_state"] = state
         return rewards
 
+class ZeroSumRewardWrapper(BaseRewardFunction):
+    """
+    Makes a reward function zero-sum between opposing teams.
+    As recommended in RLGym-PPO-Guide, this should be used for rewards where
+    it is beneficial for the opponent to prevent the action.
+    
+    Examples include:
+    - Bumps/demos
+    - Flip resets
+    - Strong powershots
+    - Collecting boost
+    - Having speed
+    
+    Not recommended for mechanics like speed flips, air roll control, or air reward.
+    """
+    
+    def __init__(self, reward_function, team_spirit=0.0):
+        """
+        Args:
+            reward_function: The reward function to wrap
+            team_spirit: How much reward is shared between teammates (0.0 to 1.0)
+        """
+        super().__init__()
+        self.reward_function = reward_function
+        self.team_spirit = team_spirit
+        self.team_rewards = {}
+        self.processed_agents = set()
+        
+    def reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
+        """Reset all component reward functions"""
+        if hasattr(self.reward_function, 'reset'):
+            self.reward_function.reset(agents, initial_state, shared_info)
+        
+        # Reset team rewards tracking
+        self.team_rewards = {0: [], 1: []}  # Blue team (0) and Orange team (1)
+        self.processed_agents = set()
+    
+    def calculate(self, agent_id: AgentID, state: GameState, previous_state: Optional[GameState] = None) -> float:
+        """Calculate zero-sum reward for an agent"""
+        # Get original reward from wrapped function
+        reward = self.reward_function.calculate(agent_id, state, previous_state)
+        
+        # Get team number of agent
+        player_team = self._get_player_team(agent_id, state)
+        opponent_team = 1 - player_team  # If team is 0, opponent is 1, vice versa
+        
+        # If this is a new calculation step, reset the tracking
+        if len(self.processed_agents) == 0:
+            self.team_rewards = {0: [], 1: []}
+            
+        # Track this reward for the player's team
+        self.team_rewards[player_team].append((agent_id, reward))
+        self.processed_agents.add(agent_id)
+        
+        # Calculate rewards for all teams once all agents have been processed
+        if len(self.processed_agents) == len(state.cars):
+            # Calculate average team rewards
+            avg_team_reward = 0
+            if self.team_rewards[player_team]:
+                avg_team_reward = sum(r for _, r in self.team_rewards[player_team]) / len(self.team_rewards[player_team])
+                
+            avg_opponent_reward = 0
+            if self.team_rewards[opponent_team]:
+                avg_opponent_reward = sum(r for _, r in self.team_rewards[opponent_team]) / len(self.team_rewards[opponent_team])
+            
+            # Apply team spirit formula: R'i = (1-τ)*R'i + τ*(R'team - R'opponent)
+            # For individual reward
+            individual_reward = reward
+            
+            # For team component
+            team_component = avg_team_reward - avg_opponent_reward
+            
+            # Combine based on team_spirit
+            final_reward = (1 - self.team_spirit) * individual_reward + self.team_spirit * team_component
+            
+            # Reset processed agents for next step
+            self.processed_agents = set()
+            
+            return final_reward
+        else:
+            # Return current reward without zero-sum adjustment if not all agents processed yet
+            return reward
+    
+    def get_rewards(self, agents: List[AgentID], state: GameState,
+                   is_terminated: Dict[AgentID, bool],
+                   is_truncated: Dict[AgentID, bool],
+                   shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
+        """Get zero-sum rewards for all agents"""
+        # First pass: collect all basic rewards
+        basic_rewards = {}
+        for agent_id in agents:
+            if hasattr(self.reward_function, 'calculate'):
+                basic_rewards[agent_id] = self.reward_function.calculate(agent_id, state, shared_info.get("previous_state"))
+            else:
+                # Fall back to get_reward if calculate is not available
+                basic_rewards[agent_id] = self.reward_function.get_reward(agent_id, state, None)
+        
+        # Group rewards by team
+        team_rewards = {0: [], 1: []}
+        for agent_id, reward in basic_rewards.items():
+            if agent_id in state.cars:
+                team = state.cars[agent_id].team_num
+                team_rewards[team].append((agent_id, reward))
+        
+        # Calculate team averages
+        team_avgs = {}
+        for team, rewards in team_rewards.items():
+            if rewards:
+                team_avgs[team] = sum(r for _, r in rewards) / len(rewards)
+            else:
+                team_avgs[team] = 0
+        
+        # Apply zero-sum and team spirit
+        final_rewards = {}
+        for agent_id in agents:
+            if agent_id in state.cars:
+                team = state.cars[agent_id].team_num
+                opponent_team = 1 - team
+                
+                # Apply team spirit formula: R'i = (1-τ)*R'i + τ*(R'team - R'opponent)
+                individual_reward = basic_rewards[agent_id]
+                team_component = team_avgs.get(team, 0) - team_avgs.get(opponent_team, 0)
+                final_rewards[agent_id] = (1 - self.team_spirit) * individual_reward + self.team_spirit * team_component
+        
+        return final_rewards
+
+
 class AirReward(BaseRewardFunction):
     """
     Reward function that encourages the agent to be airborne.
