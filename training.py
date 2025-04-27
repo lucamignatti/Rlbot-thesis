@@ -66,6 +66,64 @@ class RunningMeanStd:
         self.count = new_count
 
 
+class SkillRatingTracker:
+    """
+    Tracks agent skill rating using an Elo-like system.
+    Allows comparison against baselines or historical performance.
+    """
+    def __init__(self, initial_rating=1500, rating_inc=32, modes=None):
+        """
+        Initialize a skill rating tracker with Elo-like rating system
+        
+        Args:
+            initial_rating: Starting rating value (default: 1500)
+            rating_inc: Rating change factor (K-factor in Elo) (default: 32)
+            modes: Dict of game modes to track separately (default: {'default': initial_rating})
+        """
+        self.rating_inc = rating_inc
+        self.modes = modes or {'default': initial_rating}
+        self.history = {mode: [rating] for mode, rating in self.modes.items()}
+        self.update_count = {mode: 0 for mode in self.modes}
+        
+    def update_rating(self, opponent_rating, result, mode='default'):
+        """
+        Update the rating based on the result against an opponent.
+        
+        Args:
+            opponent_rating: The rating of the opponent (or baseline)
+            result: 1 for win, 0 for loss, 0.5 for draw
+            mode: The game mode to update
+        
+        Returns:
+            The updated rating
+        """
+        if mode not in self.modes:
+            self.modes[mode] = self.modes['default']
+            self.history[mode] = [self.modes[mode]]
+            self.update_count[mode] = 0
+            
+        # Calculate the expected score (probability of winning)
+        exp_delta = (opponent_rating - self.modes[mode]) / 400
+        expected = 1 / (pow(10, exp_delta) + 1)
+        
+        # Update rating
+        self.modes[mode] += self.rating_inc * (result - expected)
+        
+        # Store in history
+        self.history[mode].append(self.modes[mode])
+        self.update_count[mode] += 1
+        
+        return self.modes[mode]
+
+    def get_current_rating(self, mode='default'):
+        """Get the current rating for a specific mode"""
+        return self.modes.get(mode, self.modes['default'])
+    
+    def get_rating_history(self, mode='default'):
+        """Get the history of ratings for a specific mode"""
+        return self.history.get(mode, self.history['default'])
+
+
 class Trainer:
     """
     Base trainer class that manages the training of reinforcement learning algorithms.
@@ -358,6 +416,12 @@ class Trainer:
         self.env_stats_buffer = {}  # Dictionary to accumulate environment statistics between updates
         self.env_stats_counts = {}  # Counter for each statistic to calculate averages
         self.env_stats_metrics = {}  # Averaged metrics to report in WandB
+        
+        # Initialize skill rating tracker
+        self.skill_tracker = SkillRatingTracker(initial_rating=1500, rating_inc=32)
+        self.baseline_rating = 1500  # Static baseline rating
+        self.skill_update_frequency = 5  # Update skill rating every N episodes
+        self.skill_rating_window = 100  # Number of episodes to consider for performance baseline
 
         if self.debug:
             print(f"[DEBUG] Initialized {self.algorithm_type.upper()} algorithm on {self.device}")
@@ -557,7 +621,8 @@ class Trainer:
             'auxiliary': {},
             'system': {},
             'environment': {},  # Group for environment statistics
-            'rewards': {}       # New group specifically for reward metrics
+            'rewards': {},      # Group specifically for reward metrics
+            'skill': {}         # Group for skill rating metrics
         }
 
         # --- Algorithm metrics ---
@@ -627,6 +692,26 @@ class Trainer:
 
         if self.debug and env_stat_count > 0:
             print(f"[WANDB DEBUG] Adding {env_stat_count} averaged environment metrics to WandB")
+            
+        # --- Skill metrics ---
+        skill_metrics = grouped_metrics['skill']
+        skill_stat_count = 0
+        
+        # Extract skill metrics that were passed via metrics
+        for key, value in metrics.items():
+            # Process metrics with SKILL/ prefix
+            if key.startswith('SKILL/'):
+                skill_metrics[key] = value
+                skill_stat_count += 1
+            
+        # Always include current skill rating, even if not updated this step
+        if skill_stat_count == 0 and hasattr(self, 'skill_tracker'):
+            current_rating = self.skill_tracker.get_current_rating()
+            skill_metrics["SKILL/rating"] = current_rating
+            skill_stat_count += 1
+            
+        if self.debug and skill_stat_count > 0:
+            print(f"[WANDB DEBUG] Adding {skill_stat_count} skill metrics to WandB")
 
 
         # --- Auxiliary metrics ---
@@ -1181,6 +1266,47 @@ class Trainer:
             metrics['min_episode_reward'] = np.min(completed_episode_rewards)
             metrics['max_episode_reward'] = np.max(completed_episode_rewards)
             metrics['std_episode_reward'] = np.std(completed_episode_rewards)
+            
+            # Update skill rating if we have enough history
+            if len(self.episode_rewards) >= self.skill_update_frequency:
+                # Get current batch performance
+                current_reward = metrics['mean_episode_reward']
+                
+                # Only update skill rating every N episodes
+                if self.total_episodes % self.skill_update_frequency == 0:
+                    # Calculate performance relative to historical baseline
+                    if len(self.episode_rewards) > self.skill_rating_window:
+                        # Use recent history excluding current batch for comparison
+                        historical_rewards = list(self.episode_rewards)[:-len(completed_episode_rewards)]
+                        recent_rewards = historical_rewards[-self.skill_rating_window:]
+                        
+                        historical_mean = np.mean(recent_rewards) if recent_rewards else current_reward
+                        historical_std = max(0.1, np.std(recent_rewards)) if len(recent_rewards) > 1 else 1.0
+                        
+                        # Calculate z-score (how many standard deviations from mean)
+                        z_score = (current_reward - historical_mean) / historical_std
+                        
+                        # Determine win/loss/draw based on performance
+                        if z_score > 0.5:  # Significantly better than historical performance
+                            result = 1.0  # Win
+                        elif z_score < -0.5:  # Significantly worse than historical performance
+                            result = 0.0  # Loss
+                        else:  # Similar to historical performance
+                            result = 0.5  # Draw
+                            
+                        # Update skill rating
+                        new_rating = self.skill_tracker.update_rating(self.baseline_rating, result)
+                        
+                        # Add skill metrics to wandb logging
+                        metrics['SKILL/rating'] = new_rating
+                        metrics['SKILL/z_score'] = z_score
+                        metrics['SKILL/result'] = result
+                        
+                        if self.debug:
+                            print(f"[DEBUG] Updated skill rating: {new_rating:.1f} (z-score: {z_score:.2f}, result: {result})")
+                    else:
+                        # Not enough history yet, just log current rating
+                        metrics['SKILL/rating'] = self.skill_tracker.get_current_rating()
 
             if self.debug:
                 print(f"[DEBUG] Using {len(completed_episode_rewards)} completed episode rewards, mean: {metrics['mean_episode_reward']:.4f}")
@@ -1333,6 +1459,20 @@ class Trainer:
                  checkpoint['intrinsic'] = self.intrinsic_reward_generator.get_state_dict()
                  if self.debug:
                      print(f"[DEBUG Trainer Save] Included intrinsic reward state in checkpoint.")
+                     
+        # Include skill tracker state
+        if hasattr(self, 'skill_tracker'):
+            checkpoint['skill_tracker'] = {
+                'modes': self.skill_tracker.modes,
+                'history': self.skill_tracker.history,
+                'update_count': self.skill_tracker.update_count,
+                'rating_inc': self.skill_tracker.rating_inc,
+                'baseline_rating': self.baseline_rating,
+                'skill_update_frequency': self.skill_update_frequency,
+                'skill_rating_window': self.skill_rating_window
+            }
+            if self.debug:
+                print(f"[DEBUG Trainer Save] Included skill tracker state in checkpoint. Current rating: {self.skill_tracker.get_current_rating()}")
 
         # Include random states for reproducibility
         checkpoint['random_states'] = {
@@ -1590,6 +1730,39 @@ class Trainer:
                     self.episode_rewards.clear() # Ensure it's empty if not loaded
                 if self.debug:
                     print("[DEBUG] No episode rewards history found in checkpoint. Initializing empty deque.")
+                    
+            # ===== Restore Skill Tracker State =====
+            if 'skill_tracker' in checkpoint:
+                skill_data = checkpoint['skill_tracker']
+                
+                # Make sure we have a skill tracker
+                if not hasattr(self, 'skill_tracker'):
+                    self.skill_tracker = SkillRatingTracker()
+                
+                # Restore skill tracker state
+                self.skill_tracker.modes = skill_data.get('modes', {'default': 1500})
+                self.skill_tracker.history = skill_data.get('history', {'default': [1500]})
+                self.skill_tracker.update_count = skill_data.get('update_count', {'default': 0})
+                self.skill_tracker.rating_inc = skill_data.get('rating_inc', 32)
+                
+                # Restore skill tracking configuration
+                self.baseline_rating = skill_data.get('baseline_rating', 1500)
+                self.skill_update_frequency = skill_data.get('skill_update_frequency', 5)
+                self.skill_rating_window = skill_data.get('skill_rating_window', 100)
+                
+                if self.debug:
+                    current_rating = self.skill_tracker.get_current_rating()
+                    update_count = self.skill_tracker.update_count.get('default', 0)
+                    print(f"[DEBUG] Restored skill tracker state. Current rating: {current_rating}, Updates: {update_count}")
+            else:
+                # If not in checkpoint, make sure we have default values
+                if not hasattr(self, 'skill_tracker'):
+                    self.skill_tracker = SkillRatingTracker()
+                    self.baseline_rating = 1500
+                    self.skill_update_frequency = 5
+                    self.skill_rating_window = 100
+                if self.debug:
+                    print("[DEBUG] No skill tracker state found in checkpoint. Using default values.")
 
             # ===== Auto-detect models trained without pretraining =====
             if 'pretraining_completed' not in checkpoint:

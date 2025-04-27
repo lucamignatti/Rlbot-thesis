@@ -1632,16 +1632,16 @@ if __name__ == "__main__":
                        help='Learning algorithm to use: ppo (default) or streamac')
 
     # Learning rates
-    parser.add_argument('--lra', type=float, default=0.01, help='Learning rate for actor network')
-    parser.add_argument('--lrc', type=float, default=0.01, help='Learning rate for critic network') # No longer does anything. Here for stability.
+    parser.add_argument('--lra', type=float, default=5e-3, help='Learning rate for actor network')
+    parser.add_argument('--lrc', type=float, default=5e-3, help='Learning rate for critic network') # No longer does anything. Here for stability.
 
     # Discount factors
     parser.add_argument('--gamma', type=float, default=0.997, help='Discount factor for future rewards')
-    parser.add_argument('--gae_lambda', type=float, default=0.95, help='Lambda parameter for Generalized Advantage Estimation')
+    parser.add_argument('--gae_lambda', type=float, default=0.98, help='Lambda parameter for Generalized Advantage Estimation')
 
     # PPO parameters
-    parser.add_argument('--clip_epsilon', type=float, default=0.15, help='PPO clipping parameter')
-    parser.add_argument('--critic_coef', type=float, default=0.5, help='Weight of the critic loss')
+    parser.add_argument('--clip_epsilon', type=float, default=0.2, help='PPO clipping parameter')
+    parser.add_argument('--critic_coef', type=float, default=0.75, help='Weight of the critic loss')
     parser.add_argument('--entropy_coef', type=float, default=0.005, help='Weight of the entropy bonus (encourages exploration)')
     parser.add_argument('--max_grad_norm', type=float, default=0.5, help='Maximum gradient norm for clipping')
 
@@ -1652,8 +1652,8 @@ if __name__ == "__main__":
     # ------------------------------------
 
     # Training loop parameters
-    parser.add_argument('--ppo_epochs', type=int, default=3, help='Number of PPO epochs per update')
-    parser.add_argument('--batch_size', type=int, default=16384, help='Batch size for PPO updates')
+    parser.add_argument('--ppo_epochs', type=int, default=1, help='Number of PPO epochs per update')
+    parser.add_argument('--batch_size', type=int, default=24576, help='Batch size for PPO updates')
 
     parser.add_argument('--weight_clip_kappa', type=float, default=1.0, help='Weight clipping factor for PPO')
     parser.add_argument('--weight_clipping', type=bool, default=False, help='Enable weight clipping for PPO')
@@ -1695,7 +1695,7 @@ if __name__ == "__main__":
     parser.add_argument('--dropout', type=float, default=0.05, help='Dropout rate for regularization (only used by basic/simba architectures)')
 
     # Critic Network Config (Defaults from SimbaV2 Critic)
-    parser.add_argument('--hidden_dim_critic', type=int, default=512, help='Hidden dimension for the CRITIC network (only used if model-arch is not shared)')
+    parser.add_argument('--hidden_dim_critic', type=int, default=768, help='Hidden dimension for the CRITIC network (only used if model-arch is not shared)')
     parser.add_argument('--num_blocks_critic', type=int, default=4, help='Number of residual blocks in the CRITIC network (only used if model-arch is not shared)')
 
     # Action stacking parameters
@@ -1706,7 +1706,7 @@ if __name__ == "__main__":
     # Using --no-auxiliary will set args.auxiliary to False.
     parser.add_argument('--no-auxiliary', action='store_false', dest='auxiliary',
                         help='Disable auxiliary task learning (SR and RP tasks)')
-    parser.set_defaults(auxiliary=True) # Keep default as True
+    parser.set_defaults(auxiliary=False)
 
 
     parser.add_argument('--sr_weight', type=float, default=1.0,
@@ -1818,7 +1818,7 @@ if __name__ == "__main__":
     parser.add_argument('--use-reward-scaling', action='store_true', dest='use_reward_scaling', help='Enable SimbaV2 reward scaling')
     parser.add_argument('--no-reward-scaling', action='store_false', dest='use_reward_scaling', help='Disable SimbaV2 reward scaling')
     parser.set_defaults(use_reward_scaling=True)
-    parser.add_argument('--reward-scaling-gmax', type=float, default=5.0, help='G_max hyperparameter for reward scaling')
+    parser.add_argument('--reward-scaling-gmax', type=float, default=3.0, help='G_max hyperparameter for reward scaling')
 
     args = parser.parse_args()
 
