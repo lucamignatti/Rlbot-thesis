@@ -1634,30 +1634,56 @@ class Trainer:
 
 
             # ===== Resume WandB Run =====
+            # Check if wandb is intended to be used for this session (self.use_wandb)
+            # and if the checkpoint contains wandb info
             if self.use_wandb and 'wandb' in checkpoint and checkpoint['wandb']:
                 wandb_info = checkpoint['wandb']
+                run_id_to_resume = wandb_info.get('run_id')
 
-                try:
-                    # Check if we need to resume a wandb run
-                    if 'run_id' in wandb_info and (wandb.run is None or (wandb.run and wandb.run.id != wandb_info['run_id'])):
-                        run_id = wandb_info['run_id']
-                        project = wandb_info.get('project', 'rlbot-training')
-                        entity = wandb_info.get('entity', None)
-                        name = wandb_info.get('name', None)
+                if run_id_to_resume:
+                    project = wandb_info.get('project', 'rlbot-training') # Use project from checkpoint or default
+                    entity = wandb_info.get('entity') # Entity might be None
+                    name = wandb_info.get('name') # Name might be None
 
-                        print(f"Resuming wandb run: {run_id}")
-                        wandb.init(
-                            project=project,
-                            entity=entity,
-                            id=run_id,
-                            resume="must",
-                            name=name
-                        )
+                    # Check if a run is already active and if its ID matches
+                    if wandb.run is not None and wandb.run.id != run_id_to_resume:
+                        print(f"Warning: Active wandb run ({wandb.run.id}) differs from checkpoint run ({run_id_to_resume}).")
+                        print("Finishing current run and attempting to resume the correct one.")
+                        wandb.finish() # Stop the currently active run
 
-                        if self.debug:
-                            print(f"[DEBUG] Successfully resumed wandb run: {run_id}")
-                except Exception as e:
-                    print(f"Warning: Could not resume wandb run: {e}")
+                    # Now, attempt to resume the run from the checkpoint
+                    # Check if wandb.run is None *after* potential finish() call
+                    if wandb.run is None:
+                        try:
+                            print(f"Attempting to resume wandb run: id={run_id_to_resume}, project={project}, entity={entity}")
+                            wandb.init(
+                                project=project,
+                                entity=entity,
+                                id=run_id_to_resume,
+                                resume="must", # Force resume or fail
+                                name=name # Resume with original name if available
+                            )
+                            if self.debug:
+                                print(f"[DEBUG] Successfully resumed wandb run: {run_id_to_resume}")
+                            # Sync config from checkpoint if needed (optional)
+                            # wandb.config.update(checkpoint.get('config', {}), allow_val_change=True)
+
+                        except Exception as e:
+                            print(f"Error resuming wandb run {run_id_to_resume}: {e}")
+                            print("Proceeding without resuming the specific wandb run.")
+                            # Optionally, start a new run here if resume fails,
+                            # or let the initial main.py wandb.init handle it if it hasn't run yet.
+                            # For simplicity, we'll let it proceed without a specific run if resume fails.
+                            # Ensure wandb.run is None if resumption failed badly
+                            if not wandb.run or wandb.run.id != run_id_to_resume:
+                                print("Wandb run could not be resumed. Logging might go to a new run or be disabled.")
+
+                    elif wandb.run.id == run_id_to_resume:
+                         if self.debug:
+                             print(f"[DEBUG] Wandb run {run_id_to_resume} was already active and matches checkpoint.")
+                    else:
+                         # This case should ideally not be reached after the finish() call
+                         print(f"Warning: Could not resume wandb run {run_id_to_resume}. Active run is {wandb.run.id}.")
 
             print(f"Successfully loaded checkpoint from {model_path}")
             print(f"Resumed training at step {self.training_steps + self.training_step_offset}")

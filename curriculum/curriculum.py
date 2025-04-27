@@ -224,7 +224,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
             (velocity_to_ball_reward, 5.0),     # Strong incentive to move towards ball (Guide: ~5)
             (ball_proximity_reward, 1.0),       # Smaller proximity reward (Guide: FaceBall ~1)
             (air_reward, 0.2),                  # Don't forget to jump (Guide: AirReward ~0.15, scaled up)
-            (save_boost_reward, 1.0)            # Small boost saving incentive
+            (save_boost_reward, 0.1)            # Small boost saving incentive
         ),
         termination_condition=timeout_s, # End quickly after kickoff phase (Guide: Short timeout)
         truncation_condition=timeout_s,
@@ -247,7 +247,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         name="2v2 Directional Control",
         state_mutator=MutatorSequence(fixed_2v2_mutator, kickoff_mutator),
         reward_function=CombinedReward(
-            (velocity_ball_to_goal_reward, 0.8), # Start encouraging direction
+            (velocity_ball_to_goal_reward, 1.2), # Start encouraging direction
             (touch_ball_reward, 5.0),          # Lower touch reward significantly (Guide: Decrease a lot)
             (velocity_to_ball_reward, 0.2),
             (ball_proximity_reward, 0.1),

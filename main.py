@@ -616,17 +616,22 @@ def run_training(
     )
 
     # --- MODEL LOADING LOGIC ---
+    loaded_successfully = False  # Flag to track loading status
     if model_path_to_load:
         print(f"Attempting to load model from: {model_path_to_load}")
         if trainer.load_models(model_path_to_load):
              print(f"Successfully loaded model and state from {model_path_to_load}")
+             loaded_successfully = True  # Set flag
              # Add a debug print to confirm the trainer's state AFTER loading
              if debug:
-                 print(f"[DEBUG] Trainer state after load: pretraining_completed={trainer.pretraining_completed}")
-             print(f"Continuing from training step {trainer.training_step_offset}")
+                 print(f"[DEBUG] Trainer state after load: pretraining_completed={trainer.pretraining_completed}, "
+                       f"step_offset={trainer.training_step_offset}, total_env_steps={trainer.total_env_steps}")
+             print(f"Resuming training from step offset {trainer.training_step_offset}, total env steps {trainer.total_env_steps}")
         else:
              print(f"Failed to load model from {model_path_to_load}. Starting fresh.")
-             trainer.training_step_offset = 0
+             trainer.training_step_offset = 0  # Ensure offsets are 0 if loading fails
+             trainer.total_env_steps = 0
+             trainer.total_episodes_offset = 0
     # --- END MODEL LOADING LOGIC ---
 
     # Set total_episodes and training_time attributes for pretraining calculation
@@ -817,10 +822,13 @@ def run_training(
 
     # Initialize variables to track training progress.
     collected_experiences = 0
-    total_episodes_so_far = 0
-    total_env_steps = 0 # Initialize total environment steps counter
+    # Initialize total_episodes_so_far using the loaded offset
+    total_episodes_so_far = trainer.total_episodes_offset
+    # Initialize total_env_steps using the loaded value from trainer
+    total_env_steps = trainer.total_env_steps
     last_update_time = time.time()
-    last_save_episode = 0
+    # Initialize last_save_episode using the loaded offset
+    last_save_episode = trainer.total_episodes_offset
     last_intrinsic_reset_episode = 0 # Track last episode where intrinsic models were reset
 
     # Variables to track steps per second
@@ -834,13 +842,28 @@ def run_training(
     # Add a list to track rewards of completed episodes between PPO updates
     completed_episode_rewards_since_last_update = []
 
+    # Update initial stats_dict with loaded values
+    stats_dict["Episodes"] = total_episodes_so_far  # Use loaded episode count
+    if algorithm == "ppo":
+        # Experience counter should reset between updates, so start at 0
+        stats_dict["Exp"] = f"0/{update_interval}"
+    else:
+        # Use loaded step count for StreamAC/SAC progress
+        stats_dict["Steps"] = total_env_steps  # Initialize steps display with loaded value
+        # Updates count might be restored via algorithm state loading, check if possible
+        stats_dict["Updates"] = getattr(trainer.algorithm, "update_count", 0) if hasattr(trainer.algorithm, 'update_count') else 0
+
+    # Send potentially updated initial postfix to TQDM manager
+    if tqdm_q:
+        tqdm_q.put(stats_dict.copy())
+
     last_progress_update = start_time  # For updating time-based progress bar
     should_continue = True  # Initialize the control variable
 
     try:
         # Define pause file path for the pause/resume functionality
         pause_file_path = "pause.flag"  # Flag file to check for pausing
-        
+
         # Let's keep training until it's time to stop
         while should_continue:
             # --- PAUSE CHECK ---
@@ -1495,7 +1518,7 @@ def run_training(
                 print(f"Removed '{pause_file_path}' on exit.")
             except OSError as e:
                 print(f"Error removing '{pause_file_path}' on exit: {e}")
-        
+
         # Always clean up the environments.
         vec_env.close()
 
@@ -1584,7 +1607,7 @@ if __name__ == "__main__":
 
     parser.add_argument('-n', '--num_envs', type=int, default=300,
                         help='Number of parallel environments to run for faster data collection')
-    parser.add_argument('--update_interval', type=int, default=262144,
+    parser.add_argument('--update_interval', type=int, default=1048576,
                         help='Number of experiences to collect before updating the policy (PPO)')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use for training (cuda/mps/cpu).  Autodetects if not specified.')
@@ -1609,8 +1632,8 @@ if __name__ == "__main__":
                        help='Learning algorithm to use: ppo (default) or streamac')
 
     # Learning rates
-    parser.add_argument('--lra', type=float, default=3e-4, help='Learning rate for actor network')
-    parser.add_argument('--lrc', type=float, default=6e-4, help='Learning rate for critic network')
+    parser.add_argument('--lra', type=float, default=0.01, help='Learning rate for actor network')
+    parser.add_argument('--lrc', type=float, default=0.01, help='Learning rate for critic network') # No longer does anything. Here for stability.
 
     # Discount factors
     parser.add_argument('--gamma', type=float, default=0.997, help='Discount factor for future rewards')
