@@ -1286,10 +1286,10 @@ class Trainer:
                         # Calculate z-score (how many standard deviations from mean)
                         z_score = (current_reward - historical_mean) / historical_std
                         
-                        # Determine win/loss/draw based on performance
-                        if z_score > 0.5:  # Significantly better than historical performance
+                        # Determine win/loss/draw based on performance with more sensitive thresholds
+                        if z_score > 0.2:  # Better than historical performance
                             result = 1.0  # Win
-                        elif z_score < -0.5:  # Significantly worse than historical performance
+                        elif z_score < -0.2:  # Worse than historical performance
                             result = 0.0  # Loss
                         else:  # Similar to historical performance
                             result = 0.5  # Draw
