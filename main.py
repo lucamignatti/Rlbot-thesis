@@ -14,6 +14,12 @@ from queue import Empty as QueueEmpty # Import Empty exception
 import numpy as np
 from collections import Counter
 from collections.abc import Sized, Iterable
+# Import VizTracer conditionally to avoid dependency issues
+try:
+    from viztracer import VizTracer
+    VIZTRACER_AVAILABLE = True
+except ImportError:
+    VIZTRACER_AVAILABLE = False
 # Removed unused rlgym imports
 from model_architectures import (
     BasicModel, SimBa, SimbaV2, SimbaV2Shared # Add SimbaV2Shared
@@ -328,17 +334,34 @@ def _aggregate_env_stats(env_stats_list: List[Dict[str, float]]) -> Dict[str, fl
 # --- TQDM Manager Process ---
 class TqdmManager:
     """Manages a tqdm progress bar in a separate process."""
-    def __init__(self, queue: mp.Queue, total: Optional[int], desc: str, bar_format: str, dynamic_ncols: bool):
+    def __init__(self, queue: mp.Queue, total: Optional[int], desc: str, bar_format: str, dynamic_ncols: bool, use_viztracer: bool = False, debug: bool = False):
         self.queue = queue
         self.total = total
         self.desc = desc
         self.bar_format = bar_format
         self.dynamic_ncols = dynamic_ncols
+        self.use_viztracer = use_viztracer
+        self.debug = debug
         self.process: Optional[mp.Process] = None
         self._initial_postfix = {} # Store initial postfix if sent early
 
     def _run(self):
         """The target function for the tqdm process."""
+        tracer = None
+        if self.use_viztracer and VIZTRACER_AVAILABLE:
+            try:
+                tracer = VizTracer(
+                    output_file=f"viztracer_tqdm_{mp.current_process().pid}.json",
+                    log_async=True,
+                    tracer_entries=50000000, # Increase buffer size
+                    verbose=0
+                )
+                tracer.start()
+                if self.debug: print(f"[DEBUG] TQDM Manager {mp.current_process().pid} started VizTracer.")
+            except Exception as e:
+                print(f"TQDM WARNING: Failed to start VizTracer in TQDM Manager {mp.current_process().pid}: {e}")
+                tracer = None
+
         progress_bar = None
         try:
             # Wait for initial postfix if not already received
@@ -390,6 +413,14 @@ class TqdmManager:
         finally:
             if progress_bar:
                 progress_bar.close()
+            # Stop VizTracer if it was started
+            if tracer:
+                try:
+                    tracer.stop()
+                    tracer.save()
+                    if self.debug: print(f"[DEBUG] TQDM Manager {mp.current_process().pid} stopped and saved VizTracer.")
+                except Exception as e:
+                    print(f"TQDM WARNING: Failed to stop/save VizTracer in TQDM Manager {mp.current_process().pid}: {e}")
 
     def start(self):
         """Starts the tqdm manager process."""
@@ -533,7 +564,9 @@ def run_training(
     use_reward_scaling: bool = True,
     reward_scaling_G_max: float = 10.0,
     # Add TQDM queue
-    tqdm_q: Optional[mp.Queue] = None
+    tqdm_q: Optional[mp.Queue] = None,
+    # Add viztracer flag
+    use_viztracer: bool = False
 ):
     """
     Main training loop.
@@ -733,7 +766,7 @@ def run_training(
         'debug': debug
     }
 
-    vec_env = env_class(**env_args)
+    vec_env = env_class(**env_args, use_viztracer=use_viztracer) # Pass viztracer flag
 
     # For time-based training, we'll need to know when we started.
     start_time = time.time()
@@ -1603,18 +1636,46 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 if __name__ == "__main__":
-    # Set start method
+    # --- Early parse for viztracer to set start_method ---
+    # Need to know if viztracer is enabled before setting the start method,
+    # especially to choose between fork/spawn on Linux.
+    temp_parser = argparse.ArgumentParser(add_help=False) # Avoid conflict with main help
+    temp_parser.add_argument('--viztracer', action='store_true')
+    known_args, _ = temp_parser.parse_known_args()
+    use_viztracer_early = known_args.viztracer
+    # --- End early parse ---
+
+    # Set start method based on OS and viztracer flag
     if sys.platform == 'darwin':
         mp.set_start_method('spawn', force=True)
+        print("[INFO] Using 'spawn' start method (macOS default)")
     elif sys.platform == 'linux':
-        mp.set_start_method('fork', force=True)
-
+        if use_viztracer_early:
+            mp.set_start_method('spawn', force=True)
+            print("[INFO] Using 'spawn' start method (VizTracer enabled on Linux)")
+        else:
+            # Check if fork is available and safe (optional, but good practice)
+            if hasattr(os, 'fork') and hasattr(mp, 'get_context'):
+                 try:
+                     mp.get_context('fork') # Check if 'fork' context is supported
+                     mp.set_start_method('fork', force=True)
+                     print("[INFO] Using 'fork' start method (default for Linux, VizTracer disabled)")
+                 except ValueError:
+                      mp.set_start_method('spawn', force=True) # Fallback if fork isn't available/safe
+                      print("[INFO] Using 'spawn' start method (fork not available/safe on Linux)")
+            else:
+                 mp.set_start_method('spawn', force=True) # Fallback if checks aren't possible
+                 print("[INFO] Using 'spawn' start method (fork check failed on Linux)")
 
     # Set up Ctrl+C handler to exit gracefully.
     signal.signal(signal.SIGINT, signal_handler)
 
+    # --- Main Argument Parsing (remains here) ---
     parser = argparse.ArgumentParser(description='RLBot Training Script')
     parser.add_argument('--render', action='store_true', help='Enable rendering of the game environment')
+
+    # Add viztracer argument
+    parser.add_argument('--viztracer', action='store_true', default=False, help='Enable VizTracer profiling (default: disabled)')
 
     # Allow user to specify training duration either by episode count OR by time.
     training_duration = parser.add_mutually_exclusive_group()
@@ -2096,10 +2157,32 @@ if __name__ == "__main__":
         total=tqdm_params["total"],
         desc=tqdm_params["desc"],
         bar_format=tqdm_params["bar_format"],
-        dynamic_ncols=dynamic_ncols
+        dynamic_ncols=dynamic_ncols,
+        use_viztracer=args.viztracer, # Pass flag
+        debug=args.debug # Pass debug flag too
     )
     tqdm_manager_instance.start()
+
     # --- End TQDM Manager Initialization ---
+
+    # --- Start Main Process VizTracer ---
+    main_tracer = None
+    if args.viztracer and VIZTRACER_AVAILABLE:
+        print("Starting VizTracer for main process...")
+        try:
+            main_tracer = VizTracer(
+                output_file="viztracer_main.json",
+                log_async=True,
+                tracer_entries=50000000, # Increase buffer size
+                # Use pid_suffix=True to avoid overwriting if multiple main processes run somehow
+                pid_suffix=True,
+                verbose=1 # Show some output for main process
+            )
+            main_tracer.start()
+        except Exception as e:
+            print(f"MAIN WARNING: Failed to start VizTracer for main process: {e}")
+            main_tracer = None
+    # --- End Main Process VizTracer ---
 
     trainer = None # Initialize trainer to None
     saved_path = None
@@ -2167,7 +2250,8 @@ if __name__ == "__main__":
             stream_buffer_size=args.stream_buffer_size,
             use_sparse_init=args.use_sparse_init,
             update_freq=args.update_freq,
-            tqdm_q=tqdm_queue # Pass the queue to the training function
+            tqdm_q=tqdm_queue, # Pass the queue to the training function
+            use_viztracer=args.viztracer # Pass flag here
         )
 
         # Save the final trained models, unless we're in test mode or training failed.
@@ -2195,6 +2279,17 @@ if __name__ == "__main__":
         if tqdm_manager_instance:
             tqdm_manager_instance.stop()
         # --- End Stop TQDM Manager ---
+
+        # --- Stop Main Process VizTracer ---
+        if 'main_tracer' in locals() and main_tracer: # Check if tracer was initialized and started
+            print("Stopping and saving VizTracer for main process...")
+            try:
+                main_tracer.stop()
+                main_tracer.save()
+                print("VizTracer data saved.") # Simplified message
+            except Exception as e:
+                print(f"MAIN WARNING: Failed to stop/save VizTracer for main process: {e}")
+        # --- End Stop Main Process VizTracer ---
 
         # Upload the saved model to WandB as an artifact
         if args.wandb and saved_path and os.path.exists(saved_path):

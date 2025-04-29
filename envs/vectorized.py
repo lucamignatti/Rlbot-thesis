@@ -1,6 +1,12 @@
 import concurrent.futures
 import time
 import multiprocessing as mp
+# Import VizTracer conditionally
+try:
+    from viztracer import VizTracer
+    VIZTRACER_AVAILABLE = True
+except ImportError:
+    VIZTRACER_AVAILABLE = False
 from multiprocessing import Process, Pipe
 import numpy as np
 import torch
@@ -20,420 +26,451 @@ class WorkerError:
         return f"WorkerError: {self.message}\nTraceback:\n{self.traceback}"
 
 
-def worker(remote, env_fn, render: bool, action_stacker=None, initial_curriculum_config=None, debug=False):
+def worker(remote, env_fn, render: bool, action_stacker=None, initial_curriculum_config=None, debug=False, use_viztracer=False):
     """
     Worker process managing two environments (active and standby) for zero-latency resets.
     """
-    active_env = None
-    standby_env = None
-    active_renderer = None # Only used if render=True, attached to active_env
-    standby_obs = None
-    current_config = initial_curriculum_config
-    action_space_cache: Dict[Any, np.ndarray] = {} # Cache action spaces per agent_id
-    last_step_start_time = None # For render delay calculation
-
-    def get_dummy_action(agent_id, env_instance):
-        """Returns a default zero action based on the agent's action space."""
-        # Use env_instance to get action space, as it might differ between active/standby briefly during config changes
-        if agent_id not in action_space_cache:
-            try:
-                # Check if env_instance and action_space exist and are dict-like
-                if env_instance and hasattr(env_instance, 'action_space') and isinstance(env_instance.action_space, dict):
-                    space = env_instance.action_space.get(agent_id) # Use .get for safety
-                    if space:
-                        action_space_cache[agent_id] = np.zeros(space.shape, dtype=space.dtype)
-                    else:
-                         if debug: print(f"[DEBUG] Worker: Agent ID {agent_id} not found in action space. Using default [0].")
-                         action_space_cache[agent_id] = np.array([0])
-                else:
-                     if debug: print(f"[DEBUG] Worker: Invalid env_instance or action_space. Using default [0] for agent {agent_id}.")
-                     action_space_cache[agent_id] = np.array([0])
-            except Exception as e:
-                 if debug:
-                     print(f"[DEBUG] Worker: Could not get action space for agent {agent_id} ({e}). Using default [0].")
-                 action_space_cache[agent_id] = np.array([0]) # Default fallback
-        # Return a copy to prevent modification issues if stacker modifies actions
-        return np.copy(action_space_cache.get(agent_id, np.array([0])))
-
-
-    def _create_env(config, use_renderer=False):
-        """Helper to create a single environment instance."""
-        env = None
-        created_renderer = None
-        max_retries = 3
-        last_exception = None
-        for attempt in range(max_retries):
-            try:
-                # Create renderer *first* if needed, pass it during env creation
-                if use_renderer:
-                    created_renderer = RLViserRenderer()
-
-                env = env_fn(renderer=created_renderer, action_stacker=action_stacker, curriculum_config=config, debug=debug)
-
-                # Initialize tick count
-                if hasattr(env, 'transition_engine'):
-                    env.transition_engine._tick_count = 0
-                # Initialize TimeoutCondition
-                if hasattr(env, 'truncation_cond'):
-                    def set_initial_tick(cond):
-                        if isinstance(cond, TimeoutCondition): cond.initial_tick = 0
-                        elif hasattr(cond, 'conditions'):
-                            for sub_cond in cond.conditions: set_initial_tick(sub_cond)
-                    set_initial_tick(env.truncation_cond)
-
-                return env, created_renderer # Return env and potentially created renderer
-            except Exception as e:
-                last_exception = e
-                if created_renderer: # Clean up renderer if env creation failed
-                    try: created_renderer.close()
-                    except: pass
-                    created_renderer = None
-                if attempt < max_retries - 1:
-                    if debug: print(f"[DEBUG] Worker env creation attempt {attempt + 1} failed: {e}, retrying...")
-                    time.sleep(1)
-                else:
-                    if debug: print(f"[DEBUG] Worker env creation failed after {max_retries} attempts.")
-                    # Don't raise here, return None, None to signal failure
-                    return None, None
-                    # raise RuntimeError(f"Failed to create environment after {max_retries} retries: {last_exception}") from last_exception
-
-    def _safe_reset(env_instance) -> Optional[Dict[Any, Any]]:
-        """Helper to reset an environment with retries. Returns None on failure."""
-        max_retries = 3
-        last_exception = None
-        for attempt in range(max_retries):
-            try:
-                if not env_instance: return None # Skip if env is None
-                obs = env_instance.reset()
-                action_space_cache.clear() # Clear cache as agents might change
-                return obs
-            except Exception as e:
-                last_exception = e
-                if debug: print(f"[DEBUG] Worker reset attempt {attempt + 1} failed: {e}")
-                if attempt == max_retries - 1:
-                    print(f"WORKER ERROR: Failed to reset environment after {max_retries} retries: {last_exception}")
-                    return None # Return None on failure
-                time.sleep(0.1)
-        return None # Should not be reached
-
-    def _safe_close(env_instance, renderer_instance=None):
-        """Helper to close env and its renderer."""
-        # Close renderer first if it's separate
-        if renderer_instance and (not env_instance or renderer_instance != getattr(env_instance, 'renderer', None)):
-             try:
-                 if debug: print("[DEBUG] Worker closing separate renderer instance.")
-                 renderer_instance.close()
-             except Exception as e:
-                 if debug: print(f"[DEBUG] Worker error closing separate renderer: {e}")
-
-        # Close environment (which might close its attached renderer)
-        if env_instance:
-            try:
-                if debug: print("[DEBUG] Worker closing environment instance.")
-                env_instance.close()
-            except Exception as e:
-                if debug: print(f"[DEBUG] Worker error closing environment instance: {e}")
-
+    tracer = None
+    if use_viztracer and VIZTRACER_AVAILABLE:
+        try:
+            tracer = VizTracer(
+                output_file=f"viztracer_worker_{mp.current_process().pid}.json",
+                log_async=False, # Disable async logging for workers
+                tracer_entries=50000000, # Increase buffer size
+                # ignore_c_function=True, # May reduce overhead but lose some detail
+                # ignore_frozen=True,    # Ignore frozen modules
+                log_gc=False,          # Reduce noise
+                # max_stack_depth=10,    # Limit stack depth if needed
+                verbose=0 # Reduce verbosity
+            )
+            tracer.start()
+            if debug: print(f"[DEBUG] Worker {mp.current_process().pid} started VizTracer.")
+        except Exception as e:
+            print(f"WORKER WARNING: Failed to start VizTracer in worker {mp.current_process().pid}: {e}")
+            tracer = None # Ensure tracer is None if start fails
 
     try:
-        # --- Initial Setup ---
-        if debug: print(f"[DEBUG] Worker initializing with config: {current_config.get('stage_name', 'Default') if current_config else 'Default'}")
+        # --- Existing worker logic starts here ---
+        active_env = None
+        standby_env = None
+        active_renderer = None # Only used if render=True, attached to active_env
+        standby_obs = None
+        current_config = initial_curriculum_config
+        action_space_cache: Dict[Any, np.ndarray] = {} # Cache action spaces per agent_id
+        last_step_start_time = None # For render delay calculation
 
-        # Create active env (potentially with renderer)
-        active_env, active_renderer = _create_env(current_config, use_renderer=render)
-        if active_env is None: raise RuntimeError("Failed to create initial active_env")
-        initial_obs_active = _safe_reset(active_env)
-        if initial_obs_active is None: raise RuntimeError("Failed to reset initial active_env")
-
-
-        # Create standby env (no renderer)
-        standby_env, _ = _create_env(current_config, use_renderer=False)
-        if standby_env is None: raise RuntimeError("Failed to create initial standby_env")
-        standby_obs = _safe_reset(standby_env) # Reset standby and store its obs
-        if standby_obs is None: raise RuntimeError("Failed to reset initial standby_env")
-
-
-        # Perform dummy step on active env
-        if initial_obs_active:
-            dummy_actions = {agent_id: get_dummy_action(agent_id, active_env) for agent_id in initial_obs_active.keys()}
-            if debug: print(f"[DEBUG] Worker performing initial dummy step on active_env.")
-            _ = active_env.step(dummy_actions)
-        else:
-             # This case should ideally not happen if reset succeeded
-             if debug: print("[DEBUG] Worker WARNING: initial active_env reset returned empty/None obs, skipping dummy step.")
-
-
-        # Send the initial observation from the *active* env back to main process
-        remote.send(initial_obs_active)
-        if debug: print("[DEBUG] Worker initialization complete, sent initial active obs.")
-
-        # --- Main Command Loop ---
-        while True:
-            try:
-                cmd, data = remote.recv()
-
-                if cmd == 'step':
-                    if active_env is None: # Check if env is usable
-                         raise RuntimeError("Worker received 'step' command but active_env is None.")
-
-                    # --- Realtime Render Delay Logic ---
-                    current_time = time.perf_counter()
-                    if render and last_step_start_time is not None and active_env is not None:
-                        try:
-                            # Attempt to get tick_skip, default to 8 if not found or env missing attr
-                            tick_skip = getattr(active_env, '_tick_skip', 8)
-                            if tick_skip <= 0: tick_skip = 8 # Ensure positive tick_skip
-                            target_step_duration = tick_skip / 120.0 # Assuming 120hz physics
-                            expected_start_time = last_step_start_time + target_step_duration
-                            sleep_duration = expected_start_time - current_time
-                            if sleep_duration > 0:
-                                time.sleep(sleep_duration)
-                        except AttributeError:
-                             if debug: print("[DEBUG] Worker render delay: active_env missing '_tick_skip'. Using default.")
-                             # Fallback logic if _tick_skip doesn't exist
-                             target_step_duration = 8 / 120.0
-                             expected_start_time = last_step_start_time + target_step_duration
-                             sleep_duration = expected_start_time - current_time
-                             if sleep_duration > 0: time.sleep(sleep_duration)
-                        except Exception as e:
-                            # Catch other potential errors
-                            if debug: print(f"[DEBUG] Worker render delay calculation error: {e}")
-
-                    # Record actual start time after potential delay
-                    step_start_time = time.perf_counter()
-                    # Update for the next iteration's calculation (only if rendering)
-                    if render:
-                        last_step_start_time = step_start_time
-                    # --- End Realtime Render Delay Logic ---
-
-
-                    actions_dict = data
-                    formatted_actions = {}
-                    for agent_id, action in actions_dict.items():
-                        if isinstance(action, torch.Tensor):
-                            action_np = action.cpu().detach().numpy()
-                            if len(action_np.shape) == 1 and action_np.shape[0] > 1:
-                                formatted_actions[agent_id] = np.array([np.argmax(action_np)])
-                            else:
-                                formatted_actions[agent_id] = action_np
-                        elif isinstance(action, np.ndarray):
-                            formatted_actions[agent_id] = action
-                        elif isinstance(action, (int, float)):
-                             formatted_actions[agent_id] = np.array([action])
-                        else:
-                            try:
-                                formatted_actions[agent_id] = np.array([action])
-                            except:
-                                if debug: print(f"[DEBUG] Worker step: Unable to process action type {type(action)}, using default.")
-                                formatted_actions[agent_id] = get_dummy_action(agent_id, active_env)
-
-                        if action_stacker is not None:
-                            # Ensure stacker handles potential numpy arrays correctly
-                            action_to_stack = formatted_actions[agent_id]
-                            action_stacker.add_action(agent_id, action_to_stack)
-
-
-                    # Step the active environment
-                    next_obs_dict, reward_dict, terminated_dict, truncated_dict = active_env.step(formatted_actions)
-
-                    # Render if needed (only active_env has renderer)
-                    if render and active_renderer:
-                        try:
-                            # Ensure renderer is still attached (might be None if creation failed)
-                            if hasattr(active_env, 'renderer') and active_env.renderer:
-                                active_env.render()
-                        except Exception as e:
-                             if debug: print(f"[DEBUG] Worker error during render: {e}")
-
-
-                    remote.send((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
-
-                elif cmd == 'reset':
-                    if debug: print(f"[DEBUG] Worker received reset command.")
-
-                    # Check if standby is ready
-                    if standby_env is None or standby_obs is None:
-                         # This is bad, means previous standby reset failed or env creation failed.
-                         # Signal error back to main process.
-                         raise RuntimeError("Worker received 'reset' but standby_env/standby_obs is not ready.")
-
-                    # 1. Send the observation from the standby environment immediately
-                    remote.send(standby_obs)
-                    if debug: print(f"[DEBUG] Worker sent standby obs: {list(standby_obs.keys()) if standby_obs else 'None'}")
-
-                    # 2. Swap roles
-                    active_env, standby_env = standby_env, active_env
-                    # Swap renderers if rendering is enabled
-                    if render:
-                        # Detach renderer from new standby (old active)
-                        if hasattr(standby_env, 'renderer') and standby_env.renderer:
-                            standby_env.renderer = None
-                        # Attach renderer to new active (old standby)
-                        if active_renderer: # Check if renderer exists
-                             active_env.renderer = active_renderer
-
-                    if debug: print(f"[DEBUG] Worker swapped active/standby roles.")
-
-                    # 3. Perform dummy step on the *new* active environment
-                    # Use the already available standby_obs to know agents
-                    if standby_obs:
-                        try:
-                            dummy_actions = {agent_id: get_dummy_action(agent_id, active_env) for agent_id in standby_obs.keys()}
-                            if debug: print(f"[DEBUG] Worker performing dummy step on new active_env.")
-                            _ = active_env.step(dummy_actions)
-                        except Exception as e:
-                             # If dummy step fails, the env might be broken. The next 'step' will likely fail.
-                             # Log error, but proceed with resetting standby.
-                             tb_str = traceback.format_exc()
-                             print(f"WORKER ERROR during dummy step on new active_env: {e}\n{tb_str}")
-                    else:
-                         # This case means the standby_obs was empty/None, which shouldn't happen if check passed.
-                         if debug: print("[DEBUG] Worker WARNING: skipping dummy step on new active_env as standby_obs was empty/None.")
-
-                    # Reset render timer after swap and dummy step
-                    last_step_start_time = None
-                    if render and debug: print(f"[DEBUG] Worker reset render timer.")
-
-
-                    # 4. Reset the *new* standby environment (old active) and store its observation
-                    # Set standby_obs to None *before* reset attempt
-                    standby_obs = None
-                    try:
-                        if debug: print(f"[DEBUG] Worker resetting new standby_env.")
-                        standby_obs = _safe_reset(standby_env) # Returns None on failure
-                        if standby_obs is not None:
-                             if debug: print(f"[DEBUG] Worker new standby_env reset complete. Stored obs keys: {list(standby_obs.keys()) if standby_obs else 'None'}")
-                        else:
-                             # Reset failed, standby_obs remains None. Error already printed by _safe_reset.
-                             # The next 'reset' command will raise an error.
-                             pass
-                    except Exception as e:
-                        # Catch any unexpected error from _safe_reset itself (shouldn't happen)
-                        standby_obs = None
-                        tb_str = traceback.format_exc()
-                        print(f"CRITICAL WORKER ERROR: Unexpected exception during standby reset call: {e}\n{tb_str}")
-
-
-                elif cmd == 'set_curriculum':
-                    new_config = data
-                    old_stage = current_config.get('stage_name', 'Unknown') if current_config else 'Default'
-                    new_stage = new_config.get('stage_name', 'Unknown') if new_config else 'Default'
-                    if debug: print(f"[DEBUG] Worker received set_curriculum. From {old_stage} to {new_stage}")
-
-                    current_config = new_config # Store new config
-
-                    # Close existing environments and renderer
-                    _safe_close(standby_env)
-                    standby_env = None
-                    standby_obs = None # Reset standby obs
-                    _safe_close(active_env, active_renderer)
-                    active_env = None
-                    active_renderer = None
-                    action_space_cache.clear() # Clear action space cache
-
-                    # Recreate both environments with the new config
-                    ack = False
-                    try:
-                        # Create active env (potentially with renderer)
-                        active_env, active_renderer = _create_env(current_config, use_renderer=render)
-                        if active_env is None: raise RuntimeError("Failed to recreate active_env after curriculum change")
-                        initial_obs_active = _safe_reset(active_env)
-                        if initial_obs_active is None: raise RuntimeError("Failed to reset recreated active_env")
-
-                        # Create standby env (no renderer)
-                        standby_env, _ = _create_env(current_config, use_renderer=False)
-                        if standby_env is None: raise RuntimeError("Failed to recreate standby_env after curriculum change")
-                        standby_obs = _safe_reset(standby_env) # Reset standby and store its obs
-                        if standby_obs is None: raise RuntimeError("Failed to reset recreated standby_env")
-
-                        # Perform dummy step on active env
-                        if initial_obs_active:
-                            dummy_actions = {agent_id: get_dummy_action(agent_id, active_env) for agent_id in initial_obs_active.keys()}
-                            if debug: print(f"[DEBUG] Worker performing dummy step on active_env after curriculum change.")
-                            _ = active_env.step(dummy_actions)
-
-                        # Reset render timer after successful recreation
-                        last_step_start_time = None
-                        if render and debug: print(f"[DEBUG] Worker reset render timer after curriculum change.")
-
-                        ack = True # Signal success
-                        if debug: print(f"[DEBUG] Worker curriculum change complete.")
-
-                    except Exception as e:
-                         tb_str = traceback.format_exc()
-                         print(f"CRITICAL WORKER ERROR during set_curriculum recreation: {e}\n{tb_str}")
-                         # Ensure envs are None if creation failed
-                         _safe_close(standby_env) # Close potentially partially created envs
-                         _safe_close(active_env, active_renderer)
-                         active_env = None
-                         standby_env = None
-                         active_renderer = None
-                         standby_obs = None
-                         ack = False # Signal failure
-                         last_step_start_time = None # Also reset timer on failure
-                    finally:
-                         # Send acknowledgment (True/False) back to main process
-                         try:
-                             remote.send(ack)
-                         except (BrokenPipeError, EOFError):
-                              if debug: print("[DEBUG] Worker pipe broken sending curriculum ack.")
-                         except Exception as e_ack:
-                              if debug: print(f"[DEBUG] Worker error sending curriculum ack: {e_ack}")
-
-
-                elif cmd == 'close':
-                    if debug: print("[DEBUG] Worker received close command.")
-                    break # Exit loop, finally block will handle cleanup
-
-                elif cmd == 'reset_action_stacker':
-                    agent_id = data
-                    if action_stacker is not None:
-                        action_stacker.reset_agent(agent_id)
-                    # No need to send ack for this simple command unless required by main loop
-                    # remote.send(True)
-
-            except EOFError:
-                if debug: print("[DEBUG] Worker received EOFError, exiting.")
-                break
-            except (BrokenPipeError, ConnectionResetError) as e:
-                 if debug: print(f"[DEBUG] Worker pipe broken: {e}, exiting.")
-                 break
-            except Exception as e:
-                # Log unexpected errors in command processing
-                tb_str = traceback.format_exc()
-                print(f"Error in worker command loop (cmd={cmd}): {e}\n{tb_str}")
-                # Attempt to send error back to main process
+        def get_dummy_action(agent_id, env_instance):
+            """Returns a default zero action based on the agent's action space."""
+            # Use env_instance to get action space, as it might differ between active/standby briefly during config changes
+            if agent_id not in action_space_cache:
                 try:
-                    # Ensure remote is valid before sending
-                    if remote and not remote.closed:
-                         remote.send(WorkerError(f"Unhandled exception in worker loop: {e}", tb_str))
-                except:
-                    pass # Ignore if pipe is broken during error reporting
-                break # Exit loop on unhandled exception
+                    # Check if env_instance and action_space exist and are dict-like
+                    if env_instance and hasattr(env_instance, 'action_space') and isinstance(env_instance.action_space, dict):
+                        space = env_instance.action_space.get(agent_id) # Use .get for safety
+                        if space:
+                            action_space_cache[agent_id] = np.zeros(space.shape, dtype=space.dtype)
+                        else:
+                             if debug: print(f"[DEBUG] Worker: Agent ID {agent_id} not found in action space. Using default [0].")
+                             action_space_cache[agent_id] = np.array([0])
+                    else:
+                         if debug: print(f"[DEBUG] Worker: Invalid env_instance or action_space. Using default [0] for agent {agent_id}.")
+                         action_space_cache[agent_id] = np.array([0])
+                except Exception as e:
+                     if debug:
+                         print(f"[DEBUG] Worker: Could not get action space for agent {agent_id} ({e}). Using default [0].")
+                     action_space_cache[agent_id] = np.array([0]) # Default fallback
+            # Return a copy to prevent modification issues if stacker modifies actions
+            return np.copy(action_space_cache.get(agent_id, np.array([0])))
 
-    except Exception as e:
-        # Catch initialization errors or major issues
-        tb_str = traceback.format_exc()
-        print(f"Fatal error in worker setup: {e}\n{tb_str}")
+
+        def _create_env(config, use_renderer=False):
+            """Helper to create a single environment instance."""
+            env = None
+            created_renderer = None
+            max_retries = 3
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    # Create renderer *first* if needed, pass it during env creation
+                    if use_renderer:
+                        created_renderer = RLViserRenderer()
+
+                    env = env_fn(renderer=created_renderer, action_stacker=action_stacker, curriculum_config=config, debug=debug)
+
+                    # Initialize tick count
+                    if hasattr(env, 'transition_engine'):
+                        env.transition_engine._tick_count = 0
+                    # Initialize TimeoutCondition
+                    if hasattr(env, 'truncation_cond'):
+                        def set_initial_tick(cond):
+                            if isinstance(cond, TimeoutCondition): cond.initial_tick = 0
+                            elif hasattr(cond, 'conditions'):
+                                for sub_cond in cond.conditions: set_initial_tick(sub_cond)
+                        set_initial_tick(env.truncation_cond)
+
+                    return env, created_renderer # Return env and potentially created renderer
+                except Exception as e:
+                    last_exception = e
+                    if created_renderer: # Clean up renderer if env creation failed
+                        try: created_renderer.close()
+                        except: pass
+                        created_renderer = None
+                    if attempt < max_retries - 1:
+                        if debug: print(f"[DEBUG] Worker env creation attempt {attempt + 1} failed: {e}, retrying...")
+                        time.sleep(1)
+                    else:
+                        if debug: print(f"[DEBUG] Worker env creation failed after {max_retries} attempts.")
+                        # Don't raise here, return None, None to signal failure
+                        return None, None
+                        # raise RuntimeError(f"Failed to create environment after {max_retries} retries: {last_exception}") from last_exception
+
+        def _safe_reset(env_instance) -> Optional[Dict[Any, Any]]:
+            """Helper to reset an environment with retries. Returns None on failure."""
+            max_retries = 3
+            last_exception = None
+            for attempt in range(max_retries):
+                try:
+                    if not env_instance: return None # Skip if env is None
+                    obs = env_instance.reset()
+                    action_space_cache.clear() # Clear cache as agents might change
+                    return obs
+                except Exception as e:
+                    last_exception = e
+                    if debug: print(f"[DEBUG] Worker reset attempt {attempt + 1} failed: {e}")
+                    if attempt == max_retries - 1:
+                        print(f"WORKER ERROR: Failed to reset environment after {max_retries} retries: {last_exception}")
+                        return None # Return None on failure
+                    time.sleep(0.1)
+            return None # Should not be reached
+
+        def _safe_close(env_instance, renderer_instance=None):
+            """Helper to close env and its renderer."""
+            # Close renderer first if it's separate
+            if renderer_instance and (not env_instance or renderer_instance != getattr(env_instance, 'renderer', None)):
+                 try:
+                     if debug: print("[DEBUG] Worker closing separate renderer instance.")
+                     renderer_instance.close()
+                 except Exception as e:
+                     if debug: print(f"[DEBUG] Worker error closing separate renderer: {e}")
+
+            # Close environment (which might close its attached renderer)
+            if env_instance:
+                try:
+                    if debug: print("[DEBUG] Worker closing environment instance.")
+                    env_instance.close()
+                except Exception as e:
+                    if debug: print(f"[DEBUG] Worker error closing environment instance: {e}")
+
+
         try:
-            # Try sending error signal back if remote exists
-            if remote and not remote.closed:
-                remote.send(WorkerError(f"Worker failed initialization: {e}", tb_str))
-        except:
-            pass # Ignore pipe errors during error reporting
-    finally:
-        # Guaranteed cleanup
-        if debug: print("[DEBUG] Worker entering finally block for cleanup.")
-        _safe_close(standby_env)
-        # Pass active_renderer explicitly as it might be detached from active_env
-        _safe_close(active_env, active_renderer)
-        try:
-            if remote and not remote.closed:
-                if debug: print("[DEBUG] Worker closing remote connection.")
-                remote.close()
+            # --- Initial Setup ---
+            if debug: print(f"[DEBUG] Worker initializing with config: {current_config.get('stage_name', 'Default') if current_config else 'Default'}")
+
+            # Create active env (potentially with renderer)
+            active_env, active_renderer = _create_env(current_config, use_renderer=render)
+            if active_env is None: raise RuntimeError("Failed to create initial active_env")
+            initial_obs_active = _safe_reset(active_env)
+            if initial_obs_active is None: raise RuntimeError("Failed to reset initial active_env")
+
+
+            # Create standby env (no renderer)
+            standby_env, _ = _create_env(current_config, use_renderer=False)
+            if standby_env is None: raise RuntimeError("Failed to create initial standby_env")
+            standby_obs = _safe_reset(standby_env) # Reset standby and store its obs
+            if standby_obs is None: raise RuntimeError("Failed to reset initial standby_env")
+
+
+            # Perform dummy step on active env
+            if initial_obs_active:
+                dummy_actions = {agent_id: get_dummy_action(agent_id, active_env) for agent_id in initial_obs_active.keys()}
+                if debug: print(f"[DEBUG] Worker performing initial dummy step on active_env.")
+                _ = active_env.step(dummy_actions)
+            else:
+                 # This case should ideally not happen if reset succeeded
+                 if debug: print("[DEBUG] Worker WARNING: initial active_env reset returned empty/None obs, skipping dummy step.")
+
+
+            # Send the initial observation from the *active* env back to main process
+            remote.send(initial_obs_active)
+            if debug: print("[DEBUG] Worker initialization complete, sent initial active obs.")
+
+            # --- Main Command Loop ---
+            while True:
+                try:
+                    cmd, data = remote.recv()
+
+                    if cmd == 'step':
+                        if active_env is None: # Check if env is usable
+                             raise RuntimeError("Worker received 'step' command but active_env is None.")
+
+                        # --- Realtime Render Delay Logic ---
+                        current_time = time.perf_counter()
+                        if render and last_step_start_time is not None and active_env is not None:
+                            try:
+                                # Attempt to get tick_skip, default to 8 if not found or env missing attr
+                                tick_skip = getattr(active_env, '_tick_skip', 8)
+                                if tick_skip <= 0: tick_skip = 8 # Ensure positive tick_skip
+                                target_step_duration = tick_skip / 120.0 # Assuming 120hz physics
+                                expected_start_time = last_step_start_time + target_step_duration
+                                sleep_duration = expected_start_time - current_time
+                                if sleep_duration > 0:
+                                    time.sleep(sleep_duration)
+                            except AttributeError:
+                                 if debug: print("[DEBUG] Worker render delay: active_env missing '_tick_skip'. Using default.")
+                                 # Fallback logic if _tick_skip doesn't exist
+                                 target_step_duration = 8 / 120.0
+                                 expected_start_time = last_step_start_time + target_step_duration
+                                 sleep_duration = expected_start_time - current_time
+                                 if sleep_duration > 0: time.sleep(sleep_duration)
+                            except Exception as e:
+                                # Catch other potential errors
+                                if debug: print(f"[DEBUG] Worker render delay calculation error: {e}")
+
+                        # Record actual start time after potential delay
+                        step_start_time = time.perf_counter()
+                        # Update for the next iteration's calculation (only if rendering)
+                        if render:
+                            last_step_start_time = step_start_time
+                        # --- End Realtime Render Delay Logic ---
+
+
+                        actions_dict = data
+                        formatted_actions = {}
+                        for agent_id, action in actions_dict.items():
+                            if isinstance(action, torch.Tensor):
+                                action_np = action.cpu().detach().numpy()
+                                if len(action_np.shape) == 1 and action_np.shape[0] > 1:
+                                    formatted_actions[agent_id] = np.array([np.argmax(action_np)])
+                                else:
+                                    formatted_actions[agent_id] = action_np
+                            elif isinstance(action, np.ndarray):
+                                formatted_actions[agent_id] = action
+                            elif isinstance(action, (int, float)):
+                                 formatted_actions[agent_id] = np.array([action])
+                            else:
+                                try:
+                                    formatted_actions[agent_id] = np.array([action])
+                                except:
+                                    if debug: print(f"[DEBUG] Worker step: Unable to process action type {type(action)}, using default.")
+                                    formatted_actions[agent_id] = get_dummy_action(agent_id, active_env)
+
+                            if action_stacker is not None:
+                                # Ensure stacker handles potential numpy arrays correctly
+                                action_to_stack = formatted_actions[agent_id]
+                                action_stacker.add_action(agent_id, action_to_stack)
+
+
+                        # Step the active environment
+                        next_obs_dict, reward_dict, terminated_dict, truncated_dict = active_env.step(formatted_actions)
+
+                        # Render if needed (only active_env has renderer)
+                        if render and active_renderer:
+                            try:
+                                # Ensure renderer is still attached (might be None if creation failed)
+                                if hasattr(active_env, 'renderer') and active_env.renderer:
+                                    active_env.render()
+                            except Exception as e:
+                                 if debug: print(f"[DEBUG] Worker error during render: {e}")
+
+
+                        remote.send((next_obs_dict, reward_dict, terminated_dict, truncated_dict))
+
+                    elif cmd == 'reset':
+                        if debug: print(f"[DEBUG] Worker received reset command.")
+
+                        # Check if standby is ready
+                        if standby_env is None or standby_obs is None:
+                             # This is bad, means previous standby reset failed or env creation failed.
+                             # Signal error back to main process.
+                             raise RuntimeError("Worker received 'reset' but standby_env/standby_obs is not ready.")
+
+                        # 1. Send the observation from the standby environment immediately
+                        remote.send(standby_obs)
+                        if debug: print(f"[DEBUG] Worker sent standby obs: {list(standby_obs.keys()) if standby_obs else 'None'}")
+
+                        # 2. Swap roles
+                        active_env, standby_env = standby_env, active_env
+                        # Swap renderers if rendering is enabled
+                        if render:
+                            # Detach renderer from new standby (old active)
+                            if hasattr(standby_env, 'renderer') and standby_env.renderer:
+                                standby_env.renderer = None
+                            # Attach renderer to new active (old standby)
+                            if active_renderer: # Check if renderer exists
+                                 active_env.renderer = active_renderer
+
+                        if debug: print(f"[DEBUG] Worker swapped active/standby roles.")
+
+                        # 3. Perform dummy step on the *new* active environment
+                        # Use the already available standby_obs to know agents
+                        if standby_obs:
+                            try:
+                                dummy_actions = {agent_id: get_dummy_action(agent_id, active_env) for agent_id in standby_obs.keys()}
+                                if debug: print(f"[DEBUG] Worker performing dummy step on new active_env.")
+                                _ = active_env.step(dummy_actions)
+                            except Exception as e:
+                                 # If dummy step fails, the env might be broken. The next 'step' will likely fail.
+                                 # Log error, but proceed with resetting standby.
+                                 tb_str = traceback.format_exc()
+                                 print(f"WORKER ERROR during dummy step on new active_env: {e}\n{tb_str}")
+                        else:
+                             # This case means the standby_obs was empty/None, which shouldn't happen if check passed.
+                             if debug: print("[DEBUG] Worker WARNING: skipping dummy step on new active_env as standby_obs was empty/None.")
+
+                        # Reset render timer after swap and dummy step
+                        last_step_start_time = None
+                        if render and debug: print(f"[DEBUG] Worker reset render timer.")
+
+
+                        # 4. Reset the *new* standby environment (old active) and store its observation
+                        # Set standby_obs to None *before* reset attempt
+                        standby_obs = None
+                        try:
+                            if debug: print(f"[DEBUG] Worker resetting new standby_env.")
+                            standby_obs = _safe_reset(standby_env) # Returns None on failure
+                            if standby_obs is not None:
+                                 if debug: print(f"[DEBUG] Worker new standby_env reset complete. Stored obs keys: {list(standby_obs.keys()) if standby_obs else 'None'}")
+                            else:
+                                 # Reset failed, standby_obs remains None. Error already printed by _safe_reset.
+                                 # The next 'reset' command will raise an error.
+                                 pass
+                        except Exception as e:
+                            # Catch any unexpected error from _safe_reset itself (shouldn't happen)
+                            standby_obs = None
+                            tb_str = traceback.format_exc()
+                            print(f"CRITICAL WORKER ERROR: Unexpected exception during standby reset call: {e}\n{tb_str}")
+
+
+                    elif cmd == 'set_curriculum':
+                        new_config = data
+                        old_stage = current_config.get('stage_name', 'Unknown') if current_config else 'Default'
+                        new_stage = new_config.get('stage_name', 'Unknown') if new_config else 'Default'
+                        if debug: print(f"[DEBUG] Worker received set_curriculum. From {old_stage} to {new_stage}")
+
+                        current_config = new_config # Store new config
+
+                        # Close existing environments and renderer
+                        _safe_close(standby_env)
+                        standby_env = None
+                        standby_obs = None # Reset standby obs
+                        _safe_close(active_env, active_renderer)
+                        active_env = None
+                        active_renderer = None
+                        action_space_cache.clear() # Clear action space cache
+
+                        # Recreate both environments with the new config
+                        ack = False
+                        try:
+                            # Create active env (potentially with renderer)
+                            active_env, active_renderer = _create_env(current_config, use_renderer=render)
+                            if active_env is None: raise RuntimeError("Failed to recreate active_env after curriculum change")
+                            initial_obs_active = _safe_reset(active_env)
+                            if initial_obs_active is None: raise RuntimeError("Failed to reset recreated active_env")
+
+                            # Create standby env (no renderer)
+                            standby_env, _ = _create_env(current_config, use_renderer=False)
+                            if standby_env is None: raise RuntimeError("Failed to recreate standby_env after curriculum change")
+                            standby_obs = _safe_reset(standby_env) # Reset standby and store its obs
+                            if standby_obs is None: raise RuntimeError("Failed to reset recreated standby_env")
+
+                            # Perform dummy step on active env
+                            if initial_obs_active:
+                                dummy_actions = {agent_id: get_dummy_action(agent_id, active_env) for agent_id in initial_obs_active.keys()}
+                                if debug: print(f"[DEBUG] Worker performing dummy step on active_env after curriculum change.")
+                                _ = active_env.step(dummy_actions)
+
+                            # Reset render timer after successful recreation
+                            last_step_start_time = None
+                            if render and debug: print(f"[DEBUG] Worker reset render timer after curriculum change.")
+
+                            ack = True # Signal success
+                            if debug: print(f"[DEBUG] Worker curriculum change complete.")
+
+                        except Exception as e:
+                             tb_str = traceback.format_exc()
+                             print(f"CRITICAL WORKER ERROR during set_curriculum recreation: {e}\n{tb_str}")
+                             # Ensure envs are None if creation failed
+                             _safe_close(standby_env) # Close potentially partially created envs
+                             _safe_close(active_env, active_renderer)
+                             active_env = None
+                             standby_env = None
+                             active_renderer = None
+                             standby_obs = None
+                             ack = False # Signal failure
+                             last_step_start_time = None # Also reset timer on failure
+                        finally:
+                             # Send acknowledgment (True/False) back to main process
+                             try:
+                                 remote.send(ack)
+                             except (BrokenPipeError, EOFError):
+                                  if debug: print("[DEBUG] Worker pipe broken sending curriculum ack.")
+                             except Exception as e_ack:
+                                  if debug: print(f"[DEBUG] Worker error sending curriculum ack: {e_ack}")
+
+
+                    elif cmd == 'close':
+                        if debug: print("[DEBUG] Worker received close command.")
+                        break # Exit loop, finally block will handle cleanup
+
+                    elif cmd == 'reset_action_stacker':
+                        agent_id = data
+                        if action_stacker is not None:
+                            action_stacker.reset_agent(agent_id)
+                        # No need to send ack for this simple command unless required by main loop
+                        # remote.send(True)
+
+                except EOFError:
+                    if debug: print("[DEBUG] Worker received EOFError, exiting.")
+                    break
+                except (BrokenPipeError, ConnectionResetError) as e:
+                     if debug: print(f"[DEBUG] Worker pipe broken: {e}, exiting.")
+                     break
+                except Exception as e:
+                    # Log unexpected errors in command processing
+                    tb_str = traceback.format_exc()
+                    print(f"Error in worker command loop (cmd={cmd}): {e}\n{tb_str}")
+                    # Attempt to send error back to main process
+                    try:
+                        # Ensure remote is valid before sending
+                        if remote and not remote.closed:
+                             remote.send(WorkerError(f"Unhandled exception in worker loop: {e}", tb_str))
+                    except:
+                        pass # Ignore if pipe is broken during error reporting
+                    break # Exit loop on unhandled exception
+
         except Exception as e:
-            if debug: print(f"[DEBUG] Worker error closing remote: {e}")
-        if debug: print("[DEBUG] Worker cleanup finished.")
+            # Catch initialization errors or major issues
+            tb_str = traceback.format_exc()
+            print(f"Fatal error in worker setup: {e}\n{tb_str}")
+            try:
+                # Try sending error signal back if remote exists
+                if remote and not remote.closed:
+                    remote.send(WorkerError(f"Worker failed initialization: {e}", tb_str))
+            except:
+                pass # Ignore pipe errors during error reporting
+        finally:
+            # Guaranteed cleanup
+            if debug: print("[DEBUG] Worker entering finally block for cleanup.")
+            _safe_close(standby_env)
+            # Pass active_renderer explicitly as it might be detached from active_env
+            _safe_close(active_env, active_renderer)
+            try:
+                if remote and not remote.closed:
+                    if debug: print("[DEBUG] Worker closing remote connection.")
+                    remote.close()
+            except Exception as e:
+                if debug: print(f"[DEBUG] Worker error closing remote: {e}")
+            if debug: print("[DEBUG] Worker cleanup finished.")
+
+    finally:
+        # Stop VizTracer if it was started
+        if tracer:
+            try:
+                tracer.stop()
+                tracer.save()
+                if debug: print(f"[DEBUG] Worker {mp.current_process().pid} stopped and saved VizTracer.")
+            except Exception as e:
+                 print(f"WORKER WARNING: Failed to stop/save VizTracer in worker {mp.current_process().pid}: {e}")
 
 
 class VectorizedEnv:
@@ -441,13 +478,14 @@ class VectorizedEnv:
     Runs multiple RLGym environments in parallel using worker processes
     that manage active/standby environments for zero-latency resets.
     """
-    def __init__(self, num_envs, render=False, action_stacker=None, curriculum_manager=None, debug=False):
+    def __init__(self, num_envs, render=False, action_stacker=None, curriculum_manager=None, debug=False, use_viztracer=False):
         self.num_envs = num_envs
         # Render mode uses multiprocessing but only one worker creates a renderer instance.
         self.render = render
         self.action_stacker = action_stacker
         self.curriculum_manager = curriculum_manager
         self.debug = debug
+        self.use_viztracer = use_viztracer # Store the flag
         self.mode = "multiprocess" # Always use multiprocessing now
 
         # For tracking episode metrics for curriculum
@@ -483,7 +521,7 @@ class VectorizedEnv:
             worker_render = self.render and (idx == 0)
             process = Process(
                 target=worker,
-                args=(work_remote, get_env, worker_render, action_stacker, self.curriculum_configs[idx], self.debug),
+                args=(work_remote, get_env, worker_render, action_stacker, self.curriculum_configs[idx], self.debug, self.use_viztracer), # Pass flag
                 daemon=True
             )
             process.start()

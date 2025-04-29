@@ -34,5 +34,7 @@ runnable_bots.txt
 # Profiling
 result.json
 trace_processor
+viztracer*
 
+# Pausing
 pause.flag
