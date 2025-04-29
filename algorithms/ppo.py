@@ -354,10 +354,16 @@ class PPOAlgorithm(BaseAlgorithm):
 
             # Update position and size
             new_pos = (self.pos + batch_size) % self.buffer_size
-            if not self.full and new_pos < self.pos: # Wrapped around
+            # Check for wrap-around BEFORE updating self.pos
+            if not self.full and (self.pos + batch_size >= self.buffer_size):
                 self.full = True
             self.pos = new_pos
-            self.size = self.buffer_size if self.full else self.pos
+            # Simpler size calculation: increment size, capped by buffer_size
+            self.size = min(self.size + batch_size, self.buffer_size)
+
+            if self.debug and batch_size > 0:
+                 # This print should now show the correct size
+                 print(f"[DEBUG PPOMemory] Stored initial batch of size {batch_size}. New pos: {self.pos}, size: {self.size}")
 
             if self.debug and batch_size > 0:
                  print(f"[DEBUG PPOMemory] Stored initial batch of size {batch_size}. New pos: {self.pos}, size: {self.size}")
@@ -1327,7 +1333,6 @@ class PPOAlgorithm(BaseAlgorithm):
                     # --- Total Loss ---
                     # Combine actor, distributional critic, entropy, and auxiliary losses
                     total_loss = actor_loss + (self.critic_coef * critic_loss) + entropy_loss + sr_loss + rp_loss
-
                 # --- Optimization (outside autocast context) ---
                 self.optimizer.zero_grad()
                 # Scale the loss using GradScaler
