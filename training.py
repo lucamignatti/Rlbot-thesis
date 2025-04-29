@@ -11,7 +11,7 @@ from model_architectures import (
 from typing import Union, Tuple, Optional, Dict, Any, Deque
 from auxiliary import AuxiliaryTaskManager
 from intrinsic_rewards import create_intrinsic_reward_generator, IntrinsicRewardEnsemble
-from algorithms import BaseAlgorithm, PPOAlgorithm, StreamACAlgorithm, SimbaV2Algorithm
+from algorithms import BaseAlgorithm, PPOAlgorithm, StreamACAlgorithm
 from algorithms.sac import SACAlgorithm
 import time
 import os
@@ -371,18 +371,13 @@ class Trainer:
                 raise ValueError("SAC algorithm currently does not support shared actor-critic models.")
             critic2 = copy.deepcopy(critic)
 
-            # Create SimbaV2 SAC algorithm (which inherits from SACAlgorithm)
-            # Get observation dimension from actor model or use action_dim fallback
-            obs_dim = getattr(self.actor, 'obs_shape', action_dim * 2)
-            # Convert to proper shape tuple for SAC buffer
-            obs_shape = (obs_dim,) if isinstance(obs_dim, (int, np.integer)) else obs_dim
-            algorithm = SimbaV2Algorithm(
+            # Create SAC algorithm
+            algorithm = SACAlgorithm(
                 actor=self.actor,
-                critic1=self.critic,  # First Q-network (Distributional)
-                critic2=critic2,      # Second Q-network (Distributional)
+                critic1=self.critic,  # First Q-network
+                critic2=critic2,      # Second Q-network
                 action_space_type=action_space_type,
                 action_dim=action_dim,
-                observation_shape=obs_shape,  # Explicitly pass observation shape
                 action_bounds=action_bounds,
                 device=self.device,
                 lr_actor=lr_actor,
@@ -400,12 +395,7 @@ class Trainer:
                 max_grad_norm=max_grad_norm,
                 use_amp=self.use_amp, # Pass AMP flag
                 use_wandb=use_wandb,
-                debug=self.debug,
-                # SimbaV2 specific parameters
-                critic_num_atoms=num_atoms,
-                critic_return_min=v_min,
-                critic_return_max=v_max,
-                reward_scale_epsilon=reward_scaling_eps
+                debug=self.debug
             )
             self.algorithm = algorithm
         else:
@@ -941,15 +931,6 @@ class Trainer:
         """Store experience in the buffer with environment ID."""
         # Get whether we're in test mode
         test_mode = getattr(self, 'test_mode', False)
-
-        # Handle SAC's different experience storage interface
-        if self.algorithm_type == "sac" and not test_mode:
-            # For SAC, we need to store the full transition when we have it
-            # state and log_prob might be swapped due to PPO interface
-            # We'll store this experience later when we have next_obs
-            if self.debug:
-                print(f"[DEBUG Trainer] SAC store_experience will be handled after env.step() to include next_obs")
-            return
         
         # Accumulate environment statistics if provided
         if env_stats and not test_mode:

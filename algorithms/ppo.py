@@ -596,17 +596,9 @@ class PPOAlgorithm(BaseAlgorithm):
                     # Calculate log_prob of the chosen action index
                     log_prob = torch.log(torch.gather(probs, -1, action.unsqueeze(-1)).squeeze(-1) + 1e-10)
                 else: # Continuous
-                    # --- MODIFICATION START ---
-                    # Actor output is raw tensor (mean, log_std)
-                    mean, log_std = actor_output.chunk(2, dim=-1)
-                    # Use mean for deterministic action
-                    action = mean 
-                    # Calculate log_prob for the mean action
-                    log_std_clamped = torch.clamp(log_std, min=-20, max=2)
-                    std = torch.exp(log_std_clamped)
-                    action_dist = torch.distributions.Normal(mean, std)
+                    action_dist = actor_output # Assume output is already a distribution object
+                    action = action_dist.loc # Mean action (Float)
                     log_prob = action_dist.log_prob(action).sum(dim=-1)
-                    # --- MODIFICATION END ---
             else: # Sample action
                 if self.action_space_type == "discrete":
                     probs = actor_output
@@ -626,15 +618,9 @@ class PPOAlgorithm(BaseAlgorithm):
                          action = torch.argmax(probs, dim=-1)
                          log_prob = torch.log(torch.gather(probs, -1, action.unsqueeze(-1)).squeeze(-1) + 1e-10)
                 else: # Continuous
-                    # --- MODIFICATION START ---
-                    # Actor output is raw tensor (mean, log_std)
-                    mean, log_std = actor_output.chunk(2, dim=-1)
-                    log_std = torch.clamp(log_std, min=-20, max=2) # Common practice
-                    std = torch.exp(log_std)
-                    action_dist = torch.distributions.Normal(mean, std) # Create the distribution here
-                    action = action_dist.sample() # Sample from the created distribution
+                    action_dist = actor_output # Assume output is already a distribution object
+                    action = action_dist.sample() # Float
                     log_prob = action_dist.log_prob(action).sum(dim=-1)
-                    # --- MODIFICATION END ---
 
         # Create dummy value tensor (zeros) with the same batch size and device
         dummy_value = torch.zeros_like(log_prob)
