@@ -14,7 +14,18 @@ from torch.amp import GradScaler, autocast
 from model_architectures.utils import l2_norm
 
 class PPOAlgorithm(BaseAlgorithm):
-    """PPO algorithm implementation"""
+    """
+    PPO algorithm implementation with SimbaV2 Categorical Distributional Critic
+    
+    This implementation uses a distributional critic to model the full return distribution
+    rather than just the expected value. Key features:
+    
+    1. Categorical representation of value distribution using fixed support points
+    2. KL divergence loss for training the critic
+    3. Uncertainty-weighted PPO objective that gives more importance to policy updates
+       from states where the critic's distribution is more certain (lower entropy/variance)
+    4. Scalar GAE using the mean of the distributional critic
+    """
 
     def __init__(
         self,
@@ -42,6 +53,10 @@ class PPOAlgorithm(BaseAlgorithm):
         v_min=None,
         v_max=None,
         num_atoms=None,
+        # --- Distributional PPO Parameters ---
+        use_uncertainty_weight=True,  # Whether to use uncertainty weighting in PPO objective
+        uncertainty_weight_type="entropy",  # "entropy" or "variance" for uncertainty measure
+        uncertainty_weight_temp=1.0,  # Temperature parameter for uncertainty weighting
         # --- Weight Clipping Params ---
         # Unsupported using SimBa v2
         use_weight_clipping=False,
@@ -92,6 +107,12 @@ class PPOAlgorithm(BaseAlgorithm):
         # Precompute support atoms (for efficiency)
         self.support = torch.linspace(self.v_min, self.v_max, self.num_atoms, device=self.device)
         self.delta_z = (self.v_max - self.v_min) / (self.num_atoms - 1)
+        # -----------------------------------------
+        
+        # --- ADD DISTRIBUTIONAL PPO UNCERTAINTY WEIGHTING PARAMS ---
+        self.use_uncertainty_weight = use_uncertainty_weight
+        self.uncertainty_weight_type = uncertainty_weight_type
+        self.uncertainty_weight_temp = uncertainty_weight_temp
         # -----------------------------------------
 
 
@@ -157,6 +178,10 @@ class PPOAlgorithm(BaseAlgorithm):
             'mean_return': 0.0,
             'weight_clip_fraction': 0.0,
             'current_kappa': self.weight_clip_kappa,
+            # Uncertainty weighting metrics
+            'mean_uncertainty_weight': 1.0,
+            'min_uncertainty_weight': 1.0,
+            'max_uncertainty_weight': 1.0,
         }
 
         # Add episode return tracking
@@ -743,6 +768,61 @@ class PPOAlgorithm(BaseAlgorithm):
         return self.metrics
 
 
+    def _compute_uncertainty_weight(self, predicted_probs):
+        """
+        Compute uncertainty weight based on the critic's predicted distribution.
+        
+        Args:
+            predicted_probs: predicted probabilities from critic [batch_size, num_atoms]
+        
+        Returns:
+            weight tensor [batch_size] for PPO objective weighting
+        """
+        if not self.use_uncertainty_weight:
+            # Return all 1s if uncertainty weighting is disabled
+            return torch.ones(predicted_probs.shape[0], device=self.device)
+            
+        if self.uncertainty_weight_type == "entropy":
+            # Calculate entropy of the predicted distribution: -sum(p_i * log(p_i))
+            # Add a small epsilon to avoid log(0)
+            eps = 1e-8
+            log_probs = torch.log(predicted_probs + eps)
+            entropy = -(predicted_probs * log_probs).sum(dim=1)  # [batch_size]
+            
+            # Apply sigmoid transformation: w = sigmoid(-entropy * T) + 0.5
+            # Higher entropy (more uncertainty) -> lower weight
+            # Lower entropy (more certainty) -> higher weight
+            weight = torch.sigmoid(-entropy * self.uncertainty_weight_temp) + 0.5
+            
+            if self.debug and torch.rand(1).item() < 0.01:  # Debug log occasionally
+                print(f"[DEBUG PPO Uncertainty] Entropy weight range: {weight.min().item():.4f}-{weight.max().item():.4f}, "
+                      f"Mean: {weight.mean().item():.4f}")
+                
+        elif self.uncertainty_weight_type == "variance":
+            # Calculate variance of the predicted value distribution
+            # Var(X) = E[X^2] - (E[X])^2
+            support = self.support.to(predicted_probs.device)
+            # E[X] = sum(p_i * z_i)
+            expected_value = (predicted_probs * support).sum(dim=1)  # [batch_size]
+            # E[X^2] = sum(p_i * z_i^2)
+            expected_value_squared = (predicted_probs * support.pow(2)).sum(dim=1)  # [batch_size]
+            variance = expected_value_squared - expected_value.pow(2)  # [batch_size]
+            
+            # Apply sigmoid transformation: w = sigmoid(-variance * T) + 0.5
+            # Higher variance (more uncertainty) -> lower weight
+            # Lower variance (more certainty) -> higher weight
+            weight = torch.sigmoid(-variance * self.uncertainty_weight_temp) + 0.5
+            
+            if self.debug and torch.rand(1).item() < 0.01:  # Debug log occasionally
+                print(f"[DEBUG PPO Uncertainty] Variance weight range: {weight.min().item():.4f}-{weight.max().item():.4f}, "
+                      f"Mean: {weight.mean().item():.4f}")
+        else:
+            if self.debug:
+                print(f"[DEBUG PPO Uncertainty] Unknown uncertainty weight type: {self.uncertainty_weight_type}, defaulting to 1.0")
+            weight = torch.ones(predicted_probs.shape[0], device=self.device)
+            
+        return weight
+            
     def _compute_gae(self, rewards, values, dones):
         """
         Compute returns and advantages using Generalized Advantage Estimation (GAE)
@@ -924,6 +1004,9 @@ class PPOAlgorithm(BaseAlgorithm):
             'sr_loss_scalar': 0.0,
             'rp_loss_scalar': 0.0,
             'weight_clip_fraction': 0.0, # Fraction of weights clipped this update
+            'mean_uncertainty_weight': 0.0, # Track average uncertainty weight
+            'min_uncertainty_weight': float('inf'), # Track min uncertainty weight
+            'max_uncertainty_weight': 0.0, # Track max uncertainty weight
         }
 
         # Calculate explained variance (once before updates) using expected value from distribution
@@ -1080,7 +1163,53 @@ class PPOAlgorithm(BaseAlgorithm):
                     ratio = torch.exp(curr_log_probs - batch_old_log_probs)
                     surr1 = ratio * batch_advantages
                     surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * batch_advantages
-                    actor_loss = -torch.min(surr1, surr2).mean()
+                    
+                    # Standard PPO clipped objective: min(r_t * A_t, clip(r_t) * A_t)
+                    ppo_objectives = torch.min(surr1, surr2)
+                    
+                    # Apply uncertainty weighting if enabled
+                    if self.use_uncertainty_weight:
+                        # Get uncertainty weights based on critic's predicted distribution
+                        uncertainty_weights = self._compute_uncertainty_weight(predicted_probs)
+                        
+                        # Apply weights to PPO objectives (element-wise multiplication)
+                        # Higher weight = more impact on policy update when critic is confident
+                        weighted_objectives = ppo_objectives * uncertainty_weights
+                        actor_loss = -weighted_objectives.mean()
+                        
+                        # Update uncertainty weight metrics
+                        batch_mean_weight = uncertainty_weights.mean().item()
+                        batch_min_weight = uncertainty_weights.min().item()
+                        batch_max_weight = uncertainty_weights.max().item()
+                        
+                        # Accumulate for averaging across batches
+                        update_metrics_scalars['mean_uncertainty_weight'] += batch_mean_weight
+                        update_metrics_scalars['min_uncertainty_weight'] = min(
+                            update_metrics_scalars['min_uncertainty_weight'], 
+                            batch_min_weight
+                        )
+                        update_metrics_scalars['max_uncertainty_weight'] = max(
+                            update_metrics_scalars['max_uncertainty_weight'], 
+                            batch_max_weight
+                        )
+                        
+                        # Track average weight for debugging/metrics
+                        if self.debug and torch.rand(1).item() < 0.01:  # Occasional logging
+                            print(f"[DEBUG PPO Uncertainty] Weights: min={batch_min_weight:.4f}, "
+                                  f"max={batch_max_weight:.4f}, mean={batch_mean_weight:.4f}")
+                    else:
+                        # Standard unweighted PPO loss
+                        actor_loss = -ppo_objectives.mean()
+                        # Set default values for metrics when not using uncertainty weights
+                        update_metrics_scalars['mean_uncertainty_weight'] += 1.0
+                        update_metrics_scalars['min_uncertainty_weight'] = min(
+                            update_metrics_scalars['min_uncertainty_weight'], 
+                            1.0
+                        )
+                        update_metrics_scalars['max_uncertainty_weight'] = max(
+                            update_metrics_scalars['max_uncertainty_weight'],
+                            1.0
+                        )
 
                     # Calculate entropy loss bonus
                     entropy_loss = -entropy * self.entropy_coef
@@ -1235,9 +1364,14 @@ class PPOAlgorithm(BaseAlgorithm):
             for key, tensor_val in update_metrics_tensors.items():
                 final_metrics[key] = (tensor_val / num_batches_processed).item()
 
-            # Average accumulated scalars
+            # Process accumulated scalars
             for key, scalar_val in update_metrics_scalars.items():
-                final_metrics[key] = scalar_val / num_batches_processed
+                # Don't average min/max uncertainty weights, just pass through
+                if key == 'min_uncertainty_weight' or key == 'max_uncertainty_weight':
+                    final_metrics[key] = scalar_val
+                else:
+                    # Average other scalars like mean_uncertainty_weight
+                    final_metrics[key] = scalar_val / num_batches_processed
 
             # Average weight clip fraction (already accumulated per batch)
             final_metrics['weight_clip_fraction'] = total_weight_clipped_fraction_epoch / num_batches_processed
@@ -1246,8 +1380,18 @@ class PPOAlgorithm(BaseAlgorithm):
              if self.debug:
                  print("[DEBUG PPO _update_policy] No batches were processed in any epoch.")
              # Initialize metrics to zero if no batches processed
-             for key in list(update_metrics_tensors.keys()) + list(update_metrics_scalars.keys()):
+             for key in list(update_metrics_tensors.keys()):
                  final_metrics[key] = 0.0
+             
+             # Handle scalar metrics with appropriate defaults
+             for key in list(update_metrics_scalars.keys()):
+                 if key == 'min_uncertainty_weight':
+                     final_metrics[key] = 1.0
+                 elif key == 'max_uncertainty_weight':
+                     final_metrics[key] = 1.0
+                 else:
+                     final_metrics[key] = 0.0
+                     
              final_metrics['weight_clip_fraction'] = 0.0
 
 
@@ -1328,7 +1472,11 @@ class PPOAlgorithm(BaseAlgorithm):
             'episode_returns': list(self.episode_returns),
             'current_episode_rewards': self.current_episode_rewards,
             'weight_clip_kappa': self.weight_clip_kappa,
-            '_update_counter': self._update_counter
+            '_update_counter': self._update_counter,
+            # Save distributional PPO parameters
+            'use_uncertainty_weight': self.use_uncertainty_weight,
+            'uncertainty_weight_type': self.uncertainty_weight_type,
+            'uncertainty_weight_temp': self.uncertainty_weight_temp
         })
         # Add aux task manager state if it exists and has a method
         if self.aux_task_manager and hasattr(self.aux_task_manager, 'get_state_dict'):
@@ -1376,6 +1524,15 @@ class PPOAlgorithm(BaseAlgorithm):
             self.weight_clip_kappa = state_dict['weight_clip_kappa']
         if '_update_counter' in state_dict:
             self._update_counter = state_dict['_update_counter']
+        
+        # Load distributional PPO parameters if present
+        if 'use_uncertainty_weight' in state_dict:
+            self.use_uncertainty_weight = state_dict['use_uncertainty_weight']
+        if 'uncertainty_weight_type' in state_dict:
+            self.uncertainty_weight_type = state_dict['uncertainty_weight_type']
+        if 'uncertainty_weight_temp' in state_dict:
+            self.uncertainty_weight_temp = state_dict['uncertainty_weight_temp']
+        
         # Load aux task manager state if it exists and has a method
         if 'aux_task_manager' in state_dict and self.aux_task_manager and hasattr(self.aux_task_manager, 'load_state_dict'):
             self.aux_task_manager.load_state_dict(state_dict['aux_task_manager'])
