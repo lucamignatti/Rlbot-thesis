@@ -560,9 +560,9 @@ def run_training(
     stream_buffer_size: int = 32,
     use_sparse_init: bool = True,
     update_freq: int = 1,
-    # Add reward scaling parameters
-    use_reward_scaling: bool = True,
-    reward_scaling_G_max: float = 10.0,
+    # Add reward scaling parameters (REMOVED)
+    # use_reward_scaling: bool = True,
+    # reward_scaling_G_max: float = 10.0,
     # Add TQDM queue
     tqdm_q: Optional[mp.Queue] = None,
     # Add viztracer flag
@@ -643,9 +643,9 @@ def run_training(
         v_min=args.v_min,
         v_max=args.v_max,
         num_atoms=args.num_atoms,
-        # Pass reward scaling parameters to Trainer
-        use_reward_scaling=use_reward_scaling,
-        reward_scaling_G_max=reward_scaling_G_max,
+        # Pass reward scaling parameters to Trainer (REMOVED)
+        # use_reward_scaling=use_reward_scaling,
+        # reward_scaling_G_max=reward_scaling_G_max,
     )
 
     # --- MODEL LOADING LOGIC ---
@@ -1109,16 +1109,8 @@ def run_training(
                     batch_dones_np = np.array(batch_dones, dtype=bool)
                     batch_store_indices_tensor = torch.tensor(batch_store_indices_for_update, dtype=torch.long, device=device)
 
-                    # --- Reward Scaling (SimbaV2) ---
-                    scaled_extrinsic_rewards = np.zeros_like(batch_rewards_np)
-                    if trainer.use_reward_scaling:
-                        for i in range(min_len):
-                            env_id = batch_env_ids_for_intrinsic[i]
-                            done_flag = batch_dones_np[i]
-                            variance_G, max_G = trainer._update_reward_scaling_stats(env_id, batch_rewards_np[i], done_flag)
-                            scaled_extrinsic_rewards[i] = trainer._scale_reward(env_id, batch_rewards_np[i], variance_G, max_G)
-                    else:
-                        scaled_extrinsic_rewards = batch_rewards_np # Use original if scaling disabled
+                    # --- Reward Scaling (SimbaV2) --- (REMOVED - Handled in Algorithm)
+                    scaled_extrinsic_rewards = batch_rewards_np # Use original rewards here
 
                     final_rewards = scaled_extrinsic_rewards # Start with scaled extrinsic
 
@@ -1875,11 +1867,11 @@ if __name__ == "__main__":
     parser.add_argument('--model-arch', type=str, default='simbav2', choices=['basic', 'simba', 'simbav2', 'simbav2-shared'], # Changed default to simbav2
                        help='Model architecture to use (basic, simba, simbav2, simbav2-shared)')
 
-    # Add reward scaling args here, before parse_args()
-    parser.add_argument('--use-reward-scaling', action='store_true', dest='use_reward_scaling', help='Enable SimbaV2 reward scaling')
-    parser.add_argument('--no-reward-scaling', action='store_false', dest='use_reward_scaling', help='Disable SimbaV2 reward scaling')
-    parser.set_defaults(use_reward_scaling=True)
-    parser.add_argument('--reward-scaling-gmax', type=float, default=3.0, help='G_max hyperparameter for reward scaling')
+    # Add reward scaling args here, before parse_args() (REMOVED - Handled in Algorithm)
+    # parser.add_argument('--use-reward-scaling', action='store_true', dest='use_reward_scaling', help='Enable SimbaV2 reward scaling')
+    # parser.add_argument('--no-reward-scaling', action='store_false', dest='use_reward_scaling', help='Disable SimbaV2 reward scaling')
+    # parser.set_defaults(use_reward_scaling=True)
+    # parser.add_argument('--reward-scaling-gmax', type=float, default=3.0, help='G_max hyperparameter for reward scaling')
 
     args = parser.parse_args()
 
@@ -2174,9 +2166,7 @@ if __name__ == "__main__":
         trainer = run_training(
             actor=actor,
             critic=critic, # Pass the potentially shared instance
-            # Pass reward scaling args
-            use_reward_scaling=args.use_reward_scaling,
-            reward_scaling_G_max=args.reward_scaling_gmax,
+            # Pass reward scaling args (REMOVED)
             # training_step_offset is now handled inside run_training via load_models
             device=device,
             num_envs=args.num_envs,

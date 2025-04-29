@@ -196,10 +196,10 @@ class Trainer:
         buffer_size: int = 1000000,
         warmup_steps: int = 1000,
         updates_per_step: int = 1,
-        # SimbaV2 Reward Scaling parameters
-        use_reward_scaling: bool = True,
-        reward_scaling_G_max: float = 10.0,
-        reward_scaling_eps: float = 1e-5,
+        # SimbaV2 Reward Scaling parameters (REMOVED - Handled in Algorithm)
+        # use_reward_scaling: bool = True,
+        # reward_scaling_G_max: float = 10.0,
+        # reward_scaling_eps: float = 1e-5,
         v_min: float = -10.0,
         v_max: float = 10.0,
         num_atoms: int = 51,
@@ -543,15 +543,15 @@ class Trainer:
             if self.debug:
                 print(f"[DEBUG] Initialized intrinsic reward generator with scale {intrinsic_reward_scale}")
 
-        # SimbaV2 Reward Scaling Initialization
-        self.use_reward_scaling = use_reward_scaling
-        self.reward_scaling_G_max = reward_scaling_G_max
-        self.reward_scaling_eps = reward_scaling_eps
+        # SimbaV2 Reward Scaling Initialization (REMOVED - Handled in Algorithm)
+        # self.use_reward_scaling = use_reward_scaling
+        # self.reward_scaling_G_max = reward_scaling_G_max
+        # self.reward_scaling_eps = reward_scaling_eps
         # Use dictionaries to store per-environment stats for vectorized envs
-        self.running_G: Dict[int, float] = {} # Tracks G_t per env (Eq 17)
-        self.running_G_var: Dict[int, float] = {} # Tracks variance of G_t per env
-        self.running_G_count: Dict[int, float] = {} # Tracks count for variance calculation per env
-        self.running_G_max: Dict[int, float] = {} # Tracks max(G_t) per env (Eq 18)
+        # self.running_G: Dict[int, float] = {} # Tracks G_t per env (Eq 17)
+        # self.running_G_var: Dict[int, float] = {} # Tracks variance of G_t per env
+        # self.running_G_count: Dict[int, float] = {} # Tracks count for variance calculation per env
+        # self.running_G_max: Dict[int, float] = {} # Tracks max(G_t) per env (Eq 18)
 
     def _true_training_steps(self):
         """Get the true training step count (including offset)"""
@@ -936,25 +936,12 @@ class Trainer:
         if env_stats and not test_mode:
             self.accumulate_env_stats(env_stats)
 
-        # Reward Scaling (SimbaV2)
+        # Reward Scaling (SimbaV2) (REMOVED - Handled in Algorithm)
         original_reward = reward # Keep original for potential intrinsic calculation later
-        if self.use_reward_scaling and not test_mode:
-             # Ensure reward is a float for calculations
-             if isinstance(reward, torch.Tensor):
-                 reward_float = reward.item()
-             elif isinstance(reward, np.ndarray):
-                 reward_float = reward.item() if reward.size == 1 else float(reward[0])
-             else:
-                 reward_float = float(reward)
-
-             # Update running stats for this environment
-             variance_G, max_G = self._update_reward_scaling_stats(env_id, reward_float, done)
-
-             # Scale the reward
-             reward = self._scale_reward(env_id, reward_float, variance_G, max_G)
-
-             if self.debug and self._true_training_steps() % 100 == 0:
-                 print(f"[DEBUG Reward Scaling env {env_id}] Orig: {reward_float:.4f}, Scaled: {reward:.4f}, VarG: {variance_G:.4f}, MaxG: {max_G:.4f}")
+        # if self.use_reward_scaling and not test_mode:
+             # ... scaling logic removed ...
+             # reward = self._scale_reward(env_id, reward_float, variance_G, max_G)
+             # ... debug print removed ...
 
         # Skip intrinsic reward calculation when reward is 0 (placeholder value)
         # This is to avoid calculating intrinsic rewards before we have the actual reward from the environment
@@ -1039,27 +1026,17 @@ class Trainer:
                     print(f"[DEBUG] Adding intrinsic reward: {intrinsic_reward_value} to scaled extrinsic: {extrinsic_reward_val}")
 
 
-        # Get the SCALED extrinsic reward
-        if self.use_reward_scaling and not getattr(self, 'test_mode', False):
-            self._initialize_reward_scaling_stats(env_id)
-            variance_G = self.running_G_var[env_id]
-            max_G = self.running_G_max[env_id]
-            # Ensure original reward is float for scaling calculation
-            if isinstance(reward, torch.Tensor): original_reward_float = reward.item()
-            elif isinstance(reward, np.ndarray): original_reward_float = reward.item() if reward.size == 1 else float(reward[0])
-            else: original_reward_float = float(reward)
-            scaled_extrinsic_reward = self._scale_reward(env_id, original_reward_float, variance_G, max_G)
-        else:
-            # If scaling is off or in test mode, use the original reward directly
-            if isinstance(reward, torch.Tensor): scaled_extrinsic_reward = reward.item()
-            elif isinstance(reward, np.ndarray): scaled_extrinsic_reward = reward.item() if reward.size == 1 else float(reward[0])
-            else: scaled_extrinsic_reward = float(reward)
+        # Get the ORIGINAL extrinsic reward (scaling is handled by the algorithm now)
+        # Convert reward to float for calculations
+        if isinstance(original_reward, torch.Tensor): extrinsic_reward = original_reward.item()
+        elif isinstance(original_reward, np.ndarray): extrinsic_reward = original_reward.item() if original_reward.size == 1 else float(original_reward[0])
+        else: extrinsic_reward = float(original_reward)
 
-        # Calculate total reward (scaled extrinsic + scaled intrinsic)
-        total_reward = scaled_extrinsic_reward + intrinsic_reward_value
+        # Calculate total reward (extrinsic + scaled intrinsic)
+        total_reward = extrinsic_reward + intrinsic_reward_value
 
         # Store the experience using the algorithm - only update if not in test mode
-        # Use the potentially SCALED 'reward' here
+        # Pass the TOTAL reward (extrinsic + scaled intrinsic) to the algorithm storage
         if not test_mode:
             if self.algorithm_type == "streamac":
                 # For StreamAC, check if an update was performed and pass env_id
@@ -1938,67 +1915,13 @@ class Trainer:
                 wandb.log({'training/pretraining_completed': True}, step=current_step)
         # Removed transition phase logic
 
-    def _initialize_reward_scaling_stats(self, env_id):
-        """Initialize reward scaling stats for a new environment ID."""
-        if env_id not in self.running_G:
-            self.running_G[env_id] = 0.0
-            self.running_G_var[env_id] = 1.0 # Initialize variance to 1
-            self.running_G_count[env_id] = self.reward_scaling_eps # Avoid div by zero
-            self.running_G_max[env_id] = self.reward_scaling_eps # Avoid issues with max
-
-    def _update_reward_scaling_stats(self, env_id, reward_t, done):
-        """Update running statistics for reward scaling based on paper Eq 17-19."""
-        # Ensure stats are initialized for this env_id
-        self._initialize_reward_scaling_stats(env_id)
-
-        # Get current stats
-        G_prev = self.running_G[env_id]
-        var_prev = self.running_G_var[env_id]
-        count_prev = self.running_G_count[env_id]
-
-        # Update running discounted return G_t (Eq 17)
-        G_t = (1 - self.gamma) * G_prev + reward_t # Sticking to paper Eq 17
-
-        # Update running variance of G_t using Welford's online algorithm
-        count_new = count_prev + 1
-        delta = G_t - G_prev # Difference between current G and previous mean G
-        # Mean update isn't needed directly, but delta is used for variance
-        # Update variance: M2 = var * count
-        M2_prev = var_prev * count_prev
-        M2_new = M2_prev + delta * delta * count_prev / count_new # Welford's M2 update
-        var_new = M2_new / count_new
-
-        # Update running max G_t (Eq 18)
-        G_max_new = max(self.running_G_max[env_id], G_t)
-
-        # Store updated stats
-        self.running_G[env_id] = G_t
-        self.running_G_var[env_id] = var_new
-        self.running_G_count[env_id] = count_new
-        self.running_G_max[env_id] = G_max_new
-
-        # Reset G_t at the start of a new episode (when done is True)
-        if done:
-            self.running_G[env_id] = 0.0
-            # Optionally reset variance/max too, or let them persist across episodes?
-            # Paper doesn't specify reset for variance/max. Let's keep them running.
-
-        # Return the current variance and max for scaling calculation
-        return var_new, G_max_new
-
-    def _scale_reward(self, env_id, reward_t, variance_G, max_G):
-        """Scale reward according to paper Eq 19."""
-        # Denominator calculation - apply sqrt to variance term
-        # Ensure variance_G is non-negative before sqrt
-        variance_term = math.sqrt(max(0.0, variance_G) + self.reward_scaling_eps)
-        # Avoid division by zero for max_term calculation
-        max_term = (max_G / self.reward_scaling_G_max) if self.reward_scaling_G_max > 0 else float('inf')
-        denom = max(variance_term, max_term)
-        # Add small epsilon to prevent division by zero if denom is somehow zero
-        denom = max(denom, self.reward_scaling_eps)
-
-        scaled_reward = reward_t / denom
-        return scaled_reward
+    # Reward Scaling Methods (REMOVED - Handled in Algorithm)
+    # def _initialize_reward_scaling_stats(self, env_id):
+    # ... (removed method body)
+    # def _update_reward_scaling_stats(self, env_id, reward_t, done):
+    # ... (removed method body)
+    # def _scale_reward(self, env_id, reward_t, variance_G, max_G):
+    # ... (removed method body)
 
     def update_experience_with_intrinsic_reward(self, state=None, action=None, next_state=None, done=None, reward=None, store_idx=None, env_id=None):
         """
@@ -2018,25 +1941,13 @@ class Trainer:
         Returns:
             Total reward (scaled extrinsic + scaled intrinsic)
         """
-        # If intrinsic rewards are disabled, pretraining is completed, or generator is not initialized, return scaled/original reward
+        # If intrinsic rewards are disabled, pretraining is completed, or generator is not initialized, return original reward
         # --- Add pretraining check here ---
         if not self.use_intrinsic_rewards or self.pretraining_completed or self.intrinsic_reward_generator is None:
-            # Return the SCALED reward if scaling is enabled, otherwise original
-            if self.use_reward_scaling and not getattr(self, 'test_mode', False):
-                 # Recalculate scaled reward if needed (e.g., for PPO where only original might be available here)
-                 self._initialize_reward_scaling_stats(env_id)
-                 variance_G = self.running_G_var[env_id]
-                 max_G = self.running_G_max[env_id]
-                 # Ensure reward is float
-                 if isinstance(reward, torch.Tensor): reward_float = reward.item()
-                 elif isinstance(reward, np.ndarray): reward_float = reward.item() if reward.size == 1 else float(reward[0])
-                 else: reward_float = float(reward)
-                 return self._scale_reward(env_id, reward_float, variance_G, max_G)
-            else:
-                 # Ensure reward is float before returning
-                 if isinstance(reward, torch.Tensor): return reward.item()
-                 elif isinstance(reward, np.ndarray): return reward.item() if reward.size == 1 else float(reward[0])
-                 else: return float(reward) # Return original reward if scaling disabled or in test mode
+            # Return the ORIGINAL reward
+            if isinstance(reward, torch.Tensor): return reward.item()
+            elif isinstance(reward, np.ndarray): return reward.item() if reward.size == 1 else float(reward[0])
+            else: return float(reward)
 
         intrinsic_reward_value = 0.0
         try:
@@ -2087,28 +1998,19 @@ class Trainer:
                 traceback.print_exc() # Print stack trace for debugging
             scaled_intrinsic_reward = 0.0
 
-        # Get the SCALED extrinsic reward
-        if self.use_reward_scaling and not getattr(self, 'test_mode', False):
-            self._initialize_reward_scaling_stats(env_id)
-            variance_G = self.running_G_var[env_id]
-            max_G = self.running_G_max[env_id]
-            if isinstance(reward, torch.Tensor): original_reward_float = reward.item()
-            elif isinstance(reward, np.ndarray): original_reward_float = reward.item() if reward.size == 1 else float(reward[0])
-            else: original_reward_float = float(reward)
-            scaled_extrinsic_reward = self._scale_reward(env_id, original_reward_float, variance_G, max_G)
-        else:
-            if isinstance(reward, torch.Tensor): scaled_extrinsic_reward = reward.item()
-            elif isinstance(reward, np.ndarray): scaled_extrinsic_reward = reward.item() if reward.size == 1 else float(reward[0])
-            else: scaled_extrinsic_reward = float(reward)
+        # Get the ORIGINAL extrinsic reward
+        if isinstance(reward, torch.Tensor): original_extrinsic_reward = reward.item()
+        elif isinstance(reward, np.ndarray): original_extrinsic_reward = reward.item() if reward.size == 1 else float(reward[0])
+        else: original_extrinsic_reward = float(reward)
 
-        # Calculate total reward (scaled extrinsic + scaled intrinsic)
-        total_reward = scaled_extrinsic_reward + scaled_intrinsic_reward
+        # Calculate total reward (original extrinsic + scaled intrinsic)
+        total_reward = original_extrinsic_reward + scaled_intrinsic_reward
 
         # Update stored experience if index is provided (for PPO)
         if store_idx is not None and self.algorithm_type == "ppo":
             # Update the experience in memory using the dedicated method
+            # Ensure the total_reward is used here
             self.store_experience_at_idx(store_idx, reward=total_reward, done=done)
-
 
         return total_reward
 

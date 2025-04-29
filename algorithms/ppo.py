@@ -16,10 +16,10 @@ from model_architectures.utils import l2_norm
 class PPOAlgorithm(BaseAlgorithm):
     """
     PPO algorithm implementation with SimbaV2 Categorical Distributional Critic
-    
+
     This implementation uses a distributional critic to model the full return distribution
     rather than just the expected value. Key features:
-    
+
     1. Categorical representation of value distribution using fixed support points
     2. KL divergence loss for training the critic
     3. Uncertainty-weighted PPO objective that gives more importance to policy updates
@@ -108,7 +108,7 @@ class PPOAlgorithm(BaseAlgorithm):
         self.support = torch.linspace(self.v_min, self.v_max, self.num_atoms, device=self.device)
         self.delta_z = (self.v_max - self.v_min) / (self.num_atoms - 1)
         # -----------------------------------------
-        
+
         # --- ADD DISTRIBUTIONAL PPO UNCERTAINTY WEIGHTING PARAMS ---
         self.use_uncertainty_weight = use_uncertainty_weight
         self.uncertainty_weight_type = uncertainty_weight_type
@@ -133,6 +133,7 @@ class PPOAlgorithm(BaseAlgorithm):
 
         # Initialize memory with buffer size and device
         self.memory = self.PPOMemory(
+            algorithm_instance=self, # Pass reference to the algorithm
             batch_size=batch_size,
             # Increase buffer size to match update_interval typically used
             buffer_size=131072, # Example size, adjust if needed
@@ -188,10 +189,22 @@ class PPOAlgorithm(BaseAlgorithm):
         self.current_episode_rewards = []
         self.episode_returns = deque(maxlen=100)
 
+        # --- SimbaV2 Reward Normalization Params ---
+        self.running_G = 0.0 # Running discounted return
+        self.running_G_mean = 0.0 # Running mean of discounted return
+        self.running_G_var = 1.0 # Running variance of discounted return (init to 1.0)
+        self.running_G_max = 0.0 # Running maximum of discounted return
+        self.running_G_count = 0 # Count for Welford's method
+        self.reward_norm_epsilon = 1e-8 # Small constant for stability
+        # Use v_max from config if available, otherwise a default
+        self.reward_norm_G_max = self.v_max if self.v_max is not None else 10.0 # Use v_max as default G_max
+        # ------------------------------------------
+
     class PPOMemory:
         """Memory buffer for PPO to store experiences"""
 
-        def __init__(self, batch_size, buffer_size, device, debug=False, action_space_type="discrete"):
+        def __init__(self, algorithm_instance, batch_size, buffer_size, device, debug=False, action_space_type="discrete"):
+            self.algorithm_instance = algorithm_instance # Reference to the PPOAlgorithm instance
             self.batch_size = batch_size
             self.debug = debug
             self.action_space_type = action_space_type # Store action space type
@@ -366,8 +379,16 @@ class PPOAlgorithm(BaseAlgorithm):
             rewards_batch = rewards_batch.to(target_device)
             dones_batch = dones_batch.to(target_device)
 
+            # Normalize rewards using the algorithm's method
+            normed_rewards = self.algorithm_instance.normalize_reward(rewards_batch, dones_batch)
+            # Ensure normed_rewards is a tensor on the correct device
+            if not isinstance(normed_rewards, torch.Tensor):
+                 normed_rewards = torch.tensor(normed_rewards, dtype=torch.float32, device=target_device)
+            else:
+                 normed_rewards = normed_rewards.to(target_device)
+
             # Update data using index_copy_ for potential efficiency
-            self.rewards.index_copy_(0, indices, rewards_batch)
+            self.rewards.index_copy_(0, indices, normed_rewards) # Store normalized rewards
             self.dones.index_copy_(0, indices, dones_batch)
 
             if self.debug and len(indices) > 0:
@@ -553,7 +574,9 @@ class PPOAlgorithm(BaseAlgorithm):
             print(f"[DEBUG PPO] Storing single experience - reward: {reward}")
 
         # Forward to memory buffer - with placeholder value
-        self.memory.store(obs, action, log_prob, reward, value, done)
+        # Normalize reward before storing
+        normed_reward = self.normalize_reward(reward, done)
+        self.memory.store(obs, action, log_prob, normed_reward, value, done)
 
         # Track episode rewards for calculating returns (still useful for single-env or debugging)
         if isinstance(reward, torch.Tensor):
@@ -771,33 +794,33 @@ class PPOAlgorithm(BaseAlgorithm):
     def _compute_uncertainty_weight(self, predicted_probs):
         """
         Compute uncertainty weight based on the critic's predicted distribution.
-        
+
         Args:
             predicted_probs: predicted probabilities from critic [batch_size, num_atoms]
-        
+
         Returns:
             weight tensor [batch_size] for PPO objective weighting
         """
         if not self.use_uncertainty_weight:
             # Return all 1s if uncertainty weighting is disabled
             return torch.ones(predicted_probs.shape[0], device=self.device)
-            
+
         if self.uncertainty_weight_type == "entropy":
             # Calculate entropy of the predicted distribution: -sum(p_i * log(p_i))
             # Add a small epsilon to avoid log(0)
             eps = 1e-8
             log_probs = torch.log(predicted_probs + eps)
             entropy = -(predicted_probs * log_probs).sum(dim=1)  # [batch_size]
-            
+
             # Apply sigmoid transformation: w = sigmoid(-entropy * T) + 0.5
             # Higher entropy (more uncertainty) -> lower weight
             # Lower entropy (more certainty) -> higher weight
             weight = torch.sigmoid(-entropy * self.uncertainty_weight_temp) + 0.5
-            
+
             if self.debug and torch.rand(1).item() < 0.01:  # Debug log occasionally
                 print(f"[DEBUG PPO Uncertainty] Entropy weight range: {weight.min().item():.4f}-{weight.max().item():.4f}, "
                       f"Mean: {weight.mean().item():.4f}")
-                
+
         elif self.uncertainty_weight_type == "variance":
             # Calculate variance of the predicted value distribution
             # Var(X) = E[X^2] - (E[X])^2
@@ -807,12 +830,12 @@ class PPOAlgorithm(BaseAlgorithm):
             # E[X^2] = sum(p_i * z_i^2)
             expected_value_squared = (predicted_probs * support.pow(2)).sum(dim=1)  # [batch_size]
             variance = expected_value_squared - expected_value.pow(2)  # [batch_size]
-            
+
             # Apply sigmoid transformation: w = sigmoid(-variance * T) + 0.5
             # Higher variance (more uncertainty) -> lower weight
             # Lower variance (more certainty) -> higher weight
             weight = torch.sigmoid(-variance * self.uncertainty_weight_temp) + 0.5
-            
+
             if self.debug and torch.rand(1).item() < 0.01:  # Debug log occasionally
                 print(f"[DEBUG PPO Uncertainty] Variance weight range: {weight.min().item():.4f}-{weight.max().item():.4f}, "
                       f"Mean: {weight.mean().item():.4f}")
@@ -820,9 +843,9 @@ class PPOAlgorithm(BaseAlgorithm):
             if self.debug:
                 print(f"[DEBUG PPO Uncertainty] Unknown uncertainty weight type: {self.uncertainty_weight_type}, defaulting to 1.0")
             weight = torch.ones(predicted_probs.shape[0], device=self.device)
-            
+
         return weight
-            
+
     def _compute_gae(self, rewards, values, dones):
         """
         Compute returns and advantages using Generalized Advantage Estimation (GAE)
@@ -1159,40 +1182,45 @@ class PPOAlgorithm(BaseAlgorithm):
                              if self.debug: print(f"[DEBUG PPO _update_policy] Error calculating continuous log_prob/entropy: {e}")
                              continue # Skip batch
 
+                    # Calculate log probabilities and probabilities from critic logits
+                    # Needed for both critic loss and uncertainty weighting (if enabled)
+                    predicted_log_probs = F.log_softmax(critic_logits, dim=1)
+                    predicted_probs = F.softmax(critic_logits, dim=1)
+
                     # Calculate PPO actor loss components
                     ratio = torch.exp(curr_log_probs - batch_old_log_probs)
                     surr1 = ratio * batch_advantages
                     surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * batch_advantages
-                    
+
                     # Standard PPO clipped objective: min(r_t * A_t, clip(r_t) * A_t)
                     ppo_objectives = torch.min(surr1, surr2)
-                    
+
                     # Apply uncertainty weighting if enabled
                     if self.use_uncertainty_weight:
                         # Get uncertainty weights based on critic's predicted distribution
                         uncertainty_weights = self._compute_uncertainty_weight(predicted_probs)
-                        
+
                         # Apply weights to PPO objectives (element-wise multiplication)
                         # Higher weight = more impact on policy update when critic is confident
                         weighted_objectives = ppo_objectives * uncertainty_weights
                         actor_loss = -weighted_objectives.mean()
-                        
+
                         # Update uncertainty weight metrics
                         batch_mean_weight = uncertainty_weights.mean().item()
                         batch_min_weight = uncertainty_weights.min().item()
                         batch_max_weight = uncertainty_weights.max().item()
-                        
+
                         # Accumulate for averaging across batches
                         update_metrics_scalars['mean_uncertainty_weight'] += batch_mean_weight
                         update_metrics_scalars['min_uncertainty_weight'] = min(
-                            update_metrics_scalars['min_uncertainty_weight'], 
+                            update_metrics_scalars['min_uncertainty_weight'],
                             batch_min_weight
                         )
                         update_metrics_scalars['max_uncertainty_weight'] = max(
-                            update_metrics_scalars['max_uncertainty_weight'], 
+                            update_metrics_scalars['max_uncertainty_weight'],
                             batch_max_weight
                         )
-                        
+
                         # Track average weight for debugging/metrics
                         if self.debug and torch.rand(1).item() < 0.01:  # Occasional logging
                             print(f"[DEBUG PPO Uncertainty] Weights: min={batch_min_weight:.4f}, "
@@ -1203,7 +1231,7 @@ class PPOAlgorithm(BaseAlgorithm):
                         # Set default values for metrics when not using uncertainty weights
                         update_metrics_scalars['mean_uncertainty_weight'] += 1.0
                         update_metrics_scalars['min_uncertainty_weight'] = min(
-                            update_metrics_scalars['min_uncertainty_weight'], 
+                            update_metrics_scalars['min_uncertainty_weight'],
                             1.0
                         )
                         update_metrics_scalars['max_uncertainty_weight'] = max(
@@ -1254,17 +1282,12 @@ class PPOAlgorithm(BaseAlgorithm):
                         #    print("[DEBUG PPO] Warning: Target distribution does not sum to 1.")
                         #    print(target_p.sum(dim=1))
 
-                    # Get predicted log probabilities from critic logits
-                    predicted_log_probs = F.log_softmax(critic_logits, dim=1)
-
-                    predicted_probs = F.softmax(critic_logits, dim=1) # Need probs for KL
-
                     # Ensure target_p is detached and non-negative, add small epsilon for stability
                     target_p_stable = target_p.detach() + 1e-8
 
                     # Calculate KL Divergence: KL(target || predicted) = sum(target * log(target / predicted))
                     # Simplifies to: sum(target * (log(target) - log(predicted)))
-                    # Note: predicted_log_probs = log(predicted)
+                    # Note: predicted_log_probs = log(predicted) (calculated earlier)
                     kl_div = (target_p_stable * (torch.log(target_p_stable) - predicted_log_probs)).sum(dim=1)
                     critic_loss = kl_div.mean() # Minimize KL divergence
 
@@ -1382,7 +1405,7 @@ class PPOAlgorithm(BaseAlgorithm):
              # Initialize metrics to zero if no batches processed
              for key in list(update_metrics_tensors.keys()):
                  final_metrics[key] = 0.0
-             
+
              # Handle scalar metrics with appropriate defaults
              for key in list(update_metrics_scalars.keys()):
                  if key == 'min_uncertainty_weight':
@@ -1391,7 +1414,7 @@ class PPOAlgorithm(BaseAlgorithm):
                      final_metrics[key] = 1.0
                  else:
                      final_metrics[key] = 0.0
-                     
+
              final_metrics['weight_clip_fraction'] = 0.0
 
 
@@ -1458,6 +1481,89 @@ class PPOAlgorithm(BaseAlgorithm):
                          # Optional debug print if weight doesn't require grad
                          print(f"[DEBUG _project_weights] Skipping module {module} - weight does not require grad.")
 
+    def normalize_reward(self, reward, done):
+        """
+        SimbaV2 reward normalization: normalize reward using running discounted return statistics.
+        Args:
+            reward: scalar or tensor
+            done: bool or tensor (True if episode ended)
+        Returns:
+            normalized_reward: same shape as reward (numpy array or tensor, matches input type)
+        """
+        gamma = self.gamma
+        eps = self.reward_norm_epsilon
+        G_max = self.reward_norm_G_max # Should be positive
+
+        is_tensor_input = isinstance(reward, torch.Tensor)
+        target_device = reward.device if is_tensor_input else self.device # Use reward device or default
+
+        # Ensure inputs are numpy arrays for easier iteration and statistic updates
+        if is_tensor_input:
+            reward_np = reward.detach().cpu().numpy()
+            done_np = done.detach().cpu().numpy()
+        else:
+            reward_np = np.array(reward)
+            done_np = np.array(done)
+
+        # Handle scalar inputs by temporarily reshaping
+        was_scalar = False
+        if reward_np.ndim == 0:
+             reward_np = reward_np.reshape(1)
+             done_np = done_np.reshape(1)
+             was_scalar = True
+
+        normed_rewards = np.empty_like(reward_np)
+
+        for i in range(len(reward_np)): # Iterate through batch dimension
+            r = reward_np[i]
+            d = done_np[i]
+
+            # Reset running_G at episode start
+            if d:
+                self.running_G = 0.0
+
+            # Update running discounted return
+            self.running_G = (1 - gamma) * self.running_G + r
+
+            # Update running mean/var (Welford's online algorithm)
+            self.running_G_count += 1
+            delta = self.running_G - self.running_G_mean
+            self.running_G_mean += delta / self.running_G_count
+            delta2 = self.running_G - self.running_G_mean # Use updated mean
+            # M2 is the sum of squares of differences from the current mean
+            # running_G_var here effectively stores M2
+            self.running_G_var += delta * delta2
+
+            # Update running max
+            self.running_G_max = max(self.running_G_max, self.running_G)
+
+            # Compute standard deviation
+            # Variance = M2 / n for population, M2 / (n-1) for sample
+            # We'll use population variance for consistency, add eps for stability
+            current_variance = self.running_G_var / self.running_G_count if self.running_G_count > 0 else 0.0
+            std = np.sqrt(max(0.0, current_variance) + eps) # Ensure variance is non-negative
+
+            # SimbaV2 normalization denominator: max(std, G_t_max / G_max)
+            # Ensure G_max is positive to avoid division by zero or negative values
+            denom_max_term = self.running_G_max / G_max if G_max > 0 else 0.0
+            denom = max(std, denom_max_term)
+
+            # Normalize reward, handle potential division by zero if denom is zero
+            normed_rewards[i] = r / denom if denom > eps else r # Use eps to check near-zero
+
+            # If episode done, reset running_G_max for the next episode's sequence
+            if d:
+                 self.running_G_max = 0.0 # Reset max at the end of an episode
+
+        # Reshape back to scalar if input was scalar
+        if was_scalar:
+            normed_rewards = normed_rewards.item() # Convert back to scalar
+
+        # Return as tensor if input was tensor
+        if is_tensor_input:
+            return torch.tensor(normed_rewards, dtype=reward.dtype, device=target_device)
+        else:
+            return normed_rewards # Return numpy array or scalar
 
 
     def get_state_dict(self):
@@ -1473,6 +1579,15 @@ class PPOAlgorithm(BaseAlgorithm):
             'current_episode_rewards': self.current_episode_rewards,
             'weight_clip_kappa': self.weight_clip_kappa,
             '_update_counter': self._update_counter,
+            # Save reward normalization parameters
+            'running_G': self.running_G,
+            'running_G_mean': self.running_G_mean,
+            'running_G_var': self.running_G_var,
+            'running_G_max': self.running_G_max,
+            'running_G_count': self.running_G_count,
+            'reward_norm_G_max': self.reward_norm_G_max,
+            'reward_norm_epsilon': self.reward_norm_epsilon,
+
             # Save distributional PPO parameters
             'use_uncertainty_weight': self.use_uncertainty_weight,
             'uncertainty_weight_type': self.uncertainty_weight_type,
@@ -1524,7 +1639,24 @@ class PPOAlgorithm(BaseAlgorithm):
             self.weight_clip_kappa = state_dict['weight_clip_kappa']
         if '_update_counter' in state_dict:
             self._update_counter = state_dict['_update_counter']
-        
+
+        # Load reward normalization parameters if present
+        if 'running_G' in state_dict:
+            self.running_G = state_dict['running_G']
+        if 'running_G_mean' in state_dict:
+            self.running_G_mean = state_dict['running_G_mean']
+        if 'running_G_var' in state_dict:
+            self.running_G_var = state_dict['running_G_var']
+        if 'running_G_max' in state_dict:
+            self.running_G_max = state_dict['running_G_max']
+        if 'running_G_count' in state_dict:
+            self.running_G_count = state_dict['running_G_count']
+        if 'reward_norm_G_max' in state_dict:
+            self.reward_norm_G_max = state_dict['reward_norm_G_max']
+        if 'reward_norm_epsilon' in state_dict:
+            self.reward_norm_epsilon = state_dict['reward_norm_epsilon']
+
+
         # Load distributional PPO parameters if present
         if 'use_uncertainty_weight' in state_dict:
             self.use_uncertainty_weight = state_dict['use_uncertainty_weight']
@@ -1532,7 +1664,7 @@ class PPOAlgorithm(BaseAlgorithm):
             self.uncertainty_weight_type = state_dict['uncertainty_weight_type']
         if 'uncertainty_weight_temp' in state_dict:
             self.uncertainty_weight_temp = state_dict['uncertainty_weight_temp']
-        
+
         # Load aux task manager state if it exists and has a method
         if 'aux_task_manager' in state_dict and self.aux_task_manager and hasattr(self.aux_task_manager, 'load_state_dict'):
             self.aux_task_manager.load_state_dict(state_dict['aux_task_manager'])
