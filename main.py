@@ -1190,6 +1190,23 @@ def run_training(
                                      # Accumulate the ORIGINAL extrinsic reward for episode tracking
                                      episode_rewards[env_idx][agent_id] += extrinsic_reward
 
+                            # Store SAC experience here where we have next_obs
+                            if algorithm == "sac" and not test:
+                                # Store the complete transition for SAC
+                                trainer.algorithm.store_experience(
+                                    obs=all_obs_list[exp_idx],
+                                    action=action_batch[exp_idx],
+                                    reward=extrinsic_reward,
+                                    next_obs=next_obs,
+                                    done=done
+                                )
+
+                                # Update tracking
+                                if agent_id not in episode_rewards[env_idx]:
+                                    episode_rewards[env_idx][agent_id] = 0.0
+                                    if debug: print(f"[DEBUG] Initialized episode_rewards for {agent_id} in env {env_idx}")
+                                episode_rewards[env_idx][agent_id] += extrinsic_reward
+
                             if done:
                                 action_stacker.reset_agent(agent_id)
                                 trainer.reset_auxiliary_tasks()
@@ -1628,12 +1645,12 @@ if __name__ == "__main__":
                     help='Run a specific curriculum stage indefinitely (0-based index)')
 
     # Algorithm choice
-    parser.add_argument('--algorithm', type=str, default='ppo', choices=['ppo', 'streamac', 'sac'],
-                       help='Learning algorithm to use: ppo (default) or streamac')
+    parser.add_argument('--algorithm', type=str, default='sac', choices=['ppo', 'streamac', 'sac'],
+                       help='Learning algorithm to use: sac (default), ppo, or streamac')
 
     # Learning rates
     parser.add_argument('--lra', type=float, default=1e-4, help='Learning rate for actor network')
-    parser.add_argument('--lrc', type=float, default=1e-4, help='Learning rate for critic network') # No longer does anything. Here for stability.
+    parser.add_argument('--lrc', type=float, default=1e-4, help='Learning rate for critic network')
 
     # Discount factors
     parser.add_argument('--gamma', type=float, default=0.997, help='Discount factor for future rewards')
@@ -1793,18 +1810,18 @@ if __name__ == "__main__":
     # SAC-specific parameters
     parser.add_argument("--tau", type=float, default=0.005,
                         help="Target network update rate for SAC")
-    parser.add_argument("--alpha", type=float, default=0.2,
-                        help="Temperature parameter for SAC entropy")
-    parser.add_argument("--auto_alpha_tuning", action="store_true",
+    parser.add_argument("--alpha", type=float, default=0.01,
+                        help="Temperature parameter for SAC entropy (SimbaV2 default: 0.01)")
+    parser.add_argument("--auto_alpha_tuning", action="store_true", default=True,
                         help="Enable automatic entropy tuning for SAC")
     parser.add_argument("--target_entropy", type=float, default=None,
-                        help="Target entropy when auto-tuning (default: -action_dim)")
+                        help="Target entropy when auto-tuning (default: -action_dim/2 for SimbaV2)")
     parser.add_argument("--buffer_size", type=int, default=1000000,
                         help="Replay buffer size for SAC")
     parser.add_argument("--warmup_steps", type=int, default=1000,
                         help="Number of steps before starting to train SAC")
     parser.add_argument("--updates_per_step", type=int, default=1,
-                        help="Number of gradient updates per step for SAC")
+                        help="Number of gradient updates per step for SAC (SimbaV2 paper explores 1, 2, 4, 8)")
 
     # Backwards compatibility.
     parser.add_argument('-p', '--processes', type=int, default=None,
@@ -1818,7 +1835,7 @@ if __name__ == "__main__":
     parser.add_argument('--use-reward-scaling', action='store_true', dest='use_reward_scaling', help='Enable SimbaV2 reward scaling')
     parser.add_argument('--no-reward-scaling', action='store_false', dest='use_reward_scaling', help='Disable SimbaV2 reward scaling')
     parser.set_defaults(use_reward_scaling=True)
-    parser.add_argument('--reward-scaling-gmax', type=float, default=3.0, help='G_max hyperparameter for reward scaling')
+    parser.add_argument('--reward-scaling-gmax', type=float, default=5.0, help='G_max hyperparameter for reward scaling (SimbaV2 default: 5.0)')
 
     args = parser.parse_args()
 
@@ -1856,7 +1873,8 @@ if __name__ == "__main__":
     env = get_env(action_stacker=action_stacker)
     env.reset()
     obs_space = env.observation_space(env.agents[0])
-    obs_space_dims = obs_space[0]
+    # For SimbaV2, we need the raw observation dimension as an integer
+    obs_space_dims = obs_space[0]  # Keep as integer for SimbaV2
     action_space_dims = env.action_space(env.agents[0])[1]
     env.close()
 
