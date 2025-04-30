@@ -13,6 +13,7 @@ from auxiliary import AuxiliaryTaskManager
 from intrinsic_rewards import create_intrinsic_reward_generator, IntrinsicRewardEnsemble
 from algorithms import BaseAlgorithm, PPOAlgorithm, StreamACAlgorithm
 from algorithms.sac import SACAlgorithm
+from algorithms.qr_a2c import QRA2CAlgorithm
 import time
 import os
 import random
@@ -331,6 +332,37 @@ class Trainer:
             )
             # For compatibility with existing code, keep a reference to the memory
             # self.memory = self.algorithm.memory # No longer needed, access via self.algorithm.memory
+        elif self.algorithm_type == "qr-a2c" or self.algorithm_type == "qra2c":
+            # Create QR-A2C algorithm
+            # Use a minimum batch size threshold to trigger updates
+            min_batch_size = min(batch_size, 256)  # Ensures updates don't wait too long
+            
+            self.algorithm = QRA2CAlgorithm(
+                actor=self.actor,
+                critic=self.critic,
+                aux_task_manager=self.aux_task_manager if self.use_auxiliary_tasks else None,
+                action_space_type=action_space_type,
+                action_dim=action_dim,
+                action_bounds=action_bounds,
+                device=device,
+                lr_actor=lr_actor,
+                lr_critic=lr_critic,
+                gamma=gamma,
+                gae_lambda=gae_lambda,
+                critic_coef=critic_coef,
+                entropy_coef=entropy_coef,
+                max_grad_norm=max_grad_norm,
+                num_quantiles=getattr(self.critic, 'num_quantiles', 32),
+                n_steps=5,  # Default value
+                update_epochs=ppo_epochs,  # Use PPO epochs setting
+                batch_size=min_batch_size,  # Use minimum batch size for more frequent updates
+                use_amp=self.use_amp,
+                debug=debug,
+                use_wandb=use_wandb,
+            )
+            
+            if debug:
+                print(f"[DEBUG] Initialized QR-A2C with batch size {min_batch_size}")
         elif self.algorithm_type == "streamac":
             # Create StreamAC algorithm
             algorithm = StreamACAlgorithm(
@@ -398,7 +430,7 @@ class Trainer:
             )
             self.algorithm = algorithm
         else:
-            raise ValueError(f"Unknown algorithm type: {algorithm_type}. Use 'ppo', 'streamac', or 'sac'.")
+            raise ValueError(f"Unknown algorithm type: {algorithm_type}. Use 'ppo', 'qr-a2c', 'streamac', or 'sac'.")
 
         # Track metrics using deques with a max length (e.g., 1000)
         history_len = 1000

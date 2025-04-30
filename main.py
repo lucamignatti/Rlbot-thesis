@@ -793,15 +793,26 @@ def run_training(
         "Device": device,
         "Envs": num_envs,
         "Episodes": 0,  # Total episodes completed
-        "Algorithm": algorithm  # Display which algorithm is being used
+        "Algorithm": algorithm,  # Display which algorithm is being used
+        # Initialize all potential counters/indicators
+        "Exp": "N/A", # Initialize Exp counter
+        "Steps": 0, # Initialize Step counter
+        "Updates": 0, # Initialize Update counter
+        "Diff": "N/A" # Initialize curriculum difficulty
     }
 
-    # Add algorithm-specific progress metrics
-    if algorithm == "ppo":
-        stats_dict["Exp"] = f"0/{update_interval}"  # Experience counter for PPO
-    else:  # StreamAC or SAC
-        stats_dict["Steps"] = 0  # Step counter
-        stats_dict["Updates"] = 0  # Update counter
+    # Set algorithm-specific counters/indicators initially
+    if algorithm == "ppo" or algorithm == "qr-a2c":
+        # For PPO and QR-A2C, track experiences until update
+        qr_batch_size = min(batch_size, 256) # Same calculation as in Trainer
+        stats_dict["Exp"] = f"0/{qr_batch_size if algorithm == 'qr-a2c' else update_interval}"
+        # Set initial Steps and Updates to 0 for these algorithms
+        stats_dict["Steps"] = 0
+        stats_dict["Updates"] = 0
+    else: # StreamAC or SAC
+        # For StreamAC and SAC, track steps and updates
+        stats_dict["Steps"] = 0
+        stats_dict["Updates"] = 0
 
     # Add common metrics
     stats_dict.update({
@@ -1300,6 +1311,13 @@ def run_training(
                     buffer_capacity = trainer.algorithm.memory.buffer_size if hasattr(trainer.algorithm, 'memory') else 0
                     print(f"[DEBUG] PPO update triggered - collected: {collected_experiences}/{update_interval}, " +
                           f"buffer: {buffer_size}/{buffer_capacity}")
+            elif algorithm == "qr-a2c":
+                # For QR-A2C, check if the buffer has enough experiences for an update
+                if hasattr(trainer.algorithm, 'size') and hasattr(trainer.algorithm, 'batch_size'):
+                    should_update = trainer.algorithm.size >= trainer.algorithm.batch_size
+                    
+                    if debug and should_update:
+                        print(f"[DEBUG] QR-A2C update triggered - buffer size: {trainer.algorithm.size}/{trainer.algorithm.batch_size}")
             else:
                 # For StreamAC/SAC, updates happen online or based on their own logic.
                 # We still update the progress bar periodically based on collected_experiences.
@@ -1401,8 +1419,10 @@ def run_training(
                 # --- End Environment Statistics Calculation ---
 
                 # Perform the policy update.
-                if algorithm == "ppo":
-                    # For PPO, do a normal batch update and pass the completed episode rewards and total env steps
+                stats = {} # Initialize stats dictionary
+                
+                if algorithm == "ppo" or algorithm == "qr-a2c":
+                    # For PPO and QR-A2C, do a normal batch update and pass the completed episode rewards and total env steps
                     stats = trainer.update(
                         completed_episode_rewards=completed_episode_rewards_since_last_update,
                         total_env_steps=total_env_steps, # Pass total env steps
@@ -1411,7 +1431,8 @@ def run_training(
                     )
                     # Reset the list of completed episode rewards
                     completed_episode_rewards_since_last_update = []
-                    collected_experiences = 0 # Reset PPO experience counter after update
+                    if algorithm == "ppo":
+                        collected_experiences = 0 # Reset PPO experience counter after update
                 else:
                     # For StreamAC/SAC, update might happen internally or via trainer.update()
                     # If trainer.update() is called, it should just fetch metrics for online algos
@@ -1422,65 +1443,77 @@ def run_training(
                     )
                     # Don't reset collected_experiences for online algos here
 
-                # Update the statistics displayed in the progress bar.
-                # Use SCALAR versions for display
-                stats_dict.update({
-                    "Device": device,
-                    "Envs": num_envs,
-                    "Episodes": total_episodes_so_far,
-                    "Reward": f"{stats.get('mean_episode_reward', stats.get('mean_return', 0)):.2f}", # Use mean_return as fallback
-                    "PLoss": f"{stats.get('actor_loss', 0):.4f}",
-                    "VLoss": f"{stats.get('critic_loss', 0):.4f}", # Default, SAC overrides below
-                    "Entropy": f"{stats.get('entropy_loss', 0):.4f}",
-                })
-                # Only include Aux stats if enabled
-                if auxiliary:
-                    stats_dict.update({
-                        "SR_Loss": f"{stats.get('sr_loss_scalar', 0):.4f}",
-                        "RP_Loss": f"{stats.get('rp_loss_scalar', 0):.4f}"
-                    })
-
-
-                # Update algorithm-specific metrics if using that algorithm
-                if algorithm == "ppo":
-                     stats_dict["Exp"] = f"{collected_experiences}/{update_interval}" # Show 0 after update
-                elif algorithm == "streamac":
-                    stats_dict.update({
-                        "StepSize": f"{stats.get('effective_step_size', 0)::.4f}",
-                        "ActorLR": f"{getattr(trainer.algorithm, 'lr_actor', lr_actor):.6f}",
-                        "CriticLR": f"{getattr(trainer.algorithm, 'lr_critic', lr_critic):.6f}",
-                        "Updates": getattr(trainer.algorithm, "update_count", 0) # Use update_count
-                    })
-                elif algorithm == "sac":
-                    stats_dict.update({
-                        "VLoss": f"{(stats.get('critic1_loss', 0) + stats.get('critic2_loss', 0))/2:.4f}",
-                        "Alpha": f"{stats.get('alpha', 0):.4f}",
-                        "Buffer": f"{len(trainer.algorithm.memory)}" if hasattr(trainer.algorithm, 'memory') else "N/A"
-                    })
-
-
-                # Update curriculum stats if enabled
-                if curriculum_manager:
-                    curriculum_stats = curriculum_manager.get_curriculum_stats()
-                    stats_dict.update({
-                        "Stage": curriculum_stats["current_stage_name"],
-                        "Diff": f"{curriculum_stats['difficulty_level']:.2f}"
-                    })
-
-                    # WandB logging for curriculum is handled within trainer.update -> _log_to_wandb
+                # --- Common block to update stats_dict for display AFTER trainer.update() --- 
+                if stats: # Check if stats were returned (update might be skipped)
+                    if "mean_episode_reward" in stats:
+                        stats_dict["Reward"] = f"{stats['mean_episode_reward']:.2f}"
+                    elif "mean_return" in stats:
+                        stats_dict["Reward"] = f"{stats['mean_return']:.2f}"
+                        
+                    if "critic_loss" in stats:
+                        stats_dict["VLoss"] = f"{stats['critic_loss']:.4f}"
+                    else: # Fallback for SAC
+                        if "critic1_loss" in stats and "critic2_loss" in stats:
+                            stats_dict["VLoss"] = f"{(stats['critic1_loss'] + stats['critic2_loss'])/2:.4f}"
+                        
+                    if "actor_loss" in stats:
+                        stats_dict["PLoss"] = f"{stats['actor_loss']:.4f}"
+                        
+                    if "entropy_loss" in stats:
+                        stats_dict["Entropy"] = f"{stats['entropy_loss']:.4f}"
+                        
+                    # Update the curriculum difficulty if available
+                    if hasattr(trainer, 'curriculum_manager') and trainer.curriculum_manager:
+                        curriculum_stats = trainer.curriculum_manager.get_curriculum_stats()
+                        stats_dict["Diff"] = f"{curriculum_stats['difficulty_level']:.2f}"
+                        stats_dict["Stage"] = curriculum_stats.get("current_stage_name", "") # Update stage name too
+                    else:
+                        stats_dict["Diff"] = "N/A" # Ensure it's reset if curriculum disabled
+                        if "Stage" in stats_dict: del stats_dict["Stage"]
+                        
+                    # Update Steps and Updates (use total_env_steps from main loop)
+                    stats_dict["Steps"] = total_env_steps 
+                    if hasattr(trainer.algorithm, 'update_count'):
+                        stats_dict["Updates"] = trainer.algorithm.update_count
+                        
+                    # Algorithm-specific display updates
+                    if algorithm == "ppo":
+                        stats_dict["Exp"] = f"{collected_experiences}/{update_interval}" # Show 0 after update
+                    elif algorithm == "qr-a2c":
+                        qr_batch_size = trainer.algorithm.batch_size if hasattr(trainer.algorithm, 'batch_size') else 256
+                        stats_dict["Exp"] = f"0/{qr_batch_size}" # Reset to 0 experiences
+                    elif algorithm == "streamac": # Update StreamAC specific metrics if needed
+                        if "effective_step_size" in stats:
+                             stats_dict["StepSize"] = f"{stats['effective_step_size']:.4f}"
+                        if hasattr(trainer.algorithm, 'lr_actor') and hasattr(trainer.algorithm, 'lr_critic'):
+                            stats_dict["ActorLR"] = f"{trainer.algorithm.lr_actor:.6f}"
+                            stats_dict["CriticLR"] = f"{trainer.algorithm.lr_critic:.6f}"
+                        # Clear Exp counter for StreamAC
+                        if "Exp" in stats_dict: stats_dict["Exp"] = "N/A"
+                    elif algorithm == "sac": # Update SAC specific metrics
+                        if "alpha" in stats:
+                            stats_dict["Alpha"] = f"{stats['alpha']:.4f}"
+                        if hasattr(trainer.algorithm, 'memory'):
+                             stats_dict["Buffer"] = f"{len(trainer.algorithm.memory)}"
+                        # Clear Exp counter for SAC
+                        if "Exp" in stats_dict: stats_dict["Exp"] = "N/A"
+                             
+                    # Send updated stats to tqdm
+                    if tqdm_q:
+                        tqdm_q.put(stats_dict.copy())
+                        
+                    if debug:
+                        print(f"[DEBUG] Updated stats_dict after {algorithm.upper()} update. Updates: {stats_dict.get('Updates')}, VLoss: {stats_dict.get('VLoss')}")
+                # --- End common update block ---
 
                 last_update_time = time.time()
-
-                # Send updated stats_dict to TQDM manager after policy update
-                if tqdm_q:
-                    tqdm_q.put(stats_dict.copy())
 
                 # Garbage collection after updates
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-            # Update the experience count in the progress bar - ONLY for PPO
+            # Update the experience count in the progress bar - For PPO and QR-A2C
             if algorithm == "ppo":
                 # Update the 'Exp' field in stats_dict
                 new_exp_str = f"{collected_experiences}/{update_interval}"
@@ -1489,6 +1522,21 @@ def run_training(
                     # Send updated stats_dict only if 'Exp' changed
                     if tqdm_q:
                         tqdm_q.put(stats_dict.copy())
+            elif algorithm == "qr-a2c":
+                # For QR-A2C, show progress until batch_size is reached
+                if hasattr(trainer.algorithm, 'size') and hasattr(trainer.algorithm, 'batch_size'):
+                    current_buffer_size = trainer.algorithm.size
+                    qr_batch_size = trainer.algorithm.batch_size
+                    new_exp_str = f"{current_buffer_size}/{qr_batch_size}"
+                    if stats_dict.get("Exp") != new_exp_str:
+                        stats_dict["Exp"] = new_exp_str
+                        # Send updated stats_dict only if 'Exp' changed
+                        if tqdm_q:
+                            tqdm_q.put(stats_dict.copy())
+                    
+                    # Debug output
+                    if debug and current_buffer_size > 0 and current_buffer_size % 50 == 0:
+                        print(f"[DEBUG] QR-A2C buffer: {current_buffer_size}/{qr_batch_size}")
 
 
             # Update pretraining progress if enabled
@@ -1681,8 +1729,8 @@ if __name__ == "__main__":
                     help='Run a specific curriculum stage indefinitely (0-based index)')
 
     # Algorithm choice
-    parser.add_argument('--algorithm', type=str, default='ppo', choices=['ppo', 'streamac', 'sac'],
-                       help='Learning algorithm to use: ppo (default) or streamac')
+    parser.add_argument('--algorithm', type=str, default='qr-a2c', choices=['qr-a2c', 'ppo', 'streamac', 'sac'],
+                       help='Learning algorithm to use: qr-a2c (default), ppo, streamac, or sac')
 
     # Learning rates
     parser.add_argument('--lra', type=float, default=1e-4, help='Learning rate for actor network')
@@ -1754,6 +1802,9 @@ if __name__ == "__main__":
                        help='Type of uncertainty measure to use for weighting (variance or entropy)')
     parser.add_argument('--uncertainty_weight_temp', type=float, default=1.0, 
                       help='Temperature parameter for uncertainty weighting')
+                      
+    # QR-A2C parameters
+    parser.add_argument('--num_quantiles', type=int, default=32, help='Number of quantiles for Quantile Regression A2C')
 
     # Action stacking parameters
     parser.add_argument('--stack_size', type=int, default=5, help='Number of previous actions to stack')
@@ -1964,10 +2015,24 @@ if __name__ == "__main__":
         ModelClass = SimbaV2
         # SimbaV2 does not use dropout_rate
         actor = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, **actor_kwargs)
-        # Initialize critic with is_critic=True flag for Gaussian critic output
-        critic = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, 
-                          is_critic=True, # Flag for Gaussian critic mode
-                          **critic_kwargs)
+        
+        # Check if we're using QR-A2C algorithm
+        is_qr_a2c = args.algorithm.lower() == 'qr-a2c'
+        
+        # Initialize critic with appropriate parameters based on algorithm
+        if is_qr_a2c:
+            # For QR-A2C, set num_quantiles
+            critic = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims,
+                              is_critic=True,  # Flag for critic mode
+                              num_quantiles=args.num_quantiles,  # Pass quantiles parameter 
+                              **critic_kwargs)
+            if args.debug:
+                print(f"[DEBUG] Initialized QR-A2C critic with {args.num_quantiles} quantiles")
+        else:
+            # For other algorithms using Gaussian critic
+            critic = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, 
+                              is_critic=True, # Flag for Gaussian critic mode
+                              **critic_kwargs)
     elif args.model_arch == 'simbav2-shared':
         # For shared model, we need to use SimbaV2 directly as SimbaV2Shared is no longer needed
         # The current SimbaV2 implementation supports shared mode through its forward method

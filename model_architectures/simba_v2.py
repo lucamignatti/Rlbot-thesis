@@ -11,7 +11,8 @@ class SimbaV2(nn.Module):
                  hidden_dim: int = 512, num_blocks: int = 4,
                  shift_constant: float = 3.0, device: str = "cpu",
                  # --- Modified parameters ---
-                 is_critic: bool = False):
+                 is_critic: bool = False,
+                 num_quantiles: int = 32):
                  # num_atoms: Optional[int] = None): # Removed num_atoms
         super().__init__()
         self.obs_shape = obs_shape
@@ -22,6 +23,8 @@ class SimbaV2(nn.Module):
         self.device = device
         # Store critic flag
         self.is_critic = is_critic
+        # Store number of quantiles for QR-A2C
+        self.num_quantiles = num_quantiles if is_critic else None
         # self.num_atoms = num_atoms # Removed
 
         # Input Embedding (Section 4.1)
@@ -51,9 +54,14 @@ class SimbaV2(nn.Module):
         # Final linear layer for policy/value output
         # --- Modify output_dim calculation ---
         if self.is_critic:
-            # For Gaussian critic, output mean and log_std (or variance)
-            # Outputting 2 values: mean and log_std
-            output_dim = 2
+            if hasattr(self, 'num_quantiles') and self.num_quantiles is not None:
+                # For QR-A2C critic, output is N quantiles
+                output_dim = self.num_quantiles
+            else:
+                # For Gaussian critic, output mean and log_std (or variance)
+                # Outputting 2 values: mean and log_std
+                output_dim = 2
+                
             # Add the output scaler for the critic head as well (similar to paper's Eq 14 structure)
             output_final_scaler_init_scale = math.sqrt(2.0 / hidden_dim) if hidden_dim > 0 else 1.0
             self.output_final_scaler = Scaler(hidden_dim, init=output_final_scaler_init_scale, scale=output_final_scaler_init_scale)
@@ -139,15 +147,20 @@ class SimbaV2(nn.Module):
 
         # Process output based on model type
         if self.is_critic:
-            # For Gaussian critic, split into mean and log_std
-            mean, log_std = raw_output.chunk(2, dim=-1)
-            # Squeeze any extra dimensions
-            mean = mean.squeeze(-1) # Shape: [batch]
-            log_std = log_std.squeeze(-1) # Shape: [batch]
-            # Clamp log_std for stability
-            log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
-            # Stack them for the final output expected by PPO
-            output = torch.stack([mean, log_std], dim=-1) # Shape: [batch, 2]
+            if hasattr(self, 'num_quantiles') and self.num_quantiles is not None:
+                # For QR-A2C critic, output is multiple quantiles
+                # No need to reshape, raw_output already has [batch, num_quantiles]
+                output = raw_output
+            else:
+                # For Gaussian critic, split into mean and log_std
+                mean, log_std = raw_output.chunk(2, dim=-1)
+                # Squeeze any extra dimensions
+                mean = mean.squeeze(-1) # Shape: [batch]
+                log_std = log_std.squeeze(-1) # Shape: [batch]
+                # Clamp log_std for stability
+                log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
+                # Stack them for the final output expected by PPO
+                output = torch.stack([mean, log_std], dim=-1) # Shape: [batch, 2]
         else:
             # For actor, keep raw logits or distribution params
             output = raw_output
