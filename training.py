@@ -200,6 +200,12 @@ class Trainer:
         # use_reward_scaling: bool = True,
         # reward_scaling_G_max: float = 10.0,
         # reward_scaling_eps: float = 1e-5,
+        # Gaussian critic parameters (for SimbaV2)
+        variance_loss_coefficient: float = 0.01,
+        use_uncertainty_weight: bool = True,
+        uncertainty_weight_type: str = "variance",
+        uncertainty_weight_temp: float = 1.0,
+        # Keep these for backward compatibility
         v_min: float = -10.0,
         v_max: float = 10.0,
         num_atoms: int = 51,

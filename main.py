@@ -22,7 +22,8 @@ except ImportError:
     VIZTRACER_AVAILABLE = False
 # Removed unused rlgym imports
 from model_architectures import (
-    BasicModel, SimBa, SimbaV2, SimbaV2Shared # Add SimbaV2Shared
+    BasicModel, SimBa, SimbaV2
+    # Removed SimbaV2Shared as the regular SimbaV2 now supports shared model functionality
     # Removed unused functions: fix_compiled_state_dict, extract_model_dimensions, load_partial_state_dict
 )
 from observation import ActionStacker
@@ -640,6 +641,12 @@ def run_training(
         stream_buffer_size=stream_buffer_size,
         use_sparse_init=use_sparse_init,
         update_freq=update_freq,
+        # Gaussian critic parameters (for SimbaV2)
+        variance_loss_coefficient=args.variance_coef,
+        use_uncertainty_weight=args.use_uncertainty_weight,
+        uncertainty_weight_type=args.uncertainty_weight_type,
+        uncertainty_weight_temp=args.uncertainty_weight_temp,
+        # Keep these for backward compatibility
         v_min=args.v_min,
         v_max=args.v_max,
         num_atoms=args.num_atoms,
@@ -1751,6 +1758,14 @@ if __name__ == "__main__":
     parser.add_argument('--hidden_dim_critic', type=int, default=768, help='Hidden dimension for the CRITIC network (only used if model-arch is not shared)')
     parser.add_argument('--num_blocks_critic', type=int, default=4, help='Number of residual blocks in the CRITIC network (only used if model-arch is not shared)')
 
+    # Gaussian Critic Parameters (for SimbaV2)
+    parser.add_argument('--variance_coef', type=float, default=0.01, help='Coefficient for variance loss term in Gaussian critic')
+    parser.add_argument('--use_uncertainty_weight', action='store_true', help='Use uncertainty weighting in PPO objective')
+    parser.add_argument('--uncertainty_weight_type', type=str, default='variance', choices=['variance', 'entropy'], 
+                       help='Type of uncertainty measure to use for weighting (variance or entropy)')
+    parser.add_argument('--uncertainty_weight_temp', type=float, default=1.0, 
+                      help='Temperature parameter for uncertainty weighting')
+
     # Action stacking parameters
     parser.add_argument('--stack_size', type=int, default=5, help='Number of previous actions to stack')
 
@@ -1960,12 +1975,17 @@ if __name__ == "__main__":
         ModelClass = SimbaV2
         # SimbaV2 does not use dropout_rate
         actor = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, **actor_kwargs)
-        critic = ModelClass(obs_shape=obs_space_dims, action_shape=args.num_atoms, **critic_kwargs)
+        # Initialize critic with is_critic=True flag for Gaussian critic output
+        critic = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, 
+                          is_critic=True, # Flag for Gaussian critic mode
+                          **critic_kwargs)
     elif args.model_arch == 'simbav2-shared':
-        ModelClass = SimbaV2Shared
-        # SimbaV2Shared does not use dropout_rate
+        # For shared model, we need to use SimbaV2 directly as SimbaV2Shared is no longer needed
+        # The current SimbaV2 implementation supports shared mode through its forward method
+        ModelClass = SimbaV2
         # Instantiate ONE model and use it for both actor and critic
-        # Use actor_kwargs for shared model config
+        # Use actor_kwargs for shared model config (hidden_dim, num_blocks, etc.)
+        # Note: We don't set is_critic flag here as shared model handles both roles
         shared_model = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, **actor_kwargs)
         actor = shared_model
         critic = shared_model # Assign the same instance
@@ -2041,6 +2061,11 @@ if __name__ == "__main__":
                 # Critic config (only relevant if not shared)
                 "hidden_dim_critic": args.hidden_dim_critic if args.model_arch != 'simbav2-shared' else None,
                 "num_blocks_critic": args.num_blocks_critic if args.model_arch != 'simbav2-shared' else None,
+                # Gaussian critic parameters (for SimbaV2)
+                "variance_loss_coefficient": args.variance_coef,
+                "use_uncertainty_weight": args.use_uncertainty_weight,
+                "uncertainty_weight_type": args.uncertainty_weight_type,
+                "uncertainty_weight_temp": args.uncertainty_weight_temp,
                 # Dropout (only relevant for basic/simba)
                 "dropout": args.dropout if args.model_arch in ['basic', 'simba'] else None,
                 "action_stack_size": args.stack_size,

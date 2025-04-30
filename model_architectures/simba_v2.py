@@ -10,9 +10,9 @@ class SimbaV2(nn.Module):
     def __init__(self, obs_shape: int, action_shape: Union[int, Tuple[int]],
                  hidden_dim: int = 512, num_blocks: int = 4,
                  shift_constant: float = 3.0, device: str = "cpu",
-                 # --- Add these parameters ---
-                 is_critic: bool = False,
-                 num_atoms: Optional[int] = None):
+                 # --- Modified parameters ---
+                 is_critic: bool = False):
+                 # num_atoms: Optional[int] = None): # Removed num_atoms
         super().__init__()
         self.obs_shape = obs_shape
         self.action_shape = action_shape # Still needed for actor role
@@ -20,9 +20,9 @@ class SimbaV2(nn.Module):
         self.num_blocks = num_blocks # Store num_blocks
         self.shift_constant = shift_constant
         self.device = device
-        # Store critic flag and num_atoms
+        # Store critic flag
         self.is_critic = is_critic
-        self.num_atoms = num_atoms
+        # self.num_atoms = num_atoms # Removed
 
         # Input Embedding (Section 4.1)
         self.input_norm = RSNorm(obs_shape)
@@ -51,32 +51,62 @@ class SimbaV2(nn.Module):
         # Final linear layer for policy/value output
         # --- Modify output_dim calculation ---
         if self.is_critic:
-            # For distributional critic, output num_atoms logits
-            if self.num_atoms is None:
-                raise ValueError("num_atoms must be provided to SimbaV2 when is_critic=True")
-            output_dim = self.num_atoms
+            # For Gaussian critic, output mean and log_std (or variance)
+            # Outputting 2 values: mean and log_std
+            output_dim = 2
             # Add the output scaler for the critic head as well (similar to paper's Eq 14 structure)
-            # This scaler wasn't explicitly in your original code for the output layer, but fits the pattern
             output_final_scaler_init_scale = math.sqrt(2.0 / hidden_dim) if hidden_dim > 0 else 1.0
             self.output_final_scaler = Scaler(hidden_dim, init=output_final_scaler_init_scale, scale=output_final_scaler_init_scale)
 
         else: # Actor output
             if isinstance(action_shape, tuple):
                 # Continuous actions: output mean and std dev (or flattened parameters)
-                # Note: SAC often outputs mean/log_std directly. PPO might need logits if using Categorical/Normal later.
                 # Assuming mean and log_std for now.
                 output_dim = np.prod(action_shape) * 2
             else:
                 # Discrete actions: output logits
                 output_dim = action_shape
-            # Actor doesn't necessarily need the final scaler from Eq 14's structure, depends on how distribution is parameterized.
-            # We'll omit it for the actor for now, matching your original code more closely.
+            # Actor doesn't necessarily need the final scaler from Eq 14's structure.
             self.output_final_scaler = None
 
         self.output_linear = OrthogonalLinear(hidden_dim, output_dim)
         # --- End modification ---
 
-    def forward(self, x: torch.Tensor, return_features=False):
+        # --- Add log_std constraints if critic ---
+        if self.is_critic:
+            # Often log_std is constrained for stability
+            self.log_std_min = -20 # Example value, adjust as needed
+            self.log_std_max = 2   # Example value, adjust as needed
+        # --- End modification ---
+
+
+    def forward(self, x: torch.Tensor, 
+               return_features=False, 
+               return_actor=None,    # Flag for shared model use
+               return_critic=None):  # Flag for shared model use
+        """
+        Forward pass through SimbaV2 model.
+        
+        Args:
+            x: Input tensor [batch, obs_shape]
+            return_features: Whether to return intermediate features
+            return_actor: For shared model - whether to return actor output
+            return_critic: For shared model - whether to return critic output
+            
+        Returns:
+            If not shared model:
+                output or (output, features) based on return_features flag
+                - For actor: action logits/distribution [batch, action_shape]
+                - For critic: [mean, log_std] values [batch, 2]
+            If shared model:
+                dict containing requested outputs based on flags
+        """
+        # Handle default values for flags in shared model case
+        if return_actor is None:
+            return_actor = not self.is_critic
+        if return_critic is None:
+            return_critic = self.is_critic
+            
         # 1. Input Embedding
         x_norm = self.input_norm(x) # RSNorm (Eq 4)
 
@@ -94,20 +124,46 @@ class SimbaV2(nn.Module):
         features = h
         for block in self.blocks:
             h = block(h)
-            features = h
+            features = h # Keep track of the last features
 
         # 3. Output Prediction
         h_out = self.output_mlp_linear(features)
         h_out = self.output_mlp_scaler(h_out)
 
-        # --- Apply final scaler only if critic ---
+        # Apply final scaler only if critic
         if self.is_critic and self.output_final_scaler is not None:
             h_out = self.output_final_scaler(h_out)
-        # --- End modification ---
 
         # Final output layer
-        output = self.output_linear(h_out) # Shape: [batch, output_dim]
+        raw_output = self.output_linear(h_out) # Shape: [batch, output_dim]
 
+        # Process output based on model type
+        if self.is_critic:
+            # For Gaussian critic, split into mean and log_std
+            mean, log_std = raw_output.chunk(2, dim=-1)
+            # Squeeze any extra dimensions
+            mean = mean.squeeze(-1) # Shape: [batch]
+            log_std = log_std.squeeze(-1) # Shape: [batch]
+            # Clamp log_std for stability
+            log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
+            # Stack them for the final output expected by PPO
+            output = torch.stack([mean, log_std], dim=-1) # Shape: [batch, 2]
+        else:
+            # For actor, keep raw logits or distribution params
+            output = raw_output
+
+        # For shared model, return the requested outputs in a dictionary
+        if hasattr(self, 'shared_model') and self.shared_model:
+            result = {}
+            if return_features:
+                result['features'] = features
+            if return_actor and not self.is_critic:
+                result['actor_out'] = output
+            if return_critic and self.is_critic:
+                result['critic_out'] = output
+            return result
+        
+        # For separate models, return as before
         if return_features:
             return output, features
         return output
