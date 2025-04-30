@@ -205,10 +205,6 @@ class Trainer:
         use_uncertainty_weight: bool = True,
         uncertainty_weight_type: str = "variance",
         uncertainty_weight_temp: float = 1.0,
-        # Keep these for backward compatibility
-        v_min: float = -10.0,
-        v_max: float = 10.0,
-        num_atoms: int = 51,
     ):
         self.use_wandb = use_wandb
         self.debug = debug
@@ -324,9 +320,6 @@ class Trainer:
                 use_amp=self.use_amp, # Pass the trainer's use_amp flag
                 debug=debug,
                 use_wandb=use_wandb,
-                v_min=v_min,
-                v_max=v_max,
-                num_atoms=num_atoms,
                 use_weight_clipping=use_weight_clipping,
                 weight_clip_kappa=weight_clip_kappa,
                 adaptive_kappa=adaptive_kappa,

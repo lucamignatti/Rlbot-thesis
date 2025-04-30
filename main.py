@@ -645,14 +645,7 @@ def run_training(
         variance_loss_coefficient=args.variance_coef,
         use_uncertainty_weight=args.use_uncertainty_weight,
         uncertainty_weight_type=args.uncertainty_weight_type,
-        uncertainty_weight_temp=args.uncertainty_weight_temp,
-        # Keep these for backward compatibility
-        v_min=args.v_min,
-        v_max=args.v_max,
-        num_atoms=args.num_atoms,
-        # Pass reward scaling parameters to Trainer (REMOVED)
-        # use_reward_scaling=use_reward_scaling,
-        # reward_scaling_G_max=reward_scaling_G_max,
+        uncertainty_weight_temp=args.uncertainty_weight_temp
     )
 
     # --- MODEL LOADING LOGIC ---
@@ -1705,11 +1698,7 @@ if __name__ == "__main__":
     parser.add_argument('--entropy_coef', type=float, default=0.005, help='Weight of the entropy bonus (encourages exploration)')
     parser.add_argument('--max_grad_norm', type=float, default=0.5, help='Maximum gradient norm for clipping')
 
-    # --- ADD DISTRIBUTIONAL CRITIC ARGS ---
-    parser.add_argument('--v_min', type=float, default=-5.0, help='Minimum value for distributional critic support')
-    parser.add_argument('--v_max', type=float, default=5.0, help='Maximum value for distributional critic support')
-    parser.add_argument('--num_atoms', type=int, default=101, help='Number of atoms for distributional critic support')
-    # ------------------------------------
+    # Distributional critic args have been removed as they are no longer used
 
     # Training loop parameters
     parser.add_argument('--ppo_epochs', type=int, default=1, help='Number of PPO epochs per update')
