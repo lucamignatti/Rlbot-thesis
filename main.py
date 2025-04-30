@@ -1078,6 +1078,10 @@ def run_training(
                     for agent_id in reward_dict.keys():
                         if current_exp_idx < len(all_obs_list): # Ensure we don't go out of bounds
                             extrinsic_reward = reward_dict[agent_id]
+                            # --- DEBUG PRINT RAW REWARDS ---
+                            if debug and abs(extrinsic_reward) > 1e-6: # Print only non-tiny rewards
+                                print(f"[DEBUG RAW REWARD] Env {env_idx}, Agent {agent_id}: Raw Reward = {extrinsic_reward}")
+                            # --- END DEBUG ---
                             done = terminated_dict[agent_id] or truncated_dict[agent_id]
                             next_obs = next_obs_dict.get(agent_id, None)
 
@@ -1154,6 +1158,12 @@ def run_training(
                             # Use only scaled extrinsic rewards if intrinsic calculation fails
                             final_rewards = scaled_extrinsic_rewards
 
+                    # +++ DEBUG: FORCE REWARD +++
+                    if debug and len(final_rewards) > 0: # Check if final_rewards is not empty
+                        final_rewards[0] = 1.0 # Force first reward to 1.0
+                        print(f"[DEBUG FORCE REWARD] Set final_rewards[0] to 1.0")
+                    # +++ END DEBUG +++
+
                     # --- Update Rewards and Dones in Buffer (PPO) ---
                     trainer.update_rewards_dones_batch(
                         batch_store_indices_tensor,
@@ -1179,52 +1189,79 @@ def run_training(
 
                     for agent_id in reward_dict.keys():
                         if exp_idx < len(all_obs_list): # Check bounds
+                            # Extract data for the current agent step
+                            obs = all_obs_list[exp_idx]
+                            action = action_batch[exp_idx] if exp_idx < len(action_batch) else None
+                            log_prob = log_prob_batch[exp_idx] if exp_idx < len(log_prob_batch) else None
+                            value = value_batch[exp_idx] if exp_idx < len(value_batch) else None
+                            
+                            # Check if we got valid action/log_prob/value
+                            if action is None or log_prob is None or value is None:
+                                 if debug: print(f"[WARN] Missing action/log_prob/value for Env {env_idx}, Agent {agent_id} at index {exp_idx}. Skipping store.")
+                                 exp_idx += 1
+                                 continue
+                                 
                             extrinsic_reward = reward_dict[agent_id] # ORIGINAL extrinsic reward
                             done = terminated_dict[agent_id] or truncated_dict[agent_id]
                             next_obs = next_obs_dict.get(agent_id, None)
+                            
+                            # --- DEBUG PRINT RAW REWARDS ---
+                            if debug and abs(extrinsic_reward) > 1e-6: # Print only non-tiny rewards
+                                print(f"[DEBUG RAW REWARD] Env {env_idx}, Agent {agent_id}: Raw Reward = {extrinsic_reward}")
+                            # --- END DEBUG ---
 
-                            # For StreamAC/SAC, update the stored experience with actual reward/done
-                            if not test: # Only update if not testing
-                                if algorithm == "streamac":
-                                     # StreamAC updates happen within store_experience, called earlier
-                                     # We need to update the *last* stored reward/done if store_experience
-                                     # doesn't handle the next_state logic correctly.
-                                     # update_experience_with_intrinsic_reward handles scaling and intrinsic addition
-                                     total_reward_for_tracking = extrinsic_reward # Default to original
-                                     if next_obs is not None:
-                                         # Only call intrinsic reward calculation if enabled
-                                         if trainer.use_intrinsic_rewards:
-                                             # Use the single update method to get the combined reward
-                                             total_reward_for_tracking = trainer.update_experience_with_intrinsic_reward(
-                                                 state=all_obs_list[exp_idx],
-                                                 action=action_batch[exp_idx], # Original action
-                                                 next_state=next_obs,
-                                                 reward=extrinsic_reward, # Pass ORIGINAL extrinsic
-                                                 env_id=env_idx,
-                                                 done=done # Pass done flag
-                                                 # store_idx is None for StreamAC here
-                                             )
-                                         # Otherwise just use extrinsic reward - no need to call the intrinsic method
-                                     # Defensive check/initialization before accumulating reward
-                                     if agent_id not in episode_rewards[env_idx]:
-                                         episode_rewards[env_idx][agent_id] = 0.0
-                                         if debug: print(f"[DEBUG] Initialized episode_rewards for {agent_id} in env {env_idx} (during {algorithm} result processing)")
-                                     # Accumulate the ORIGINAL extrinsic reward for episode tracking
-                                     episode_rewards[env_idx][agent_id] += extrinsic_reward
+                            # --- Store Experience (Unified Call) ---
+                            if not test: # Only store if not testing
+                                # Calculate final reward (including intrinsic if enabled)
+                                final_reward = extrinsic_reward # Default to extrinsic
+                                # --- Intrinsic Reward Calculation (Copied & Adapted from unified logic) ---
+                                add_intrinsic = trainer.use_intrinsic_rewards and not trainer.pretraining_completed and trainer.intrinsic_reward_generator is not None
+                                intrinsic_reward_value = 0.0
+                                if add_intrinsic and next_obs is not None:
+                                    try:
+                                        state_tensor = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0) if not isinstance(obs, torch.Tensor) else obs.unsqueeze(0)
+                                        next_obs_tensor = torch.tensor(next_obs, dtype=torch.float32, device=device).unsqueeze(0) if not isinstance(next_obs, torch.Tensor) else next_obs.unsqueeze(0)
+                                        if not isinstance(action, torch.Tensor):
+                                            if trainer.action_space_type == "discrete":
+                                                action_idx = int(action[0]) if isinstance(action, np.ndarray) else int(action)
+                                                action_tensor = torch.tensor([action_idx], dtype=torch.long, device=device)
+                                            else:
+                                                action_tensor = torch.tensor(action, dtype=torch.float32, device=device).unsqueeze(0)
+                                        else:
+                                            action_tensor = action.unsqueeze(0) if action.dim() == trainer.action_dim else action
+                                            if trainer.action_space_type == "discrete" and action_tensor.dtype != torch.long: action_tensor = action_tensor.long()
+                                        intrinsic_reward_value = trainer.intrinsic_reward_generator.compute_intrinsic_reward(state_tensor, action_tensor, next_obs_tensor)
+                                        trainer.intrinsic_reward_generator.update(state_tensor, action_tensor, next_obs_tensor, done)
+                                        intrinsic_reward_value = intrinsic_reward_value.item() if isinstance(intrinsic_reward_value, torch.Tensor) else float(intrinsic_reward_value)
+                                        intrinsic_reward_value *= trainer.intrinsic_reward_scale
+                                        if debug and abs(intrinsic_reward_value) > 1e-6: print(f"[DEBUG INTRINSIC] Env {env_idx} Ag {agent_id}: Intrinsic={intrinsic_reward_value:.4f} (Scale={trainer.intrinsic_reward_scale})")
+                                    except Exception as e:
+                                        if debug: print(f"[WARN] Error calculating intrinsic reward for Env {env_idx}, Agent {agent_id}: {e}")
+                                        intrinsic_reward_value = 0.0
+                                extrinsic_reward_float = float(extrinsic_reward) if not isinstance(extrinsic_reward, float) else extrinsic_reward
+                                final_reward = extrinsic_reward_float + intrinsic_reward_value
+                                
+                                # Call the algorithm's store_experience method
+                                try:
+                                    trainer.algorithm.store_experience(
+                                        obs,
+                                        action,     # Pass original action
+                                        log_prob,   # Pass original log_prob
+                                        final_reward, # Pass the final combined reward
+                                        value,      # Pass original value
+                                        done,
+                                        env_id=env_idx # Pass env_id
+                                    )
+                                except Exception as e:
+                                    if debug: print(f"[WARN] Error calling store_experience for Env {env_idx}, Agent {agent_id}: {e}")
+                                    if debug: import traceback; traceback.print_exc()
+                            # --- End Store Experience ---
 
-                                elif algorithm == "sac":
-                                     # SAC uses a replay buffer, update the last stored experience
-                                     # This assumes SAC's store_experience adds placeholders first
-                                     # We need a way to find the index or update the last item.
-                                     # Let's use store_experience_at_idx if SAC supports it,
-                                     # otherwise, this needs refinement based on SAC's buffer.
-                                     # Assuming SAC's store_experience handles it for now.
-                                     # Defensive check/initialization before accumulating reward
-                                     if agent_id not in episode_rewards[env_idx]:
-                                         episode_rewards[env_idx][agent_id] = 0.0
-                                         if debug: print(f"[DEBUG] Initialized episode_rewards for {agent_id} in env {env_idx} (during {algorithm} result processing)")
-                                     # Accumulate the ORIGINAL extrinsic reward for episode tracking
-                                     episode_rewards[env_idx][agent_id] += extrinsic_reward
+                            # --- Track Episode Rewards --- 
+                            if agent_id not in episode_rewards[env_idx]:
+                                episode_rewards[env_idx][agent_id] = 0.0
+                            episode_rewards[env_idx][agent_id] += extrinsic_reward # Accumulate original extrinsic reward
+                            # --- End Track Episode Rewards ---
 
                             if done:
                                 action_stacker.reset_agent(agent_id)

@@ -687,10 +687,10 @@ class QRA2CAlgorithm(BaseAlgorithm):
         # Clear episode returns after update
         self.episode_returns = []
 
-        # Reset buffer after update
-        self.pos = 0
-        self.size = 0
-        self.buffer_full = False
+        # DO NOT Reset buffer after update for A2C style - let it overwrite naturally
+        # self.pos = 0
+        # self.size = 0
+        # self.buffer_full = False
 
         return self.metrics
 
