@@ -1690,8 +1690,8 @@ if __name__ == "__main__":
                        help='Learning algorithm to use: ppo (default) or streamac')
 
     # Learning rates
-    parser.add_argument('--lra', type=float, default=1e-4, help='Learning rate for actor network')
-    parser.add_argument('--lrc', type=float, default=1e-4, help='Learning rate for critic network') # No longer does anything. Here for stability.
+    parser.add_argument('--lra', type=float, default=3e-4, help='Learning rate for actor network')
+    parser.add_argument('--lrc', type=float, default=3e-4, help='Learning rate for critic network') # No longer does anything. Here for stability.
 
     # Learning rate decay
     parser.add_argument('--lr-decay', action='store_true', help='Enable learning rate decay')
@@ -2043,7 +2043,7 @@ if __name__ == "__main__":
                 "max_grad_norm": args.max_grad_norm,
                 "ppo_epochs": args.ppo_epochs,
                 "batch_size": args.batch_size,
-                
+
                 # Learning rate decay
                 "use_lr_decay": args.lr_decay,
                 "lr_decay_rate": args.lr_decay_rate,
