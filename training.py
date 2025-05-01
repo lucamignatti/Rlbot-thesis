@@ -148,14 +148,7 @@ class Trainer:
         entropy_coef_decay: float = 0.995,
         max_grad_norm: float = 0.5,
         ppo_epochs: int = 10,
-        use_weight_clipping: bool = True,
-        weight_clip_kappa: float = 1.0,
-        adaptive_kappa: bool = False,
-        kappa_update_freq: int = 10,
-        kappa_update_rate: float = 0.01,
-        target_clip_fraction: float = 0.05,
-        min_kappa: float = 0.1,
-        max_kappa: float = 10.0,
+
         batch_size: int = 128,
         use_wandb: bool = False,
         debug: bool = False,
@@ -205,9 +198,7 @@ class Trainer:
         # use_reward_scaling: bool = True,
         # reward_scaling_G_max: float = 10.0,
         # reward_scaling_eps: float = 1e-5,
-        v_min: float = -10.0,
-        v_max: float = 10.0,
-        num_atoms: int = 51,
+
     ):
         self.use_wandb = use_wandb
         self.debug = debug
@@ -331,17 +322,7 @@ class Trainer:
                 use_amp=self.use_amp, # Pass the trainer's use_amp flag
                 debug=debug,
                 use_wandb=use_wandb,
-                v_min=v_min,
-                v_max=v_max,
-                num_atoms=num_atoms,
-                use_weight_clipping=use_weight_clipping,
-                weight_clip_kappa=weight_clip_kappa,
-                adaptive_kappa=adaptive_kappa,
-                kappa_update_freq=kappa_update_freq,
-                kappa_update_rate=kappa_update_rate,
-                target_clip_fraction=target_clip_fraction,
-                min_kappa=min_kappa,
-                max_kappa=max_kappa,
+
             )
             # For compatibility with existing code, keep a reference to the memory
             # self.memory = self.algorithm.memory # No longer needed, access via self.algorithm.memory

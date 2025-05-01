@@ -528,8 +528,6 @@ def run_training(
     entropy_coef: float = 0.01,
     max_grad_norm: float = 0.5,
     ppo_epochs: int = 10,
-    use_weight_clipping: bool = False,
-    weight_clip_kappa: float = 1.0,
     batch_size: int = 64,
     aux_amp: bool = False,
     aux_scale: float = 0.005,
@@ -614,8 +612,7 @@ def run_training(
         max_grad_norm=max_grad_norm,
         ppo_epochs=ppo_epochs,
         batch_size=batch_size,
-        use_weight_clipping=use_weight_clipping,
-        weight_clip_kappa=weight_clip_kappa,
+
         use_wandb=use_wandb,
         debug=debug,
         use_compile=use_compile,
@@ -645,9 +642,6 @@ def run_training(
         stream_buffer_size=stream_buffer_size,
         use_sparse_init=use_sparse_init,
         update_freq=update_freq,
-        v_min=args.v_min,
-        v_max=args.v_max,
-        num_atoms=args.num_atoms,
         # Pass reward scaling parameters to Trainer (REMOVED)
         # use_reward_scaling=use_reward_scaling,
         # reward_scaling_G_max=reward_scaling_G_max,
@@ -1709,28 +1703,14 @@ if __name__ == "__main__":
     parser.add_argument('--entropy_coef', type=float, default=0.005, help='Weight of the entropy bonus (encourages exploration)')
     parser.add_argument('--max_grad_norm', type=float, default=0.5, help='Maximum gradient norm for clipping')
 
-    # --- ADD DISTRIBUTIONAL CRITIC ARGS ---
-    parser.add_argument('--v_min', type=float, default=-5.0, help='Minimum value for distributional critic support')
-    parser.add_argument('--v_max', type=float, default=5.0, help='Maximum value for distributional critic support')
-    parser.add_argument('--num_atoms', type=int, default=101, help='Number of atoms for distributional critic support')
+    # Distributional critic args removed - no longer used
     # ------------------------------------
 
     # Training loop parameters
     parser.add_argument('--ppo_epochs', type=int, default=1, help='Number of PPO epochs per update')
     parser.add_argument('--batch_size', type=int, default=24576, help='Batch size for PPO updates')
 
-    parser.add_argument('--weight_clip_kappa', type=float, default=1.0, help='Weight clipping factor for PPO')
-    parser.add_argument('--weight_clipping', type=bool, default=False, help='Enable weight clipping for PPO')
-
-    # Adaptive weight clipping parameters
-    parser.add_argument('--adaptive_kappa', action='store_false', help='Enable adaptive weight clipping kappa')
-    parser.add_argument('--no-adaptive_kappa', action='store_true', dest='adaptive_kappa', help='Disable adaptive weight clipping kappa')
-    parser.set_defaults(adaptive_kappa=False)  # Disable by default
-    parser.add_argument('--kappa_update_freq', type=int, default=10, help='Update frequency for adaptive kappa')
-    parser.add_argument('--kappa_update_rate', type=float, default=0.01, help='Update rate for adaptive kappa (1% by default)')
-    parser.add_argument('--target_clip_fraction', type=float, default=0.05, help='Target fraction of weights to clip (5% by default)')
-    parser.add_argument('--min_kappa', type=float, default=0.1, help='Minimum value for adaptive kappa')
-    parser.add_argument('--max_kappa', type=float, default=10.0, help='Maximum value for adaptive kappa')
+    # Weight clipping parameters removed - no longer used
 
     parser.add_argument('--compile', action='store_true', help='Use torch.compile for model optimization (if available)')
     parser.add_argument('--no-compile', action='store_false', dest='compile', help='Disable torch.compile')
@@ -1875,7 +1855,7 @@ if __name__ == "__main__":
                         help='Legacy parameter; use --num_envs instead')
 
     # Model architecture argument
-    parser.add_argument('--model-arch', type=str, default='simbav2', choices=['basic', 'simba', 'simbav2', 'simbav2-shared'], # Changed default to simbav2
+    parser.add_argument('--model-arch', type=str, default='simba', choices=['basic', 'simba', 'simbav2', 'simbav2-shared'], # Changed default to simbav2
                        help='Model architecture to use (basic, simba, simbav2, simbav2-shared)')
 
     # Add reward scaling args here, before parse_args() (REMOVED - Handled in Algorithm)
@@ -2211,8 +2191,6 @@ if __name__ == "__main__":
             entropy_coef=args.entropy_coef,
             max_grad_norm=args.max_grad_norm,
             ppo_epochs=args.ppo_epochs,
-            weight_clip_kappa=args.weight_clip_kappa,
-            use_weight_clipping=args.weight_clipping,
             batch_size=args.batch_size,
             aux_amp=args.aux_amp if args.aux_amp is not None else args.amp,
             aux_scale=args.aux_scale,

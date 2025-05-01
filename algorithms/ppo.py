@@ -271,7 +271,13 @@ class PPOAlgorithm(BaseAlgorithm):
                       if self.debug: print(f"[DEBUG PPOMemory] Continuous action shape mismatch. Buffer: {self.actions.shape}, Batch: {action_batch.shape}")
 
             self.log_probs.index_copy_(0, indices, log_prob_batch.detach())
-            self.values.index_copy_(0, indices, value_batch.detach()) # Store the actual scalar value estimate
+            # Handle value shapes - ensure value_batch is 1D
+            if value_batch.dim() == 2 and value_batch.shape[1] == 1:
+                value_batch = value_batch.squeeze(1)  # Convert from [batch, 1] to [batch]
+            elif value_batch.dim() != 1:
+                if self.debug:
+                    print(f"[DEBUG PPOMemory] Unexpected value shape: {value_batch.shape}")
+            self.values.index_copy_(0, indices, value_batch.detach())  # Store the actual scalar value estimate
 
             new_pos = (self.pos + batch_size) % self.buffer_size
             if not self.full and (self.pos + batch_size >= self.buffer_size):
@@ -442,10 +448,11 @@ class PPOAlgorithm(BaseAlgorithm):
         """Get action and value for a given observation"""
         if not isinstance(obs, torch.Tensor):
             obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
-        # Add batch dimension if missing
-        needs_unsqueeze = obs.dim() == len(self.actor.input_shape) # Example check, adapt to your model
+        # Add batch dimension if missing - check if first dimension could be batch size
+        # We expect obs to be [batch_size, ...] or [...] where ... is the observation shape
+        needs_unsqueeze = obs.dim() < 2  # If 1D or 0D tensor, needs batch dimension
         if needs_unsqueeze:
-             obs = obs.unsqueeze(0)
+            obs = obs.unsqueeze(0)
 
         action = None
         log_prob = None
