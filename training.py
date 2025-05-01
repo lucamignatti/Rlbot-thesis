@@ -172,6 +172,11 @@ class Trainer:
         # Removed pretraining_transition_steps
         total_episode_target: int = None,
         training_step_offset: int = 0,
+        # Learning rate decay parameters
+        use_lr_decay: bool = False,
+        lr_decay_rate: float = 0.7,
+        lr_decay_steps: int = 1000000,
+        min_lr: float = 3e-5,
         # Intrinsic reward parameters
         use_intrinsic_rewards: bool = True,
         intrinsic_reward_scale: float = 1.0,
@@ -265,6 +270,14 @@ class Trainer:
         # Learning rates
         self.lr_actor = lr_actor
         self.lr_critic = lr_critic
+        
+        # Learning rate decay settings
+        self.use_lr_decay = use_lr_decay
+        self.lr_decay_rate = lr_decay_rate
+        self.lr_decay_steps = lr_decay_steps
+        self.min_lr = min_lr
+        self.initial_lr_actor = lr_actor  # Store initial learning rates
+        self.initial_lr_critic = lr_critic  # Store initial learning rates
 
         # Initialize auxiliary tasks if enabled BEFORE creating the algorithm
         self.use_auxiliary_tasks = use_auxiliary_tasks
@@ -444,7 +457,11 @@ class Trainer:
                 "rp_weight": rp_weight,
                 "use_pretraining": use_pretraining,
                 "use_amp": use_amp,
-                "aux_amp": aux_amp # Log aux_amp setting
+                "aux_amp": aux_amp, # Log aux_amp setting
+                "use_lr_decay": use_lr_decay,
+                "lr_decay_rate": lr_decay_rate,
+                "lr_decay_steps": lr_decay_steps,
+                "min_lr": min_lr
             }, allow_val_change=True)
 
         # If requested and available, compile the models for performance
@@ -669,6 +686,7 @@ class Trainer:
         algorithm_metrics[f"{alg_prefix}/entropy_coefficient"] = self.entropy_coef
         algorithm_metrics[f"{alg_prefix}/actor_learning_rate"] = getattr(self.algorithm, "lr_actor", self.lr_actor)
         algorithm_metrics[f"{alg_prefix}/critic_learning_rate"] = getattr(self.algorithm, "lr_critic", self.lr_critic)
+        algorithm_metrics[f"{alg_prefix}/lr_decay_enabled"] = self.use_lr_decay
 
         # Add buffer size for SAC
         if self.algorithm_type == "sac":
@@ -1176,6 +1194,11 @@ class Trainer:
         if self.use_pretraining:
             self._update_pretraining_state()
             self._update_auxiliary_weights()
+            
+        # Apply learning rate decay if enabled
+        if self.use_lr_decay:
+            current_step = self._true_training_steps()
+            self.update_learning_rate(current_step)
 
         # Store total_env_steps if provided (mainly for PPO)
         if total_env_steps is not None:
@@ -1472,6 +1495,16 @@ class Trainer:
             'base_entropy_coef': self.base_entropy_coef
         }
 
+        # Include learning rate decay settings
+        checkpoint['lr_decay'] = {
+            'use_lr_decay': self.use_lr_decay,
+            'lr_decay_rate': self.lr_decay_rate,
+            'lr_decay_steps': self.lr_decay_steps,
+            'min_lr': self.min_lr,
+            'initial_lr_actor': self.initial_lr_actor,
+            'initial_lr_critic': self.initial_lr_critic
+        }
+
         # Include wandb info if enabled
         if self.use_wandb and wandb.run:
             checkpoint['wandb'] = {
@@ -1665,6 +1698,21 @@ class Trainer:
 
                 if self.debug:
                     print(f"[DEBUG] Restored entropy settings: coef={self.entropy_coef:.6f}, decay={self.entropy_coef_decay:.6f}")
+                    
+            # ===== Restore Learning Rate Decay Settings =====
+            if 'lr_decay' in checkpoint:
+                lr_decay_settings = checkpoint['lr_decay']
+                self.use_lr_decay = lr_decay_settings.get('use_lr_decay', self.use_lr_decay)
+                self.lr_decay_rate = lr_decay_settings.get('lr_decay_rate', self.lr_decay_rate)
+                self.lr_decay_steps = lr_decay_settings.get('lr_decay_steps', self.lr_decay_steps)
+                self.min_lr = lr_decay_settings.get('min_lr', self.min_lr)
+                self.initial_lr_actor = lr_decay_settings.get('initial_lr_actor', self.initial_lr_actor)
+                self.initial_lr_critic = lr_decay_settings.get('initial_lr_critic', self.initial_lr_critic)
+                
+                if self.debug:
+                    print(f"[DEBUG] Restored learning rate decay settings: "
+                          f"enabled={self.use_lr_decay}, rate={self.lr_decay_rate}, "
+                          f"steps={self.lr_decay_steps}, min_lr={self.min_lr}")
 
             # ===== Restore Training Counters =====
             if 'metadata' in checkpoint:
@@ -1914,6 +1962,66 @@ class Trainer:
             if self.use_wandb:
                 wandb.log({'training/pretraining_completed': True}, step=current_step)
         # Removed transition phase logic
+        
+    def update_learning_rate(self, current_step):
+        """
+        Update learning rate based on the current training step and decay parameters.
+        
+        Args:
+            current_step: Current training step count
+            
+        Returns:
+            tuple: Updated (actor_lr, critic_lr)
+        """
+        # Skip if lr decay is disabled or step is 0
+        if not self.use_lr_decay or current_step <= 0:
+            return self.lr_actor, self.lr_critic
+            
+        if self.algorithm_type == "streamac" and self.adaptive_learning_rate:
+            # For StreamAC with adaptive learning rate, we don't use this decay schedule
+            # The algorithm handles its own learning rate adjustments
+            if self.debug:
+                print("[DEBUG] Skipping LR decay for StreamAC with adaptive learning rate")
+            return self.lr_actor, self.lr_critic
+            
+        # Calculate decay factor (exponential decay)
+        decay_factor = max(self.lr_decay_rate ** (current_step / self.lr_decay_steps), self.min_lr / self.initial_lr_actor)
+        
+        # Apply decay to learning rates
+        new_lr_actor = max(self.initial_lr_actor * decay_factor, self.min_lr)
+        new_lr_critic = max(self.initial_lr_critic * decay_factor, self.min_lr)
+        
+        # Only log if there's a significant change
+        if abs(new_lr_actor - self.lr_actor) > 1e-7 and self.debug:
+            print(f"[DEBUG] Updating learning rate at step {current_step}: actor {self.lr_actor:.6f} -> {new_lr_actor:.6f}, "
+                  f"critic {self.lr_critic:.6f} -> {new_lr_critic:.6f}")
+                  
+        # Check if we're using a shared optimizer in the algorithm
+        if hasattr(self.algorithm, 'optimizer'):
+            # Update optimizer's learning rate
+            for param_group in self.algorithm.optimizer.param_groups:
+                param_group['lr'] = new_lr_actor  # Use actor LR for combined optimizer
+                
+        # Update separate optimizers if they exist
+        if hasattr(self.algorithm, 'actor_optimizer'):
+            for param_group in self.algorithm.actor_optimizer.param_groups:
+                param_group['lr'] = new_lr_actor
+                
+        if hasattr(self.algorithm, 'critic_optimizer'):
+            for param_group in self.algorithm.critic_optimizer.param_groups:
+                param_group['lr'] = new_lr_critic
+                
+        # Update stored values
+        self.lr_actor = new_lr_actor
+        self.lr_critic = new_lr_critic
+        
+        # Update algorithm's learning rates if it stores them directly
+        if hasattr(self.algorithm, 'lr_actor'):
+            self.algorithm.lr_actor = new_lr_actor
+        if hasattr(self.algorithm, 'lr_critic'):
+            self.algorithm.lr_critic = new_lr_critic
+            
+        return new_lr_actor, new_lr_critic
 
     # Reward Scaling Methods (REMOVED - Handled in Algorithm)
     # def _initialize_reward_scaling_stats(self, env_id):

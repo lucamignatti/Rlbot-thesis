@@ -544,6 +544,11 @@ def run_training(
     pretraining_sr_weight: float = 10.0,
     pretraining_rp_weight: float = 5.0,
     # Removed pretraining_transition_steps
+    # Learning rate decay parameters
+    use_lr_decay: bool = False,
+    lr_decay_rate: float = 0.7,
+    lr_decay_steps: int = 1000000,
+    min_lr: float = 3e-5,
     # Intrinsic rewards parameters
     use_intrinsic_rewards: bool = False,  # Changed default to match CLI default (False)
     intrinsic_reward_scale: float = 0.1,
@@ -1688,6 +1693,12 @@ if __name__ == "__main__":
     parser.add_argument('--lra', type=float, default=1e-4, help='Learning rate for actor network')
     parser.add_argument('--lrc', type=float, default=1e-4, help='Learning rate for critic network') # No longer does anything. Here for stability.
 
+    # Learning rate decay
+    parser.add_argument('--lr-decay', action='store_true', help='Enable learning rate decay')
+    parser.add_argument('--lr-decay-rate', type=float, default=0.7, help='Learning rate decay factor (e.g., 0.7 means decay to 70% over decay steps)')
+    parser.add_argument('--lr-decay-steps', type=int, default=1000000, help='Number of steps over which to decay the learning rate')
+    parser.add_argument('--min-lr', type=float, default=3e-5, help='Minimum learning rate after decay')
+
     # Discount factors
     parser.add_argument('--gamma', type=float, default=0.997, help='Discount factor for future rewards')
     parser.add_argument('--gae_lambda', type=float, default=0.98, help='Lambda parameter for Generalized Advantage Estimation')
@@ -2032,6 +2043,12 @@ if __name__ == "__main__":
                 "max_grad_norm": args.max_grad_norm,
                 "ppo_epochs": args.ppo_epochs,
                 "batch_size": args.batch_size,
+                
+                # Learning rate decay
+                "use_lr_decay": args.lr_decay,
+                "lr_decay_rate": args.lr_decay_rate,
+                "lr_decay_steps": args.lr_decay_steps,
+                "min_lr": args.min_lr,
 
                 # Model Details
                 "model_arch": args.model_arch, # Log model architecture
@@ -2207,6 +2224,11 @@ if __name__ == "__main__":
             pretraining_fraction=args.pretraining_fraction,
             pretraining_sr_weight=args.pretraining_sr_weight,
             pretraining_rp_weight=args.pretraining_rp_weight,
+            # Learning rate decay parameters
+            use_lr_decay=args.lr_decay,
+            lr_decay_rate=args.lr_decay_rate,
+            lr_decay_steps=args.lr_decay_steps,
+            min_lr=args.min_lr,
             # Removed pretraining_transition_steps argument
             use_intrinsic_rewards=args.use_intrinsic,
             intrinsic_reward_scale=args.intrinsic_scale,
