@@ -79,8 +79,9 @@ class DPPOAlgorithm(BaseAlgorithm):
         use_confidence_weighting=True,      # Whether to weight PPO loss term by confidence
         confidence_weight_type="entropy",   # "entropy" or "variance" to measure inverse confidence
         confidence_weight_delta=1e-6,       # Epsilon for numerical stability in weighting denominator (if using inverse)
-        normalize_confidence_weights=True,  # Normalize weights across batch for stability
-        # --- Quantile Sampling (Enabled implicitly by GAE modification, no specific params needed here) ---
+        normalize_confidence_weights=False,  # Normalize weights across batch for stability
+        # --- Value Calculation Method ---
+        advantage_calculation_method="quantile_sampling", # "quantile_sampling" or "mean"
         # --- SimbaV2 Reward Normalization G_max ---
         reward_norm_G_max=10.0, # Default G_max for reward normalization
         # --- Deprecated / Unused Weight Clipping Params ---
@@ -131,6 +132,11 @@ class DPPOAlgorithm(BaseAlgorithm):
         self.confidence_weight_type = confidence_weight_type
         self.confidence_weight_delta = confidence_weight_delta
         self.normalize_confidence_weights = normalize_confidence_weights
+
+        # --- Value Calculation Method ---
+        if advantage_calculation_method not in ["quantile_sampling", "mean"]:
+            raise ValueError(f"Invalid advantage_calculation_method: {advantage_calculation_method}. Use 'quantile_sampling' or 'mean'")
+        self.advantage_calculation_method = advantage_calculation_method
 
         # --- Deprecated Weight Clipping ---
         self.use_weight_clipping = use_weight_clipping
@@ -442,8 +448,8 @@ class DPPOAlgorithm(BaseAlgorithm):
             if self.debug: print("[DEBUG PPO] Failed to get experiences from buffer, skipping update")
             return self.metrics
 
-        # --- CALCULATE SAMPLED VALUES FOR GAE (Modification 1: Quantile Sampling for GAE) ---
-        values_sampled_for_gae_list = []
+        # --- CALCULATE VALUES FOR GAE (Based on chosen method) ---
+        values_for_gae_list = []
         all_logits_list = [] # Store all logits for critic loss later
         with torch.no_grad():
             for i in range(0, buffer_size, self.batch_size):
@@ -456,41 +462,48 @@ class DPPOAlgorithm(BaseAlgorithm):
                         chunk_logits = self.critic(chunk_states)
 
                     if chunk_logits is None or chunk_logits.shape != (chunk_states.shape[0], self.num_atoms):
-                         if self.debug: print(f"[DEBUG PPO GAE] Critic output shape mismatch for GAE calc. Expected {(chunk_states.shape[0], self.num_atoms)}, got {chunk_logits.shape if chunk_logits is not None else 'None'}. Skipping update.")
-                         self.memory.clear(); return self.metrics
+                        if self.debug: print(f"[DEBUG PPO GAE] Critic output shape mismatch for GAE calc. Expected {(chunk_states.shape[0], self.num_atoms)}, got {chunk_logits.shape if chunk_logits is not None else 'None'}. Skipping update.")
+                        self.memory.clear(); return self.metrics
 
-                    # Sample from the categorical distribution
-                    dist = torch.distributions.Categorical(logits=chunk_logits)
-                    sampled_indices = dist.sample() # Shape [chunk_size]
-                    support_device = self.support.to(sampled_indices.device)
-                    value_sample = support_device[sampled_indices] # Shape [chunk_size]
+                    # Process values based on the chosen advantage calculation method
+                    if self.advantage_calculation_method == "quantile_sampling":
+                        # Sample from the categorical distribution
+                        dist = torch.distributions.Categorical(logits=chunk_logits)
+                        sampled_indices = dist.sample() # Shape [chunk_size]
+                        support_device = self.support.to(sampled_indices.device)
+                        value_for_gae = support_device[sampled_indices] # Shape [chunk_size]
+                    else: # mean
+                        # Calculate the expected value (mean) from the distribution
+                        probs = F.softmax(chunk_logits, dim=-1)
+                        support_device = self.support.to(probs.device)
+                        value_for_gae = torch.sum(probs * support_device.unsqueeze(0), dim=-1) # Shape [chunk_size]
 
-                    values_sampled_for_gae_list.append(value_sample)
+                    values_for_gae_list.append(value_for_gae)
                     all_logits_list.append(chunk_logits) # Store logits
 
-            values_sampled_for_gae = torch.cat(values_sampled_for_gae_list)
+            values_for_gae = torch.cat(values_for_gae_list)
             all_logits = torch.cat(all_logits_list) # Logits for the whole buffer [buffer_size, num_atoms]
 
-        # Store sampled values back into memory.values for _compute_gae
-        self.memory.values = values_sampled_for_gae.detach()
-        self.metrics['mean_sampled_value_gae'] = values_sampled_for_gae.mean().item() # Track sampled value mean
-        if self.debug: print(f"[DEBUG PPO GAE] Calculated SAMPLED values for GAE. Mean: {values_sampled_for_gae.mean().item():.4f}, Std: {values_sampled_for_gae.std().item():.4f}")
-        # --- END SAMPLED VALUES CALCULATION ---
+        # Store values back into memory.values for _compute_gae
+        self.memory.values = values_for_gae.detach()
+        self.metrics[f'mean_{self.advantage_calculation_method}_value_gae'] = values_for_gae.mean().item() # Track value mean
+        if self.debug: print(f"[DEBUG PPO GAE] Calculated {self.advantage_calculation_method.upper()} values for GAE. Mean: {values_for_gae.mean().item():.4f}, Std: {values_for_gae.std().item():.4f}")
+        # --- END VALUES CALCULATION ---
 
-        # --- COMPUTE GAE USING SAMPLED V ---
-        # returns_target here is based on the SAMPLED values, used for critic loss target projection
-        returns_target, advantages_sampled = self._compute_gae(rewards, values_sampled_for_gae, dones)
-        # Note: advantages_sampled now inherently contains noise/info from the distribution sampling
+        # --- COMPUTE GAE USING VALUES FROM CHOSEN METHOD ---
+        # returns_target here is based on the values from chosen method, used for critic loss target projection
+        returns_target, advantages = self._compute_gae(rewards, values_for_gae, dones)
+        # Note: advantages now contain info based on the chosen value calculation method
 
-        if torch.isnan(advantages_sampled).any() or torch.isinf(advantages_sampled).any():
-            if self.debug: print("[DEBUG PPO] NaN or Inf detected in SAMPLED advantages, skipping update")
+        if torch.isnan(advantages).any() or torch.isinf(advantages).any():
+            if self.debug: print(f"[DEBUG PPO] NaN or Inf detected in {self.advantage_calculation_method} advantages, skipping update")
             self.memory.clear(); return self.metrics
 
-        # --- Normalize Sampled Advantages ---
-        adv_mean = advantages_sampled.mean()
-        adv_std = advantages_sampled.std()
-        advantages_normalized_sampled = (advantages_sampled - adv_mean) / (adv_std + 1e-8)
-        self.metrics['mean_advantage'] = advantages_normalized_sampled.mean().item() # Track final advantage mean used
+        # --- Normalize Advantages ---
+        adv_mean = advantages.mean()
+        adv_std = advantages.std()
+        advantages_normalized = (advantages - adv_mean) / (adv_std + 1e-8)
+        self.metrics['mean_advantage'] = advantages_normalized.mean().item() # Track final advantage mean used
 
         # --- Prepare data dictionary for _update_policy ---
         update_data = {
@@ -498,7 +511,7 @@ class DPPOAlgorithm(BaseAlgorithm):
             "actions": actions,
             "old_log_probs": old_log_probs,
             "returns_target": returns_target, # Target distribution will be projected from these scalar returns
-            "advantages_normalized_sampled": advantages_normalized_sampled, # Use sampled advantages
+            "advantages_normalized": advantages_normalized, # Use advantages from chosen method
             "all_logits": all_logits, # Pass logits for variance/entropy calculation
             "rewards": rewards # For aux tasks
         }
@@ -513,18 +526,18 @@ class DPPOAlgorithm(BaseAlgorithm):
         return self.metrics
 
     # --- _compute_gae remains the same, uses values passed to it (which are now sampled) ---
-    def _compute_gae(self, rewards, values_sampled, dones):
-        """Compute returns and advantages using GAE with SAMPLED values."""
+    def _compute_gae(self, rewards, values, dones):
+        """Compute returns and advantages using GAE with values from the chosen method."""
         buffer_size = len(rewards)
         advantages = torch.zeros_like(rewards)
         last_gae_lam = 0
         for t in reversed(range(buffer_size)):
             if t == buffer_size - 1: next_non_terminal, next_values = 1.0 - dones[t].float(), 0
-            else: next_non_terminal, next_values = 1.0 - dones[t+1].float(), values_sampled[t+1]
-            delta = rewards[t] + self.gamma * next_values * next_non_terminal - values_sampled[t]
+            else: next_non_terminal, next_values = 1.0 - dones[t+1].float(), values[t+1]
+            delta = rewards[t] + self.gamma * next_values * next_non_terminal - values[t]
             advantages[t] = last_gae_lam = delta + self.gamma * self.gae_lambda * next_non_terminal * last_gae_lam
-        returns = advantages + values_sampled # Target returns are based on sampled advantages + sampled values
-        if self.debug: print(f"[DEBUG PPO _compute_gae] Using SAMPLED values. Advantage Mean: {advantages.mean().item():.4f}, Std: {advantages.std().item():.4f}")
+        returns = advantages + values # Target returns are based on advantages + values from chosen method
+        if self.debug: print(f"[DEBUG PPO _compute_gae] Using {self.advantage_calculation_method.upper()} values. Advantage Mean: {advantages.mean().item():.4f}, Std: {advantages.std().item():.4f}")
         return returns, advantages
 
     # --- _compute_confidence_weight (modified name and potential logic) ---
@@ -572,7 +585,7 @@ class DPPOAlgorithm(BaseAlgorithm):
         actions = update_data["actions"]
         old_log_probs = update_data["old_log_probs"]
         returns_target = update_data["returns_target"] # Target scalar returns for projecting critic target dist
-        advantages_normalized_sampled = update_data["advantages_normalized_sampled"] # Use SAMPLED GAE results
+        advantages_normalized = update_data["advantages_normalized"] # Use advantages from chosen method
         all_logits = update_data["all_logits"] # Logits for the whole buffer
         rewards = update_data["rewards"]
 
@@ -605,7 +618,7 @@ class DPPOAlgorithm(BaseAlgorithm):
                 batch_actions = actions[batch_indices]
                 batch_old_log_probs = old_log_probs[batch_indices]
                 batch_returns_target = returns_target[batch_indices] # Target scalar returns for critic projection
-                batch_advantages_sampled = advantages_normalized_sampled[batch_indices] # Use SAMPLED advantage
+                batch_advantages = advantages_normalized[batch_indices] # Use advantages from chosen method
                 batch_rewards = rewards[batch_indices]
 
                 with autocast("cuda", enabled=self.use_amp):
@@ -778,7 +791,6 @@ class DPPOAlgorithm(BaseAlgorithm):
     # (Keep these largely the same as previous version, ensure state dict saves/loads NEW params)
     def _project_weights(self):
         """Project weights of OrthogonalLinear layers (SimbaV2)."""
-        # ... (Keep implementation from previous Gaussian version) ...
         try: from model_architectures.utils import OrthogonalLinear
         except ImportError:
             if self.debug and self._update_counter % 100 == 0: print("[DEBUG _project_weights] Could not import OrthogonalLinear.")
@@ -800,7 +812,6 @@ class DPPOAlgorithm(BaseAlgorithm):
 
     def normalize_reward(self, reward, done):
         """SimbaV2 reward normalization."""
-        # ... (Keep implementation from previous Gaussian version) ...
         gamma = self.gamma; eps = self.reward_norm_epsilon; G_max = self.reward_norm_G_max
         is_tensor = isinstance(reward, torch.Tensor)
         device = reward.device if is_tensor else self.device

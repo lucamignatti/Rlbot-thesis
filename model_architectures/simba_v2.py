@@ -52,9 +52,13 @@ class SimbaV2(nn.Module):
         # --- Modify output_dim calculation ---
         if self.is_critic:
             # For distributional critic, output num_atoms logits
-            if self.num_atoms is None:
-                raise ValueError("num_atoms must be provided to SimbaV2 when is_critic=True")
-            output_dim = self.num_atoms
+            if self.num_atoms is not None:
+                if self.num_atoms <= 0:
+                    raise ValueError("num_atoms must be positive if provided")
+                output_dim = self.num_atoms
+            else:
+                # For standard value critic, output 1 value
+                output_dim = 1
             # Add the output scaler for the critic head as well (similar to paper's Eq 14 structure)
             # This scaler wasn't explicitly in your original code for the output layer, but fits the pattern
             output_final_scaler_init_scale = math.sqrt(2.0 / hidden_dim) if hidden_dim > 0 else 1.0
@@ -78,6 +82,11 @@ class SimbaV2(nn.Module):
 
     def forward(self, x: torch.Tensor, return_features=False):
         # 1. Input Embedding
+        
+        # Ensure input has correct dimensionality - add batch dimension if missing
+        if x.dim() == 1:
+            x = x.unsqueeze(0)  # Add batch dimension
+            
         x_norm = self.input_norm(x) # RSNorm (Eq 4)
 
         # Shift + L2 Norm (Eq 9)
