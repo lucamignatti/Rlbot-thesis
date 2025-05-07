@@ -10,6 +10,7 @@ from .utils import (
     fix_rsnorm_cuda_graphs,
     RSNorm
 )
+from .mlp_model import MLPModel
 
 __all__ = [
     "BasicModel",
@@ -21,5 +22,6 @@ __all__ = [
     "extract_model_dimensions",
     "fix_compiled_state_dict",
     "fix_rsnorm_cuda_graphs",
-    "RSNorm"
+    "RSNorm",
+    "MLPModel"
 ]

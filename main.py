@@ -22,7 +22,7 @@ except ImportError:
     VIZTRACER_AVAILABLE = False
 # Removed unused rlgym imports
 from model_architectures import (
-    BasicModel, SimBa, SimbaV2, SimbaV2Shared # Add SimbaV2Shared
+    BasicModel, SimBa, SimbaV2, SimbaV2Shared, MLPModel
     # Removed unused functions: fix_compiled_state_dict, extract_model_dimensions, load_partial_state_dict
 )
 from observation import ActionStacker
@@ -1684,11 +1684,11 @@ if __name__ == "__main__":
                        help='Learning algorithm to use: ppo (default) or streamac')
 
     # Learning rates
-    parser.add_argument('--lra', type=float, default=3e-4, help='Learning rate for actor network')
-    parser.add_argument('--lrc', type=float, default=3e-4, help='Learning rate for critic network') # No longer does anything. Here for stability.
+    parser.add_argument('--lra', type=float, default=1e-3, help='Learning rate for actor network')
+    parser.add_argument('--lrc', type=float, default=1e-3, help='Learning rate for critic network') # No longer does anything. Here for stability.
 
     # Learning rate decay
-    parser.add_argument('--lr-decay', action='store_true', help='Enable learning rate decay')
+    parser.add_argument('--lr-decay', action='store_true', default=False,help='Enable learning rate decay')
     parser.add_argument('--lr-decay-rate', type=float, default=0.7, help='Learning rate decay factor (e.g., 0.7 means decay to 70% over decay steps)')
     parser.add_argument('--lr-decay-steps', type=int, default=1000000, help='Number of steps over which to decay the learning rate')
     parser.add_argument('--min-lr', type=float, default=3e-5, help='Minimum learning rate after decay')
@@ -1733,14 +1733,14 @@ if __name__ == "__main__":
     parser.add_argument('--save_interval', type=int, default=1000,
                        help='Save the model every N episodes')
 
-    # Actor/Shared Network Config (Defaults from SimbaV2 Actor)
-    parser.add_argument('--hidden_dim', type=int, default=384, help='Hidden dimension for the ACTOR network (or shared network if using simbav2-shared)')
-    parser.add_argument('--num_blocks', type=int, default=4, help='Number of residual blocks in the ACTOR network (or shared network if using simbav2-shared)')
-    parser.add_argument('--dropout', type=float, default=0.05, help='Dropout rate for regularization (only used by basic/simba architectures)')
+    # Actor/Shared Network Config (Defaults for MLP: 1024/4)
+    parser.add_argument('--hidden_dim', type=int, default=1024, help='Hidden dimension for the ACTOR network (or shared network if using simbav2-shared/mlp)')
+    parser.add_argument('--num_blocks', type=int, default=4, help='Number of layers/blocks in the ACTOR network (or shared network if using simbav2-shared/mlp)')
+    parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate for regularization (used by basic/simba/mlp architectures)')
 
-    # Critic Network Config (Defaults from SimbaV2 Critic)
-    parser.add_argument('--hidden_dim_critic', type=int, default=768, help='Hidden dimension for the CRITIC network (only used if model-arch is not shared)')
-    parser.add_argument('--num_blocks_critic', type=int, default=4, help='Number of residual blocks in the CRITIC network (only used if model-arch is not shared)')
+    # Critic Network Config (Defaults for MLP: 1024/4)
+    parser.add_argument('--hidden_dim_critic', type=int, default=1024, help='Hidden dimension for the CRITIC network (only used if model-arch is not shared)')
+    parser.add_argument('--num_blocks_critic', type=int, default=4, help='Number of layers/blocks in the CRITIC network (only used if model-arch is not shared)')
 
     # Action stacking parameters
     parser.add_argument('--stack_size', type=int, default=5, help='Number of previous actions to stack')
@@ -1855,8 +1855,8 @@ if __name__ == "__main__":
                         help='Legacy parameter; use --num_envs instead')
 
     # Model architecture argument
-    parser.add_argument('--model-arch', type=str, default='simba', choices=['basic', 'simba', 'simbav2', 'simbav2-shared'], # Changed default to simbav2
-                       help='Model architecture to use (basic, simba, simbav2, simbav2-shared)')
+    parser.add_argument('--model-arch', type=str, default='mlp', choices=['mlp', 'basic', 'simba', 'simbav2', 'simbav2-shared'],
+                       help='Model architecture to use (mlp, basic, simba, simbav2, simbav2-shared)')
 
     # Add reward scaling args here, before parse_args() (REMOVED - Handled in Algorithm)
     # parser.add_argument('--use-reward-scaling', action='store_true', dest='use_reward_scaling', help='Enable SimbaV2 reward scaling')
@@ -1935,7 +1935,13 @@ if __name__ == "__main__":
     }
 
 
-    if args.model_arch == 'basic':
+    if args.model_arch == 'mlp':
+        ModelClass = MLPModel
+        actor_kwargs['dropout_rate'] = args.dropout
+        critic_kwargs['dropout_rate'] = args.dropout
+        actor = ModelClass(obs_shape=obs_space_dims, action_shape=action_space_dims, hidden_dim=args.hidden_dim, num_blocks=args.num_blocks, dropout_rate=args.dropout)
+        critic = ModelClass(obs_shape=obs_space_dims, action_shape=1, hidden_dim=args.hidden_dim_critic, num_blocks=args.num_blocks_critic, dropout_rate=args.dropout)
+    elif args.model_arch == 'basic':
         ModelClass = BasicModel
         actor_kwargs['dropout_rate'] = args.dropout
         critic_kwargs['dropout_rate'] = args.dropout # Use same dropout for basic critic

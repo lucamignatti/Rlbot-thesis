@@ -13,7 +13,6 @@ class BasicModel(nn.Module):
         self.device = device
 
         # Input norm and embedding
-        self.input_norm = RSNorm(obs_shape)
         self.embedding = nn.Linear(obs_shape, hidden_dim)
 
         # Dropout (MPS-friendly if needed)
@@ -33,7 +32,6 @@ class BasicModel(nn.Module):
 
     def forward(self, x, return_features=False):
         # Input normalization and embedding
-        x = self.input_norm(x)
         features = self.embedding(x)
         features = self.dropout(features)
 
