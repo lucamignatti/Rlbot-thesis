@@ -367,6 +367,18 @@ class AuxiliaryTaskManager:
         self.last_rp_loss = 0.0
         self.history_size = 0
 
+    def get_parameters(self):
+        """
+        Collects and returns all trainable parameters from the managed auxiliary tasks.
+        """
+        params = []
+        # StateRepresentationTask and RewardPredictionTask are assumed to be nn.Module or similar
+        if hasattr(self.sr_task, 'parameters') and callable(self.sr_task.parameters):
+            params.extend(list(self.sr_task.parameters()))
+        if hasattr(self.rp_task, 'parameters') and callable(self.rp_task.parameters):
+            params.extend(list(self.rp_task.parameters()))
+        return params
+
     @property
     def history_filled(self):
         """Property to track how many items are in the history (for test compatibility)"""

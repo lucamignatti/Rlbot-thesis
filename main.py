@@ -1659,7 +1659,7 @@ if __name__ == "__main__":
 
     parser.add_argument('-n', '--num_envs', type=int, default=300,
                         help='Number of parallel environments to run for faster data collection')
-    parser.add_argument('--update_interval', type=int, default=524288,
+    parser.add_argument('--update_interval', type=int, default=4194304,
                         help='Number of experiences to collect before updating the policy (PPO)')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use for training (cuda/mps/cpu).  Autodetects if not specified.')
