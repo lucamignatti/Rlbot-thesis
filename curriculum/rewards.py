@@ -736,15 +736,15 @@ class LucySKGReward(BaseRewardFunction):
         self.save_boost = SaveBoostReward(weight=0.5)
         self.distance_weighted_alignment = DistanceWeightedAlignmentKRC(team_goal_y=team_goal_y, dispersion=1.1, weight=0.6)
         self.offensive_potential = OffensivePotentialKRC(team_goal_y=team_goal_y, dispersion=1.1, density=1.1, weight=1.0)
-
-        # Event reward functions
-        self.goal = None  # Goal event reward - weight 10.0
-        self.concede = None  # Concede event reward - weight -3.0
-        self.shot = None  # Shot event reward - weight 1.5
         self.touch_ball_to_goal_acceleration = TouchBallToGoalAccelerationReward(team_goal_y=team_goal_y, weight=0.25)
         self.touch_ball = TouchBallReward(weight=0.05)
-        self.demolish = None  # Demolish event reward - weight 2.0
-        self.demolished = None  # Demolished event reward - weight -2.0
+
+        # Event reward tracking
+        self.last_state = None
+        self.last_scores = None
+        self.last_shots = {}
+        self.last_demolishes = {}
+        self.last_demolished = {}
 
         # Weights from paper
         self.weights = {
@@ -779,6 +779,13 @@ class LucySKGReward(BaseRewardFunction):
         # Reset team rewards tracking
         self.team_rewards = {0: [], 1: []}
 
+        # Reset event reward tracking
+        self.last_state = initial_state
+        self.last_scores = {team: 0 for team in [0, 1]}
+        self.last_shots = {str(agent): 0 for agent in agents}
+        self.last_demolishes = {str(agent): 0 for agent in agents}
+        self.last_demolished = {str(agent): 0 for agent in agents}
+
     def calculate(self, agent_id, state: GameState, previous_state: Optional[GameState] = None) -> float:
         reward = 0.0
 
@@ -789,24 +796,62 @@ class LucySKGReward(BaseRewardFunction):
         reward += self.distance_weighted_alignment.calculate(agent_id, state, previous_state)
         reward += self.offensive_potential.calculate(agent_id, state, previous_state)
 
+        # Add event rewards (goal, concede, shot, demolish, demolished)
+        # These are detected by comparing state to previous state
+        car_id = str(agent_id) if isinstance(agent_id, str) else str(getattr(agent_id, 'car_id', agent_id))
+        player_team = self._get_player_team(agent_id, state)
+        opponent_team = 1 if player_team == 0 else 0
 
-        # Add event rewards
-        # Note: Goal, Concede, Shot, Demolish and Demolished are not implemented here
-        # as they're typically handled by the game environment directly
+        # Goal/concede detection
+        if self.last_state and hasattr(state, 'scores') and hasattr(self.last_state, 'scores'):
+            prev_scores = getattr(self.last_state, 'scores', {0: 0, 1: 0})
+            curr_scores = getattr(state, 'scores', {0: 0, 1: 0})
+            # Goal for player's team
+            if curr_scores[player_team] > prev_scores[player_team]:
+                reward += self.weights['goal']
+            # Concede (opponent scored)
+            if curr_scores[opponent_team] > prev_scores[opponent_team]:
+                reward += self.weights['concede']
+
+        # Shot detection
+        if hasattr(state, 'cars') and car_id in state.cars:
+            car = state.cars[car_id]
+            curr_shots = getattr(car, 'shots', 0)
+            prev_shots = self.last_shots.get(car_id, 0)
+            if curr_shots > prev_shots:
+                reward += self.weights['shot']
+            self.last_shots[car_id] = curr_shots
+
+            # Demolish detection (player demolished someone)
+            curr_demolishes = getattr(car, 'demolishes', 0)
+            prev_demolishes = self.last_demolishes.get(car_id, 0)
+            if curr_demolishes > prev_demolishes:
+                reward += self.weights['demolish']
+            self.last_demolishes[car_id] = curr_demolishes
+
+            # Demolished detection (player was demolished)
+            curr_demolished = getattr(car, 'demolished', 0)
+            prev_demolished = self.last_demolished.get(car_id, 0)
+            if curr_demolished > prev_demolished:
+                reward += self.weights['demolished']
+            self.last_demolished[car_id] = curr_demolished
+
+        # Add touch/acceleration event rewards
         reward += self.touch_ball_to_goal_acceleration.calculate(agent_id, state, previous_state)
         reward += self.touch_ball.calculate(agent_id, state, previous_state)
 
         # Track rewards for team spirit calculation
-        player_team = self._get_player_team(agent_id, state)
         self.team_rewards[player_team].append(reward)
 
         # Apply team spirit formula: R'i = (1-τ)*R'i + τ*(R'team - R'opponent)
         if self.team_spirit > 0:
-            opponent_team = 1 if player_team == 0 else 0
             team_avg = np.mean(self.team_rewards[player_team]) if self.team_rewards[player_team] else 0
             opponent_avg = np.mean(self.team_rewards[opponent_team]) if self.team_rewards[opponent_team] else 0
             team_component = team_avg - opponent_avg
             reward = (1.0 - self.team_spirit) * reward + self.team_spirit * team_component
+
+        # Update last state for event detection
+        self.last_state = state
 
         return clamp_reward(reward)
 
@@ -939,22 +984,6 @@ def create_lucy_skg_reward(team_goal_y=5120):
     Creates the complete Lucy-SKG reward function as described in the paper.
     Includes all utility and event rewards with appropriate weights.
     """
-    # Create the reward components
-    ball_to_goal_distance = BallToGoalDistanceReward(
-        team_goal_y=team_goal_y,
-        offensive_dispersion=0.6,
-        defensive_dispersion=0.4,
-        offensive_density=1.0,
-        defensive_density=1.0
-    )
-    ball_to_goal_velocity = BallVelocityToGoalReward(team_goal_y=team_goal_y, weight=0.8)
-    save_boost = SaveBoostReward(weight=0.5)
-    distance_weighted_alignment = create_distance_weighted_alignment_reward(team_goal_y)
-    offensive_potential = create_offensive_potential_reward(team_goal_y)
-    touch_ball_to_goal_acceleration = TouchBallToGoalAccelerationReward(team_goal_y=team_goal_y, weight=0.25)
-    touch_ball = TouchBallReward(weight=0.05)
-
-    # Combine into a single reward function
     return LucySKGReward(team_goal_y=team_goal_y, team_spirit=0.3)
 
 

@@ -1673,7 +1673,7 @@ if __name__ == "__main__":
                     help='Enable curriculum learning')
     parser.add_argument('--no-curriculum', action='store_false', dest='curriculum',
                     help='Disable curriculum learning')
-    parser.set_defaults(curriculum=True)
+    parser.set_defaults(curriculum=False)
 
     # Add single-stage mode argument
     parser.add_argument('--stage', type=int, default=None,
