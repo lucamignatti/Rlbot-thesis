@@ -8,14 +8,15 @@ from rlgym.rocket_league.done_conditions import GoalCondition, TimeoutCondition,
 from rlgym.rocket_league.reward_functions import CombinedReward, GoalReward, TouchReward
 from rlgym.rocket_league.state_mutators import MutatorSequence, FixedTeamSizeMutator, KickoffMutator
 from .rewards import (
-    ZeroSumRewardWrapper, BallProximityReward, BallToGoalDistanceReward, TouchBallReward,
+    BaseRewardFunction, ZeroSumRewardWrapper, BallProximityReward, BallToGoalDistanceReward, TouchBallReward,
     BallVelocityToGoalReward, AlignBallToGoalReward, SaveBoostReward,
     KRCReward, PlayerVelocityTowardBallReward, TouchBallToGoalAccelerationReward,
     PassCompletionReward, ScoringOpportunityCreationReward, AerialControlReward,
     AerialDirectionalTouchReward, BlockSuccessReward, DefensivePositioningReward,
     BallClearanceReward, TeamSpacingReward, TeamPossessionReward, AirReward,
     create_distance_weighted_alignment_reward, create_offensive_potential_reward, create_lucy_skg_reward,
-    AerialDistanceReward, FlipResetReward, WavedashReward, FirstTouchSpeedReward, SpeedflipReward
+    AerialDistanceReward, FlipResetReward, WavedashReward, FirstTouchSpeedReward, SpeedflipReward, LucySKGReward,
+    DistanceWeightedAlignmentKRC, OffensivePotentialKRC
 )
 
 # Advanced touch reward that scales with touch strength as per guide recommendation
@@ -38,21 +39,21 @@ class TouchBallVelocityReward(TouchBallReward):
         if player.ball_touched:
             # Get current ball velocity
             curr_ball_vel = state.ball.linear_velocity
-            
+
             # If we have previous velocity, calculate the change
             if self.prev_ball_vel is not None:
                 # Calculate velocity change magnitude
                 vel_change = np.linalg.norm(curr_ball_vel - self.prev_ball_vel)
-                
+
                 # Scale the reward based on velocity change
                 if vel_change > self.min_vel_change:
                     # Clamp to max and normalize to 0-1
                     normalized_change = min(vel_change, self.max_vel_change) / self.max_vel_change
                     return normalized_change
-            
+
             # Default touch reward if we can't calculate velocity change
             return 0.2
-        
+
         # Store current velocity for next step
         self.prev_ball_vel = state.ball.linear_velocity.copy()
         return 0
@@ -71,89 +72,245 @@ class EnhancedAerialTouchReward(AerialDirectionalTouchReward):
         super().__init__(goal_y=goal_y)
         self.max_time_in_air = max_time_in_air
         self.player_air_time = {}  # Track air time for each player
-    
+
     def reset(self, initial_state):
         super().reset(initial_state)
         self.player_air_time = {}
-    
+
     def get_reward(self, player, state, previous_action):
         # Base reward from parent class (directional touch)
         directional_touch_reward = super().get_reward(player, state, previous_action)
-        
+
         # Update air time tracking
         player_id = player.car_id
         if player_id not in self.player_air_time:
             self.player_air_time[player_id] = 0
-            
+
         if not player.on_ground:
             self.player_air_time[player_id] += state.dt
         else:
             self.player_air_time[player_id] = 0
-            
+
         # Calculate height fraction
         ceiling_height = 2044  # Ceiling height in Rocket League
         height_frac = state.ball.position[2] / ceiling_height
-        
+
         # Calculate air time fraction
         air_time_frac = min(self.player_air_time[player_id], self.max_time_in_air) / self.max_time_in_air
-        
+
         # Combine the rewards - only add the air/height component if we have a touch
         if directional_touch_reward > 0:
             # Use minimum to require both height and air time
             height_air_factor = min(air_time_frac, height_frac)
             return directional_touch_reward * (1 + height_air_factor)
-        
+
         return directional_touch_reward
 
-# Zero-sum reward wrapper as recommended by the guide
-class ZeroSumReward:
-    """
-    Wrapper to make a reward zero-sum between teams.
-    Based on the guide recommendation for certain reward types.
-    """
-    def __init__(self, reward_function, team_spirit=0.0):
+# Import standard Python libraries
+from typing import Any, Dict, List, Tuple
+import numpy as np
+import random
+import inspect
+
+# Import the RLGym reward functions
+from rlgym.api import RewardFunction, AgentID
+from rlgym.rocket_league.api import GameState
+
+# Try to import reward functions - these may fail if libraries aren't installed
+try:
+    from rlgym.rocket_league.reward_functions import CombinedReward, GoalReward, TouchReward
+    RLGYM_REWARDS_AVAILABLE = True
+except ImportError:
+    print("Warning: rlgym reward functions not available. CustomReward will be used instead.")
+    RLGYM_REWARDS_AVAILABLE = False
+
+# Try to import rlgym-tools reward functions
+try:
+    from rlgym_tools.rocket_league.reward_functions.velocity_player_to_ball_reward import VelocityPlayerToBallReward
+    from rlgym_tools.rocket_league.reward_functions.ball_travel_reward import BallTravelReward
+    from rlgym_tools.rocket_league.reward_functions.advanced_touch_reward import AdvancedTouchReward
+    from rlgym_tools.rocket_league.reward_functions.boost_change_reward import BoostChangeReward
+    from rlgym_tools.rocket_league.reward_functions.goal_prob_reward import GoalViewReward
+    from rlgym_tools.rocket_league.reward_functions.aerial_distance_reward import AerialDistanceReward
+    from rlgym_tools.rocket_league.reward_functions.team_spirit_reward_wrapper import TeamSpiritRewardWrapper
+    from rlgym_tools.rocket_league.reward_functions.flip_reset_reward import FlipResetReward
+    from rlgym_tools.rocket_league.reward_functions.wavedash_reward import WavedashReward
+    from rlgym_tools.rocket_league.reward_functions.demo_reward import DemoReward
+    RLGYM_TOOLS_AVAILABLE = True
+except ImportError:
+    print("Warning: rlgym-tools reward functions not available. CustomReward will be used instead.")
+    RLGYM_TOOLS_AVAILABLE = False
+
+
+
+# Adapter class is no longer needed; using ZeroSumRewardWrapper from .rewards
+    def __init__(self, reward_function):
+        super().__init__()
         self.reward_function = reward_function
-        self.team_spirit = team_spirit  # How much reward to share among teammates
-        self.rewards = {}  # Store rewards for all players
-    
+        self.agents = {}  # Map car_id to AgentID
+        self.current_state = None
+        self.cached_rewards = {}
+
     def reset(self, initial_state):
-        self.reward_function.reset(initial_state)
-        self.rewards = {}
-    
+        """
+        Reset method for curriculum interface
+        """
+        # Create a simplified GameState from initial_state for the reset method
+        game_state = self._convert_to_game_state(initial_state)
+
+        # Initialize agent_ids map
+        self.agents = {}
+        for player in initial_state.players:
+            self.agents[player.car_id] = player.car_id  # Use car_id as the AgentID
+
+        # Call the wrapped function's reset
+        agent_ids = list(self.agents.values())
+        shared_info = {}
+        # Use rlgym_reset if available, otherwise fall back to reset
+        if hasattr(self.reward_function, 'rlgym_reset'):
+            self.reward_function.rlgym_reset(agent_ids, game_state, shared_info)
+        elif hasattr(self.reward_function, 'reset'):
+            self.reward_function.reset(agent_ids, game_state, shared_info)
+        self.cached_rewards = {}
+
+    # Method for curriculum interface
     def get_reward(self, player, state, previous_action):
-        player_id = player.car_id
-        team = player.team_num
-        
-        # If we haven't calculated this player's reward yet, do so
-        if player_id not in self.rewards:
-            self.rewards[player_id] = self.reward_function.get_reward(player, state, previous_action)
-        
-        # Get all players
-        all_players = state.players
-        
-        # Separate players by team
-        team_players = [p for p in all_players if p.team_num == team]
-        opponent_players = [p for p in all_players if p.team_num != team]
-        
-        # Calculate rewards for all players if not done already
-        for p in all_players:
-            if p.car_id not in self.rewards:
-                self.rewards[p.car_id] = self.reward_function.get_reward(p, state, previous_action)
-        
-        # Calculate team average reward (including self)
-        team_rewards = [self.rewards[p.car_id] for p in team_players]
-        team_avg_reward = sum(team_rewards) / len(team_rewards) if team_rewards else 0
-        
-        # Calculate opponent average reward
-        opp_rewards = [self.rewards[p.car_id] for p in opponent_players]
-        opp_avg_reward = sum(opp_rewards) / len(opp_rewards) if opp_rewards else 0
-        
-        # Apply team spirit and zero-sum
-        individual_reward = self.rewards[player_id]
-        team_spirit_reward = (individual_reward * (1 - self.team_spirit)) + (team_avg_reward * self.team_spirit)
-        zero_sum_reward = team_spirit_reward - opp_avg_reward
-        
-        return zero_sum_reward
+        # Convert state to GameState expected by rlgym
+        game_state = self._convert_to_game_state(state)
+        self.current_state = game_state
+
+        # Make sure this agent is in our map
+        if player.car_id not in self.agents:
+            self.agents[player.car_id] = player.car_id
+
+        # We only need the reward for one agent
+        agent_id = self.agents[player.car_id]
+        is_terminated = {agent_id: False}
+        is_truncated = {agent_id: False}
+        shared_info = {}
+
+        # Call the wrapped function and extract just the reward we need
+        rewards = self.reward_function.get_rewards([agent_id], game_state, is_terminated, is_truncated, shared_info)
+        # Cache the reward for potential future calls to get_rewards
+        self.cached_rewards[agent_id] = rewards[agent_id]
+        return rewards[agent_id]
+
+    def rlgym_reset(self, agents: List[AgentID], initial_state: GameState, shared_info: Dict[str, Any]) -> None:
+        """Reset implementation for rlgym API - won't be called in current curriculum"""
+        self.agents = {agent: agent for agent in agents}
+        # Use rlgym_reset if available, otherwise fall back to reset
+        if hasattr(self.reward_function, 'rlgym_reset'):
+            self.reward_function.rlgym_reset(agents, initial_state, shared_info)
+        elif hasattr(self.reward_function, 'reset') and len(inspect.signature(self.reward_function.reset).parameters) >= 3:
+            self.reward_function.reset(agents, initial_state, shared_info)
+        self.cached_rewards = {}
+
+    def get_rewards(self, agents: List[AgentID], state: GameState,
+                   is_terminated: Dict[AgentID, bool],
+                   is_truncated: Dict[AgentID, bool],
+                   shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
+        """Get rewards implementation for rlgym API"""
+        self.current_state = state
+        return self.reward_function.get_rewards(agents, state, is_terminated, is_truncated, shared_info)
+
+    def _convert_to_game_state(self, state):
+        """Create a simplified GameState compatible with rlgym from our state"""
+        # This is a simplified adapter - you may need to add more state conversions
+        class SimpleGameState:
+            def __init__(self, state):
+                self.ball = state.ball
+                self.cars = {player.car_id: player for player in state.players}
+                self.goal_scored = hasattr(state, 'goal_scored') and state.goal_scored
+                self.scoring_team = getattr(state, 'scoring_team', -1)
+                self.players = state.players
+                # Add any other required fields for rlgym compatibility
+
+        return SimpleGameState(state)
+
+# --- Configure RLGym-Based Reward Functions ---
+def create_phase1_reward():
+    """
+    Phase 1: Basic Ball Interaction
+    Rewards for touching the ball and moving towards it
+    Based on the RLGym-PPO guide recommendation for early training
+    """
+    # Main components with appropriate weights
+    velocity_reward = VelocityPlayerToBallReward(include_negative_values=True)
+    touch_reward = AdvancedTouchReward(touch_reward=10.0, acceleration_reward=5.0)
+    ball_travel_reward = BallTravelReward(consecutive_weight=2.0, goal_weight=3.0)
+
+    # Combine rewards
+    combined = CombinedReward(
+        (velocity_reward, 1.0),
+        (touch_reward, 1.0),
+        (ball_travel_reward, 0.5)
+    )
+
+    # Wrap in zero-sum reward wrapper
+    return ZeroSumRewardWrapper(combined, team_spirit=0.2)
+
+def create_phase2_reward():
+    """
+    Phase 2: Goal Scoring Focus
+    Rewards for moving the ball toward the goal and scoring
+    """
+    # Main components with appropriate weights
+    velocity_reward = VelocityPlayerToBallReward(include_negative_values=True)
+    touch_reward = AdvancedTouchReward(touch_reward=5.0, acceleration_reward=7.0)
+    ball_travel_reward = BallTravelReward(consecutive_weight=1.0, goal_weight=5.0)
+    goal_reward = GoalReward()
+    goal_prob_reward = GoalViewReward(gamma=0.99)
+    boost_reward = BoostChangeReward(gain_weight=0.5, lose_weight=0.3)
+
+    # Combine rewards
+    combined = CombinedReward(
+        (velocity_reward, 0.5),
+        (touch_reward, 0.7),
+        (ball_travel_reward, 1.0),
+        (goal_reward, 10.0),
+        (goal_prob_reward, 3.0),
+        (boost_reward, 0.2)
+    )
+
+    # Wrap in zero-sum reward wrapper
+    return ZeroSumRewardWrapper(combined, team_spirit=0.3)
+
+def create_phase3_reward():
+    """
+    Phase 3: Advanced Play
+    Full game rewards including aerial play and team coordination
+    """
+    # Basic components
+    velocity_reward = VelocityPlayerToBallReward(include_negative_values=True)
+    touch_reward = AdvancedTouchReward(touch_reward=3.0, acceleration_reward=5.0)
+    ball_travel_reward = BallTravelReward(consecutive_weight=1.0, goal_weight=5.0,
+                                          pass_weight=2.0, receive_weight=2.0)
+    goal_reward = GoalReward()
+    goal_prob_reward = GoalViewReward(gamma=0.99)
+    boost_reward = BoostChangeReward(gain_weight=0.3, lose_weight=0.2)
+
+    # Advanced mechanics components
+    aerial_reward = AerialDistanceReward(touch_height_weight=1.0, ball_distance_weight=1.0)
+    flip_reset_reward = FlipResetReward()
+    demo_reward = DemoReward()
+    wavedash_reward = WavedashReward()
+
+    # Combine all rewards with appropriate weights
+    combined = CombinedReward(
+        (velocity_reward, 0.4),
+        (touch_reward, 0.5),
+        (ball_travel_reward, 1.0),
+        (goal_reward, 15.0),
+        (goal_prob_reward, 4.0),
+        (boost_reward, 0.3),
+        (aerial_reward, 2.0),
+        (flip_reset_reward, 3.0),
+        (demo_reward, 1.0),
+        (wavedash_reward, 0.8)
+    )
+
+    # Wrap in zero-sum reward wrapper
+    return ZeroSumRewardWrapper(combined, team_spirit=0.5)
 
 # --- Position/Orientation Helper Functions (Keep existing ones) ---
 
@@ -241,109 +398,34 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         CurriculumManager: The created curriculum manager
     """
     # Use provided learning rates or fall back to defaults
-    default_lr_actor = 0.0002 # Guide suggestion for early stages
-    default_lr_critic = 0.0002 # Guide suggestion for early stages (matching actor)
+    default_lr_actor = 0.0003 # Adjusted default
+    default_lr_critic = 0.0003 # Adjusted default
     lr_actor = lr_actor if lr_actor is not None else default_lr_actor
     lr_critic = lr_critic if lr_critic is not None else default_lr_critic
 
     if debug:
-        print(f"[DEBUG Curriculum] Creating 2v2 curriculum. Initial LR Actor: {lr_actor}, Initial LR Critic: {lr_critic}")
-        if use_pretraining:
-            print("[DEBUG Curriculum] Note: use_pretraining=True flag ignored, starting directly with 2v2 stages.")
+        print(f"[DEBUG Curriculum] Creating 3-stage curriculum. Initial LR Actor: {lr_actor}, Initial LR Critic: {lr_critic}")
+        if use_pretraining: # This flag is noted as ignored but kept for compatibility
+            print("[DEBUG Curriculum] Note: use_pretraining=True flag is present but this curriculum starts directly with 2v2 stages.")
 
     # --- Constants and Common Components ---
-    VERY_SHORT_TIMEOUT = 5
-    SHORT_TIMEOUT = 10
-    MED_TIMEOUT = 20
-    LONG_TIMEOUT = 45
-    MATCH_TIMEOUT = 300
-
-    # Team spirit parameter - will increase gradually through stages
-    # Starting low as recommended by the guide to speed up early learning
-    team_spirit_values = {
-        "stage1": 0.0,  # No team spirit in early stage
-        "stage2": 0.1,  # Small amount
-        "stage3": 0.2,  # Increasing
-        "stage4": 0.3,
-        "stage5": 0.6,  # Significant increase in team positioning stage
-        "stage6": 0.8,
-        "stage7": 1.0   # Full team spirit in final stage as recommended
-    }
+    VERY_SHORT_TIMEOUT = 10 # Increased slightly
+    MED_TIMEOUT = 30
+    MATCH_TIMEOUT = 300 # Standard match time
 
     goal_condition = GoalCondition()
-    timeout_vs = TimeoutCondition(VERY_SHORT_TIMEOUT)
-    timeout_s = TimeoutCondition(SHORT_TIMEOUT)
-    timeout_m = TimeoutCondition(MED_TIMEOUT)
-    timeout_l = TimeoutCondition(LONG_TIMEOUT)
-    timeout_match = TimeoutCondition(MATCH_TIMEOUT)
-    touch_condition = TouchBallCondition() # Assuming this exists and works
+    # Timeout conditions, instantiated per stage for clarity or if values differ significantly
+    # For simplicity, we can define them here if they are reused with these exact values.
+    timeout_touch_stage = TimeoutCondition(VERY_SHORT_TIMEOUT)
+    timeout_score_stage = TimeoutCondition(MED_TIMEOUT)
+    timeout_full_game_stage = TimeoutCondition(MATCH_TIMEOUT)
 
-    # --- Reward Components (Instantiate once) ---
-    touch_ball_reward = TouchBallReward()
-    # Enhanced touch ball reward that scales with velocity change
-    touch_ball_velocity_reward = TouchBallVelocityReward(min_vel_change=100, max_vel_change=4000)
-    velocity_to_ball_reward = PlayerVelocityTowardBallReward()
-    ball_proximity_reward = BallProximityReward(negative_slope=True) # Reward closer proximity more
-    save_boost_reward = SaveBoostReward()
-    velocity_ball_to_goal_reward = BallVelocityToGoalReward(team_goal_y=5120)
-    goal_reward_base = GoalReward() # Base goal reward instance
-    touch_accel_reward = TouchBallToGoalAccelerationReward(team_goal_y=5120)
-    offensive_potential_krc = create_offensive_potential_reward(team_goal_y=5120)
-    block_success_reward = BlockSuccessReward(goal_y=5120)
-    defensive_positioning_reward = DefensivePositioningReward(goal_y=5120)
-    ball_clearance_reward = BallClearanceReward(goal_y=5120)
-    team_spacing_reward = TeamSpacingReward()
-    team_possession_reward = TeamPossessionReward()
-    aerial_control_reward = AerialControlReward()
-    aerial_touch_reward = AerialDirectionalTouchReward(goal_y=5120)
-    # Enhanced aerial reward combining height and air time
-    enhanced_aerial_reward = EnhancedAerialTouchReward(goal_y=5120, max_time_in_air=1.75)
-    lucy_skg_reward = create_lucy_skg_reward(team_goal_y=5120) # Base full game reward (may include goal logic)
-    pass_completion_reward = PassCompletionReward()
-    opportunity_creation_reward = ScoringOpportunityCreationReward(goal_y=5120)
-    air_reward = AirReward(weight=0.2) # Instantiate AirReward with weight
+    # TouchBallCondition might be useful for the first stage's termination
+    touch_ball_condition = TouchBallCondition()
 
-    # Aggression bias for final stage
-    aggression_bias = 0.2  # Using 0.2 as recommended by the guide
-    final_goal_weight = 5.0 # Moderate goal weight for final stage
-    final_concede_weight = -final_goal_weight * (1 - aggression_bias) # Reduced penalty for being scored on
+    # --- Keeping some of the existing mutators and position functions ---
 
-    # Optional advanced mechanics
-    flip_reset_reward = FlipResetReward()
-    wavedash_reward = WavedashReward()
-    speedflip_reward = SpeedflipReward()
-    
-    # Create zero-sum versions of rewards as recommended by the guide
-    # These should be rewards where it's beneficial for opponents to prevent the action
-    
-    # Team spirit values for different stages - start with low values and increase
-    team_spirit_values = {
-        "stage1": 0.0,  # No team spirit in early stages (pure individual rewards)
-        "stage2": 0.0,
-        "stage3": 0.1,  # Start introducing slight team spirit
-        "stage4": 0.2,
-        "stage5": 0.3,  # Medium team spirit for team positioning stage
-        "stage6": 0.5,  # Higher team spirit for aerial foundations
-        "stage7": 0.7   # Highest team spirit for full game
-    }
-    
-    # Zero-sum wrappers for rewards where opponents want to prevent the action
-    zero_sum_velocity_to_ball = ZeroSumRewardWrapper(velocity_to_ball_reward)
-    zero_sum_ball_velocity_to_goal = ZeroSumRewardWrapper(velocity_ball_to_goal_reward) 
-    zero_sum_touch_accel = ZeroSumRewardWrapper(touch_accel_reward)
-    zero_sum_block = ZeroSumRewardWrapper(block_success_reward)
-    zero_sum_clearance = ZeroSumRewardWrapper(ball_clearance_reward)
-    zero_sum_team_possession = ZeroSumRewardWrapper(team_possession_reward)
-    zero_sum_aerial_touch = ZeroSumRewardWrapper(aerial_touch_reward)
-    zero_sum_pass = ZeroSumRewardWrapper(pass_completion_reward)
-    zero_sum_opportunity = ZeroSumRewardWrapper(opportunity_creation_reward)
-    zero_sum_flip_reset = ZeroSumRewardWrapper(flip_reset_reward)
-    
-    # Higher team spirit for later stages
-    zero_sum_team_possession_late = ZeroSumRewardWrapper(team_possession_reward, team_spirit=team_spirit_values["stage5"])
-    zero_sum_pass_late = ZeroSumRewardWrapper(pass_completion_reward, team_spirit=team_spirit_values["stage7"])
-    zero_sum_opportunity_late = ZeroSumRewardWrapper(opportunity_creation_reward, team_spirit=team_spirit_values["stage7"])
-    zero_sum_aerial = ZeroSumRewardWrapper(enhanced_aerial_reward, team_spirit=team_spirit_values["stage7"])
+    # Use imported reward functions instead of custom LucySKGReward
 
     # --- Mutators ---
     kickoff_mutator = KickoffMutator()
@@ -357,6 +439,17 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         CarPositionMutator(car_id="blue-1", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-2000, 2000), random.uniform(-4500, -1000), 17])), orientation_function=get_random_yaw_orientation),
         CarPositionMutator(car_id="orange-0", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-2000, 2000), random.uniform(1000, 4500), 17])), orientation_function=get_random_yaw_orientation),
         CarPositionMutator(car_id="orange-1", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-2000, 2000), random.uniform(1000, 4500), 17])), orientation_function=get_random_yaw_orientation),
+    )
+
+    # Simple spawn for touch stage (ball at center, cars in kickoff pos)
+    simple_touch_spawn = MutatorSequence(
+        fixed_2v2_mutator,
+        BallPositionMutator(position_function=SafePositionWrapper(lambda: np.array([0, 0, 93.15]))), # Standard ball spawn height
+        CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(lambda: np.array([2048, -2560, 17.01])), orientation_function=get_face_opp_goal_orientation),
+        CarPositionMutator(car_id="blue-1", position_function=SafePositionWrapper(lambda: np.array([-2048, -2560, 17.01])), orientation_function=get_face_opp_goal_orientation),
+        CarPositionMutator(car_id="orange-0", position_function=SafePositionWrapper(lambda: np.array([2048, 2560, 17.01])), orientation_function=get_face_own_goal_orientation),
+        CarPositionMutator(car_id="orange-1", position_function=SafePositionWrapper(lambda: np.array([-2048, 2560, 17.01])), orientation_function=get_face_own_goal_orientation),
+        CarBoostMutator(boost_amount=33) # Start with some boost
     )
 
     # Offensive scenario spawn
@@ -396,219 +489,83 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
 
     # --- Stage Definitions ---
 
-    # STAGE 1: 2v2 Basic Interaction & Movement (Following Guide's Early Stage)
-    stage1 = CurriculumStage(
-        name="2v2 Basic Interaction",
-        state_mutator=MutatorSequence(fixed_2v2_mutator, kickoff_mutator),
-        reward_function=CombinedReward(
-            (touch_ball_reward, 50.0),          # Giant reward for touching (Guide: ~50)
-            (zero_sum_velocity_to_ball, 5.0),   # Zero-sum version of velocity to ball (competition for speed)
-            (ball_proximity_reward, 1.0),       # Smaller proximity reward (Guide: FaceBall ~1)
-            (air_reward, 0.2),                  # Don't forget to jump (Guide: AirReward ~0.15, scaled up)
-            (ZeroSumRewardWrapper(save_boost_reward), 0.1)  # Zero-sum boost saving (competition for boost)
-        ),
-        termination_condition=timeout_s, # End quickly after kickoff phase (Guide: Short timeout)
-        truncation_condition=timeout_s,
+    # STAGE 1: Touch the Ball and Learn Basic Control
+    # Goal: Encourage the agent to make contact with the ball and move toward it effectively.
+    # Reward: Combined reward focused on ball touches and velocity toward the ball.
+    touch_reward_fn = create_phase1_reward()
+    stage_touch = CurriculumStage(
+        name="2v2 Basic Ball Control",
+        state_mutator=simple_touch_spawn, # Simple spawn, or kickoff_mutator
+        reward_function=touch_reward_fn,
+        termination_condition=touch_ball_condition, # End episode on touch
+        truncation_condition=timeout_touch_stage, # Short episodes
         progression_requirements=ProgressionRequirements(
-            min_success_rate=0.0, # Not applicable here
-            min_avg_reward=0.1,   # Just need some positive interaction signal
-            min_episodes=100,
-            max_std_dev=5.0,
-            required_consecutive_successes=1 # Not applicable
+            min_success_rate=0.5, # Success = positive reward from touching
+            min_avg_reward=2.0,   # Agent should be getting significant touch rewards
+            min_episodes=150,     # More episodes to ensure learning this basic skill
+            max_std_dev=15.0,     # Higher variance expected initially
+            required_consecutive_successes=5 # Ensure consistent touches
         ),
         hyperparameter_adjustments={
-            "lr_actor": lr_actor,       # Start with base LR (Guide: ~2e-4)
+            "lr_actor": lr_actor,       # Use initial LR
             "lr_critic": lr_critic,
-            "entropy_coef": 0.01      # Higher entropy for exploration
+            "entropy_coef": 0.02      # Higher entropy for exploration
         }
     )
 
-    # STAGE 2: 2v2 Directional Ball Control
-    stage2 = CurriculumStage(
-        name="2v2 Directional Control",
-        state_mutator=MutatorSequence(fixed_2v2_mutator, kickoff_mutator),
-        reward_function=CombinedReward(
-            (zero_sum_ball_velocity_to_goal, 1.2), # Zero-sum for powershots toward goal
-            (touch_ball_reward, 5.0),          # Lower touch reward significantly (Guide: Decrease a lot)
-            (zero_sum_velocity_to_ball, 0.2),  # Zero-sum for ball approach speed
-            (ball_proximity_reward, 0.1),
-            (ZeroSumRewardWrapper(save_boost_reward), 0.3) # Zero-sum boost saving with increased importance
-        ),
-        termination_condition=goal_condition, # End on goal or timeout
-        truncation_condition=timeout_m,
-        progression_requirements=ProgressionRequirements(
-            min_success_rate=0.0,
-            min_avg_reward=0.2,   # Expect slightly higher reward with directional push
-            min_episodes=150,
-            max_std_dev=4.0,
-            required_consecutive_successes=2
-        ),
-        hyperparameter_adjustments={
-            "lr_actor": lr_actor * 0.7, # Guide: Decrease LR to ~1e-4 (adjust multiplier if needed)
-            "lr_critic": lr_critic * 0.7,
-            "entropy_coef": 0.008
-        }
-    )
-
-    # STAGE 3: 2v2 Basic Offense & Scoring
-    stage3 = CurriculumStage(
-        name="2v2 Basic Offense",
-        state_mutator=offensive_spawn, # Use offensive scenarios
-        reward_function=CombinedReward(
-            (goal_reward_base, 5.0),                # Base goal reward weighted (Guide: ~20 relative weight, here 5 absolute)
-            (zero_sum_ball_velocity_to_goal, 1.0),  # Zero-sum for powershots toward goal
-            (touch_ball_velocity_reward, 0.5),      # Using the enhanced touch reward that scales with velocity
-            (zero_sum_touch_accel, 0.5),            # Zero-sum for accelerating ball to goal
-            (offensive_potential_krc, 0.3),         # Basic offensive positioning
-            (ZeroSumRewardWrapper(save_boost_reward, team_spirit=team_spirit_values["stage3"]), 0.2)
-        ),
+    # STAGE 2: Score Goals and Offensive Play
+    # Goal: Teach the agent to score goals and manage boost.
+    # Reward: Combined reward focused on goal scoring and ball positioning.
+    score_reward_fn = create_phase2_reward()
+    stage_score = CurriculumStage(
+        name="2v2 Goal Scoring",
+        state_mutator=offensive_spawn, # Spawn in offensive positions
+        reward_function=score_reward_fn,
         termination_condition=goal_condition,
-        truncation_condition=timeout_m,
+        truncation_condition=timeout_score_stage, # Medium length episodes
         progression_requirements=ProgressionRequirements(
-            min_success_rate=0.4, # Expect some goals now
-            min_avg_reward=0.3,
-            min_episodes=200,
-            max_std_dev=3.0,
-            required_consecutive_successes=3
-        ),
-        hyperparameter_adjustments={
-            "lr_actor": lr_actor * 0.6, # Continue decreasing LR
-            "lr_critic": lr_critic * 0.6,
-            "entropy_coef": 0.007,
-            "team_spirit": team_spirit_values["stage3"]  # Add team spirit parameter
-        }
-    )
-
-    # STAGE 4: 2v2 Basic Defense & Saves
-    stage4 = CurriculumStage(
-        name="2v2 Basic Defense",
-        state_mutator=defensive_spawn, # Use defensive scenarios
-        reward_function=CombinedReward(
-            # Use zero-sum rewards for defense, since it's beneficial for opponents to prevent these
-            (zero_sum_block, 1.5),               # Zero-sum reward for successful blocks
-            (defensive_positioning_reward, 1.0),  # Reward staying between ball and goal
-            (zero_sum_clearance, 0.7),           # Zero-sum reward for clearing the ball
-            (save_boost_reward, 0.3)
-            # Goal reward is implicitly negative via termination (opponent scoring)
-        ),
-        termination_condition=goal_condition, # Opponent scoring ends episode
-        truncation_condition=timeout_l,       # Longer timeout for defensive practice
-        progression_requirements=ProgressionRequirements(
-            min_success_rate=0.5, # High success = preventing goals
-            min_avg_reward=0.25,  # Lower avg reward expected in defense
-            min_episodes=200,
-            max_std_dev=2.5,
-            required_consecutive_successes=3
-        ),
-        hyperparameter_adjustments={
-            "lr_actor": lr_actor * 0.5,
-            "lr_critic": lr_critic * 0.5,
-            "entropy_coef": 0.006,
-            "team_spirit": team_spirit_values["stage4"]  # Add team spirit parameter
-        }
-    )
-
-    # STAGE 5: 2v2 Team Positioning & Spacing
-    stage5 = CurriculumStage(
-        name="2v2 Team Positioning",
-        state_mutator=MutatorSequence(fixed_2v2_mutator, kickoff_mutator),
-        reward_function=CombinedReward(
-            (lucy_skg_reward, 0.6),                     # Base reward for general play
-            (team_spacing_reward, 0.8),                 # Strongly reward good spacing
-            (zero_sum_team_possession_late, 0.5),       # Reward keeping ball near team (with team spirit)
-            # Add a small pass completion reward using zero-sum
-            (zero_sum_pass_late, 0.3)                   # Reward successful passes (zero-sum with team spirit)
-        ),
-        termination_condition=goal_condition,
-        truncation_condition=timeout_match,     # Full match length
-        progression_requirements=ProgressionRequirements(
-            min_success_rate=0.5,               # Based on goals (proxy for effectiveness)
-            min_avg_reward=0.3,
-            min_episodes=250,
-            max_std_dev=2.0,
-            required_consecutive_successes=2
-        ),
-        hyperparameter_adjustments={
-            "lr_actor": lr_actor * 0.4,
-            "lr_critic": lr_critic * 0.4,
-            "entropy_coef": 0.005,
-            "team_spirit": team_spirit_values["stage5"]  # Significant increase in team spirit for this stage
-        }
-    )
-
-    # STAGE 6: 2v2 Aerial Foundations
-    stage6 = CurriculumStage(
-        name="2v2 Aerial Foundations",
-        state_mutator=aerial_spawn, # Use aerial scenarios
-        reward_function=CombinedReward(
-            (lucy_skg_reward, 0.5),              # Base reward
-            (zero_sum_aerial, 1.0),              # Enhanced aerial reward with height and air time (zero-sum)
-            (aerial_control_reward, 0.7),        # Reward stable aerial control
-            (air_reward, 0.3)                    # Additional incentive to get airborne
-            # AerialDistanceReward removed as it wasn't instantiated
-        ),
-        termination_condition=goal_condition,
-        truncation_condition=timeout_l,
-        progression_requirements=ProgressionRequirements(
-            min_success_rate=0.45, # Aerials are harder
-            min_avg_reward=0.25,
+            min_success_rate=0.2, # Success = scoring a goal (can be challenging)
+            min_avg_reward=3.0,   # Higher reward due to goal focus
             min_episodes=300,
-            max_std_dev=2.5,
-            required_consecutive_successes=2
+            max_std_dev=10.0,
+            required_consecutive_successes=3
         ),
         hyperparameter_adjustments={
-            "lr_actor": lr_actor * 0.3, # Further decrease LR
-            "lr_critic": lr_critic * 0.3,
-            "entropy_coef": 0.004,
-            "team_spirit": team_spirit_values["stage6"]  # High team spirit for aerial stage
+            "lr_actor": lr_actor * 0.7, # Slightly reduce LR
+            "lr_critic": lr_critic * 0.7,
+            "entropy_coef": 0.01
         }
     )
 
-    # STAGE 7: 2v2 Full Game & Advanced Play (with Aggression Bias)
-    stage7 = CurriculumStage(
-        name="2v2 Full Game",
+    # STAGE 3: Full Game with Advanced Mechanics
+    # Goal: Play a full game with aerial skills, demos, and team coordination.
+    # Reward: Combined reward with full feature set.
+    full_game_reward_fn = create_phase3_reward()
+    stage_full_game = CurriculumStage(
+        name="2v2 Advanced Play",
         state_mutator=MutatorSequence(fixed_2v2_mutator, kickoff_mutator),
-        reward_function=CombinedReward(
-             # Use goal reward with aggression bias as recommended by the guide
-             (goal_reward_base, final_goal_weight),   # Positive reward for scoring
-             # We've configured final_concede_weight with aggression_bias of 0.2 as the guide recommends
-             # This makes conceding less punishing, encouraging aggressive play
-             (lucy_skg_reward, 0.8),                  # Slightly reduced weight if it overlaps with goal logic
-             (zero_sum_pass_late, 0.3),               # Using zero-sum version for passes with team spirit
-             (zero_sum_aerial, 0.3),                  # Using zero-sum enhanced aerial reward
-             (zero_sum_opportunity_late, 0.2),        # Zero-sum reward for creating opportunities (with team spirit)
-             (ZeroSumRewardWrapper(touch_ball_velocity_reward), 0.2),  # Zero-sum velocity-based touch reward
-             # Optional advanced mechanics - only flip reset as zero-sum
-             (speedflip_reward, 0.1),                 # Keep non-zero sum (movement mechanics)
-             (wavedash_reward, 0.1),                  # Keep non-zero sum (movement mechanics)
-             (zero_sum_flip_reset, 0.1)               # Zero-sum for reset advantage
-        ),
+        reward_function=full_game_reward_fn,
         termination_condition=goal_condition,
-        truncation_condition=timeout_match,
-        progression_requirements=ProgressionRequirements( # Final stage requirements are less critical
-            min_success_rate=0.5,
-            min_avg_reward=0.3,
-            min_episodes=500, # Train longer in final stage
-            max_std_dev=2.0,
-            required_consecutive_successes=2
+        truncation_condition=timeout_full_game_stage, # Full match length
+        progression_requirements=ProgressionRequirements( # Final stage, less critical for auto-progression
+            min_success_rate=0.4, # Proxy for win rate / effectiveness
+            min_avg_reward=0.5,   # Expect balanced reward from full SKG
+            min_episodes=500,     # Train longer on the full task
+            max_std_dev=5.0,
+            required_consecutive_successes=2 # Less strict consecutive successes
         ),
         hyperparameter_adjustments={
-            "lr_actor": lr_actor * 0.2,       # Lowest LR
-            "lr_critic": lr_critic * 0.2,
-            "entropy_coef": 0.003,           # Lowest entropy
-            "team_spirit": team_spirit_values["stage7"]  # Full team spirit in final stage
+            "lr_actor": lr_actor * 0.5, # Further reduce LR for fine-tuning
+            "lr_critic": lr_critic * 0.5,
+            "entropy_coef": 0.005      # Lower entropy
         }
     )
 
     # --- Assemble Curriculum ---
     stages = [
-        stage1,
-        stage2,
-        stage3,
-        stage4,
-        stage5,
-        stage6,
-        stage7
+        stage_touch,
+        stage_score,
+        stage_full_game
     ]
 
     curriculum_manager = CurriculumManager(

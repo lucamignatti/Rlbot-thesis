@@ -732,12 +732,14 @@ class LucySKGReward(BaseRewardFunction):
             offensive_density=1.0,
             defensive_density=1.0
         )
-        self.ball_to_goal_velocity = BallVelocityToGoalReward(team_goal_y=team_goal_y, weight=0.8)
-        self.save_boost = SaveBoostReward(weight=0.5)
+        # Ensure BallVelocityToGoalReward's internal weight is 1.0, LucySKGReward.self.weights will apply the final 0.8
+        self.ball_to_goal_velocity = BallVelocityToGoalReward(team_goal_y=team_goal_y, weight=1.0)
+        # Ensure SaveBoostReward's internal weight is 1.0, LucySKGReward.self.weights will apply the final 0.5
+        self.save_boost = SaveBoostReward(weight=1.0)
         self.distance_weighted_alignment = DistanceWeightedAlignmentKRC(team_goal_y=team_goal_y, dispersion=1.1, weight=0.6)
         self.offensive_potential = OffensivePotentialKRC(team_goal_y=team_goal_y, dispersion=1.1, density=1.1, weight=1.0)
-        self.touch_ball_to_goal_acceleration = TouchBallToGoalAccelerationReward(team_goal_y=team_goal_y, weight=0.25)
-        self.touch_ball = TouchBallReward(weight=0.05)
+        self.touch_ball_to_goal_acceleration = TouchBallToGoalAccelerationReward(team_goal_y=team_goal_y, weight=1.0) # Actual weight applied from self.weights
+        self.touch_ball = TouchBallReward(weight=1.0) # Actual weight applied from self.weights
 
         # Event reward tracking
         self.last_state = None
@@ -746,18 +748,18 @@ class LucySKGReward(BaseRewardFunction):
         self.last_demolishes = {}
         self.last_demolished = {}
 
-        # Weights from paper
+        # Weights from paper (guide)
         self.weights = {
             'ball_to_goal_distance': 2.0,
             'ball_to_goal_velocity': 0.8,
             'save_boost': 0.5,
-            'distance_weighted_alignment': 0.6,
-            'offensive_potential': 1.0,
+            'distance_weighted_alignment': 0.6, # KRC is self-weighted, this is for reference
+            'offensive_potential': 1.0,         # KRC is self-weighted, this is for reference
             'goal': 10.0,
             'concede': -3.0,
             'shot': 1.5,
-            'touch_ball_to_goal_acceleration': 0.25,
-            'touch_ball': 0.05,
+            'touch_ball_to_goal_acceleration': 0.25, # Applied to component instantiated with weight=1.0
+            'touch_ball': 0.05,                     # Applied to component instantiated with weight=1.0
             'demolish': 2.0,
             'demolished': -2.0
         }
@@ -837,8 +839,8 @@ class LucySKGReward(BaseRewardFunction):
             self.last_demolished[car_id] = curr_demolished
 
         # Add touch/acceleration event rewards
-        reward += self.touch_ball_to_goal_acceleration.calculate(agent_id, state, previous_state)
-        reward += self.touch_ball.calculate(agent_id, state, previous_state)
+        reward += self.weights['touch_ball_to_goal_acceleration'] * self.touch_ball_to_goal_acceleration.calculate(agent_id, state, previous_state)
+        reward += self.weights['touch_ball'] * self.touch_ball.calculate(agent_id, state, previous_state)
 
         # Track rewards for team spirit calculation
         self.team_rewards[player_team].append(reward)
@@ -2351,14 +2353,10 @@ class ZeroSumRewardWrapper(BaseRewardFunction):
                    is_truncated: Dict[AgentID, bool],
                    shared_info: Dict[str, Any]) -> Dict[AgentID, float]:
         """Get zero-sum rewards for all agents"""
-        # First pass: collect all basic rewards
-        basic_rewards = {}
-        for agent_id in agents:
-            if hasattr(self.reward_function, 'calculate'):
-                basic_rewards[agent_id] = self.reward_function.calculate(agent_id, state, shared_info.get("previous_state"))
-            else:
-                # Fall back to get_reward if calculate is not available
-                basic_rewards[agent_id] = self.reward_function.get_reward(agent_id, state, None)
+        # First pass: collect all basic rewards from the wrapped reward function
+        # The wrapped reward_function should adhere to the RLGym RewardFunction interface,
+        # which means it should have a get_rewards method.
+        basic_rewards = self.reward_function.get_rewards(agents, state, is_terminated, is_truncated, shared_info)
         
         # Group rewards by team
         team_rewards = {0: [], 1: []}

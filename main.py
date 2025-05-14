@@ -1673,7 +1673,7 @@ if __name__ == "__main__":
                     help='Enable curriculum learning')
     parser.add_argument('--no-curriculum', action='store_false', dest='curriculum',
                     help='Disable curriculum learning')
-    parser.set_defaults(curriculum=False)
+    parser.set_defaults(curriculum=True)
 
     # Add single-stage mode argument
     parser.add_argument('--stage', type=int, default=None,
@@ -1684,12 +1684,12 @@ if __name__ == "__main__":
                        help='Learning algorithm to use: ppo (default) or streamac')
 
     # Learning rates
-    parser.add_argument('--lra', type=float, default=1e-3, help='Learning rate for actor network')
-    parser.add_argument('--lrc', type=float, default=1e-3, help='Learning rate for critic network') # No longer does anything. Here for stability.
+    parser.add_argument('--lra', type=float, default=3e-4, help='Learning rate for actor network')
+    parser.add_argument('--lrc', type=float, default=3e-4, help='Learning rate for critic network') # No longer does anything. Here for stability.
 
     # Learning rate decay
-    parser.add_argument('--lr-decay', action='store_true', default=False,help='Enable learning rate decay')
-    parser.add_argument('--lr-decay-rate', type=float, default=0.7, help='Learning rate decay factor (e.g., 0.7 means decay to 70% over decay steps)')
+    parser.add_argument('--lr-decay', action='store_true', default=True,help='Enable learning rate decay')
+    parser.add_argument('--lr-decay-rate', type=float, default=0.05, help='Learning rate decay factor (e.g., 0.7 means decay to 70% over decay steps)')
     parser.add_argument('--lr-decay-steps', type=int, default=1000000, help='Number of steps over which to decay the learning rate')
     parser.add_argument('--min-lr', type=float, default=3e-5, help='Minimum learning rate after decay')
 
@@ -1707,7 +1707,7 @@ if __name__ == "__main__":
     # ------------------------------------
 
     # Training loop parameters
-    parser.add_argument('--ppo_epochs', type=int, default=1, help='Number of PPO epochs per update')
+    parser.add_argument('--ppo_epochs', type=int, default=10, help='Number of PPO epochs per update')
     parser.add_argument('--batch_size', type=int, default=24576, help='Batch size for PPO updates')
 
     # Weight clipping parameters removed - no longer used
