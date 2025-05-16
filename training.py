@@ -148,6 +148,7 @@ class Trainer:
         entropy_coef_decay: float = 0.995,
         max_grad_norm: float = 0.5,
         ppo_epochs: int = 10,
+        skill_zscore_threshold: float = 0.3,
 
         batch_size: int = 128,
         use_wandb: bool = False,
@@ -203,6 +204,9 @@ class Trainer:
         self.use_wandb = use_wandb
         self.debug = debug
         self.test_mode = False  # Initialize test_mode attribute to False by default
+
+        # Skill rating z-score threshold for win/loss/draw (customizable, default 0.3)
+        self.skill_zscore_threshold = skill_zscore_threshold
 
         # IMPORTANT: Set use_intrinsic_rewards early to avoid attribute access errors
         self.use_intrinsic_rewards = use_intrinsic_rewards # Keep base flag
@@ -1267,10 +1271,10 @@ class Trainer:
                         # Calculate z-score (how many standard deviations from mean)
                         z_score = (current_reward - historical_mean) / historical_std
                         
-                        # Determine win/loss/draw based on performance with more sensitive thresholds
-                        if z_score > 0.2:  # Better than historical performance
+                        # Determine win/loss/draw based on performance with customizable z-score threshold
+                        if z_score > self.skill_zscore_threshold:  # Better than historical performance
                             result = 1.0  # Win
-                        elif z_score < -0.2:  # Worse than historical performance
+                        elif z_score < -self.skill_zscore_threshold:  # Worse than historical performance
                             result = 0.0  # Loss
                         else:  # Similar to historical performance
                             result = 0.5  # Draw

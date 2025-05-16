@@ -645,6 +645,7 @@ def run_training(
         # Pass reward scaling parameters to Trainer (REMOVED)
         # use_reward_scaling=use_reward_scaling,
         # reward_scaling_G_max=reward_scaling_G_max,
+        skill_zscore_threshold=args.skill_zscore_threshold,
     )
 
     # --- MODEL LOADING LOGIC ---
@@ -1659,7 +1660,7 @@ if __name__ == "__main__":
 
     parser.add_argument('-n', '--num_envs', type=int, default=300,
                         help='Number of parallel environments to run for faster data collection')
-    parser.add_argument('--update_interval', type=int, default=262144,
+    parser.add_argument('--update_interval', type=int, default=204800,
                         help='Number of experiences to collect before updating the policy (PPO)')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use for training (cuda/mps/cpu).  Autodetects if not specified.')
@@ -1684,11 +1685,11 @@ if __name__ == "__main__":
                        help='Learning algorithm to use: ppo (default) or streamac')
 
     # Learning rates
-    parser.add_argument('--lra', type=float, default=3e-4, help='Learning rate for actor network')
-    parser.add_argument('--lrc', type=float, default=3e-4, help='Learning rate for critic network') # No longer does anything. Here for stability.
+    parser.add_argument('--lra', type=float, default=3e-5, help='Learning rate for actor network')
+    parser.add_argument('--lrc', type=float, default=3e-5, help='Learning rate for critic network') # No longer does anything. Here for stability.
 
     # Learning rate decay
-    parser.add_argument('--lr-decay', action='store_true', default=True,help='Enable learning rate decay')
+    parser.add_argument('--lr-decay', action='store_true', default=False,help='Enable learning rate decay')
     parser.add_argument('--lr-decay-rate', type=float, default=0.05, help='Learning rate decay factor (e.g., 0.7 means decay to 70% over decay steps)')
     parser.add_argument('--lr-decay-steps', type=int, default=1000000, help='Number of steps over which to decay the learning rate')
     parser.add_argument('--min-lr', type=float, default=3e-5, help='Minimum learning rate after decay')
@@ -1702,6 +1703,10 @@ if __name__ == "__main__":
     parser.add_argument('--critic_coef', type=float, default=0.75, help='Weight of the critic loss')
     parser.add_argument('--entropy_coef', type=float, default=0.005, help='Weight of the entropy bonus (encourages exploration)')
     parser.add_argument('--max_grad_norm', type=float, default=0.5, help='Maximum gradient norm for clipping')
+
+    # Skill rating z-score threshold
+    parser.add_argument('--skill-zscore-threshold', type=float, default=0.3,
+                        help='Z-score threshold for skill rating win/loss/draw (default: 0.3)')
 
     # Distributional critic args removed - no longer used
     # ------------------------------------
