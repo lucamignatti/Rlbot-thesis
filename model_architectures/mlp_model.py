@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.init as init
 
 class MLPModel(nn.Module):
     """
@@ -31,6 +32,11 @@ class MLPModel(nn.Module):
 
         # Activation
         self.activation = nn.GELU()
+
+        # Orthogonal initialization of linear layers
+        for layer in [self.embedding] + list(self.blocks) + [self.output]:
+            init.orthogonal_(layer.weight)
+            init.zeros_(layer.bias)
 
     @staticmethod
     def _mps_friendly_dropout(p):
