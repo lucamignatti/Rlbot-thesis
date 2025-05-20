@@ -241,13 +241,13 @@ def create_phase1_reward():
 
     # Combine rewards
     combined = CombinedReward(
-        (velocity_reward, 1.0),
-        (touch_reward, 1.0),
-        (ball_travel_reward, 0.5)
+        (velocity_reward, 5.0),
+        (touch_reward, 50.0),
+        (ball_travel_reward, 1.0)
     )
 
     # Wrap in zero-sum reward wrapper
-    return ZeroSumRewardWrapper(combined, team_spirit=0.2)
+    return combined
 
 def create_phase2_reward():
     """
@@ -264,12 +264,12 @@ def create_phase2_reward():
 
     # Combine rewards
     combined = CombinedReward(
-        (velocity_reward, 0.5),
-        (touch_reward, 0.7),
-        (ball_travel_reward, 1.0),
-        (goal_reward, 10.0),
-        (goal_prob_reward, 3.0),
-        (boost_reward, 0.2)
+        (velocity_reward, 5.0),
+        (touch_reward, 25.0),
+        (ball_travel_reward, 10.0),
+        (goal_reward, 200.0),
+        (goal_prob_reward, 10.0),
+        (boost_reward, 10.0)
     )
 
     # Wrap in zero-sum reward wrapper
@@ -297,16 +297,16 @@ def create_phase3_reward():
 
     # Combine all rewards with appropriate weights
     combined = CombinedReward(
-        (velocity_reward, 0.4),
-        (touch_reward, 0.5),
-        (ball_travel_reward, 1.0),
-        (goal_reward, 15.0),
-        (goal_prob_reward, 4.0),
-        (boost_reward, 0.3),
-        (aerial_reward, 2.0),
-        (flip_reset_reward, 3.0),
-        (demo_reward, 1.0),
-        (wavedash_reward, 0.8)
+        (velocity_reward, 10.0),
+        (touch_reward, 25.0),
+        (ball_travel_reward, 5.0),
+        (goal_reward, 200.0),
+        (goal_prob_reward, 25.0),
+        (boost_reward, 15.0),
+        (aerial_reward, 50.0),
+        (flip_reset_reward, 15.0),
+        (demo_reward, 20.0),
+        (wavedash_reward, 10.0)
     )
 
     # Wrap in zero-sum reward wrapper
@@ -497,7 +497,7 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
         name="2v2 Basic Ball Control",
         state_mutator=simple_touch_spawn, # Simple spawn, or kickoff_mutator
         reward_function=touch_reward_fn,
-        termination_condition=touch_ball_condition, # End episode on touch
+        termination_condition=goal_condition, # End episode on touch
         truncation_condition=timeout_touch_stage, # Short episodes
         progression_requirements=ProgressionRequirements(
             min_success_rate=0.5, # Success = positive reward from touching
