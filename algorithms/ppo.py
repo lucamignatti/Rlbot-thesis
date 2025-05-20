@@ -9,7 +9,8 @@ from .base import BaseAlgorithm
 # Import AuxiliaryTaskManager to use its methods
 from auxiliary import AuxiliaryTaskManager # Assuming this exists and works as intended
 # Import GradScaler for AMP
-from torch.amp import GradScaler, autocast
+from torch.amp.grad_scaler import GradScaler
+from torch.amp.autocast_mode import autocast
 # Removed SimbaV2 l2_norm import
 
 class PPOAlgorithm(BaseAlgorithm):
@@ -36,6 +37,7 @@ class PPOAlgorithm(BaseAlgorithm):
         device: str = "cuda",
         lr_actor: float = 3e-4,
         lr_critic: float = 3e-4, # Can be the same or different from lr_actor
+        adam_eps: float = 1e-5,   # Adam epsilon for numerical stability
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         clip_epsilon: float = 0.2,
@@ -71,8 +73,13 @@ class PPOAlgorithm(BaseAlgorithm):
             debug=debug,
             use_wandb=use_wandb,
         )
+        # Running-stat normalizers; obs_rms lazy, ret_rms eager
+        self.obs_rms = None
+        from training import RunningMeanStd
+        self.ret_rms = RunningMeanStd(shape=())
 
-        # Store the auxiliary task manager
+        # Save initial clip epsilon and store the auxiliary task manager
+        self.initial_clip_epsilon = self.clip_epsilon
         self.aux_task_manager = aux_task_manager
         # Check if actor and critic are the same instance
         self.shared_model = (actor is critic)
@@ -107,7 +114,7 @@ class PPOAlgorithm(BaseAlgorithm):
                  aux_params = self.aux_task_manager.get_parameters() # Assume manager provides its params
                  combined_params += aux_params
 
-             self.optimizer = torch.optim.Adam(combined_params, lr=lr_actor)
+             self.optimizer = torch.optim.Adam(combined_params, lr=lr_actor, eps=adam_eps)
              self.actor_optimizer = self.optimizer # Point to the same optimizer
              self.critic_optimizer = self.optimizer # Point to the same optimizer
              if self.debug: print("[DEBUG PPO] Using combined optimizer.")
@@ -124,8 +131,8 @@ class PPOAlgorithm(BaseAlgorithm):
                 # Decide where aux params go - usually actor if features come from there
                 actor_params += aux_params # Assuming aux tasks depend on actor features
 
-            self.actor_optimizer = torch.optim.Adam(actor_params, lr=lr_actor)
-            self.critic_optimizer = torch.optim.Adam(critic_params, lr=lr_critic)
+            self.actor_optimizer = torch.optim.Adam(actor_params, lr=lr_actor, eps=adam_eps)
+            self.critic_optimizer = torch.optim.Adam(critic_params, lr=lr_critic, eps=adam_eps)
             # Create a dummy combined optimizer reference for scaler (only one needed)
             self.optimizer = self.actor_optimizer # Or critic_optimizer, scaler works with any
             if self.debug: print("[DEBUG PPO] Using separate optimizers.")
@@ -415,9 +422,10 @@ class PPOAlgorithm(BaseAlgorithm):
              pass # Logic moved to store_experience for simplicity
 
     # --- Single Experience Method (Legacy/Optional) ---
-    def store_experience(self, obs, action, log_prob, reward, value, done):
+    def store_experience(self, obs, action, log_prob, reward, value, done, env_id=0):
         """
         Store a single experience in the buffer.
+        env_id is the environment index (unused in PPO but matches base signature).
         Value should be the scalar value estimate V(s) from the critic at collection time.
         """
         if self.debug:
@@ -448,6 +456,17 @@ class PPOAlgorithm(BaseAlgorithm):
         """Get action and value for a given observation"""
         if not isinstance(obs, torch.Tensor):
             obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
+        # Lazy init and normalize observation
+        if self.obs_rms is None:
+            feat_dim = obs.shape[-1] if obs.dim() > 1 else obs.numel()
+            self.obs_rms = self.ret_rms.__class__(shape=(feat_dim,))
+        obs_np = obs.cpu().numpy()
+        if obs_np.ndim == 1:
+            obs_np = obs_np[None, :]
+        self.obs_rms.update(obs_np)
+        mean = torch.from_numpy(self.obs_rms.mean).to(self.device).float()
+        std = torch.from_numpy(np.sqrt(self.obs_rms.var + 1e-8)).to(self.device).float()
+        obs = (obs - mean) / std
         # Add batch dimension if missing - check if first dimension could be batch size
         # We expect obs to be [batch_size, ...] or [...] where ... is the observation shape
         needs_unsqueeze = obs.dim() < 2  # If 1D or 0D tensor, needs batch dimension
@@ -618,6 +637,11 @@ class PPOAlgorithm(BaseAlgorithm):
 
         # `values` from buffer are V(s_t), `last_value` is V(s_{t+1}) for the last step.
         returns, advantages = self._compute_gae(rewards, values, dones, last_value.item()) # Pass scalar last_value
+        # Normalize returns before update (ret_rms eagerly initialized in constructor)
+        self.ret_rms.update(returns.cpu().numpy())
+        mean_r = torch.tensor(self.ret_rms.mean, device=self.device, dtype=torch.float32)
+        std_r = torch.tensor(np.sqrt(self.ret_rms.var + 1e-8), device=self.device, dtype=torch.float32)
+        returns = (returns - mean_r) / std_r
 
         # Check for NaNs/Infs in advantages or returns
         if torch.isnan(advantages).any() or torch.isinf(advantages).any() or \
@@ -631,7 +655,7 @@ class PPOAlgorithm(BaseAlgorithm):
             return self.metrics # Return previous metrics
 
         # Update the policy and value networks using PPO
-        metrics = self._update_policy(states, actions, old_log_probs, returns, advantages, rewards)
+        metrics = self._update_policy(states, actions, old_log_probs, returns, advantages, rewards, values)
 
         # Clear the memory buffer after using the data for updates
         self.memory.clear()
@@ -702,7 +726,7 @@ class PPOAlgorithm(BaseAlgorithm):
 
 
     # --- Update Policy and Value Network ---
-    def _update_policy(self, states, actions, old_log_probs, returns, advantages, rewards):
+    def _update_policy(self, states, actions, old_log_probs, returns, advantages, rewards, old_values):
         """
         Update policy and value networks using standard PPO algorithm, including auxiliary losses.
         Handles both shared and separate actor/critic models. Uses scalar critic with MSE loss.
@@ -768,12 +792,14 @@ class PPOAlgorithm(BaseAlgorithm):
 
         # Multiple epochs of PPO update
         for epoch in range(self.ppo_epochs):
+            # linearly anneal clip range from initial to 0 over epochs
+            eps = self.initial_clip_epsilon * (1.0 - epoch / float(self.ppo_epochs))
             batch_indices = self.memory.generate_batches()
             if not batch_indices:
                 if self.debug: print(f"[DEBUG PPO _update_policy] Epoch {epoch}: No batches generated, skipping.")
                 continue
 
-            if self.debug: print(f"[DEBUG PPO _update_policy] Epoch {epoch}: Processing {len(batch_indices)} batches.")
+            if self.debug: print(f"[DEBUG PPO _update_policy] Epoch {epoch}: Processing {len(batch_indices)} batches. clip_eps={eps:.4f}")
 
             for batch_idx in batch_indices:
                 num_batches_processed += 1
@@ -783,6 +809,10 @@ class PPOAlgorithm(BaseAlgorithm):
                 batch_returns = returns[batch_idx] # Target for critic
                 batch_advantages = advantages[batch_idx]
                 batch_rewards = rewards[batch_idx] # For aux tasks
+                # Old value predictions for clipped value loss
+                batch_old_values = old_values[batch_idx]
+                if batch_old_values.dim() > 1 and batch_old_values.shape[-1] == 1:
+                    batch_old_values = batch_old_values.squeeze(-1)
 
 
                 # --- Forward pass for current policy and value ---
@@ -852,14 +882,18 @@ class PPOAlgorithm(BaseAlgorithm):
 
                         if curr_log_probs is None: raise ValueError("Could not compute current log probs")
 
-                        # Ratio and surrogate objectives
+                        # Ratio and surrogate objectives with annealed clip
                         ratio = torch.exp(curr_log_probs - batch_old_log_probs)
                         surr1 = ratio * batch_advantages
-                        surr2 = torch.clamp(ratio, 1.0 - self.clip_epsilon, 1.0 + self.clip_epsilon) * batch_advantages
+                        surr2 = torch.clamp(ratio, 1.0 - eps, 1.0 + eps) * batch_advantages
                         actor_loss = -torch.min(surr1, surr2).mean()
 
-                        # --- Calculate Critic Loss (MSE) ---
-                        critic_loss = F.mse_loss(predicted_values, batch_returns)
+                        # --- Calculate Critic Loss (clipped-value) ---
+                        # Clipped value loss to stabilize critic
+                        value_pred_clipped = batch_old_values + (predicted_values - batch_old_values).clamp(-eps, eps)
+                        loss_original = (predicted_values - batch_returns).pow(2)
+                        loss_clipped = (value_pred_clipped - batch_returns).pow(2)
+                        critic_loss = 0.5 * torch.mean(torch.max(loss_original, loss_clipped))
 
                         # --- Calculate Entropy Loss ---
                         entropy_loss = -entropy * self.entropy_coef
