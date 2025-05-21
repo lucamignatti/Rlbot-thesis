@@ -383,6 +383,58 @@ class SafePositionWrapper:
         except:
             return f"Position function (error evaluating)"
 
+# Define position and velocity functions outside of create_curriculum for pickling compatibility
+def random_ground_ball_position():
+    return np.array([random.uniform(-3000, 3000), random.uniform(-4000, 4000), 93])
+
+def random_blue_car_position():
+    return np.array([random.uniform(-2000, 2000), random.uniform(-4500, -1000), 17])
+
+def random_orange_car_position():
+    return np.array([random.uniform(-2000, 2000), random.uniform(1000, 4500), 17])
+
+def center_ball_position():
+    return np.array([0, 0, 93.15])
+
+def blue_left_kickoff_position():
+    return np.array([-2048, -2560, 17.01])
+
+def blue_right_kickoff_position():
+    return np.array([2048, -2560, 17.01])
+    
+def orange_left_kickoff_position():
+    return np.array([-2048, 2560, 17.01])
+    
+def orange_right_kickoff_position():
+    return np.array([2048, 2560, 17.01])
+
+def offensive_ball_position():
+    return np.array([random.uniform(-2500, 2500), random.uniform(1000, 4000), 93])
+
+def offensive_blue_car_position():
+    return np.array([random.uniform(-2000, 2000), random.uniform(-1000, 2000), 17])
+
+def defensive_orange_car_position():
+    return np.array([random.uniform(-1500, 1500), random.uniform(3500, 4800), 17])
+
+def defensive_ball_position():
+    return np.array([random.uniform(-2500, 2500), random.uniform(-4000, -1000), 93])
+
+def defensive_ball_velocity():
+    return np.array([random.uniform(-500, 500), random.uniform(-1500, -500), 0])
+
+def defensive_blue_car_position():
+    return np.array([random.uniform(-1500, 1500), random.uniform(-4800, -3500), 17])
+
+def offensive_orange_car_position():
+    return np.array([random.uniform(-2000, 2000), random.uniform(-2000, 1000), 17])
+
+def aerial_ball_position():
+    return np.array([random.uniform(-2000, 2000), random.uniform(-3000, 3000), random.uniform(300, 1200)])
+
+def aerial_ball_velocity():
+    return np.array([random.uniform(-500, 500), random.uniform(-500, 500), random.uniform(-200, 200)])
+
 def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None, use_pretraining=True):
     """
     Create a 2v2 focused curriculum based on the RLBot guide.
@@ -434,57 +486,57 @@ def create_curriculum(debug=False, use_wandb=True, lr_actor=None, lr_critic=None
     # Basic random ground spawn
     basic_ground_spawn = MutatorSequence(
         fixed_2v2_mutator,
-        BallPositionMutator(position_function=SafePositionWrapper(lambda: np.array([random.uniform(-3000, 3000), random.uniform(-4000, 4000), 93]))),
-        CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-2000, 2000), random.uniform(-4500, -1000), 17])), orientation_function=get_random_yaw_orientation),
-        CarPositionMutator(car_id="blue-1", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-2000, 2000), random.uniform(-4500, -1000), 17])), orientation_function=get_random_yaw_orientation),
-        CarPositionMutator(car_id="orange-0", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-2000, 2000), random.uniform(1000, 4500), 17])), orientation_function=get_random_yaw_orientation),
-        CarPositionMutator(car_id="orange-1", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-2000, 2000), random.uniform(1000, 4500), 17])), orientation_function=get_random_yaw_orientation),
+        BallPositionMutator(position_function=SafePositionWrapper(random_ground_ball_position)),
+        CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(random_blue_car_position), orientation_function=get_random_yaw_orientation),
+        CarPositionMutator(car_id="blue-1", position_function=SafePositionWrapper(random_blue_car_position), orientation_function=get_random_yaw_orientation),
+        CarPositionMutator(car_id="orange-0", position_function=SafePositionWrapper(random_orange_car_position), orientation_function=get_random_yaw_orientation),
+        CarPositionMutator(car_id="orange-1", position_function=SafePositionWrapper(random_orange_car_position), orientation_function=get_random_yaw_orientation),
     )
 
     # Simple spawn for touch stage (ball at center, cars in kickoff pos)
     simple_touch_spawn = MutatorSequence(
         fixed_2v2_mutator,
-        BallPositionMutator(position_function=SafePositionWrapper(lambda: np.array([0, 0, 93.15]))), # Standard ball spawn height
-        CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(lambda: np.array([2048, -2560, 17.01])), orientation_function=get_face_opp_goal_orientation),
-        CarPositionMutator(car_id="blue-1", position_function=SafePositionWrapper(lambda: np.array([-2048, -2560, 17.01])), orientation_function=get_face_opp_goal_orientation),
-        CarPositionMutator(car_id="orange-0", position_function=SafePositionWrapper(lambda: np.array([2048, 2560, 17.01])), orientation_function=get_face_own_goal_orientation),
-        CarPositionMutator(car_id="orange-1", position_function=SafePositionWrapper(lambda: np.array([-2048, 2560, 17.01])), orientation_function=get_face_own_goal_orientation),
+        BallPositionMutator(position_function=SafePositionWrapper(center_ball_position)), # Standard ball spawn height
+        CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(blue_right_kickoff_position), orientation_function=get_face_opp_goal_orientation),
+        CarPositionMutator(car_id="blue-1", position_function=SafePositionWrapper(blue_left_kickoff_position), orientation_function=get_face_opp_goal_orientation),
+        CarPositionMutator(car_id="orange-0", position_function=SafePositionWrapper(orange_right_kickoff_position), orientation_function=get_face_own_goal_orientation),
+        CarPositionMutator(car_id="orange-1", position_function=SafePositionWrapper(orange_left_kickoff_position), orientation_function=get_face_own_goal_orientation),
         CarBoostMutator(boost_amount=33) # Start with some boost
     )
 
     # Offensive scenario spawn
     offensive_spawn = MutatorSequence(
         fixed_2v2_mutator,
-        BallPositionMutator(position_function=SafePositionWrapper(lambda: np.array([random.uniform(-2500, 2500), random.uniform(1000, 4000), 93]))), # Ball in opponent half
-        CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-2000, 2000), random.uniform(-1000, 2000), 17])), orientation_function=get_face_opp_goal_orientation),
-        CarPositionMutator(car_id="blue-1", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-2000, 2000), random.uniform(-1000, 2000), 17])), orientation_function=get_face_opp_goal_orientation),
+        BallPositionMutator(position_function=SafePositionWrapper(offensive_ball_position)), # Ball in opponent half
+        CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(offensive_blue_car_position), orientation_function=get_face_opp_goal_orientation),
+        CarPositionMutator(car_id="blue-1", position_function=SafePositionWrapper(offensive_blue_car_position), orientation_function=get_face_opp_goal_orientation),
         # Opponents further back
-        CarPositionMutator(car_id="orange-0", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-1500, 1500), random.uniform(3500, 4800), 17])), orientation_function=get_face_own_goal_orientation),
-        CarPositionMutator(car_id="orange-1", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-1500, 1500), random.uniform(3500, 4800), 17])), orientation_function=get_face_own_goal_orientation),
+        CarPositionMutator(car_id="orange-0", position_function=SafePositionWrapper(defensive_orange_car_position), orientation_function=get_face_own_goal_orientation),
+        CarPositionMutator(car_id="orange-1", position_function=SafePositionWrapper(defensive_orange_car_position), orientation_function=get_face_own_goal_orientation),
     )
 
     # Defensive scenario spawn
     defensive_spawn = MutatorSequence(
         fixed_2v2_mutator,
-        BallPositionMutator(position_function=SafePositionWrapper(lambda: np.array([random.uniform(-2500, 2500), random.uniform(-4000, -1000), 93]))), # Ball in own half
-        BallVelocityMutator(velocity_function=lambda: np.array([random.uniform(-500, 500), random.uniform(-1500, -500), 0])), # Ball moving towards own goal
-        CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-1500, 1500), random.uniform(-4800, -3500), 17])), orientation_function=get_face_own_goal_orientation),
-        CarPositionMutator(car_id="blue-1", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-1500, 1500), random.uniform(-4800, -3500), 17])), orientation_function=get_face_own_goal_orientation),
+        BallPositionMutator(position_function=SafePositionWrapper(defensive_ball_position)), # Ball in own half
+        BallVelocityMutator(velocity_function=defensive_ball_velocity), # Ball moving towards own goal
+        CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(defensive_blue_car_position), orientation_function=get_face_own_goal_orientation),
+        CarPositionMutator(car_id="blue-1", position_function=SafePositionWrapper(defensive_blue_car_position), orientation_function=get_face_own_goal_orientation),
         # Opponents further up
-        CarPositionMutator(car_id="orange-0", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-2000, 2000), random.uniform(-2000, 1000), 17])), orientation_function=get_face_opp_goal_orientation),
-        CarPositionMutator(car_id="orange-1", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-2000, 2000), random.uniform(-2000, 1000), 17])), orientation_function=get_face_opp_goal_orientation),
+        CarPositionMutator(car_id="orange-0", position_function=SafePositionWrapper(offensive_orange_car_position), orientation_function=get_face_opp_goal_orientation),
+        CarPositionMutator(car_id="orange-1", position_function=SafePositionWrapper(offensive_orange_car_position), orientation_function=get_face_opp_goal_orientation),
     )
 
     # Aerial scenario spawn
     aerial_spawn = MutatorSequence(
         fixed_2v2_mutator,
-        BallPositionMutator(position_function=SafePositionWrapper(lambda: np.array([random.uniform(-2000, 2000), random.uniform(-3000, 3000), random.uniform(300, 1200)]))), # Ball in air
-        BallVelocityMutator(velocity_function=lambda: np.array([random.uniform(-500, 500), random.uniform(-500, 500), random.uniform(-200, 200)])), # Slow random velocity
+        BallPositionMutator(position_function=SafePositionWrapper(aerial_ball_position)), # Ball in air
+        BallVelocityMutator(velocity_function=aerial_ball_velocity), # Slow random velocity
         # Cars start grounded
-        CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-2000, 2000), random.uniform(-4500, -1000), 17])), orientation_function=get_random_yaw_orientation),
-        CarPositionMutator(car_id="blue-1", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-2000, 2000), random.uniform(-4500, -1000), 17])), orientation_function=get_random_yaw_orientation),
-        CarPositionMutator(car_id="orange-0", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-2000, 2000), random.uniform(1000, 4500), 17])), orientation_function=get_random_yaw_orientation),
-        CarPositionMutator(car_id="orange-1", position_function=SafePositionWrapper(lambda: np.array([random.uniform(-2000, 2000), random.uniform(1000, 4500), 17])), orientation_function=get_random_yaw_orientation),
+        CarPositionMutator(car_id="blue-0", position_function=SafePositionWrapper(random_blue_car_position), orientation_function=get_random_yaw_orientation),
+        CarPositionMutator(car_id="blue-1", position_function=SafePositionWrapper(random_blue_car_position), orientation_function=get_random_yaw_orientation),
+        CarPositionMutator(car_id="orange-0", position_function=SafePositionWrapper(random_orange_car_position), orientation_function=get_random_yaw_orientation),
+        CarPositionMutator(car_id="orange-1", position_function=SafePositionWrapper(random_orange_car_position), orientation_function=get_random_yaw_orientation),
     )
 
     # --- Stage Definitions ---
