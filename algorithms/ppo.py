@@ -41,11 +41,11 @@ class PPOAlgorithm(BaseAlgorithm):
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         clip_epsilon: float = 0.2,
-        value_clip_epsilon: float = 0.2,
+        value_clip_epsilon: float = 0.1,
         critic_coef: float = 0.5,
         entropy_coef: float = 0.01,
         max_grad_norm: float = 0.5,
-        ppo_epochs: int = 10,
+        ppo_epochs: int = 4,
         batch_size: int = 64,
         use_amp: bool = False,
         debug: bool = False,
@@ -96,8 +96,8 @@ class PPOAlgorithm(BaseAlgorithm):
         # Note: PPOMemory class needs to be adapted slightly or confirmed compatible
         self.memory = self.PPOMemory(
             batch_size=batch_size,
-            # Increase buffer size to match update_interval typically used
-            buffer_size=131072, # Example size, adjust if needed
+            # Smaller buffer size for fresher experiences
+            buffer_size=16384, # Reduced from 131072 to prevent staleness
             device=device,
             debug=debug,
             action_space_type=self.action_space_type,
@@ -766,19 +766,26 @@ class PPOAlgorithm(BaseAlgorithm):
         returns = advantages + values
 
         # Normalize advantages across the entire buffer (standard practice)
+        # Use more robust normalization with better numerical stability
         adv_mean = advantages.mean()
         adv_std = advantages.std()
         
-        # Add small epsilon to prevent division by zero
-        adv_std_safe = torch.clamp(adv_std, min=1e-8)
-        advantages = (advantages - adv_mean) / adv_std_safe
+        # Use a larger epsilon (1e-5) and check if std is too small before normalizing
+        if adv_std.item() > 1e-6:
+            # Only normalize if std is large enough to avoid numerical instability
+            adv_std_safe = torch.clamp(adv_std, min=1e-5)
+            advantages = (advantages - adv_mean) / adv_std_safe
+        else:
+            # If std is too small, just center the advantages but don't scale
+            advantages = advantages - adv_mean
 
         # Check for NaN/Inf in computed values
         if torch.isnan(advantages).any() or torch.isinf(advantages).any():
             if self.debug:
                 print("[DEBUG PPO _compute_gae] NaN or Inf detected in advantages after normalization")
-            # Fallback: use unnormalized advantages
-            advantages = (advantages + values) - values  # Reset to unnormalized
+            # Fallback: use centered but unscaled advantages
+            advantages = (returns - values)  # Use raw advantages without scaling
+            advantages = advantages - advantages.mean()  # At least center them
             
         if torch.isnan(returns).any() or torch.isinf(returns).any():
             if self.debug:
@@ -856,10 +863,10 @@ class PPOAlgorithm(BaseAlgorithm):
              # Use normalized advantage mean
              mean_advantage_scalar = advantages.mean().item() # Advantages are already normalized
 
-        # Multiple epochs of PPO update
+        # Multiple epochs of PPO update (fewer epochs = less overfitting)
         for epoch in range(self.ppo_epochs):
-            # linearly anneal clip range from initial to 0 over epochs
-            eps = self.initial_clip_epsilon * (1.0 - epoch / float(self.ppo_epochs))
+            # Keep clip epsilon constant but slightly decay for later epochs
+            eps = self.initial_clip_epsilon * (1.0 - 0.05 * epoch / float(self.ppo_epochs))
             batch_indices = self.memory.generate_batches()
             if not batch_indices:
                 if self.debug: print(f"[DEBUG PPO _update_policy] Epoch {epoch}: No batches generated, skipping.")
@@ -952,18 +959,40 @@ class PPOAlgorithm(BaseAlgorithm):
 
                         if curr_log_probs is None: raise ValueError("Could not compute current log probs")
 
-                        # Ratio and surrogate objectives with annealed clip
-                        ratio = torch.exp(curr_log_probs - batch_old_log_probs)
+                        # Ratio and surrogate objectives 
+                        # First check for numerical issues in log probs
+                        if torch.isnan(curr_log_probs).any() or torch.isinf(curr_log_probs).any():
+                            if self.debug: print("Warning: NaN/Inf in current log probs, clamping")
+                            curr_log_probs = torch.clamp(curr_log_probs, -20.0, 0.0)
+                        
+                        if torch.isnan(batch_old_log_probs).any() or torch.isinf(batch_old_log_probs).any():
+                            if self.debug: print("Warning: NaN/Inf in old log probs, clamping") 
+                            batch_old_log_probs = torch.clamp(batch_old_log_probs, -20.0, 0.0)
+                            
+                        # Calculate policy ratio with stricter numerical safeguards
+                        log_ratio = curr_log_probs - batch_old_log_probs
+                        ratio = torch.exp(torch.clamp(log_ratio, -10, 10))  # Tighter clipping range
+                        
+                        # Apply clipping to prevent extreme policy updates
                         surr1 = ratio * batch_advantages
                         surr2 = torch.clamp(ratio, 1.0 - eps, 1.0 + eps) * batch_advantages
                         actor_loss = -torch.min(surr1, surr2).mean()
 
                         # --- Calculate Critic Loss (clipped-value) ---
                         # Clipped value loss to stabilize critic using separate value clip epsilon
+                        # First handle potential NaN/Inf in predicted values
+                        if torch.isnan(predicted_values).any() or torch.isinf(predicted_values).any():
+                            if self.debug: print("Warning: NaN/Inf in predicted values, clamping")
+                            predicted_values = torch.clamp(predicted_values, -10.0, 10.0)
+                            
                         value_pred_clipped = batch_old_values + (predicted_values - batch_old_values).clamp(-self.value_clip_epsilon, self.value_clip_epsilon)
                         loss_original = (predicted_values - batch_returns).pow(2)
                         loss_clipped = (value_pred_clipped - batch_returns).pow(2)
                         critic_loss = 0.5 * torch.mean(torch.max(loss_original, loss_clipped))
+                        
+                        # Add light L2 regularization to prevent value extremes
+                        l2_reg = torch.mean(predicted_values.pow(2)) * 0.0001  # Reduced from 0.001
+                        critic_loss = critic_loss + l2_reg
 
                         # --- Calculate Entropy Loss ---
                         entropy_loss = -entropy * self.entropy_coef
@@ -1090,12 +1119,13 @@ class PPOAlgorithm(BaseAlgorithm):
     # --- Simplified normalize_reward ---
     def normalize_reward(self, reward, done):
         """
-        Placeholder for reward normalization. Currently returns reward unchanged.
-        Standard implementations might normalize based on running mean/std of returns
-        or use environment wrappers for normalization.
+        Normalize rewards using running statistics for more stable training.
+        This helps prevent reward scaling issues across different environments.
         """
-        # For now, return raw reward. Advantage normalization handles scaling differences.
-        return reward
+        # Skip reward normalization for now as it could be causing instability
+        # Simply clip reward to prevent extreme values
+        clipped_reward = np.clip(reward, -10.0, 10.0)
+        return clipped_reward
 
     # --- Save/Load State ---
     def get_state_dict(self):

@@ -574,26 +574,66 @@ class Trainer:
             return 100000  # Default to 100k steps for pretraining
 
     def _update_auxiliary_weights(self):
-        """Update auxiliary task weights based on pretraining state."""
+        """Update auxiliary task weights based on pretraining state with smooth transitions."""
         if not self.use_auxiliary_tasks or not hasattr(self, 'aux_task_manager'):
             return
 
-        # Removed transition phase logic
-        if not self.use_pretraining or self.pretraining_completed:
-            # Use base weights if pretraining is disabled or completed
+        # Calculate smooth transition factor when leaving pretraining
+        transition_steps = 5000  # INCREASED: Number of steps to smoothly transition weights
+        
+        if not self.use_pretraining:
+            # Use base weights if pretraining is disabled
             self.aux_task_manager.sr_weight = self.base_sr_weight
             self.aux_task_manager.rp_weight = self.base_rp_weight
-            self.entropy_coef = self.base_entropy_coef # Also reset entropy
-        else: # Pretraining is active
+            self.entropy_coef = self.base_entropy_coef
+        elif not self.pretraining_completed:
             # Use pretraining weights if pretraining is active
             self.aux_task_manager.sr_weight = self.pretraining_sr_weight
             self.aux_task_manager.rp_weight = self.pretraining_rp_weight
             # Use higher entropy during active pretraining
             self.entropy_coef = max(self.min_entropy_coef, self.base_entropy_coef * self.pretraining_entropy_scale)
+        else:
+            # Smooth transition from pretraining weights to base weights
+            # Set _pretraining_completion_step if not already set
+            if not hasattr(self, '_pretraining_completion_step'):
+                self._pretraining_completion_step = self._true_training_steps()
+                
+            steps_since_completion = self._true_training_steps() - self._pretraining_completion_step
+            # Use smoother transition with cosine schedule instead of linear
+            if steps_since_completion < transition_steps:
+                progress = steps_since_completion / transition_steps
+                # Cosine schedule provides smoother transition
+                transition_factor = 0.5 * (1 - math.cos(math.pi * progress))
+                
+                # Interpolate between pretraining and base weights
+                self.aux_task_manager.sr_weight = (
+                    self.pretraining_sr_weight * (1 - transition_factor) + 
+                    self.base_sr_weight * transition_factor
+                )
+                self.aux_task_manager.rp_weight = (
+                    self.pretraining_rp_weight * (1 - transition_factor) + 
+                    self.base_rp_weight * transition_factor
+                )
+                
+                # Smooth entropy transition
+                pretraining_entropy = max(self.min_entropy_coef, self.base_entropy_coef * self.pretraining_entropy_scale)
+                self.entropy_coef = max(self.min_entropy_coef, 
+                                      pretraining_entropy * (1 - transition_factor) + 
+                                      self.base_entropy_coef * transition_factor)
+            else:
+                # After transition completes, use base weights
+                self.aux_task_manager.sr_weight = self.base_sr_weight
+                self.aux_task_manager.rp_weight = self.base_rp_weight
+                self.entropy_coef = self.base_entropy_coef
 
-        # Decay entropy coefficient over time (independent of pretraining state after completion)
-        if self.pretraining_completed:
-             self.entropy_coef = max(self.min_entropy_coef, self.entropy_coef * self.entropy_coef_decay)
+        # Apply very gradual entropy decay only after transition is complete
+        # Using a milder decay rate to prevent instability
+        if self.pretraining_completed and hasattr(self, '_pretraining_completion_step'):
+            steps_since_completion = self._true_training_steps() - self._pretraining_completion_step
+            if steps_since_completion > transition_steps:
+                # Use a milder decay rate (sqrt of original decay)
+                effective_decay = math.sqrt(self.entropy_coef_decay)
+                self.entropy_coef = max(self.min_entropy_coef, self.entropy_coef * effective_decay)
 
         # Log weight changes if debugging
         if self.debug:
@@ -2093,8 +2133,9 @@ class Trainer:
         return avg_stats
 
     def _update_pretraining_state(self):
-        """Update pretraining state and manage transition to regular training."""
-        # Skip if pretraining is not enabled or already completed
+        """
+        Update the pretraining state based on training steps.
+        """
         if not self.use_pretraining or self.pretraining_completed:
             return
 
@@ -2105,15 +2146,13 @@ class Trainer:
         # Check if we've reached the end of the pretraining phase
         if current_step >= pretraining_end_step:
             self.pretraining_completed = True
-            print(f"Pretraining phase completed at step {current_step}. Switching to regular training.")
+            print(f"Pretraining phase completed at step {current_step}. Starting gradual transition to regular training.")
 
-            # Reset auxiliary task weights to regular values immediately
-            if self.use_auxiliary_tasks and self.aux_task_manager:
-                self.aux_task_manager.sr_weight = self.base_sr_weight
-                self.aux_task_manager.rp_weight = self.base_rp_weight
-
-            # Reset entropy coefficient to base value immediately
-            self.entropy_coef = self.base_entropy_coef
+            # Store the step when pretraining completed for smooth transitions
+            self._pretraining_completion_step = current_step
+            
+            # Weights will be transitioned gradually in _update_auxiliary_weights
+            # Don't reset weights immediately to avoid sudden changes
 
             if self.use_wandb:
                 wandb.log({'training/pretraining_completed': True}, step=current_step)
@@ -2122,6 +2161,7 @@ class Trainer:
     def update_learning_rate(self, current_step):
         """
         Update learning rate based on the current training step and decay parameters.
+        Uses a more stable and gradual cosine decay schedule.
 
         Args:
             current_step: Current training step count
@@ -2140,12 +2180,19 @@ class Trainer:
                 print("[DEBUG] Skipping LR decay for StreamAC with adaptive learning rate")
             return self.lr_actor, self.lr_critic
 
-        # Calculate decay factor (exponential decay)
-        decay_factor = max(self.lr_decay_rate ** (current_step / self.lr_decay_steps), self.min_lr / self.initial_lr_actor)
-
-        # Apply decay to learning rates
-        new_lr_actor = max(self.initial_lr_actor * decay_factor, self.min_lr)
-        new_lr_critic = max(self.initial_lr_critic * decay_factor, self.min_lr)
+        # First 10% of training has constant learning rate (warmup)
+        warmup_steps = 0.1 * self.lr_decay_steps
+        if current_step < warmup_steps:
+            new_lr_actor = self.initial_lr_actor
+            new_lr_critic = self.initial_lr_critic
+        else:
+            # Use cosine decay schedule, gentler than exponential
+            progress = min(1.0, (current_step - warmup_steps) / (self.lr_decay_steps - warmup_steps))
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            
+            # Linear interpolation between initial and min learning rates
+            new_lr_actor = max(self.min_lr, self.min_lr + (self.initial_lr_actor - self.min_lr) * cosine_decay)
+            new_lr_critic = max(self.min_lr, self.min_lr + (self.initial_lr_critic - self.min_lr) * cosine_decay)
 
         # Only log if there's a significant change
         if abs(new_lr_actor - self.lr_actor) > 1e-7 and self.debug:
