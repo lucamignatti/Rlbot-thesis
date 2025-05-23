@@ -977,184 +977,109 @@ def run_training(
                     # For shared model, get_action in algorithm handles requesting only actor output
                     action_batch, log_prob_batch, value_batch, features_batch = trainer.get_action(obs_batch, return_features=True)
 
-                # --- Batch Store Initial Experience (PPO) ---
-                if algorithm == "ppo" and not test:
-                    # Store obs, action, log_prob, value (placeholder) in batch
-                    store_indices = trainer.store_initial_batch(
-                        obs_batch, action_batch, log_prob_batch, value_batch
-                    )
-                    collected_experiences += len(obs_batch) # Increment collected experiences count
-                    if debug and collected_experiences % 100 == 0:
-                         print(f"[DEBUG PPO] Collected {collected_experiences} experiences (batch size {len(obs_batch)})")
-
                 # --- Prepare actions for environment step ---
-                # Convert actions to CPU numpy arrays for the environment step
-                # Handle both tensor and non-tensor actions returned by get_action
                 if isinstance(action_batch, torch.Tensor):
                     action_batch_np = action_batch.cpu().numpy()
                 else:
-                    # If not a tensor, assume it's a list/array already compatible
                     action_batch_np = np.array(action_batch)
 
-
-                # Organize actions into a list of dictionaries, one for each environment.
-                for i, action_np in enumerate(action_batch_np):
+                for i, action_np_val in enumerate(action_batch_np): # Renamed to avoid conflict
                     env_idx = all_env_indices[i]
                     agent_id = all_agent_ids[i]
-                    actions_dict_list[env_idx][agent_id] = action_np # Use CPU numpy action
+                    actions_dict_list[env_idx][agent_id] = action_np_val
 
-                    # --- Store Experience (Non-PPO or Test Mode) ---
-                    # If not PPO or in test mode, use the old single-store method
-                    if (algorithm != "ppo" or test) and not test: # Only store if not testing
-                        # Pass original tensors (potentially GPU) to store_experience
-                        trainer.store_experience(
-                            all_obs_list[i],
-                            action_batch[i], # Original action tensor/value
-                            log_prob_batch[i],
-                            0,  # Placeholder reward, updated after environment step
-                            value_batch[i],
-                            False,  # Placeholder done flag, updated after environment step
-                            env_id=env_idx
-                        )
-                        collected_experiences += 1 # Increment for non-PPO algorithms too
-
-
-            # Step all environments forward in parallel - optimized implementation
+            # Step all environments forward in parallel
             results, dones, episode_counts = vec_env.step(actions_dict_list)
-
-            # Increment total environment steps counter
-            current_batch_env_steps = len(all_obs_list) # Number of agent steps in this batch
+            current_batch_env_steps = len(all_obs_list)
             total_env_steps += current_batch_env_steps
-
-            # Update trainer's total_env_steps attribute for logging
             trainer.total_env_steps = total_env_steps
 
             # Calculate steps per second
-            current_time = time.time()
-            elapsed_since_last_calc = current_time - last_steps_time
-            if elapsed_since_last_calc >= 1.0:  # Update once per second
+            current_time_calc = time.time() # Renamed to avoid conflict
+            elapsed_since_last_calc = current_time_calc - last_steps_time
+            if elapsed_since_last_calc >= 1.0:
                 steps_this_period = total_env_steps - last_steps_count
                 steps_per_second = steps_this_period / elapsed_since_last_calc
-                last_steps_time = current_time
+                last_steps_time = current_time_calc
                 last_steps_count = total_env_steps
                 stats_dict["Steps/s"] = f"{steps_per_second:.1f}"
-                # Send updated stats_dict to TQDM manager (includes Steps/s)
                 if tqdm_q:
                     tqdm_q.put(stats_dict.copy())
 
-
-            # --- Process Results and Update Rewards/Dones (PPO Batch) ---
-            if algorithm == "ppo" and not test and store_indices is not None:
-                batch_rewards = []
-                batch_dones = []
-                batch_next_obs = []
-                batch_env_ids_for_intrinsic = []
-                batch_store_indices_for_update = [] # Indices corresponding to rewards/dones
-
-                exp_idx_map = {i: idx for i, idx in enumerate(store_indices.tolist())} # Map batch index to buffer index
+            # --- Process Results and Store Experiences ---
+            if not test:
+                # Prepare data for batch storage
+                batch_obs_store = []
+                batch_actions_store = []
+                batch_log_probs_store = []
+                batch_rewards_store = []
+                batch_values_store = []
+                batch_dones_store = []
+                batch_env_ids_store = [] # For intrinsic rewards if calculated individually
 
                 current_exp_idx = 0
-                for env_idx, result in enumerate(results):
-                    # Handle return formats
-                    if isinstance(result, tuple):
-                        if len(result) == 5: _, next_obs_dict, reward_dict, terminated_dict, truncated_dict = result
-                        else: next_obs_dict, reward_dict, terminated_dict, truncated_dict = result
+                for env_idx, result_item in enumerate(results): # Renamed to avoid conflict
+                    if isinstance(result_item, tuple):
+                        if len(result_item) == 5: _, next_obs_dict, reward_dict, terminated_dict, truncated_dict = result_item
+                        else: next_obs_dict, reward_dict, terminated_dict, truncated_dict = result_item
                     else: continue
 
-                    # Ensure episode_rewards dict exists for this env_idx
                     if env_idx not in episode_rewards: episode_rewards[env_idx] = {}
 
                     for agent_id in reward_dict.keys():
-                        if current_exp_idx < len(all_obs_list): # Ensure we don't go out of bounds
+                        if current_exp_idx < len(all_obs_list):
+                            # Original data from before env step
+                            obs_to_store = all_obs_list[current_exp_idx]
+                            action_to_store = action_batch[current_exp_idx] # Original tensor/value
+                            log_prob_to_store = log_prob_batch[current_exp_idx]
+                            value_to_store = value_batch[current_exp_idx]
+
+                            # Data from after env step
                             extrinsic_reward = reward_dict[agent_id]
-                            done = terminated_dict[agent_id] or truncated_dict[agent_id]
+                            done_val = terminated_dict[agent_id] or truncated_dict[agent_id] # Renamed
                             next_obs = next_obs_dict.get(agent_id, None)
 
-                            batch_rewards.append(extrinsic_reward) # Store ORIGINAL extrinsic reward
-                            batch_dones.append(done)
-                            if next_obs is not None: batch_next_obs.append(next_obs)
-                            batch_env_ids_for_intrinsic.append(env_idx)
-                            # Get the correct buffer index for this agent step
-                            buffer_idx = exp_idx_map.get(current_exp_idx)
-                            if buffer_idx is not None:
-                                batch_store_indices_for_update.append(buffer_idx)
+                            batch_obs_store.append(obs_to_store)
+                            batch_actions_store.append(action_to_store)
+                            batch_log_probs_store.append(log_prob_to_store)
+                            batch_rewards_store.append(extrinsic_reward) # Store original extrinsic for now
+                            batch_values_store.append(value_to_store)
+                            batch_dones_store.append(done_val)
+                            batch_env_ids_store.append(env_idx)
 
-                            # Accumulate rewards for episode tracking (using ORIGINAL extrinsic for now)
-                            # Defensive check/initialization before accumulating
+
                             if agent_id not in episode_rewards[env_idx]:
                                 episode_rewards[env_idx][agent_id] = 0.0
-                                if debug: print(f"[DEBUG] Initialized episode_rewards for {agent_id} in env {env_idx} (during PPO result processing)")
                             episode_rewards[env_idx][agent_id] += extrinsic_reward
 
-                            if done:
+                            if done_val:
                                 action_stacker.reset_agent(agent_id)
                                 trainer.reset_auxiliary_tasks()
-
                             current_exp_idx += 1
                         else:
-                             if debug: print(f"[DEBUG] Warning: current_exp_idx ({current_exp_idx}) exceeded all_obs_list length ({len(all_obs_list)})")
-
-
-                # Ensure all lists have the same length before proceeding
-                min_len = min(len(batch_rewards), len(batch_dones), len(batch_store_indices_for_update))
-                if len(batch_rewards) != min_len: batch_rewards = batch_rewards[:min_len]
-                if len(batch_dones) != min_len: batch_dones = batch_dones[:min_len]
-                if len(batch_store_indices_for_update) != min_len: batch_store_indices_for_update = batch_store_indices_for_update[:min_len]
-                if len(batch_next_obs) != min_len: batch_next_obs = batch_next_obs[:min_len] # Need next_obs for intrinsic
-                if len(batch_env_ids_for_intrinsic) != min_len: batch_env_ids_for_intrinsic = batch_env_ids_for_intrinsic[:min_len]
-
-
-                if min_len > 0:
-                    batch_rewards_np = np.array(batch_rewards, dtype=np.float32)
-                    batch_dones_np = np.array(batch_dones, dtype=bool)
-                    batch_store_indices_tensor = torch.tensor(batch_store_indices_for_update, dtype=torch.long, device=device)
-
-                    # --- Reward Scaling (SimbaV2) --- (REMOVED - Handled in Algorithm)
-                    scaled_extrinsic_rewards = batch_rewards_np # Use original rewards here
-
-                    final_rewards = scaled_extrinsic_rewards # Start with scaled extrinsic
-
-                    # --- Batch Intrinsic Reward Calculation (PPO) ---
-                    if trainer.use_intrinsic_rewards and len(batch_next_obs) == min_len:
-                        if debug: print(f"[DEBUG PPO] Calculating intrinsic rewards for batch size {min_len}")
-                        try:
-                            # Prepare inputs for batch intrinsic calculation
-                            intrinsic_states = np.stack(all_obs_list[:min_len]) # Use the initial states for this batch
-                            intrinsic_actions = action_batch_np[:min_len] # Use the actions taken
-                            intrinsic_next_states = np.stack(batch_next_obs)
-                            intrinsic_env_ids = batch_env_ids_for_intrinsic[:min_len]
-
-                            # calculate_intrinsic_rewards_batch now applies the fixed scale internally
-                            intrinsic_rewards = trainer.calculate_intrinsic_rewards_batch(
-                                states=intrinsic_states,
-                                actions=intrinsic_actions,
-                                next_states=intrinsic_next_states,
-                                env_ids=intrinsic_env_ids
-                            )
-                            # Add intrinsic rewards to scaled extrinsic rewards
-                            final_rewards = scaled_extrinsic_rewards + intrinsic_rewards
-                            if debug and min_len > 0:
-                                print(f"[DEBUG PPO] Intrinsic reward example: Scaled Extrinsic={scaled_extrinsic_rewards[0]:.4f}, Intrinsic={intrinsic_rewards[0]:.4f}, Total={final_rewards[0]:.4f}")
-
-                        except Exception as e:
-                            if debug:
-                                print(f"[DEBUG PPO] Error calculating batch intrinsic rewards: {e}")
-                                traceback.print_exc()
-                            # Use only scaled extrinsic rewards if intrinsic calculation fails
-                            final_rewards = scaled_extrinsic_rewards
-
-                    # --- Update Rewards and Dones in Buffer (PPO) ---
-                    trainer.update_rewards_dones_batch(
-                        batch_store_indices_tensor,
-                        torch.tensor(final_rewards, dtype=torch.float32, device=device), # Use final combined reward
-                        torch.tensor(batch_dones_np, dtype=torch.bool, device=device)
+                            if debug: print(f"[DEBUG] Warning: current_exp_idx ({current_exp_idx}) exceeded all_obs_list length ({len(all_obs_list)})")
+                
+                # Call batch store experience
+                if len(batch_obs_store) > 0:
+                    # Pass next_obs_batch if available and needed for batch intrinsic rewards
+                    # For now, intrinsic rewards in store_experience_batch might be individual
+                    final_rewards_batch = trainer.store_experience_batch(
+                        states=batch_obs_store,
+                        actions=batch_actions_store,
+                        log_probs=batch_log_probs_store,
+                        rewards=batch_rewards_store, # Original extrinsic rewards
+                        values=batch_values_store,
+                        dones=batch_dones_store,
+                        env_ids=batch_env_ids_store
+                        # next_obs_batch=batch_next_obs_store # If you collect next_obs in a batch
                     )
-                elif debug:
-                     print("[DEBUG PPO] No valid experiences to update rewards/dones for.")
+                    collected_experiences += len(batch_obs_store)
+                    if debug and algorithm == "ppo" and collected_experiences % 100 == 0:
+                        print(f"[DEBUG PPO] Batch stored {len(batch_obs_store)} experiences. Total collected: {collected_experiences}")
 
 
-            # --- Process Results (Non-PPO or Test Mode) ---
-            elif algorithm != "ppo" or test:
+            # --- Process Results (Test Mode Only - No Storage) ---
+            elif test: # Only process for episode tracking if in test mode
                 exp_idx = 0
                 for env_idx, result in enumerate(results):
                     # Handle return formats

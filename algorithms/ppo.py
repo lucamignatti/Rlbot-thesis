@@ -41,6 +41,7 @@ class PPOAlgorithm(BaseAlgorithm):
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         clip_epsilon: float = 0.2,
+        value_clip_epsilon: float = 0.2,
         critic_coef: float = 0.5,
         entropy_coef: float = 0.01,
         max_grad_norm: float = 0.5,
@@ -78,8 +79,9 @@ class PPOAlgorithm(BaseAlgorithm):
         from training import RunningMeanStd
         self.ret_rms = RunningMeanStd(shape=())
 
-        # Save initial clip epsilon and store the auxiliary task manager
+        # Save initial clip epsilon and value clip epsilon
         self.initial_clip_epsilon = self.clip_epsilon
+        self.value_clip_epsilon = value_clip_epsilon
         self.aux_task_manager = aux_task_manager
         # Check if actor and critic are the same instance
         self.shared_model = (actor is critic)
@@ -156,8 +158,8 @@ class PPOAlgorithm(BaseAlgorithm):
         }
 
         # Add episode return tracking
-        self.current_episode_rewards = []
         self.episode_returns = deque(maxlen=100)
+        self._temp_episode_rewards = []
 
         # --- Removed SimbaV2 Reward Normalization Params ---
 
@@ -231,61 +233,79 @@ class PPOAlgorithm(BaseAlgorithm):
                 self.actions = torch.zeros((self.buffer_size, *action_shape), dtype=action_dtype, device=self.device)
 
 
-        def store_initial_batch(self, obs_batch, action_batch, log_prob_batch, value_batch):
-            """Store the initial part of experiences in batch (obs, action, log_prob, value)."""
+        def store_batch(self, obs_batch, action_batch, log_prob_batch, reward_batch, value_batch, done_batch):
+            """Store complete experiences in batch atomically."""
             batch_size = obs_batch.shape[0]
             if batch_size == 0:
-                return torch.tensor([], dtype=torch.long, device=self.device)
+                return
 
             expected_action_dtype = torch.long if self.action_space_type == "discrete" else torch.float32
             action_sample_for_init = action_batch[0].clone().to(expected_action_dtype)
             self._initialize_buffers_if_needed(obs_batch[0], action_sample_for_init)
 
-            if not isinstance(obs_batch, torch.Tensor): obs_batch = torch.tensor(obs_batch, dtype=torch.float32)
+            # Convert all inputs to tensors with correct types
+            if not isinstance(obs_batch, torch.Tensor): 
+                obs_batch = torch.tensor(obs_batch, dtype=torch.float32)
             if not isinstance(action_batch, torch.Tensor):
                 action_batch = torch.tensor(action_batch, dtype=expected_action_dtype)
             elif action_batch.dtype != expected_action_dtype:
-                 if self.debug: print(f"[DEBUG PPOMemory] Casting action_batch from {action_batch.dtype} to {expected_action_dtype}")
-                 action_batch = action_batch.to(expected_action_dtype)
+                if self.debug: print(f"[DEBUG PPOMemory] Casting action_batch from {action_batch.dtype} to {expected_action_dtype}")
+                action_batch = action_batch.to(expected_action_dtype)
+            if not isinstance(log_prob_batch, torch.Tensor): 
+                log_prob_batch = torch.tensor(log_prob_batch, dtype=torch.float32)
+            if not isinstance(reward_batch, torch.Tensor): 
+                reward_batch = torch.tensor(reward_batch, dtype=torch.float32)
+            if not isinstance(value_batch, torch.Tensor): 
+                value_batch = torch.tensor(value_batch, dtype=torch.float32)
+            elif value_batch.dtype != torch.float32: 
+                value_batch = value_batch.to(torch.float32)
+            if not isinstance(done_batch, torch.Tensor): 
+                done_batch = torch.tensor(done_batch, dtype=torch.bool)
 
-            if not isinstance(log_prob_batch, torch.Tensor): log_prob_batch = torch.tensor(log_prob_batch, dtype=torch.float32)
-            # Ensure value_batch is float32
-            if not isinstance(value_batch, torch.Tensor): value_batch = torch.tensor(value_batch, dtype=torch.float32)
-            elif value_batch.dtype != torch.float32: value_batch = value_batch.to(torch.float32)
-
-
+            # Move to target device
             target_device = self.device
             obs_batch = obs_batch.to(target_device)
             action_batch = action_batch.to(target_device)
             log_prob_batch = log_prob_batch.to(target_device)
-            value_batch = value_batch.to(target_device) # Store the value estimate from collection time
+            reward_batch = reward_batch.to(target_device)
+            value_batch = value_batch.to(target_device)
+            done_batch = done_batch.to(target_device)
 
+            # Calculate indices for circular buffer
             indices = torch.arange(self.pos, self.pos + batch_size, device=target_device) % self.buffer_size
 
+            # Store all data atomically
             self.obs.index_copy_(0, indices, obs_batch.detach())
+            
             # Handle action shapes
             if self.action_space_type == "discrete":
-                 if action_batch.dim() == 1 and self.actions.dim() == 1:
-                     self.actions.index_copy_(0, indices, action_batch.detach())
-                 elif action_batch.dim() == 2 and action_batch.shape[1] == 1 and self.actions.dim() == 1:
-                     self.actions.index_copy_(0, indices, action_batch.detach().squeeze(1))
-                 else:
-                      if self.debug: print(f"[DEBUG PPOMemory] Discrete action shape mismatch. Buffer: {self.actions.shape}, Batch: {action_batch.shape}")
+                if action_batch.dim() == 1 and self.actions.dim() == 1:
+                    self.actions.index_copy_(0, indices, action_batch.detach())
+                elif action_batch.dim() == 2 and action_batch.shape[1] == 1 and self.actions.dim() == 1:
+                    self.actions.index_copy_(0, indices, action_batch.detach().squeeze(1))
+                else:
+                    if self.debug: print(f"[DEBUG PPOMemory] Discrete action shape mismatch. Buffer: {self.actions.shape}, Batch: {action_batch.shape}")
             else: # Continuous
-                 if self.actions.shape[1:] == action_batch.shape[1:]:
-                     self.actions.index_copy_(0, indices, action_batch.detach())
-                 else:
-                      if self.debug: print(f"[DEBUG PPOMemory] Continuous action shape mismatch. Buffer: {self.actions.shape}, Batch: {action_batch.shape}")
+                if self.actions.shape[1:] == action_batch.shape[1:]:
+                    self.actions.index_copy_(0, indices, action_batch.detach())
+                else:
+                    if self.debug: print(f"[DEBUG PPOMemory] Continuous action shape mismatch. Buffer: {self.actions.shape}, Batch: {action_batch.shape}")
 
             self.log_probs.index_copy_(0, indices, log_prob_batch.detach())
+            self.rewards.index_copy_(0, indices, reward_batch.detach())
+            
             # Handle value shapes - ensure value_batch is 1D
             if value_batch.dim() == 2 and value_batch.shape[1] == 1:
                 value_batch = value_batch.squeeze(1)  # Convert from [batch, 1] to [batch]
             elif value_batch.dim() != 1:
                 if self.debug:
                     print(f"[DEBUG PPOMemory] Unexpected value shape: {value_batch.shape}")
-            self.values.index_copy_(0, indices, value_batch.detach())  # Store the actual scalar value estimate
+                value_batch = value_batch.view(-1)  # Flatten to 1D
+            self.values.index_copy_(0, indices, value_batch.detach())
+            
+            self.dones.index_copy_(0, indices, done_batch.detach())
 
+            # Update buffer state
             new_pos = (self.pos + batch_size) % self.buffer_size
             if not self.full and (self.pos + batch_size >= self.buffer_size):
                 self.full = True
@@ -293,29 +313,7 @@ class PPOAlgorithm(BaseAlgorithm):
             self.size = min(self.size + batch_size, self.buffer_size)
 
             if self.debug and batch_size > 0:
-                 print(f"[DEBUG PPOMemory] Stored initial batch of size {batch_size}. New pos: {self.pos}, size: {self.size}")
-
-            return indices
-
-        def update_rewards_dones_batch(self, indices, rewards_batch, dones_batch):
-            """Update rewards and dones for experiences at given indices."""
-            if len(indices) == 0:
-                return
-
-            if not isinstance(rewards_batch, torch.Tensor): rewards_batch = torch.tensor(rewards_batch, dtype=torch.float32)
-            if not isinstance(dones_batch, torch.Tensor): dones_batch = torch.tensor(dones_batch, dtype=torch.bool)
-
-            target_device = self.device
-            indices = indices.to(target_device)
-            rewards_batch = rewards_batch.to(target_device)
-            dones_batch = dones_batch.to(target_device)
-
-            # Store raw rewards - normalization happens during GAE calculation if needed (advantage normalization)
-            self.rewards.index_copy_(0, indices, rewards_batch)
-            self.dones.index_copy_(0, indices, dones_batch)
-
-            if self.debug and len(indices) > 0:
-                 print(f"[DEBUG PPOMemory] Updated rewards/dones for {len(indices)} indices. First reward: {rewards_batch[0].item():.4f}")
+                print(f"[DEBUG PPOMemory] Stored complete batch of size {batch_size}. New pos: {self.pos}, size: {self.size}")
 
         # store() and store_experience_at_idx() can be simplified or removed if only batch methods are used externally
         # For now, let's assume they might still be called and adapt them
@@ -327,14 +325,12 @@ class PPOAlgorithm(BaseAlgorithm):
              obs_b = torch.tensor([obs], dtype=torch.float32) if not isinstance(obs, torch.Tensor) else obs.unsqueeze(0)
              act_b = torch.tensor([action], dtype=expected_action_dtype) if not isinstance(action, torch.Tensor) else action.unsqueeze(0).to(expected_action_dtype)
              lp_b = torch.tensor([log_prob], dtype=torch.float32) if not isinstance(log_prob, torch.Tensor) else log_prob.unsqueeze(0)
-             # Ensure value is float32
-             val_b = torch.tensor([value], dtype=torch.float32) if not isinstance(value, torch.Tensor) else value.unsqueeze(0).to(torch.float32)
              rew_b = torch.tensor([reward], dtype=torch.float32) if not isinstance(reward, torch.Tensor) else reward.unsqueeze(0)
+             val_b = torch.tensor([value], dtype=torch.float32) if not isinstance(value, torch.Tensor) else value.unsqueeze(0).to(torch.float32)
              done_b = torch.tensor([done], dtype=torch.bool) if not isinstance(done, torch.Tensor) else done.unsqueeze(0)
 
-             indices = self.store_initial_batch(obs_b, act_b, lp_b, val_b)
-             if len(indices) > 0:
-                 self.update_rewards_dones_batch(indices, rew_b, done_b)
+             # Store complete experience atomically
+             self.store_batch(obs_b, act_b, lp_b, rew_b, val_b, done_b)
 
 
         def get(self):
@@ -384,6 +380,8 @@ class PPOAlgorithm(BaseAlgorithm):
 
             return batches
 
+
+
         def clear(self):
             """Reset the buffer."""
             self.pos = 0
@@ -394,34 +392,54 @@ class PPOAlgorithm(BaseAlgorithm):
                 print("[DEBUG PPOMemory] Buffer cleared.")
 
     # --- Batch Storage Methods ---
-    def store_initial_batch(self, obs_batch, action_batch, log_prob_batch, value_batch):
-        """Store the initial part of experiences (obs, action, log_prob, value) in batch."""
+    def store_batch(self, obs_batch, action_batch, log_prob_batch, reward_batch, value_batch, done_batch):
+        """Store complete experiences in batch."""
         if self.debug:
-            print(f"[DEBUG PPO] Storing initial batch of size {obs_batch.shape[0]}")
+            print(f"[DEBUG PPO] Storing complete batch of size {obs_batch.shape[0]}")
+        
         # Ensure value_batch is float32 before storing
         if not isinstance(value_batch, torch.Tensor):
              value_batch = torch.tensor(value_batch, dtype=torch.float32)
         elif value_batch.dtype != torch.float32:
              value_batch = value_batch.to(torch.float32)
-        return self.memory.store_initial_batch(obs_batch, action_batch, log_prob_batch, value_batch)
+        
+        # Store complete experiences atomically
+        self.memory.store_batch(obs_batch, action_batch, log_prob_batch, reward_batch, value_batch, done_batch)
+
+        # Track episode returns when dones are received - simplified for batch storage
+        # Note: Proper episode tracking would require tracking per environment
+        # This is a simplified version for single environment scenarios
+        pass
 
     def update_rewards_dones_batch(self, indices, rewards_batch, dones_batch):
         """Update rewards and dones for experiences at given indices in batch."""
         if self.debug:
             print(f"[DEBUG PPO] Updating rewards/dones for batch of size {len(indices)}")
-        self.memory.update_rewards_dones_batch(indices, rewards_batch, dones_batch)
+        
+        # Convert to tensors if needed
+        if not isinstance(rewards_batch, torch.Tensor):
+            rewards_batch = torch.tensor(rewards_batch, dtype=torch.float32, device=self.device)
+        if not isinstance(dones_batch, torch.Tensor):
+            dones_batch = torch.tensor(dones_batch, dtype=torch.bool, device=self.device)
+        if not isinstance(indices, torch.Tensor):
+            indices = torch.tensor(indices, dtype=torch.long, device=self.device)
+        
+        # Batch update the memory buffer
+        indices = indices.to(self.device)
+        rewards_batch = rewards_batch.to(self.device)
+        dones_batch = dones_batch.to(self.device)
+        
+        # Update rewards and dones in batch
+        self.memory.rewards.index_copy_(0, indices, rewards_batch)
+        self.memory.dones.index_copy_(0, indices, dones_batch)
+        
+        # Track episode returns for completed episodes
+        if torch.any(dones_batch):
+            # Simple episode tracking - just count completed episodes
+            num_done = torch.sum(dones_batch).item()
+            if self.debug:
+                print(f"[DEBUG PPO] {num_done} episodes completed in batch")
 
-        # Track episode returns when dones are received
-        done_indices_local = torch.where(dones_batch.cpu())[0] # Find dones on CPU
-        if len(done_indices_local) > 0:
-             # Process each completed episode in the batch
-             # This requires careful handling if batches contain partial episodes
-             # For simplicity, this assumes reward tracking happens externally or per-step
-             # Or, we reconstruct episode rewards if possible (more complex)
-             # Let's keep the simple per-step reward accumulation for now
-             pass # Logic moved to store_experience for simplicity
-
-    # --- Single Experience Method (Legacy/Optional) ---
     def store_experience(self, obs, action, log_prob, reward, value, done, env_id=0):
         """
         Store a single experience in the buffer.
@@ -441,15 +459,16 @@ class PPOAlgorithm(BaseAlgorithm):
             reward_val = reward.item()
         else:
             reward_val = float(reward)
-        self.current_episode_rewards.append(reward_val)
+        
+        self._temp_episode_rewards.append(reward_val)
 
         if done:
-            if self.current_episode_rewards:
-                episode_return = sum(self.current_episode_rewards)
+            if self._temp_episode_rewards:
+                episode_return = sum(self._temp_episode_rewards)
                 self.episode_returns.append(episode_return)
                 if self.debug:
                     print(f"[DEBUG PPO] Episode done with return: {episode_return}")
-                self.current_episode_rewards = [] # Reset for next episode
+                self._temp_episode_rewards = [] # Reset for next episode
 
     # --- Action Selection ---
     def get_action(self, obs, deterministic=False, return_features=False):
@@ -458,15 +477,25 @@ class PPOAlgorithm(BaseAlgorithm):
             obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
         # Lazy init and normalize observation
         if self.obs_rms is None:
-            feat_dim = obs.shape[-1] if obs.dim() > 1 else obs.numel()
+            # Handle different observation shapes more robustly
+            if obs.dim() == 1:
+                feat_dim = obs.numel()
+            else:
+                # For multi-dimensional obs, flatten to get feature count
+                feat_dim = obs.view(-1).shape[0] if obs.dim() > 1 else obs.numel()
             self.obs_rms = self.ret_rms.__class__(shape=(feat_dim,))
-        obs_np = obs.cpu().numpy()
+        
+        # Flatten observation for normalization if needed
+        obs_shape = obs.shape
+        obs_flat = obs.view(-1) if obs.dim() > 1 else obs
+        obs_np = obs_flat.cpu().numpy()
         if obs_np.ndim == 1:
             obs_np = obs_np[None, :]
         self.obs_rms.update(obs_np)
         mean = torch.from_numpy(self.obs_rms.mean).to(self.device).float()
         std = torch.from_numpy(np.sqrt(self.obs_rms.var + 1e-8)).to(self.device).float()
-        obs = (obs - mean) / std
+        obs_flat_norm = (obs_flat - mean) / std
+        obs = obs_flat_norm.view(obs_shape) # Restore original shape
         # Add batch dimension if missing - check if first dimension could be batch size
         # We expect obs to be [batch_size, ...] or [...] where ... is the observation shape
         needs_unsqueeze = obs.dim() < 2  # If 1D or 0D tensor, needs batch dimension
@@ -515,15 +544,16 @@ class PPOAlgorithm(BaseAlgorithm):
                 if return_features: return dummy_action, dummy_log_prob, dummy_value, features
                 else: return dummy_action, dummy_log_prob, dummy_value
 
-            # Ensure value is correctly shaped [batch, 1] or [batch] -> [batch, 1]
+            # Ensure value is correctly shaped [batch] (scalar values)
             if value is None: # Handle critic error
                  if self.debug: print("[DEBUG PPO get_action] Error: Critic output (value) not found.")
-                 value = torch.zeros(obs.shape[0], 1, device=self.device) # Dummy value
-            elif value.dim() == 1:
-                 value = value.unsqueeze(1) # Ensure shape [batch, 1]
-            elif value.dim() == 2 and value.shape[1] != 1:
-                 if self.debug: print(f"[DEBUG PPO get_action] Warning: Critic output has shape {value.shape}, expected [batch, 1]. Taking first element.")
-                 value = value[:, 0].unsqueeze(1)
+                 value = torch.zeros(obs.shape[0], device=self.device) # Dummy value
+            elif value.dim() == 2:
+                 if value.shape[1] == 1:
+                     value = value.squeeze(1) # Convert [batch, 1] to [batch]
+                 else:
+                     if self.debug: print(f"[DEBUG PPO get_action] Warning: Critic output has shape {value.shape}, expected [batch, 1]. Taking first element.")
+                     value = value[:, 0] # Take first column
 
 
             # --- Action Sampling / Deterministic Choice ---
@@ -531,7 +561,7 @@ class PPOAlgorithm(BaseAlgorithm):
             if self.action_space_type == "discrete":
                 # Assuming actor_output contains logits or probabilities
                 # If logits, apply softmax
-                if torch.is_floating_point(actor_output[0]) and actor_output.shape[-1] > 1 : # Heuristic: check if looks like logits/probs
+                if torch.is_floating_point(actor_output) and actor_output.shape[-1] > 1 : # Heuristic: check if looks like logits/probs
                     probs = F.softmax(actor_output, dim=-1)
                     # Clamp and re-normalize for stability
                     probs = torch.clamp(probs, min=1e-8)
@@ -573,7 +603,7 @@ class PPOAlgorithm(BaseAlgorithm):
         if needs_unsqueeze:
              action = action.squeeze(0)
              log_prob = log_prob.squeeze(0)
-             value = value.squeeze(0) # Shape [1]
+             value = value.squeeze(0) # Shape [] (scalar)
              if return_features and features is not None:
                  features = features.squeeze(0)
 
@@ -625,23 +655,28 @@ class PPOAlgorithm(BaseAlgorithm):
                  if not dones[-1]: # If the trajectory didn't end
                       if self.shared_model:
                           model_output = self.critic(last_state, return_actor=False, return_critic=True, return_features=False)
-                          last_value = model_output.get('critic_out', torch.tensor([[0.0]], device=self.device))
+                          last_value = model_output.get('critic_out', torch.tensor(0.0, device=self.device))
                       else:
                           last_value = self.critic(last_state) # Get V(s_last)
 
-                      # Ensure scalar value shape [1, 1]
-                      if last_value.dim() == 0: last_value = last_value.view(1, 1)
-                      elif last_value.dim() == 1: last_value = last_value.unsqueeze(1)
-                      elif last_value.shape[1] != 1: last_value = last_value[:, 0].unsqueeze(1)
+                      # Ensure scalar value
+                      if last_value.dim() == 2 and last_value.shape[1] == 1:
+                          last_value = last_value.squeeze() # Convert [1, 1] to scalar
+                      elif last_value.dim() == 1:
+                          last_value = last_value.squeeze() # Convert [1] to scalar
+                      elif last_value.dim() == 2:
+                          last_value = last_value[0, 0] # Take first element if multi-dimensional
 
 
         # `values` from buffer are V(s_t), `last_value` is V(s_{t+1}) for the last step.
-        returns, advantages = self._compute_gae(rewards, values, dones, last_value.item()) # Pass scalar last_value
-        # Normalize returns before update (ret_rms eagerly initialized in constructor)
-        self.ret_rms.update(returns.cpu().numpy())
-        mean_r = torch.tensor(self.ret_rms.mean, device=self.device, dtype=torch.float32)
-        std_r = torch.tensor(np.sqrt(self.ret_rms.var + 1e-8), device=self.device, dtype=torch.float32)
-        returns = (returns - mean_r) / std_r
+        last_value_scalar = last_value.item() if isinstance(last_value, torch.Tensor) else float(last_value)
+        returns, advantages = self._compute_gae(rewards, values, dones, last_value_scalar) # Pass scalar last_value
+        # Don't normalize returns for critic loss - keep original scale
+        # Return normalization can destabilize value learning
+        # self.ret_rms.update(returns.cpu().numpy())
+        # mean_r = torch.tensor(self.ret_rms.mean, device=self.device, dtype=torch.float32)
+        # std_r = torch.tensor(np.sqrt(self.ret_rms.var + 1e-8), device=self.device, dtype=torch.float32)
+        # returns = (returns - mean_r) / std_r
 
         # Check for NaNs/Infs in advantages or returns
         if torch.isnan(advantages).any() or torch.isinf(advantages).any() or \
@@ -691,12 +726,29 @@ class PPOAlgorithm(BaseAlgorithm):
             tuple of (returns, advantages) tensors, both shape [buffer_size]
         """
         buffer_size = len(rewards)
+        
+        # Validate inputs
+        if buffer_size == 0:
+            if self.debug:
+                print("[DEBUG PPO _compute_gae] Empty buffer, returning empty tensors")
+            empty_tensor = torch.zeros(0, device=rewards.device)
+            return empty_tensor, empty_tensor
+            
+        if not isinstance(last_value, (int, float)):
+            raise ValueError(f"last_value must be a scalar, got {type(last_value)}")
+
         advantages = torch.zeros_like(rewards)
         gae = 0.0
 
         # Ensure values has shape [buffer_size] for calculation
-        if values.dim() > 1:
-             values = values.squeeze(-1) # Convert [buffer_size, 1] to [buffer_size]
+        if values.dim() == 2 and values.shape[1] == 1:
+            values = values.squeeze(1) # Convert [buffer_size, 1] to [buffer_size]
+        elif values.dim() > 1:
+            values = values.view(-1) # Flatten to [buffer_size]
+            
+        # Validate tensor shapes match
+        if values.shape[0] != buffer_size or dones.shape[0] != buffer_size:
+            raise ValueError(f"Tensor shape mismatch: rewards={rewards.shape}, values={values.shape}, dones={dones.shape}")
 
         # Calculate advantages
         for t in reversed(range(buffer_size)):
@@ -716,7 +768,21 @@ class PPOAlgorithm(BaseAlgorithm):
         # Normalize advantages across the entire buffer (standard practice)
         adv_mean = advantages.mean()
         adv_std = advantages.std()
-        advantages = (advantages - adv_mean) / (adv_std + 1e-8)
+        
+        # Add small epsilon to prevent division by zero
+        adv_std_safe = torch.clamp(adv_std, min=1e-8)
+        advantages = (advantages - adv_mean) / adv_std_safe
+
+        # Check for NaN/Inf in computed values
+        if torch.isnan(advantages).any() or torch.isinf(advantages).any():
+            if self.debug:
+                print("[DEBUG PPO _compute_gae] NaN or Inf detected in advantages after normalization")
+            # Fallback: use unnormalized advantages
+            advantages = (advantages + values) - values  # Reset to unnormalized
+            
+        if torch.isnan(returns).any() or torch.isinf(returns).any():
+            if self.debug:
+                print("[DEBUG PPO _compute_gae] NaN or Inf detected in returns")
 
         if self.debug:
             print(f"[DEBUG PPO _compute_gae] Returns mean: {returns.mean():.4f}, std: {returns.std():.4f}")
@@ -811,8 +877,10 @@ class PPOAlgorithm(BaseAlgorithm):
                 batch_rewards = rewards[batch_idx] # For aux tasks
                 # Old value predictions for clipped value loss
                 batch_old_values = old_values[batch_idx]
-                if batch_old_values.dim() > 1 and batch_old_values.shape[-1] == 1:
-                    batch_old_values = batch_old_values.squeeze(-1)
+                if batch_old_values.dim() == 2 and batch_old_values.shape[1] == 1:
+                    batch_old_values = batch_old_values.squeeze(1)
+                elif batch_old_values.dim() > 1:
+                    batch_old_values = batch_old_values.view(-1) # Ensure [batch] shape
 
 
                 # --- Forward pass for current policy and value ---
@@ -851,8 +919,10 @@ class PPOAlgorithm(BaseAlgorithm):
                         if predicted_values is None: raise ValueError("Critic output (value) missing")
 
                         # Ensure predicted_values is [batch] for loss calculation
-                        if predicted_values.dim() > 1:
-                             predicted_values = predicted_values.squeeze(-1)
+                        if predicted_values.dim() == 2 and predicted_values.shape[1] == 1:
+                             predicted_values = predicted_values.squeeze(1)
+                        elif predicted_values.dim() > 1:
+                             predicted_values = predicted_values.view(-1) # Flatten to [batch]
 
                         # --- Calculate Actor Loss components ---
                         dist = None
@@ -889,8 +959,8 @@ class PPOAlgorithm(BaseAlgorithm):
                         actor_loss = -torch.min(surr1, surr2).mean()
 
                         # --- Calculate Critic Loss (clipped-value) ---
-                        # Clipped value loss to stabilize critic
-                        value_pred_clipped = batch_old_values + (predicted_values - batch_old_values).clamp(-eps, eps)
+                        # Clipped value loss to stabilize critic using separate value clip epsilon
+                        value_pred_clipped = batch_old_values + (predicted_values - batch_old_values).clamp(-self.value_clip_epsilon, self.value_clip_epsilon)
                         loss_original = (predicted_values - batch_returns).pow(2)
                         loss_clipped = (value_pred_clipped - batch_returns).pow(2)
                         critic_loss = 0.5 * torch.mean(torch.max(loss_original, loss_clipped))
@@ -1042,7 +1112,7 @@ class PPOAlgorithm(BaseAlgorithm):
             'scaler': self.scaler.state_dict(),
             # 'memory_state': self.memory.get_state_dict() if hasattr(self.memory, 'get_state_dict') else None, # Memory usually not saved
             'episode_returns': list(self.episode_returns),
-            'current_episode_rewards': self.current_episode_rewards,
+            '_temp_episode_rewards': self._temp_episode_rewards,
             # Removed non-standard params like kappa, G_running etc.
         })
         # Add aux task manager state if needed
@@ -1077,8 +1147,8 @@ class PPOAlgorithm(BaseAlgorithm):
         #     self.memory.load_state_dict(state_dict['memory_state'])
         if 'episode_returns' in state_dict:
             self.episode_returns = deque(state_dict['episode_returns'], maxlen=self.episode_returns.maxlen)
-        if 'current_episode_rewards' in state_dict:
-            self.current_episode_rewards = state_dict['current_episode_rewards']
+        if '_temp_episode_rewards' in state_dict:
+            self._temp_episode_rewards = state_dict['_temp_episode_rewards']
 
         # Load aux task manager state if needed
         if 'aux_task_manager' in state_dict and self.aux_task_manager and hasattr(self.aux_task_manager, 'load_state_dict'):

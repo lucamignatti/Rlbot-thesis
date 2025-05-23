@@ -74,7 +74,7 @@ class SkillRatingTracker:
     def __init__(self, initial_rating=1500, rating_inc=32, modes=None):
         """
         Initialize a skill rating tracker with Elo-like rating system
-        
+
         Args:
             initial_rating: Starting rating value (default: 1500)
             rating_inc: Rating change factor (K-factor in Elo) (default: 32)
@@ -84,16 +84,16 @@ class SkillRatingTracker:
         self.modes = modes or {'default': initial_rating}
         self.history = {mode: [rating] for mode, rating in self.modes.items()}
         self.update_count = {mode: 0 for mode in self.modes}
-        
+
     def update_rating(self, opponent_rating, result, mode='default'):
         """
         Update the rating based on the result against an opponent.
-        
+
         Args:
             opponent_rating: The rating of the opponent (or baseline)
             result: 1 for win, 0 for loss, 0.5 for draw
             mode: The game mode to update
-        
+
         Returns:
             The updated rating
         """
@@ -101,24 +101,24 @@ class SkillRatingTracker:
             self.modes[mode] = self.modes['default']
             self.history[mode] = [self.modes[mode]]
             self.update_count[mode] = 0
-            
+
         # Calculate the expected score (probability of winning)
         exp_delta = (opponent_rating - self.modes[mode]) / 400
         expected = 1 / (pow(10, exp_delta) + 1)
-        
+
         # Update rating
         self.modes[mode] += self.rating_inc * (result - expected)
-        
+
         # Store in history
         self.history[mode].append(self.modes[mode])
         self.update_count[mode] += 1
-        
+
         return self.modes[mode]
 
     def get_current_rating(self, mode='default'):
         """Get the current rating for a specific mode"""
         return self.modes.get(mode, self.modes['default'])
-    
+
     def get_rating_history(self, mode='default'):
         """Get the history of ratings for a specific mode"""
         return self.history.get(mode, self.history['default'])
@@ -265,7 +265,7 @@ class Trainer:
         # Learning rates
         self.lr_actor = lr_actor
         self.lr_critic = lr_critic
-        
+
         # Learning rate decay settings
         self.use_lr_decay = use_lr_decay
         self.lr_decay_rate = lr_decay_rate
@@ -408,13 +408,13 @@ class Trainer:
         self.aux_sr_losses = collections.deque(maxlen=history_len)
         self.aux_rp_losses = collections.deque(maxlen=history_len)
         self.episode_rewards = collections.deque(maxlen=history_len)  # Track episode rewards
-        
+
         # Environment statistics tracking
         # Environment statistics tracking - accumulate values between updates
         self.env_stats_buffer = {}  # Dictionary to accumulate environment statistics between updates
         self.env_stats_counts = {}  # Counter for each statistic to calculate averages
         self.env_stats_metrics = {}  # Averaged metrics to report in WandB
-        
+
         # Initialize skill rating tracker
         self.skill_tracker = SkillRatingTracker(initial_rating=1500, rating_inc=32)
         self.baseline_rating = 1500  # Static baseline rating
@@ -606,10 +606,10 @@ class Trainer:
 
         # Get current training step if not explicitly provided
         current_step = step if step is not None else self._true_training_steps()
-        
+
         # Use environment steps as our primary x-axis for logging
         current_env_steps = total_env_steps if total_env_steps is not None else self.total_env_steps
-        
+
         # Skip logging if we've already logged this environment step
         if hasattr(self, '_last_wandb_env_step') and current_env_steps <= self._last_wandb_env_step:
             if self.debug:
@@ -695,24 +695,24 @@ class Trainer:
 
         if self.debug and env_stat_count > 0:
             print(f"[WANDB DEBUG] Adding {env_stat_count} averaged environment metrics to WandB")
-            
+
         # --- Skill metrics ---
         skill_metrics = grouped_metrics['skill']
         skill_stat_count = 0
-        
+
         # Extract skill metrics that were passed via metrics
         for key, value in metrics.items():
             # Process metrics with SKILL/ prefix
             if key.startswith('SKILL/'):
                 skill_metrics[key] = value
                 skill_stat_count += 1
-            
+
         # Always include current skill rating, even if not updated this step
         if skill_stat_count == 0 and hasattr(self, 'skill_tracker'):
             current_rating = self.skill_tracker.get_current_rating()
             skill_metrics["SKILL/rating"] = current_rating
             skill_stat_count += 1
-            
+
         if self.debug and skill_stat_count > 0:
             print(f"[WANDB DEBUG] Adding {skill_stat_count} skill metrics to WandB")
 
@@ -880,7 +880,7 @@ class Trainer:
         Store the initial part of experiences (obs, action, log_prob, value) in batch.
         Delegates to the algorithm's implementation.
         Returns the indices where the experiences were stored.
-        
+
         Args:
             obs_batch: Batch of observations
             action_batch: Batch of actions
@@ -893,7 +893,7 @@ class Trainer:
             for env_stats in env_stats_batch:
                 if env_stats:
                     self.accumulate_env_stats(env_stats)
-        
+
         if hasattr(self.algorithm, 'store_initial_batch'):
             return self.algorithm.store_initial_batch(obs_batch, action_batch, log_prob_batch, value_batch)
         else:
@@ -934,173 +934,344 @@ class Trainer:
         """Store experience in the buffer with environment ID."""
         # Get whether we're in test mode
         test_mode = getattr(self, 'test_mode', False)
-        
+
         # Accumulate environment statistics if provided
         if env_stats and not test_mode:
             self.accumulate_env_stats(env_stats)
 
         # Reward Scaling (SimbaV2) (REMOVED - Handled in Algorithm)
         original_reward = reward # Keep original for potential intrinsic calculation later
-        # if self.use_reward_scaling and not test_mode:
-             # ... scaling logic removed ...
-             # reward = self._scale_reward(env_id, reward_float, variance_G, max_G)
-             # ... debug print removed ...
 
         # Skip intrinsic reward calculation when reward is 0 (placeholder value)
-        # This is to avoid calculating intrinsic rewards before we have the actual reward from the environment
-        # Instead, we'll use the update_experience_with_intrinsic_reward method after we have the real reward
-        # --- Add pretraining check here ---
         add_intrinsic = self.use_intrinsic_rewards and not self.pretraining_completed and self.intrinsic_reward_generator is not None
         is_placeholder_reward = isinstance(original_reward, (int, float)) and original_reward == 0 or \
                               hasattr(original_reward, 'item') and original_reward.item() == 0
 
         intrinsic_reward_value = 0.0 # Default value
 
-        if add_intrinsic and not is_placeholder_reward: # add_intrinsic now includes the pretraining check
-            # Convert inputs to tensor format for intrinsic reward computation
-            if not isinstance(state, torch.Tensor):
-                state_tensor = torch.FloatTensor(state).to(self.device)
-                if state_tensor.dim() == 1:
-                    state_tensor = state_tensor.unsqueeze(0)
-            else:
-                state_tensor = state.to(self.device)
+        if add_intrinsic and not is_placeholder_reward:
+            state_tensor = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0) if not isinstance(state, torch.Tensor) else state.to(self.device)
+            action_tensor = self._prepare_action_tensor(action)
 
-            if not isinstance(action, torch.Tensor):
-                if self.action_space_type == "discrete":
-                    if isinstance(action, np.ndarray):
-                        # For numpy arrays
-                        if action.size == 1:
-                            # Single value in array
-                            action = int(action.item())
-                        else:
-                            # Convert first element if multiple values
-                            action = int(action[0])
-                    elif isinstance(action, (float, np.floating)):
-                        # Direct float types
-                        action = int(action)
-                    elif hasattr(action, 'item'):
-                        # Tensor-like objects
-                        action = int(action.item())
-                    action_tensor = torch.LongTensor([action]).to(self.device)
-                else:
-                    action_tensor = torch.FloatTensor(action).to(self.device)
-                    if action_tensor.dim() == 1:
-                        action_tensor = action_tensor.unsqueeze(0)
-            else:
-                action_tensor = action.to(self.device)
-
-            # Get next state based on algorithm type and buffer structure
-            next_state = None
-            if self.algorithm_type == "streamac" and hasattr(self.algorithm, 'experience_buffers') and env_id in self.algorithm.experience_buffers:
-                # For StreamAC, use environment-specific buffer
-                if len(self.algorithm.experience_buffers[env_id]) > 0:
-                    next_state = self.algorithm.experience_buffers[env_id][-1]['obs']
-            elif self.algorithm_type == "ppo":
-                # For PPO, use the memory buffer
-                if hasattr(self.algorithm, 'memory') and hasattr(self.algorithm.memory, 'obs') and self.algorithm.memory.size > 0:
-                    # Get the most recent observation (accounting for circular buffer)
-                    idx = (self.algorithm.memory.pos - 1) % self.algorithm.memory.buffer_size
-                    next_state = self.algorithm.memory.obs[idx]
-            elif hasattr(self.algorithm, 'experience_buffer') and len(self.algorithm.experience_buffer) > 0:
-                # For other algorithms with a flat buffer
-                next_state = self.algorithm.experience_buffer[-1][0]
-
-            # If we found a next state, compute and apply intrinsic reward
+            next_state = self._get_next_state(env_id)
             if next_state is not None:
-                # Convert next_state to tensor if needed
-                if not isinstance(next_state, torch.Tensor):
-                    next_state = torch.FloatTensor(next_state).to(self.device)
-                # Ensure batch dimension
-                if next_state.dim() == 1:
-                    next_state = next_state.unsqueeze(0)
-
-                # Compute intrinsic reward using the correct method name
-                intrinsic_reward_value = self.intrinsic_reward_generator.compute_intrinsic_reward(
-                    state_tensor, action_tensor, next_state
-                )
-
-                # Removed adaptive scaling logic
-                # Scale the intrinsic reward using the fixed scale
-                intrinsic_reward_value = intrinsic_reward_value * self.intrinsic_reward_scale
-
-                # Log that we're applying intrinsic rewards in debug mode
+                next_state_tensor = torch.as_tensor(next_state, dtype=torch.float32, device=self.device).unsqueeze(0) if not isinstance(next_state, torch.Tensor) else next_state.to(self.device)
+                intrinsic_reward_value = self.intrinsic_reward_generator.compute_intrinsic_reward(state_tensor, action_tensor, next_state_tensor)
+                intrinsic_reward_value *= self.intrinsic_reward_scale
                 if self.debug:
                     extrinsic_reward_val = reward.item() if hasattr(reward, 'item') else reward
                     print(f"[DEBUG] Adding intrinsic reward: {intrinsic_reward_value} to scaled extrinsic: {extrinsic_reward_val}")
 
-
-        # Get the ORIGINAL extrinsic reward (scaling is handled by the algorithm now)
-        # Convert reward to float for calculations
-        if isinstance(original_reward, torch.Tensor): extrinsic_reward = original_reward.item()
-        elif isinstance(original_reward, np.ndarray): extrinsic_reward = original_reward.item() if original_reward.size == 1 else float(original_reward[0])
-        else: extrinsic_reward = float(original_reward)
-
-        # Calculate total reward (extrinsic + scaled intrinsic)
+        extrinsic_reward = self._get_scalar_reward(original_reward)
         total_reward = extrinsic_reward + intrinsic_reward_value
 
-        # Store the experience using the algorithm - only update if not in test mode
-        # Pass the TOTAL reward (extrinsic + scaled intrinsic) to the algorithm storage
-        if not test_mode:
-            if self.algorithm_type == "streamac":
-                # For StreamAC, check if an update was performed and pass env_id
-                if self.debug:
-                    print(f"[STEP DEBUG] Trainer.store_experience calling StreamAC.store_experience, current step: {self._true_training_steps()}")
+        if self.algorithm_type == "streamac":
+            self.algorithm.store_experience(state, action, log_prob, total_reward, value, done, env_id)
+        elif not test_mode:
+            if hasattr(self.algorithm, 'store_experience'):
+                 self.algorithm.store_experience(state, action, log_prob, total_reward, value, done, env_id)
+            elif hasattr(self.algorithm, 'memory') and hasattr(self.algorithm.memory, 'store'):
+                 self.algorithm.memory.store(state, action, log_prob, total_reward, value, done)
+            self.training_steps += 1
+            if self.debug:
+                print(f"[STEP DEBUG] Trainer.store_experience incremented training_steps to {self.training_steps}")
+        return total_reward
 
-                metrics, did_update = self.algorithm.store_experience(state, action, log_prob, total_reward, value, done, env_id=env_id) # Use total_reward
+    def store_experience_batch(self, states, actions, log_probs, rewards, values, dones, env_ids=None, env_stats_list=None):
+        """Store a batch of experiences."""
+        test_mode = getattr(self, 'test_mode', False)
+        batch_size = len(states)
+        total_rewards_batch = []
 
-                # If StreamAC performed an update, log to wandb immediately
-                if did_update and self.use_wandb:
-                    try:
-                        # Increment training steps counter BEFORE logging
-                        self.training_steps += 1
+        if env_stats_list and not test_mode:
+            for env_stats in env_stats_list:
+                self.accumulate_env_stats(env_stats)
 
-                        # Get a unique environment step value for this update
-                        unique_env_step = self._get_unique_wandb_step()
+        original_rewards_batch = rewards # Keep original for potential intrinsic calculation later
 
-                        if self.debug:
-                            print(f"[STEP DEBUG] StreamAC performed update, incrementing step to {self._true_training_steps()}")
-                            print(f"[STEP DEBUG] About to log to wandb with env_step={unique_env_step}")
+        # Batch intrinsic reward calculation
+        intrinsic_rewards_batch = torch.zeros(batch_size, device=self.device)
+        if self.use_intrinsic_rewards and not self.pretraining_completed and self.intrinsic_reward_generator is not None:
+            # Prepare batch tensors - handle possible CUDA tensors
+            processed_states = []
+            for s in states:
+                if isinstance(s, torch.Tensor):
+                    processed_states.append(s.cpu().detach().numpy())
+                else:
+                    processed_states.append(s)
+            states_tensor = torch.as_tensor(np.array(processed_states), dtype=torch.float32, device=self.device)
+            actions_tensor = self._prepare_action_batch_tensor(actions) # Assumes a new helper method
 
-                        # Log metrics using our centralized logging function - no need to pass step parameter
-                        # as it will use total_env_steps (which we pass) by default
-                        self._log_to_wandb(metrics, total_env_steps=unique_env_step)
-                    except Exception as e:
-                        if self.debug:
-                            print(f"[STEP DEBUG] Error logging to wandb: {e}")
-                            import traceback
-                            traceback.print_exc()
-            else:
-                # For other algorithms like PPO, just store normally
-                # This method is now less used for PPO due to batching
-                self.algorithm.store_experience(state, action, log_prob, total_reward, value, done) # Use total_reward
-        else:
-            # In test mode, just store without updating (for StreamAC)
-            if hasattr(self.algorithm, 'experience_buffer'):
-                exp = {
-                    'obs': state,
-                    'action': action,
-                    'log_prob': log_prob,
-                    'reward': original_reward, # Store original reward in test mode
-                    'value': value,
-                    'done': done,
-                    'env_id': env_id
-                }
-                self.algorithm.experience_buffer.append(exp)
+            # Getting next_states in batch is tricky, requires careful buffer inspection or assumptions
+            # For simplicity, this example might skip batch next_state or use a simplified approach
+            # A more robust solution would involve the algorithm providing next_states or modifying buffer access
+            # Placeholder: For now, let's assume we can get next_states or this part needs more work
+            # For PPO, we might be able to get next_obs from the main loop if it's passed here.
+            # If next_obs_batch is available from the main loop:
+            # next_states_tensor = torch.as_tensor(np.array(next_obs_batch), dtype=torch.float32, device=self.device)
+            # intrinsic_rewards_batch = self.intrinsic_reward_generator.compute_intrinsic_reward_batch(states_tensor, actions_tensor, next_states_tensor)
+            # intrinsic_rewards_batch *= self.intrinsic_reward_scale
+            # Fallback to individual calculation if batch next_state is hard.
+            # This part needs to be adapted based on how `next_obs_batch` is made available.
+            # For now, let's assume individual calculation as a fallback if batch next_state isn't readily available.
+            # This is a simplification and ideally should be batched.
+            if hasattr(self.intrinsic_reward_generator, 'compute_intrinsic_reward_batch') and False: # Disabled for now
+                pass # Placeholder for batch intrinsic reward
+            else: # Fallback to individual (less efficient)
+                for i in range(batch_size):
+                    is_placeholder_reward = isinstance(original_rewards_batch[i], (int, float)) and original_rewards_batch[i] == 0 or \
+                                          hasattr(original_rewards_batch[i], 'item') and original_rewards_batch[i].item() == 0
+                    if not is_placeholder_reward:
+                        state_i_tensor = torch.as_tensor(states[i], dtype=torch.float32, device=self.device).unsqueeze(0)
+                        action_i_tensor = self._prepare_action_tensor(actions[i])
+                        env_id_i = env_ids[i] if env_ids else 0
+                        next_state_i = self._get_next_state(env_id_i) # This is still per-item
+                        if next_state_i is not None:
+                            next_state_i_tensor = torch.as_tensor(next_state_i, dtype=torch.float32, device=self.device).unsqueeze(0)
+                            intrinsic_reward_i = self.intrinsic_reward_generator.compute_intrinsic_reward(state_i_tensor, action_i_tensor, next_state_i_tensor)
+                            intrinsic_rewards_batch[i] = intrinsic_reward_i * self.intrinsic_reward_scale
 
-                # Also store in environment-specific buffer if it exists
-                if hasattr(self.algorithm, 'experience_buffers'):
-                    if env_id not in self.algorithm.experience_buffers:
-                        self.algorithm.experience_buffers[env_id] = []
-                    self.algorithm.experience_buffers[env_id].append(exp)
 
-        # Update auxiliary task HISTORY BUFFERS if enabled
-        # Loss calculation is now handled within PPO update or separately for StreamAC
-        if self.use_auxiliary_tasks and hasattr(self, 'aux_task_manager'):
-            # Pass the ORIGINAL observation and the SCALED reward to the history
-            self.aux_task_manager.update(
-                observations=state,
-                rewards=total_reward # Use the total reward (scaled extrinsic + scaled intrinsic)
+        extrinsic_rewards_batch_scalar = [self._get_scalar_reward(r) for r in original_rewards_batch]
+        extrinsic_rewards_tensor = torch.tensor(extrinsic_rewards_batch_scalar, dtype=torch.float32, device=self.device)
+
+        total_rewards_tensor = extrinsic_rewards_tensor + intrinsic_rewards_batch
+        total_rewards_batch = total_rewards_tensor.cpu().tolist()
+
+        if self.algorithm_type == "ppo" and hasattr(self.algorithm, 'store_batch') and not test_mode:
+            # PPO uses its own batch storage method
+            obs_batch_tensor = torch.as_tensor(np.array(states), dtype=torch.float32, device=self.device)
+            # Actions might need specific formatting for PPO (e.g., Long for discrete)
+            action_dtype = torch.long if self.action_space_type == "discrete" else torch.float32
+            
+            # Handle possible CUDA tensors by moving to CPU first if needed
+            processed_actions = []
+            for a in actions:
+                if isinstance(a, torch.Tensor):
+                    processed_actions.append(a.cpu().detach().numpy())
+                else:
+                    processed_actions.append(a)
+            
+            try:
+                # Attempt to convert actions directly
+                actions_batch_tensor = torch.as_tensor(np.array(processed_actions), dtype=action_dtype, device=self.device)
+            except TypeError:
+                # Fallback for complex tensor types
+                actions_batch_tensor = torch.stack([torch.as_tensor(a, dtype=action_dtype) if not isinstance(a, torch.Tensor) 
+                                                  else a.to(dtype=action_dtype) for a in actions]).to(self.device)
+
+            # Process log_probs - handle CUDA tensors
+            processed_log_probs = []
+            for lp in log_probs:
+                if isinstance(lp, torch.Tensor):
+                    processed_log_probs.append(lp.cpu().detach().numpy())
+                else:
+                    processed_log_probs.append(lp)
+            log_probs_batch_tensor = torch.as_tensor(np.array(processed_log_probs), dtype=torch.float32, device=self.device)
+            
+            # Process values - handle CUDA tensors
+            processed_values = []
+            for v in values:
+                if isinstance(v, torch.Tensor):
+                    processed_values.append(v.cpu().detach().numpy())
+                else:
+                    processed_values.append(v)
+            # Values should be scalar, ensure they are float32
+            values_batch_tensor = torch.as_tensor(np.array(processed_values), dtype=torch.float32, device=self.device)
+            if values_batch_tensor.dim() > 1 and values_batch_tensor.shape[-1] == 1: # Ensure [batch_size]
+                values_batch_tensor = values_batch_tensor.squeeze(-1)
+            elif values_batch_tensor.dim() > 1: # If still >1D, flatten
+                 values_batch_tensor = values_batch_tensor.view(batch_size, -1)[:,0] # Take first element if multiple features per value
+
+
+            dones_batch_tensor = torch.as_tensor(np.array(dones), dtype=torch.bool, device=self.device)
+
+            self.algorithm.store_batch(
+                obs_batch_tensor,
+                actions_batch_tensor,
+                log_probs_batch_tensor,
+                total_rewards_tensor, # Use the tensor directly
+                values_batch_tensor,
+                dones_batch_tensor
             )
+            self.training_steps += batch_size # Increment by batch size for PPO
+            if self.debug:
+                print(f"[STEP DEBUG] Trainer.store_experience_batch (PPO) incremented training_steps by {batch_size} to {self.training_steps}")
+
+        elif not test_mode: # Fallback for other algorithms or if PPO's batch store isn't used
+            for i in range(batch_size):
+                env_id_i = env_ids[i] if env_ids else 0
+                # This path reuses the single store_experience, which is less efficient
+                # but ensures intrinsic rewards are handled if not batched above.
+                # To truly batch, the intrinsic reward and storage for other algos would need batch methods.
+                self.store_experience(states[i], actions[i], log_probs[i], rewards[i], values[i], dones[i], env_id_i)
+
+        return total_rewards_batch
+
+    def _prepare_action_tensor(self, action):
+        """Helper to convert a single action to a tensor."""
+        if isinstance(action, torch.Tensor):
+            # Handle CUDA tensors safely
+            if action.device.type == 'cuda':
+                # If already on CUDA, just ensure it's on the right device
+                return action.to(self.device)
+            return action.to(self.device)
+            
+        if self.action_space_type == "discrete":
+            if isinstance(action, np.ndarray): action = int(action.item()) if action.size == 1 else int(action[0])
+            elif isinstance(action, (float, np.floating)): action = int(action)
+            elif hasattr(action, 'item'): 
+                # Handle tensor.item() for CUDA tensors
+                try:
+                    action = int(action.item())
+                except RuntimeError:
+                    # If CUDA tensor, move to CPU first
+                    action = int(action.cpu().item())
+            return torch.LongTensor([action]).to(self.device)
+        else: # Continuous
+            # Handle possible CUDA tensor
+            if isinstance(action, torch.Tensor):
+                action_tensor = action.to(dtype=torch.float32)
+            else:
+                action_tensor = torch.FloatTensor(action)
+            action_tensor = action_tensor.to(self.device)
+            return action_tensor.unsqueeze(0) if action_tensor.dim() == 1 else action_tensor
+
+    def _prepare_action_batch_tensor(self, actions):
+        """Helper to convert a batch of actions to a tensor."""
+        if isinstance(actions, torch.Tensor):
+            return actions.to(self.device)
+        
+        processed_actions = []
+        for action in actions:
+            if isinstance(action, torch.Tensor):
+                # Handle CUDA tensors by moving to CPU before conversion
+                action_cpu = action.cpu().detach()
+                if self.action_space_type == "discrete":
+                    processed_actions.append(int(action_cpu.item()))
+                else:
+                    processed_actions.append(action_cpu.numpy())
+            elif self.action_space_type == "discrete":
+                if isinstance(action, np.ndarray): action_val = int(action.item()) if action.size == 1 else int(action[0])
+                elif isinstance(action, (float, np.floating)): action_val = int(action)
+                elif hasattr(action, 'item'): action_val = int(action.item())
+                else: action_val = int(action) # Fallback
+                processed_actions.append(action_val)
+            else: # Continuous
+                # Assuming actions are already list of lists/arrays or similar for continuous
+                processed_actions.append(action)
+        
+        action_dtype = torch.long if self.action_space_type == "discrete" else torch.float32
+        try:
+            return torch.tensor(processed_actions, dtype=action_dtype, device=self.device)
+        except Exception as e:
+            if self.debug: print(f"Error converting batch actions to tensor: {e}. Actions: {actions}")
+            # Fallback for complex structures, e.g. list of tensors
+            return torch.stack([
+                torch.as_tensor(a, dtype=action_dtype) if not isinstance(a, torch.Tensor) 
+                else a.to(dtype=action_dtype, device="cpu") 
+                for a in actions
+            ]).to(self.device)
+
+
+    def _get_next_state(self, env_id):
+        """Helper to get the next state from the buffer for intrinsic reward calculation."""
+        if self.algorithm_type == "streamac" and hasattr(self.algorithm, 'experience_buffers') and env_id in self.algorithm.experience_buffers:
+            if len(self.algorithm.experience_buffers[env_id]) > 0:
+                return self.algorithm.experience_buffers[env_id][-1]['obs']
+        elif self.algorithm_type == "ppo":
+            if hasattr(self.algorithm, 'memory') and hasattr(self.algorithm.memory, 'obs') and self.algorithm.memory.size > 0:
+                idx = (self.algorithm.memory.pos - 1 + self.algorithm.memory.buffer_size) % self.algorithm.memory.buffer_size
+                return self.algorithm.memory.obs[idx]
+        elif hasattr(self.algorithm, 'experience_buffer') and len(self.algorithm.experience_buffer) > 0:
+            return self.algorithm.experience_buffer[-1][0]
+        return None
+
+    def _get_scalar_reward(self, reward):
+        """Helper to convert reward to a scalar float."""
+        if isinstance(reward, torch.Tensor): return reward.item()
+        elif isinstance(reward, np.ndarray): return reward.item() if reward.size == 1 else float(reward[0])
+        return float(reward)
+
+    def update_experience_with_intrinsic_reward(self, store_idx, obs, action, next_obs, reward, done):
+        """
+        Update a previously stored experience with intrinsic rewards.
+        
+        Args:
+            store_idx: Index in the buffer where the experience is stored
+            obs: Original observation
+            action: Action taken
+            next_obs: Next observation
+            reward: Extrinsic reward
+            done: Done flag
+            
+        Returns:
+            Total reward (extrinsic + intrinsic)
+        """
+        if not self.use_intrinsic_rewards or self.intrinsic_reward_generator is None:
+            return reward  # Return original reward if intrinsic rewards not used
+
+        # Convert inputs to tensor format for intrinsic reward computation
+        state_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
+        if state_tensor.dim() == 1:
+            state_tensor = state_tensor.unsqueeze(0)
+            
+        # Prepare action tensor
+        action_tensor = self._prepare_action_tensor(action)
+        
+        # Prepare next state tensor
+        next_state_tensor = torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
+        if next_state_tensor.dim() == 1:
+            next_state_tensor = next_state_tensor.unsqueeze(0)
+            
+        # Calculate intrinsic reward
+        intrinsic_reward = 0.0
+        try:
+            intrinsic_reward = self.intrinsic_reward_generator.compute_intrinsic_reward(
+                state_tensor, action_tensor, next_state_tensor
+            )
+            # Scale the intrinsic reward
+            intrinsic_reward = intrinsic_reward * self.intrinsic_reward_scale
+            
+            if self.debug:
+                print(f"[DEBUG] Intrinsic reward calculated: {intrinsic_reward:.4f}")
+                
+        except Exception as e:
+            if self.debug:
+                print(f"[DEBUG] Error calculating intrinsic reward: {e}")
+                
+        # Calculate total reward (extrinsic + intrinsic)
+        extrinsic_reward = self._get_scalar_reward(reward)
+        total_reward = extrinsic_reward + intrinsic_reward
+        
+        # Update the experience in the algorithm's buffer with the new total reward
+        if store_idx is not None:
+            if self.algorithm_type == "ppo":
+                # PPO uses its own memory buffer with dedicated index-based update
+                if hasattr(self.algorithm, 'update_rewards_dones_batch') and isinstance(store_idx, torch.Tensor):
+                    # Use batch update if possible
+                    self.algorithm.update_rewards_dones_batch(
+                        store_idx, 
+                        torch.tensor([total_reward], device=self.device), 
+                        torch.tensor([done], device=self.device)
+                    )
+                elif hasattr(self.algorithm.memory, 'rewards') and hasattr(self.algorithm.memory, 'dones'):
+                    # Direct buffer update as fallback
+                    self.algorithm.memory.rewards[store_idx] = torch.tensor(total_reward, device=self.device)
+                    self.algorithm.memory.dones[store_idx] = torch.tensor(done, device=self.device)
+            else:
+                # Other algorithms might have their own update methods
+                if hasattr(self.algorithm, 'update_experience_at_idx'):
+                    self.algorithm.update_experience_at_idx(store_idx, reward=total_reward, done=done)
+        
+        # Update auxiliary task buffers if needed
+        if self.use_auxiliary_tasks and hasattr(self, 'aux_task_manager'):
+            self.aux_task_manager.update(
+                observations=obs,
+                rewards=total_reward
+            )
+            
+        return total_reward
 
 
     # Helper method to get a unique wandb step based on environment steps
@@ -1179,7 +1350,7 @@ class Trainer:
         if self.use_pretraining:
             self._update_pretraining_state()
             self._update_auxiliary_weights()
-            
+
         # Apply learning rate decay if enabled
         if self.use_lr_decay:
             current_step = self._true_training_steps()
@@ -1199,14 +1370,14 @@ class Trainer:
                 print(f"[DEBUG] Received {len(env_stats)} environment stats for accumulation")
             # Accumulate stats for averaging at log time
             self.accumulate_env_stats(env_stats)
-            
-        # Compute averages from accumulated environment stats 
+
+        # Compute averages from accumulated environment stats
         # and add them to metrics dictionary
         avg_env_stats = self._compute_avg_env_stats()
         if avg_env_stats:
-            if self.debug: 
+            if self.debug:
                 print(f"[DEBUG] Adding {len(avg_env_stats)} averaged environment stats to metrics")
-            
+
             # Add the averaged stats to the metrics dictionary with 'env_' prefix
             for key, value in avg_env_stats.items():
                 # Ensure all env stats have the 'env_' prefix
@@ -1251,12 +1422,12 @@ class Trainer:
             metrics['min_episode_reward'] = np.min(completed_episode_rewards)
             metrics['max_episode_reward'] = np.max(completed_episode_rewards)
             metrics['std_episode_reward'] = np.std(completed_episode_rewards)
-            
+
             # Update skill rating if we have enough history
             if len(self.episode_rewards) >= self.skill_update_frequency:
                 # Get current batch performance
                 current_reward = metrics['mean_episode_reward']
-                
+
                 # Only update skill rating every N episodes
                 if self.total_episodes % self.skill_update_frequency == 0:
                     # Calculate performance relative to historical baseline
@@ -1264,13 +1435,13 @@ class Trainer:
                         # Use recent history excluding current batch for comparison
                         historical_rewards = list(self.episode_rewards)[:-len(completed_episode_rewards)]
                         recent_rewards = historical_rewards[-self.skill_rating_window:]
-                        
+
                         historical_mean = np.mean(recent_rewards) if recent_rewards else current_reward
                         historical_std = max(0.1, np.std(recent_rewards)) if len(recent_rewards) > 1 else 1.0
-                        
+
                         # Calculate z-score (how many standard deviations from mean)
                         z_score = (current_reward - historical_mean) / historical_std
-                        
+
                         # Determine win/loss/draw based on performance with customizable z-score threshold
                         if z_score > self.skill_zscore_threshold:  # Better than historical performance
                             result = 1.0  # Win
@@ -1278,15 +1449,15 @@ class Trainer:
                             result = 0.0  # Loss
                         else:  # Similar to historical performance
                             result = 0.5  # Draw
-                            
+
                         # Update skill rating
                         new_rating = self.skill_tracker.update_rating(self.baseline_rating, result)
-                        
+
                         # Add skill metrics to wandb logging
                         metrics['SKILL/rating'] = new_rating
                         metrics['SKILL/z_score'] = z_score
                         metrics['SKILL/result'] = result
-                        
+
                         if self.debug:
                             print(f"[DEBUG] Updated skill rating: {new_rating:.1f} (z-score: {z_score:.2f}, result: {result})")
                     else:
@@ -1444,7 +1615,7 @@ class Trainer:
                  checkpoint['intrinsic'] = self.intrinsic_reward_generator.get_state_dict()
                  if self.debug:
                      print(f"[DEBUG Trainer Save] Included intrinsic reward state in checkpoint.")
-                     
+
         # Include skill tracker state
         if hasattr(self, 'skill_tracker'):
             checkpoint['skill_tracker'] = {
@@ -1683,7 +1854,7 @@ class Trainer:
 
                 if self.debug:
                     print(f"[DEBUG] Restored entropy settings: coef={self.entropy_coef:.6f}, decay={self.entropy_coef_decay:.6f}")
-                    
+
             # ===== Restore Learning Rate Decay Settings =====
             if 'lr_decay' in checkpoint:
                 lr_decay_settings = checkpoint['lr_decay']
@@ -1693,7 +1864,7 @@ class Trainer:
                 self.min_lr = lr_decay_settings.get('min_lr', self.min_lr)
                 self.initial_lr_actor = lr_decay_settings.get('initial_lr_actor', self.initial_lr_actor)
                 self.initial_lr_critic = lr_decay_settings.get('initial_lr_critic', self.initial_lr_critic)
-                
+
                 if self.debug:
                     print(f"[DEBUG] Restored learning rate decay settings: "
                           f"enabled={self.use_lr_decay}, rate={self.lr_decay_rate}, "
@@ -1740,26 +1911,26 @@ class Trainer:
                     self.episode_rewards.clear() # Ensure it's empty if not loaded
                 if self.debug:
                     print("[DEBUG] No episode rewards history found in checkpoint. Initializing empty deque.")
-                    
+
             # ===== Restore Skill Tracker State =====
             if 'skill_tracker' in checkpoint:
                 skill_data = checkpoint['skill_tracker']
-                
+
                 # Make sure we have a skill tracker
                 if not hasattr(self, 'skill_tracker'):
                     self.skill_tracker = SkillRatingTracker()
-                
+
                 # Restore skill tracker state
                 self.skill_tracker.modes = skill_data.get('modes', {'default': 1500})
                 self.skill_tracker.history = skill_data.get('history', {'default': [1500]})
                 self.skill_tracker.update_count = skill_data.get('update_count', {'default': 0})
                 self.skill_tracker.rating_inc = skill_data.get('rating_inc', 32)
-                
+
                 # Restore skill tracking configuration
                 self.baseline_rating = skill_data.get('baseline_rating', 1500)
                 self.skill_update_frequency = skill_data.get('skill_update_frequency', 5)
                 self.skill_rating_window = skill_data.get('skill_rating_window', 100)
-                
+
                 if self.debug:
                     current_rating = self.skill_tracker.get_current_rating()
                     update_count = self.skill_tracker.update_count.get('default', 0)
@@ -1882,23 +2053,23 @@ class Trainer:
     def accumulate_env_stats(self, env_stats):
         """
         Accumulate environment statistics between updates for averaging.
-        
+
         Args:
             env_stats (dict): Dictionary of environment statistics from observations
         """
         if not env_stats:
             return
-            
+
         for key, value in env_stats.items():
             # Only process numerical values
             if isinstance(value, (int, float, np.number)) and not isinstance(value, bool):
                 if key not in self.env_stats_buffer:
                     self.env_stats_buffer[key] = 0.0
                     self.env_stats_counts[key] = 0
-                
+
                 self.env_stats_buffer[key] += float(value)
                 self.env_stats_counts[key] += 1
-                
+
         if self.debug and len(env_stats) > 0 and self._true_training_steps() % 500 == 0:
             print(f"[DEBUG] Accumulated env stats for {len(env_stats)} metrics. Total accumulated metrics: {len(self.env_stats_buffer)}")
 
@@ -1911,14 +2082,14 @@ class Trainer:
         for key, total_value in self.env_stats_buffer.items():
             count = max(1, self.env_stats_counts.get(key, 1))  # Avoid division by zero
             avg_stats[key] = total_value / count
-            
+
         # Clear the buffers for next accumulation period
         self.env_stats_buffer = {}
         self.env_stats_counts = {}
-        
+
         # Store the computed averages
         self.env_stats_metrics = avg_stats
-        
+
         return avg_stats
 
     def _update_pretraining_state(self):
@@ -1947,65 +2118,65 @@ class Trainer:
             if self.use_wandb:
                 wandb.log({'training/pretraining_completed': True}, step=current_step)
         # Removed transition phase logic
-        
+
     def update_learning_rate(self, current_step):
         """
         Update learning rate based on the current training step and decay parameters.
-        
+
         Args:
             current_step: Current training step count
-            
+
         Returns:
             tuple: Updated (actor_lr, critic_lr)
         """
         # Skip if lr decay is disabled or step is 0
         if not self.use_lr_decay or current_step <= 0:
             return self.lr_actor, self.lr_critic
-            
+
         if self.algorithm_type == "streamac" and self.adaptive_learning_rate:
             # For StreamAC with adaptive learning rate, we don't use this decay schedule
             # The algorithm handles its own learning rate adjustments
             if self.debug:
                 print("[DEBUG] Skipping LR decay for StreamAC with adaptive learning rate")
             return self.lr_actor, self.lr_critic
-            
+
         # Calculate decay factor (exponential decay)
         decay_factor = max(self.lr_decay_rate ** (current_step / self.lr_decay_steps), self.min_lr / self.initial_lr_actor)
-        
+
         # Apply decay to learning rates
         new_lr_actor = max(self.initial_lr_actor * decay_factor, self.min_lr)
         new_lr_critic = max(self.initial_lr_critic * decay_factor, self.min_lr)
-        
+
         # Only log if there's a significant change
         if abs(new_lr_actor - self.lr_actor) > 1e-7 and self.debug:
             print(f"[DEBUG] Updating learning rate at step {current_step}: actor {self.lr_actor:.6f} -> {new_lr_actor:.6f}, "
                   f"critic {self.lr_critic:.6f} -> {new_lr_critic:.6f}")
-                  
+
         # Check if we're using a shared optimizer in the algorithm
         if hasattr(self.algorithm, 'optimizer'):
             # Update optimizer's learning rate
             for param_group in self.algorithm.optimizer.param_groups:
                 param_group['lr'] = new_lr_actor  # Use actor LR for combined optimizer
-                
+
         # Update separate optimizers if they exist
         if hasattr(self.algorithm, 'actor_optimizer'):
             for param_group in self.algorithm.actor_optimizer.param_groups:
                 param_group['lr'] = new_lr_actor
-                
+
         if hasattr(self.algorithm, 'critic_optimizer'):
             for param_group in self.algorithm.critic_optimizer.param_groups:
                 param_group['lr'] = new_lr_critic
-                
+
         # Update stored values
         self.lr_actor = new_lr_actor
         self.lr_critic = new_lr_critic
-        
+
         # Update algorithm's learning rates if it stores them directly
         if hasattr(self.algorithm, 'lr_actor'):
             self.algorithm.lr_actor = new_lr_actor
         if hasattr(self.algorithm, 'lr_critic'):
             self.algorithm.lr_critic = new_lr_critic
-            
+
         return new_lr_actor, new_lr_critic
 
     # Reward Scaling Methods (REMOVED - Handled in Algorithm)
