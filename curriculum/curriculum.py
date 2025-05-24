@@ -229,59 +229,77 @@ except ImportError:
 
 # --- Configure RLGym-Based Reward Functions ---
 def create_phase1_reward():
-    """
-    Phase 1: Basic Ball Interaction
-    Rewards for touching the ball and moving towards it
-    Based on the RLGym-PPO guide recommendation for early training
-    """
-    # Main components with appropriate weights
-    velocity_reward = VelocityPlayerToBallReward(include_negative_values=True)
-    touch_reward = AdvancedTouchReward(touch_reward=10.0, acceleration_reward=5.0)
-    ball_travel_reward = BallTravelReward(consecutive_weight=2.0, goal_weight=3.0)
+    velocity_reward = VelocityPlayerToBallReward(include_negative_values=False)
+    touch_reward = AdvancedTouchReward(touch_reward=5.0, acceleration_reward=2.0)  # Reduce weights
+    ball_travel_reward = BallTravelReward(consecutive_weight=1.0, goal_weight=2.0)
 
-    # Combine rewards
+    # More balanced weights
     combined = CombinedReward(
-        (velocity_reward, 5.0),
-        (touch_reward, 50.0),
-        (ball_travel_reward, 1.0)
+        (velocity_reward, 1.0),      # Reduced from 5.0
+        (touch_reward, 10.0),        # Reduced from 50.0
+        (ball_travel_reward, 2.0)    # Increased from 1.0
     )
-
-    # Wrap in zero-sum reward wrapper
     return combined
 
 def create_phase2_reward():
     """
     Phase 2: Goal Scoring Focus
-    Rewards for moving the ball toward the goal and scoring
+    Gradual transition with more stable reward scaling
     """
-    # Main components with appropriate weights
-    velocity_reward = VelocityPlayerToBallReward(include_negative_values=True)
+    # Keep negative values disabled for stability
+    velocity_reward = VelocityPlayerToBallReward(include_negative_values=False)
     touch_reward = AdvancedTouchReward(touch_reward=5.0, acceleration_reward=7.0)
     ball_travel_reward = BallTravelReward(consecutive_weight=1.0, goal_weight=5.0)
     goal_reward = GoalReward()
     goal_prob_reward = GoalViewReward(gamma=0.99)
     boost_reward = BoostChangeReward(gain_weight=0.5, lose_weight=0.3)
 
-    # Combine rewards
+    # More conservative weight scaling
     combined = CombinedReward(
-        (velocity_reward, 5.0),
-        (touch_reward, 25.0),
-        (ball_travel_reward, 10.0),
-        (goal_reward, 200.0),
-        (goal_prob_reward, 10.0),
-        (boost_reward, 10.0)
+        (velocity_reward, 2.0),        # Reduced from 5.0
+        (touch_reward, 15.0),          # Reduced from 25.0
+        (ball_travel_reward, 8.0),     # Reduced from 10.0
+        (goal_reward, 50.0),           # MUCH reduced from 200.0
+        (goal_prob_reward, 5.0),       # Reduced from 10.0
+        (boost_reward, 3.0)            # Reduced from 10.0
     )
 
-    # Wrap in zero-sum reward wrapper
-    return ZeroSumRewardWrapper(combined, team_spirit=0.3)
+    # Consider removing zero-sum wrapper initially
+    return combined
+
+def create_phase3a_reward():
+    """
+    Phase 3A: Introduce aerials gradually
+    """
+    # Base components (similar to phase 2)
+    velocity_reward = VelocityPlayerToBallReward(include_negative_values=False)
+    touch_reward = AdvancedTouchReward(touch_reward=4.0, acceleration_reward=6.0)
+    ball_travel_reward = BallTravelReward(consecutive_weight=1.0, goal_weight=5.0)
+    goal_reward = GoalReward()
+    goal_prob_reward = GoalViewReward(gamma=0.99)
+    boost_reward = BoostChangeReward(gain_weight=0.3, lose_weight=0.2)
+
+    # Add ONLY aerial component first
+    aerial_reward = AerialDistanceReward(touch_height_weight=1.0, ball_distance_weight=1.0)
+
+    combined = CombinedReward(
+        (velocity_reward, 3.0),
+        (touch_reward, 18.0),
+        (ball_travel_reward, 8.0),
+        (goal_reward, 60.0),           # Gradually increase
+        (goal_prob_reward, 8.0),
+        (boost_reward, 5.0),
+        (aerial_reward, 15.0)          # Much lower than your 50.0
+    )
+
+    return ZeroSumRewardWrapper(combined, team_spirit=0.2)
 
 def create_phase3_reward():
     """
-    Phase 3: Advanced Play
-    Full game rewards including aerial play and team coordination
+    Phase 3B: Full advanced mechanics
     """
-    # Basic components
-    velocity_reward = VelocityPlayerToBallReward(include_negative_values=True)
+    # Base components
+    velocity_reward = VelocityPlayerToBallReward(include_negative_values=False)
     touch_reward = AdvancedTouchReward(touch_reward=3.0, acceleration_reward=5.0)
     ball_travel_reward = BallTravelReward(consecutive_weight=1.0, goal_weight=5.0,
                                           pass_weight=2.0, receive_weight=2.0)
@@ -289,28 +307,26 @@ def create_phase3_reward():
     goal_prob_reward = GoalViewReward(gamma=0.99)
     boost_reward = BoostChangeReward(gain_weight=0.3, lose_weight=0.2)
 
-    # Advanced mechanics components
+    # Advanced mechanics with conservative weights
     aerial_reward = AerialDistanceReward(touch_height_weight=1.0, ball_distance_weight=1.0)
     flip_reset_reward = FlipResetReward()
     demo_reward = DemoReward()
     wavedash_reward = WavedashReward()
 
-    # Combine all rewards with appropriate weights
     combined = CombinedReward(
-        (velocity_reward, 10.0),
-        (touch_reward, 25.0),
-        (ball_travel_reward, 5.0),
-        (goal_reward, 200.0),
-        (goal_prob_reward, 25.0),
-        (boost_reward, 15.0),
-        (aerial_reward, 50.0),
-        (flip_reset_reward, 15.0),
-        (demo_reward, 20.0),
-        (wavedash_reward, 10.0)
+        (velocity_reward, 4.0),
+        (touch_reward, 20.0),
+        (ball_travel_reward, 6.0),
+        (goal_reward, 80.0),           # Still much lower than 200.0
+        (goal_prob_reward, 12.0),
+        (boost_reward, 8.0),
+        (aerial_reward, 20.0),         # Reduced from 50.0
+        (flip_reset_reward, 8.0),      # Reduced from 15.0
+        (demo_reward, 10.0),           # Reduced from 20.0
+        (wavedash_reward, 5.0)         # Reduced from 10.0
     )
 
-    # Wrap in zero-sum reward wrapper
-    return ZeroSumRewardWrapper(combined, team_spirit=0.5)
+    return ZeroSumRewardWrapper(combined, team_spirit=0.3)
 
 # --- Position/Orientation Helper Functions (Keep existing ones) ---
 
@@ -401,10 +417,10 @@ def blue_left_kickoff_position():
 
 def blue_right_kickoff_position():
     return np.array([2048, -2560, 17.01])
-    
+
 def orange_left_kickoff_position():
     return np.array([-2048, 2560, 17.01])
-    
+
 def orange_right_kickoff_position():
     return np.array([2048, 2560, 17.01])
 

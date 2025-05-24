@@ -1648,7 +1648,7 @@ if __name__ == "__main__":
     # ------------------------------------
 
     # Training loop parameters
-    parser.add_argument('--ppo_epochs', type=int, default=10, help='Number of PPO epochs per update')
+    parser.add_argument('--ppo_epochs', type=int, default=4, help='Number of PPO epochs per update')
     parser.add_argument('--batch_size', type=int, default=24576, help='Batch size for PPO updates')
 
     # Weight clipping parameters removed - no longer used
