@@ -204,10 +204,14 @@ class PPOAlgorithm(BaseAlgorithm):
             """Initialize buffer tensors based on sample shapes if not already done."""
             if self.obs is None:
                 if not isinstance(obs_sample, torch.Tensor):
-                    obs_sample = torch.tensor(obs_sample, dtype=torch.float32)
+                    obs_sample = torch.tensor(obs_sample, dtype=torch.float32, device=self.device)
+                else:
+                    obs_sample = obs_sample.to(self.device)
                 if not isinstance(action_sample, torch.Tensor):
                     action_dtype = torch.long if self.action_space_type == "discrete" else torch.float32
-                    action_sample = torch.tensor(action_sample, dtype=action_dtype)
+                    action_sample = torch.tensor(action_sample, dtype=action_dtype, device=self.device)
+                else:
+                    action_sample = action_sample.to(self.device)
 
                 if obs_sample.dim() == 1: obs_sample = obs_sample.unsqueeze(0)
 
@@ -244,33 +248,39 @@ class PPOAlgorithm(BaseAlgorithm):
             action_sample_for_init = action_batch[0].clone().to(expected_action_dtype)
             self._initialize_buffers_if_needed(obs_batch[0], action_sample_for_init)
 
-            # Convert all inputs to tensors with correct types
-            if not isinstance(obs_batch, torch.Tensor): 
-                obs_batch = torch.tensor(obs_batch, dtype=torch.float32)
-            if not isinstance(action_batch, torch.Tensor):
-                action_batch = torch.tensor(action_batch, dtype=expected_action_dtype)
-            elif action_batch.dtype != expected_action_dtype:
-                if self.debug: print(f"[DEBUG PPOMemory] Casting action_batch from {action_batch.dtype} to {expected_action_dtype}")
-                action_batch = action_batch.to(expected_action_dtype)
-            if not isinstance(log_prob_batch, torch.Tensor): 
-                log_prob_batch = torch.tensor(log_prob_batch, dtype=torch.float32)
-            if not isinstance(reward_batch, torch.Tensor): 
-                reward_batch = torch.tensor(reward_batch, dtype=torch.float32)
-            if not isinstance(value_batch, torch.Tensor): 
-                value_batch = torch.tensor(value_batch, dtype=torch.float32)
-            elif value_batch.dtype != torch.float32: 
-                value_batch = value_batch.to(torch.float32)
-            if not isinstance(done_batch, torch.Tensor): 
-                done_batch = torch.tensor(done_batch, dtype=torch.bool)
-
-            # Move to target device
+            # Convert all inputs to tensors with correct types directly on device
             target_device = self.device
-            obs_batch = obs_batch.to(target_device)
-            action_batch = action_batch.to(target_device)
-            log_prob_batch = log_prob_batch.to(target_device)
-            reward_batch = reward_batch.to(target_device)
-            value_batch = value_batch.to(target_device)
-            done_batch = done_batch.to(target_device)
+            if not isinstance(obs_batch, torch.Tensor): 
+                obs_batch = torch.tensor(obs_batch, dtype=torch.float32, device=target_device)
+            else:
+                obs_batch = obs_batch.to(target_device)
+            
+            if not isinstance(action_batch, torch.Tensor):
+                action_batch = torch.tensor(action_batch, dtype=expected_action_dtype, device=target_device)
+            elif action_batch.dtype != expected_action_dtype or action_batch.device != target_device:
+                if self.debug and action_batch.dtype != expected_action_dtype: 
+                    print(f"[DEBUG PPOMemory] Casting action_batch from {action_batch.dtype} to {expected_action_dtype}")
+                action_batch = action_batch.to(dtype=expected_action_dtype, device=target_device)
+            
+            if not isinstance(log_prob_batch, torch.Tensor): 
+                log_prob_batch = torch.tensor(log_prob_batch, dtype=torch.float32, device=target_device)
+            else:
+                log_prob_batch = log_prob_batch.to(target_device)
+            
+            if not isinstance(reward_batch, torch.Tensor): 
+                reward_batch = torch.tensor(reward_batch, dtype=torch.float32, device=target_device)
+            else:
+                reward_batch = reward_batch.to(target_device)
+            
+            if not isinstance(value_batch, torch.Tensor): 
+                value_batch = torch.tensor(value_batch, dtype=torch.float32, device=target_device)
+            elif value_batch.dtype != torch.float32 or value_batch.device != target_device: 
+                value_batch = value_batch.to(dtype=torch.float32, device=target_device)
+            
+            if not isinstance(done_batch, torch.Tensor): 
+                done_batch = torch.tensor(done_batch, dtype=torch.bool, device=target_device)
+            else:
+                done_batch = done_batch.to(target_device)
 
             # Calculate indices for circular buffer
             indices = torch.arange(self.pos, self.pos + batch_size, device=target_device) % self.buffer_size
@@ -323,12 +333,12 @@ class PPOAlgorithm(BaseAlgorithm):
              """Store a single experience (obs, action, log_prob, reward, value, done)"""
              expected_action_dtype = torch.long if self.action_space_type == "discrete" else torch.float32
 
-             obs_b = torch.tensor([obs], dtype=torch.float32) if not isinstance(obs, torch.Tensor) else obs.unsqueeze(0)
-             act_b = torch.tensor([action], dtype=expected_action_dtype) if not isinstance(action, torch.Tensor) else action.unsqueeze(0).to(expected_action_dtype)
-             lp_b = torch.tensor([log_prob], dtype=torch.float32) if not isinstance(log_prob, torch.Tensor) else log_prob.unsqueeze(0)
-             rew_b = torch.tensor([reward], dtype=torch.float32) if not isinstance(reward, torch.Tensor) else reward.unsqueeze(0)
-             val_b = torch.tensor([value], dtype=torch.float32) if not isinstance(value, torch.Tensor) else value.unsqueeze(0).to(torch.float32)
-             done_b = torch.tensor([done], dtype=torch.bool) if not isinstance(done, torch.Tensor) else done.unsqueeze(0)
+             obs_b = torch.tensor([obs], dtype=torch.float32, device=self.device) if not isinstance(obs, torch.Tensor) else obs.unsqueeze(0).to(self.device)
+             act_b = torch.tensor([action], dtype=expected_action_dtype, device=self.device) if not isinstance(action, torch.Tensor) else action.unsqueeze(0).to(dtype=expected_action_dtype, device=self.device)
+             lp_b = torch.tensor([log_prob], dtype=torch.float32, device=self.device) if not isinstance(log_prob, torch.Tensor) else log_prob.unsqueeze(0).to(self.device)
+             rew_b = torch.tensor([reward], dtype=torch.float32, device=self.device) if not isinstance(reward, torch.Tensor) else reward.unsqueeze(0).to(self.device)
+             val_b = torch.tensor([value], dtype=torch.float32, device=self.device) if not isinstance(value, torch.Tensor) else value.unsqueeze(0).to(dtype=torch.float32, device=self.device)
+             done_b = torch.tensor([done], dtype=torch.bool, device=self.device) if not isinstance(done, torch.Tensor) else done.unsqueeze(0).to(self.device)
 
              # Store complete experience atomically
              self.store_batch(obs_b, act_b, lp_b, rew_b, val_b, done_b)
@@ -398,11 +408,11 @@ class PPOAlgorithm(BaseAlgorithm):
         if self.debug:
             print(f"[DEBUG PPO] Storing complete batch of size {obs_batch.shape[0]}")
         
-        # Ensure value_batch is float32 before storing
+        # Ensure value_batch is float32 and on correct device before storing
         if not isinstance(value_batch, torch.Tensor):
-             value_batch = torch.tensor(value_batch, dtype=torch.float32)
-        elif value_batch.dtype != torch.float32:
-             value_batch = value_batch.to(torch.float32)
+             value_batch = torch.tensor(value_batch, dtype=torch.float32, device=self.device)
+        elif value_batch.dtype != torch.float32 or value_batch.device != self.device:
+             value_batch = value_batch.to(dtype=torch.float32, device=self.device)
         
         # Store complete experiences atomically
         self.memory.store_batch(obs_batch, action_batch, log_prob_batch, reward_batch, value_batch, done_batch)
@@ -476,6 +486,8 @@ class PPOAlgorithm(BaseAlgorithm):
         """Get action and value for a given observation"""
         if not isinstance(obs, torch.Tensor):
             obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
+        else:
+            obs = obs.to(device=self.device, dtype=torch.float32)
         # Lazy init and normalize observation
         if self.obs_rms is None:
             # Handle different observation shapes more robustly
@@ -485,17 +497,28 @@ class PPOAlgorithm(BaseAlgorithm):
                 # For multi-dimensional obs, flatten to get feature count
                 feat_dim = obs.view(-1).shape[0] if obs.dim() > 1 else obs.numel()
             self.obs_rms = self.ret_rms.__class__(shape=(feat_dim,))
+            # Cache tensors to avoid repeated conversions
+            self._obs_mean_cache = None
+            self._obs_std_cache = None
         
         # Flatten observation for normalization if needed
         obs_shape = obs.shape
         obs_flat = obs.view(-1) if obs.dim() > 1 else obs
-        obs_np = obs_flat.cpu().numpy()
+        obs_np = obs_flat.detach().cpu().numpy()
         if obs_np.ndim == 1:
             obs_np = obs_np[None, :]
         self.obs_rms.update(obs_np)
-        mean = torch.from_numpy(self.obs_rms.mean).to(self.device).float()
-        std = torch.from_numpy(np.sqrt(self.obs_rms.var + 1e-8)).to(self.device).float()
-        obs_flat_norm = (obs_flat - mean) / std
+        
+        # Cache mean and std tensors to avoid repeated numpy-to-tensor conversions
+        if self._obs_mean_cache is None or self._obs_std_cache is None:
+            self._obs_mean_cache = torch.from_numpy(self.obs_rms.mean).to(device=self.device, dtype=torch.float32)
+            self._obs_std_cache = torch.from_numpy(np.sqrt(self.obs_rms.var + 1e-8)).to(device=self.device, dtype=torch.float32)
+        else:
+            # Update cached tensors in-place to avoid allocations
+            self._obs_mean_cache.copy_(torch.from_numpy(self.obs_rms.mean))
+            self._obs_std_cache.copy_(torch.from_numpy(np.sqrt(self.obs_rms.var + 1e-8)))
+        
+        obs_flat_norm = (obs_flat - self._obs_mean_cache) / self._obs_std_cache
         obs = obs_flat_norm.view(obs_shape) # Restore original shape
         # Add batch dimension if missing - check if first dimension could be batch size
         # We expect obs to be [batch_size, ...] or [...] where ... is the observation shape
@@ -816,6 +839,7 @@ class PPOAlgorithm(BaseAlgorithm):
         Returns:
             dict: metrics from the update
         """
+        # Initialize metric tensors once to avoid repeated allocations
         update_metrics_tensors = {
             'actor_loss': torch.tensor(0.0, device=self.device),
             'critic_loss': torch.tensor(0.0, device=self.device),
@@ -823,6 +847,10 @@ class PPOAlgorithm(BaseAlgorithm):
             'total_loss': torch.tensor(0.0, device=self.device), # Tracks combined loss of main optimizer
             'clip_fraction': torch.tensor(0.0, device=self.device),
         }
+        # Reusable tensors to avoid repeated allocations in loops
+        entropy_reuse = torch.tensor(0.0, device=self.device)
+        sr_loss_reuse = torch.tensor(0.0, device=self.device)
+        rp_loss_reuse = torch.tensor(0.0, device=self.device)
         update_metrics_scalars = { # For metrics not averaged over batches easily
             'sr_loss_scalar': 0.0,
             'rp_loss_scalar': 0.0,
@@ -895,7 +923,7 @@ class PPOAlgorithm(BaseAlgorithm):
                 actor_output = None
                 predicted_values = None # Scalar values
                 current_features = None
-                entropy = torch.tensor(0.0, device=self.device)
+                entropy = entropy_reuse.zero_()
                 curr_log_probs = None
 
                 try:
@@ -999,8 +1027,8 @@ class PPOAlgorithm(BaseAlgorithm):
                         entropy_loss = -entropy * self.entropy_coef
 
                         # --- Auxiliary Loss Calculation ---
-                        sr_loss = torch.tensor(0.0, device=self.device)
-                        rp_loss = torch.tensor(0.0, device=self.device)
+                        sr_loss = sr_loss_reuse.zero_()
+                        rp_loss = rp_loss_reuse.zero_()
                         sr_loss_scalar = 0.0
                         rp_loss_scalar = 0.0
                         if self.aux_task_manager is not None and current_features is not None and \

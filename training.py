@@ -1033,14 +1033,11 @@ class Trainer:
         # Batch intrinsic reward calculation
         intrinsic_rewards_batch = torch.zeros(batch_size, device=self.device)
         if self.use_intrinsic_rewards and not self.pretraining_completed and self.intrinsic_reward_generator is not None:
-            # Prepare batch tensors - handle possible CUDA tensors
-            processed_states = []
-            for s in states:
-                if isinstance(s, torch.Tensor):
-                    processed_states.append(s.cpu().detach().numpy())
-                else:
-                    processed_states.append(s)
-            states_tensor = torch.as_tensor(np.array(processed_states), dtype=torch.float32, device=self.device)
+            # Prepare batch tensors efficiently - avoid CPU transfers
+            if isinstance(states[0], torch.Tensor):
+                states_tensor = torch.stack([s.to(device=self.device, dtype=torch.float32) for s in states])
+            else:
+                states_tensor = torch.tensor(states, dtype=torch.float32, device=self.device)
             actions_tensor = self._prepare_action_batch_tensor(actions) # Assumes a new helper method
 
             # Getting next_states in batch is tricky, requires careful buffer inspection or assumptions
@@ -1077,55 +1074,54 @@ class Trainer:
         extrinsic_rewards_tensor = torch.tensor(extrinsic_rewards_batch_scalar, dtype=torch.float32, device=self.device)
 
         total_rewards_tensor = extrinsic_rewards_tensor + intrinsic_rewards_batch
-        total_rewards_batch = total_rewards_tensor.cpu().tolist()
+        # Keep tensor on GPU for algorithm storage, only convert to list if needed elsewhere
+        total_rewards_batch = None  # Will compute only if needed
 
         if self.algorithm_type == "ppo" and hasattr(self.algorithm, 'store_batch') and not test_mode:
-            # PPO uses its own batch storage method
-            obs_batch_tensor = torch.as_tensor(np.array(states), dtype=torch.float32, device=self.device)
-            # Actions might need specific formatting for PPO (e.g., Long for discrete)
+            # PPO uses its own batch storage method - optimize tensor creation
+            # Handle states efficiently
+            if isinstance(states[0], torch.Tensor):
+                obs_batch_tensor = torch.stack([s.to(device=self.device, dtype=torch.float32) for s in states])
+            else:
+                obs_batch_tensor = torch.tensor(states, dtype=torch.float32, device=self.device)
+            
+            # Handle actions efficiently
             action_dtype = torch.long if self.action_space_type == "discrete" else torch.float32
-            
-            # Handle possible CUDA tensors by moving to CPU first if needed
-            processed_actions = []
-            for a in actions:
-                if isinstance(a, torch.Tensor):
-                    processed_actions.append(a.cpu().detach().numpy())
-                else:
-                    processed_actions.append(a)
-            
-            try:
-                # Attempt to convert actions directly
-                actions_batch_tensor = torch.as_tensor(np.array(processed_actions), dtype=action_dtype, device=self.device)
-            except TypeError:
-                # Fallback for complex tensor types
-                actions_batch_tensor = torch.stack([torch.as_tensor(a, dtype=action_dtype) if not isinstance(a, torch.Tensor) 
-                                                  else a.to(dtype=action_dtype) for a in actions]).to(self.device)
+            if isinstance(actions[0], torch.Tensor):
+                # Stack existing tensors directly
+                actions_batch_tensor = torch.stack([a.to(device=self.device, dtype=action_dtype) for a in actions])
+            else:
+                # Create tensor directly from list
+                try:
+                    actions_batch_tensor = torch.tensor(actions, dtype=action_dtype, device=self.device)
+                except (ValueError, TypeError):
+                    # Fallback for complex action types
+                    actions_batch_tensor = torch.stack([torch.tensor(a, dtype=action_dtype, device=self.device) for a in actions])
 
-            # Process log_probs - handle CUDA tensors
-            processed_log_probs = []
-            for lp in log_probs:
-                if isinstance(lp, torch.Tensor):
-                    processed_log_probs.append(lp.cpu().detach().numpy())
-                else:
-                    processed_log_probs.append(lp)
-            log_probs_batch_tensor = torch.as_tensor(np.array(processed_log_probs), dtype=torch.float32, device=self.device)
+            # Handle log_probs efficiently
+            if isinstance(log_probs[0], torch.Tensor):
+                log_probs_batch_tensor = torch.stack([lp.to(device=self.device, dtype=torch.float32) for lp in log_probs])
+            else:
+                log_probs_batch_tensor = torch.tensor(log_probs, dtype=torch.float32, device=self.device)
             
-            # Process values - handle CUDA tensors
-            processed_values = []
-            for v in values:
-                if isinstance(v, torch.Tensor):
-                    processed_values.append(v.cpu().detach().numpy())
+            # Handle values efficiently
+            if isinstance(values[0], torch.Tensor):
+                values_batch_tensor = torch.stack([v.to(device=self.device, dtype=torch.float32) for v in values])
+            else:
+                values_batch_tensor = torch.tensor(values, dtype=torch.float32, device=self.device)
+            
+            # Ensure values have correct shape [batch_size]
+            if values_batch_tensor.dim() > 1:
+                if values_batch_tensor.shape[-1] == 1:
+                    values_batch_tensor = values_batch_tensor.squeeze(-1)
                 else:
-                    processed_values.append(v)
-            # Values should be scalar, ensure they are float32
-            values_batch_tensor = torch.as_tensor(np.array(processed_values), dtype=torch.float32, device=self.device)
-            if values_batch_tensor.dim() > 1 and values_batch_tensor.shape[-1] == 1: # Ensure [batch_size]
-                values_batch_tensor = values_batch_tensor.squeeze(-1)
-            elif values_batch_tensor.dim() > 1: # If still >1D, flatten
-                 values_batch_tensor = values_batch_tensor.view(batch_size, -1)[:,0] # Take first element if multiple features per value
+                    values_batch_tensor = values_batch_tensor.view(batch_size, -1)[:, 0]
 
-
-            dones_batch_tensor = torch.as_tensor(np.array(dones), dtype=torch.bool, device=self.device)
+            # Handle dones efficiently
+            if isinstance(dones[0], torch.Tensor):
+                dones_batch_tensor = torch.stack([d.to(device=self.device, dtype=torch.bool) for d in dones])
+            else:
+                dones_batch_tensor = torch.tensor(dones, dtype=torch.bool, device=self.device)
 
             self.algorithm.store_batch(
                 obs_batch_tensor,
@@ -1140,79 +1136,92 @@ class Trainer:
                 print(f"[STEP DEBUG] Trainer.store_experience_batch (PPO) incremented training_steps by {batch_size} to {self.training_steps}")
 
         elif not test_mode: # Fallback for other algorithms or if PPO's batch store isn't used
+            # Convert total_rewards_tensor to list only if needed for individual storage
+            if total_rewards_batch is None:
+                total_rewards_batch = total_rewards_tensor.detach().cpu().tolist()
+            
             for i in range(batch_size):
                 env_id_i = env_ids[i] if env_ids else 0
                 # This path reuses the single store_experience, which is less efficient
                 # but ensures intrinsic rewards are handled if not batched above.
                 # To truly batch, the intrinsic reward and storage for other algos would need batch methods.
                 self.store_experience(states[i], actions[i], log_probs[i], rewards[i], values[i], dones[i], env_id_i)
+        
+        # Only convert to list if needed for return value and not already done
+        if total_rewards_batch is None:
+            total_rewards_batch = total_rewards_tensor.detach().cpu().tolist()
 
         return total_rewards_batch
 
     def _prepare_action_tensor(self, action):
-        """Helper to convert a single action to a tensor."""
+        """Helper to convert a single action to a tensor without CPU transfers."""
         if isinstance(action, torch.Tensor):
-            # Handle CUDA tensors safely
-            if action.device.type == 'cuda':
-                # If already on CUDA, just ensure it's on the right device
-                return action.to(self.device)
+            # Keep tensor on GPU, just ensure correct device
             return action.to(self.device)
             
         if self.action_space_type == "discrete":
-            if isinstance(action, np.ndarray): action = int(action.item()) if action.size == 1 else int(action[0])
-            elif isinstance(action, (float, np.floating)): action = int(action)
+            if isinstance(action, np.ndarray): 
+                action = int(action.item()) if action.size == 1 else int(action[0])
+            elif isinstance(action, (float, np.floating)): 
+                action = int(action)
             elif hasattr(action, 'item'): 
-                # Handle tensor.item() for CUDA tensors
-                try:
-                    action = int(action.item())
-                except RuntimeError:
-                    # If CUDA tensor, move to CPU first
-                    action = int(action.cpu().item())
-            return torch.LongTensor([action]).to(self.device)
-        else: # Continuous
-            # Handle possible CUDA tensor
-            if isinstance(action, torch.Tensor):
-                action_tensor = action.to(dtype=torch.float32)
+                action = int(action.item())
             else:
-                action_tensor = torch.FloatTensor(action)
-            action_tensor = action_tensor.to(self.device)
-            return action_tensor.unsqueeze(0) if action_tensor.dim() == 1 else action_tensor
+                action = int(action)
+            # Create tensor directly on device
+            return torch.tensor([action], dtype=torch.long, device=self.device)
+        else: # Continuous
+            if isinstance(action, torch.Tensor):
+                action_tensor = action.to(dtype=torch.float32, device=self.device)
+            else:
+                # Create tensor directly on device
+                action_tensor = torch.tensor(action, dtype=torch.float32, device=self.device)
+            return action_tensor.unsqueeze(0) if action_tensor.dim() == 0 else action_tensor
 
     def _prepare_action_batch_tensor(self, actions):
-        """Helper to convert a batch of actions to a tensor."""
+        """Helper to convert a batch of actions to a tensor without CPU transfers."""
         if isinstance(actions, torch.Tensor):
             return actions.to(self.device)
         
+        action_dtype = torch.long if self.action_space_type == "discrete" else torch.float32
+        
+        # Check if all actions are already tensors
+        if all(isinstance(action, torch.Tensor) for action in actions):
+            # Stack tensors directly without CPU conversion
+            return torch.stack([action.to(device=self.device, dtype=action_dtype) for action in actions])
+        
+        # Mixed types or all non-tensors - convert efficiently
         processed_actions = []
         for action in actions:
             if isinstance(action, torch.Tensor):
-                # Handle CUDA tensors by moving to CPU before conversion
-                action_cpu = action.cpu().detach()
+                # Keep on GPU, convert to scalar if needed
                 if self.action_space_type == "discrete":
-                    processed_actions.append(int(action_cpu.item()))
+                    action_val = action.to(dtype=torch.long).item()
+                    processed_actions.append(action_val)
                 else:
-                    processed_actions.append(action_cpu.numpy())
+                    # For continuous, convert tensor to list/array on GPU then to CPU only once
+                    action_val = action.to(dtype=torch.float32).detach().cpu().numpy()
+                    processed_actions.append(action_val)
             elif self.action_space_type == "discrete":
-                if isinstance(action, np.ndarray): action_val = int(action.item()) if action.size == 1 else int(action[0])
-                elif isinstance(action, (float, np.floating)): action_val = int(action)
-                elif hasattr(action, 'item'): action_val = int(action.item())
-                else: action_val = int(action) # Fallback
+                if isinstance(action, np.ndarray): 
+                    action_val = int(action.item()) if action.size == 1 else int(action[0])
+                elif isinstance(action, (float, np.floating)): 
+                    action_val = int(action)
+                elif hasattr(action, 'item'): 
+                    action_val = int(action.item())
+                else: 
+                    action_val = int(action)
                 processed_actions.append(action_val)
             else: # Continuous
-                # Assuming actions are already list of lists/arrays or similar for continuous
                 processed_actions.append(action)
         
-        action_dtype = torch.long if self.action_space_type == "discrete" else torch.float32
         try:
             return torch.tensor(processed_actions, dtype=action_dtype, device=self.device)
         except Exception as e:
-            if self.debug: print(f"Error converting batch actions to tensor: {e}. Actions: {actions}")
-            # Fallback for complex structures, e.g. list of tensors
-            return torch.stack([
-                torch.as_tensor(a, dtype=action_dtype) if not isinstance(a, torch.Tensor) 
-                else a.to(dtype=action_dtype, device="cpu") 
-                for a in actions
-            ]).to(self.device)
+            if self.debug: 
+                print(f"Error converting batch actions to tensor: {e}. Actions: {actions}")
+            # Fallback for complex structures
+            return torch.stack([torch.tensor(action, dtype=action_dtype, device=self.device) for action in actions])
 
 
     def _get_next_state(self, env_id):
@@ -2345,11 +2354,11 @@ class Trainer:
             # Return zeros with the right shape
             return np.zeros(len(states))
 
-        # Convert inputs to tensors
+        # Convert inputs to tensors efficiently
         if not isinstance(states, torch.Tensor):
-            states_tensor = torch.FloatTensor(states).to(self.device)
+            states_tensor = torch.tensor(states, dtype=torch.float32, device=self.device)
         else:
-            states_tensor = states.to(self.device)
+            states_tensor = states.to(device=self.device, dtype=torch.float32)
 
         # Handle actions based on action space type
         if not isinstance(actions, torch.Tensor):
@@ -2359,15 +2368,15 @@ class Trainer:
                         actions_indices = np.argmax(actions, axis=1)
                     else:
                         actions_indices = np.array(actions, dtype=int)
-                    actions_tensor = torch.LongTensor(actions_indices).to(self.device)
+                    actions_tensor = torch.tensor(actions_indices, dtype=torch.long, device=self.device)
                 except Exception as e:
                     if self.debug:
                         print(f"[DEBUG] Failed to convert actions to LongTensor indices: {e}. Using FloatTensor.")
-                    actions_tensor = torch.FloatTensor(actions).to(self.device)
+                    actions_tensor = torch.tensor(actions, dtype=torch.float32, device=self.device)
             else: # Continuous
-                actions_tensor = torch.FloatTensor(actions).to(self.device)
+                actions_tensor = torch.tensor(actions, dtype=torch.float32, device=self.device)
         else:
-            actions_tensor = actions.to(self.device)
+            actions_tensor = actions.to(device=self.device)
             if self.action_space_type == "discrete" and actions_tensor.dtype != torch.long:
                  if actions_tensor.ndim == 2 and actions_tensor.shape[1] == self.action_dim:
                      actions_tensor = torch.argmax(actions_tensor, dim=1).long()
@@ -2376,9 +2385,9 @@ class Trainer:
 
 
         if not isinstance(next_states, torch.Tensor):
-            next_states_tensor = torch.FloatTensor(next_states).to(self.device)
+            next_states_tensor = torch.tensor(next_states, dtype=torch.float32, device=self.device)
         else:
-            next_states_tensor = next_states.to(self.device)
+            next_states_tensor = next_states.to(device=self.device, dtype=torch.float32)
 
         # Ensure batch dimension
         if states_tensor.dim() == 1: states_tensor = states_tensor.unsqueeze(0)
