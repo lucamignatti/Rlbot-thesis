@@ -528,7 +528,8 @@ def run_training(
     entropy_coef: float = 0.01,
     max_grad_norm: float = 0.5,
     ppo_epochs: int = 10,
-    batch_size: int = 64,
+    batch_size: int = 128,
+    buffer_size: int = 262144,
     aux_amp: bool = False,
     aux_scale: float = 0.005,
     algorithm: str = "ppo",
@@ -592,6 +593,13 @@ def run_training(
     # Initialize action stacker for keeping track of previous actions
     action_stacker = ActionStacker(stack_size=5, action_size=actor.action_shape)
 
+    # Validate buffer_size for PPO
+    if algorithm == "ppo" and buffer_size < update_interval:
+        print(f"WARNING: PPO buffer_size ({buffer_size}) is smaller than update_interval ({update_interval})")
+        print(f"This will cause PPO stats to appear as 0 because the buffer will be overwritten before updates.")
+        print(f"Automatically increasing buffer_size to {update_interval}")
+        buffer_size = update_interval
+
     # Initialize the Trainer
     trainer = Trainer(
         actor,
@@ -612,6 +620,7 @@ def run_training(
         max_grad_norm=max_grad_norm,
         ppo_epochs=ppo_epochs,
         batch_size=batch_size,
+        buffer_size=buffer_size,
 
         use_wandb=use_wandb,
         debug=debug,
@@ -1058,7 +1067,7 @@ def run_training(
                             current_exp_idx += 1
                         else:
                             if debug: print(f"[DEBUG] Warning: current_exp_idx ({current_exp_idx}) exceeded all_obs_list length ({len(all_obs_list)})")
-                
+
                 # Call batch store experience
                 if len(batch_obs_store) > 0:
                     # Pass next_obs_batch if available and needed for batch intrinsic rewards
@@ -1587,6 +1596,8 @@ if __name__ == "__main__":
                         help='Number of parallel environments to run for faster data collection')
     parser.add_argument('--update_interval', type=int, default=204800,
                         help='Number of experiences to collect before updating the policy (PPO)')
+    parser.add_argument('--ppo_buffer_size', type=int, default=262144,
+                        help='Size of the PPO experience buffer (should be >= update_interval)')
     parser.add_argument('--device', type=str, default=None,
                        help='Device to use for training (cuda/mps/cpu).  Autodetects if not specified.')
     parser.add_argument('--wandb', action='store_true', help='Enable logging to Weights & Biases')
@@ -1614,8 +1625,8 @@ if __name__ == "__main__":
     parser.add_argument('--lrc', type=float, default=1e-4, help='Learning rate for critic network') # No longer does anything. Here for stability.
 
     # Learning rate decay
-    parser.add_argument('--lr-decay', action='store_true', default=True,help='Enable learning rate decay')
-    parser.add_argument('--lr-decay-rate', type=float, default=0.005, help='Learning rate decay factor (e.g., 0.7 means decay to 70% over decay steps)')
+    parser.add_argument('--lr-decay', action='store_true', default=False, help='Enable learning rate decay')
+    parser.add_argument('--lr-decay-rate', type=float, default=0.005, help='Learning rate decay factor (e.g., 0.7 means decay to 70%% over decay steps)')
     parser.add_argument('--lr-decay-steps', type=int, default=1000000, help='Number of steps over which to decay the learning rate')
     parser.add_argument('--min-lr', type=float, default=3e-5, help='Minimum learning rate after decay')
 
@@ -2107,6 +2118,7 @@ if __name__ == "__main__":
             training_time=training_time_seconds,
             render=args.render,
             update_interval=args.update_interval,
+            buffer_size=args.ppo_buffer_size,
             use_wandb=args.wandb,
             debug=args.debug,
             use_compile=args.compile,

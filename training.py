@@ -323,6 +323,7 @@ class Trainer:
                 max_grad_norm=max_grad_norm,
                 ppo_epochs=ppo_epochs,
                 batch_size=batch_size,
+                buffer_size=buffer_size,
                 use_amp=self.use_amp, # Pass the trainer's use_amp flag
                 debug=debug,
                 use_wandb=use_wandb,

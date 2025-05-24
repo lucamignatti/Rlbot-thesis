@@ -45,8 +45,9 @@ class PPOAlgorithm(BaseAlgorithm):
         critic_coef: float = 0.5,
         entropy_coef: float = 0.01,
         max_grad_norm: float = 0.5,
-        ppo_epochs: int = 4,
+        ppo_epochs: int = 10,
         batch_size: int = 64,
+        buffer_size: int = 262144,
         use_amp: bool = False,
         debug: bool = False,
         use_wandb: bool = False,
@@ -96,8 +97,8 @@ class PPOAlgorithm(BaseAlgorithm):
         # Note: PPOMemory class needs to be adapted slightly or confirmed compatible
         self.memory = self.PPOMemory(
             batch_size=batch_size,
-            # Smaller buffer size for fresher experiences
-            buffer_size=16384, # Reduced from 131072 to prevent staleness
+            # Buffer size should be at least as large as update_interval
+            buffer_size=buffer_size, # Configurable buffer size
             device=device,
             debug=debug,
             action_space_type=self.action_space_type,
