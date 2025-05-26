@@ -106,39 +106,36 @@ class PPOAlgorithm(BaseAlgorithm):
         )
 
         # Initialize optimizer(s)
-        # Option 1: Shared Optimizer (if lr_actor == lr_critic or models are shared)
-        if self.shared_model or lr_actor == lr_critic:
-             combined_params = list(self.actor.parameters()) # Covers both if shared
-             if not self.shared_model:
-                 combined_params += list(self.critic.parameters()) # Add critic if separate
+        # Always use separate optimizers to enable different learning rates for actor and critic
+        if self.shared_model:
+            # For shared models, both optimizers point to the same parameters but can have different LRs
+            combined_params = list(self.actor.parameters()) # Covers both since they're shared
 
-             # Add auxiliary task parameters if they exist
-             if self.aux_task_manager:
-                 aux_params = self.aux_task_manager.get_parameters() # Assume manager provides its params
-                 combined_params += aux_params
+            # Add auxiliary task parameters if they exist
+            if self.aux_task_manager:
+                aux_params = self.aux_task_manager.get_parameters()
+                combined_params += aux_params
 
-             self.optimizer = torch.optim.Adam(combined_params, lr=lr_actor, eps=adam_eps)
-             self.actor_optimizer = self.optimizer # Point to the same optimizer
-             self.critic_optimizer = self.optimizer # Point to the same optimizer
-             if self.debug: print("[DEBUG PPO] Using combined optimizer.")
-
-        # Option 2: Separate Optimizers
+            self.actor_optimizer = torch.optim.Adam(combined_params, lr=lr_actor, eps=adam_eps)
+            self.critic_optimizer = torch.optim.Adam(combined_params, lr=lr_critic, eps=adam_eps)
+            # Create a dummy combined optimizer reference for scaler (use actor optimizer)
+            self.optimizer = self.actor_optimizer
+            if self.debug: print(f"[DEBUG PPO] Using separate optimizers for shared model. Actor LR: {lr_actor}, Critic LR: {lr_critic}")
         else:
+            # Separate models get separate parameters and optimizers
             actor_params = list(self.actor.parameters())
             critic_params = list(self.critic.parameters())
 
-            # Add auxiliary task parameters ONLY to the optimizer corresponding to the shared backbone
-            # Typically, aux tasks branch off the actor's backbone features
+            # Add auxiliary task parameters to actor optimizer (assuming aux tasks depend on actor features)
             if self.aux_task_manager:
                 aux_params = self.aux_task_manager.get_parameters()
-                # Decide where aux params go - usually actor if features come from there
-                actor_params += aux_params # Assuming aux tasks depend on actor features
+                actor_params += aux_params
 
             self.actor_optimizer = torch.optim.Adam(actor_params, lr=lr_actor, eps=adam_eps)
             self.critic_optimizer = torch.optim.Adam(critic_params, lr=lr_critic, eps=adam_eps)
-            # Create a dummy combined optimizer reference for scaler (only one needed)
-            self.optimizer = self.actor_optimizer # Or critic_optimizer, scaler works with any
-            if self.debug: print("[DEBUG PPO] Using separate optimizers.")
+            # Create a dummy combined optimizer reference for scaler (use actor optimizer)
+            self.optimizer = self.actor_optimizer
+            if self.debug: print(f"[DEBUG PPO] Using separate optimizers for separate models. Actor LR: {lr_actor}, Critic LR: {lr_critic}")
 
 
         # Initialize GradScaler if AMP is enabled
@@ -161,9 +158,6 @@ class PPOAlgorithm(BaseAlgorithm):
         # Add episode return tracking
         self.episode_returns = deque(maxlen=100)
         self._temp_episode_rewards = []
-
-        # --- Removed SimbaV2 Reward Normalization Params ---
-
 
     class PPOMemory:
         """Memory buffer for PPO to store experiences (Standard Version)"""
@@ -250,34 +244,34 @@ class PPOAlgorithm(BaseAlgorithm):
 
             # Convert all inputs to tensors with correct types directly on device
             target_device = self.device
-            if not isinstance(obs_batch, torch.Tensor): 
+            if not isinstance(obs_batch, torch.Tensor):
                 obs_batch = torch.tensor(obs_batch, dtype=torch.float32, device=target_device)
             else:
                 obs_batch = obs_batch.to(target_device)
-            
+
             if not isinstance(action_batch, torch.Tensor):
                 action_batch = torch.tensor(action_batch, dtype=expected_action_dtype, device=target_device)
             elif action_batch.dtype != expected_action_dtype or action_batch.device != target_device:
-                if self.debug and action_batch.dtype != expected_action_dtype: 
+                if self.debug and action_batch.dtype != expected_action_dtype:
                     print(f"[DEBUG PPOMemory] Casting action_batch from {action_batch.dtype} to {expected_action_dtype}")
                 action_batch = action_batch.to(dtype=expected_action_dtype, device=target_device)
-            
-            if not isinstance(log_prob_batch, torch.Tensor): 
+
+            if not isinstance(log_prob_batch, torch.Tensor):
                 log_prob_batch = torch.tensor(log_prob_batch, dtype=torch.float32, device=target_device)
             else:
                 log_prob_batch = log_prob_batch.to(target_device)
-            
-            if not isinstance(reward_batch, torch.Tensor): 
+
+            if not isinstance(reward_batch, torch.Tensor):
                 reward_batch = torch.tensor(reward_batch, dtype=torch.float32, device=target_device)
             else:
                 reward_batch = reward_batch.to(target_device)
-            
-            if not isinstance(value_batch, torch.Tensor): 
+
+            if not isinstance(value_batch, torch.Tensor):
                 value_batch = torch.tensor(value_batch, dtype=torch.float32, device=target_device)
-            elif value_batch.dtype != torch.float32 or value_batch.device != target_device: 
+            elif value_batch.dtype != torch.float32 or value_batch.device != target_device:
                 value_batch = value_batch.to(dtype=torch.float32, device=target_device)
-            
-            if not isinstance(done_batch, torch.Tensor): 
+
+            if not isinstance(done_batch, torch.Tensor):
                 done_batch = torch.tensor(done_batch, dtype=torch.bool, device=target_device)
             else:
                 done_batch = done_batch.to(target_device)
@@ -287,7 +281,7 @@ class PPOAlgorithm(BaseAlgorithm):
 
             # Store all data atomically
             self.obs.index_copy_(0, indices, obs_batch.detach())
-            
+
             # Handle action shapes
             if self.action_space_type == "discrete":
                 if action_batch.dim() == 1 and self.actions.dim() == 1:
@@ -304,7 +298,7 @@ class PPOAlgorithm(BaseAlgorithm):
 
             self.log_probs.index_copy_(0, indices, log_prob_batch.detach())
             self.rewards.index_copy_(0, indices, reward_batch.detach())
-            
+
             # Handle value shapes - ensure value_batch is 1D
             if value_batch.dim() == 2 and value_batch.shape[1] == 1:
                 value_batch = value_batch.squeeze(1)  # Convert from [batch, 1] to [batch]
@@ -313,7 +307,7 @@ class PPOAlgorithm(BaseAlgorithm):
                     print(f"[DEBUG PPOMemory] Unexpected value shape: {value_batch.shape}")
                 value_batch = value_batch.view(-1)  # Flatten to 1D
             self.values.index_copy_(0, indices, value_batch.detach())
-            
+
             self.dones.index_copy_(0, indices, done_batch.detach())
 
             # Update buffer state
@@ -407,13 +401,13 @@ class PPOAlgorithm(BaseAlgorithm):
         """Store complete experiences in batch."""
         if self.debug:
             print(f"[DEBUG PPO] Storing complete batch of size {obs_batch.shape[0]}")
-        
+
         # Ensure value_batch is float32 and on correct device before storing
         if not isinstance(value_batch, torch.Tensor):
              value_batch = torch.tensor(value_batch, dtype=torch.float32, device=self.device)
         elif value_batch.dtype != torch.float32 or value_batch.device != self.device:
              value_batch = value_batch.to(dtype=torch.float32, device=self.device)
-        
+
         # Store complete experiences atomically
         self.memory.store_batch(obs_batch, action_batch, log_prob_batch, reward_batch, value_batch, done_batch)
 
@@ -426,7 +420,7 @@ class PPOAlgorithm(BaseAlgorithm):
         """Update rewards and dones for experiences at given indices in batch."""
         if self.debug:
             print(f"[DEBUG PPO] Updating rewards/dones for batch of size {len(indices)}")
-        
+
         # Convert to tensors if needed
         if not isinstance(rewards_batch, torch.Tensor):
             rewards_batch = torch.tensor(rewards_batch, dtype=torch.float32, device=self.device)
@@ -434,16 +428,16 @@ class PPOAlgorithm(BaseAlgorithm):
             dones_batch = torch.tensor(dones_batch, dtype=torch.bool, device=self.device)
         if not isinstance(indices, torch.Tensor):
             indices = torch.tensor(indices, dtype=torch.long, device=self.device)
-        
+
         # Batch update the memory buffer
         indices = indices.to(self.device)
         rewards_batch = rewards_batch.to(self.device)
         dones_batch = dones_batch.to(self.device)
-        
+
         # Update rewards and dones in batch
         self.memory.rewards.index_copy_(0, indices, rewards_batch)
         self.memory.dones.index_copy_(0, indices, dones_batch)
-        
+
         # Track episode returns for completed episodes
         if torch.any(dones_batch):
             # Simple episode tracking - just count completed episodes
@@ -470,7 +464,7 @@ class PPOAlgorithm(BaseAlgorithm):
             reward_val = reward.item()
         else:
             reward_val = float(reward)
-        
+
         self._temp_episode_rewards.append(reward_val)
 
         if done:
@@ -500,7 +494,7 @@ class PPOAlgorithm(BaseAlgorithm):
             # Cache tensors to avoid repeated conversions
             self._obs_mean_cache = None
             self._obs_std_cache = None
-        
+
         # Flatten observation for normalization if needed
         obs_shape = obs.shape
         obs_flat = obs.view(-1) if obs.dim() > 1 else obs
@@ -508,7 +502,7 @@ class PPOAlgorithm(BaseAlgorithm):
         if obs_np.ndim == 1:
             obs_np = obs_np[None, :]
         self.obs_rms.update(obs_np)
-        
+
         # Cache mean and std tensors to avoid repeated numpy-to-tensor conversions
         if self._obs_mean_cache is None or self._obs_std_cache is None:
             self._obs_mean_cache = torch.from_numpy(self.obs_rms.mean).to(device=self.device, dtype=torch.float32)
@@ -517,7 +511,7 @@ class PPOAlgorithm(BaseAlgorithm):
             # Update cached tensors in-place to avoid allocations
             self._obs_mean_cache.copy_(torch.from_numpy(self.obs_rms.mean))
             self._obs_std_cache.copy_(torch.from_numpy(np.sqrt(self.obs_rms.var + 1e-8)))
-        
+
         obs_flat_norm = (obs_flat - self._obs_mean_cache) / self._obs_std_cache
         obs = obs_flat_norm.view(obs_shape) # Restore original shape
         # Add batch dimension if missing - check if first dimension could be batch size
@@ -750,14 +744,14 @@ class PPOAlgorithm(BaseAlgorithm):
             tuple of (returns, advantages) tensors, both shape [buffer_size]
         """
         buffer_size = len(rewards)
-        
+
         # Validate inputs
         if buffer_size == 0:
             if self.debug:
                 print("[DEBUG PPO _compute_gae] Empty buffer, returning empty tensors")
             empty_tensor = torch.zeros(0, device=rewards.device)
             return empty_tensor, empty_tensor
-            
+
         if not isinstance(last_value, (int, float)):
             raise ValueError(f"last_value must be a scalar, got {type(last_value)}")
 
@@ -769,7 +763,7 @@ class PPOAlgorithm(BaseAlgorithm):
             values = values.squeeze(1) # Convert [buffer_size, 1] to [buffer_size]
         elif values.dim() > 1:
             values = values.view(-1) # Flatten to [buffer_size]
-            
+
         # Validate tensor shapes match
         if values.shape[0] != buffer_size or dones.shape[0] != buffer_size:
             raise ValueError(f"Tensor shape mismatch: rewards={rewards.shape}, values={values.shape}, dones={dones.shape}")
@@ -789,11 +783,14 @@ class PPOAlgorithm(BaseAlgorithm):
         # Compute returns R_t = A_t + V(s_t)
         returns = advantages + values
 
+        # Clip returns to prevent extreme values that cause critic loss spikes
+        returns = torch.clamp(returns, -100.0, 100.0)
+
         # Normalize advantages across the entire buffer (standard practice)
         # Use more robust normalization with better numerical stability
         adv_mean = advantages.mean()
         adv_std = advantages.std()
-        
+
         # Use a larger epsilon (1e-5) and check if std is too small before normalizing
         if adv_std.item() > 1e-6:
             # Only normalize if std is large enough to avoid numerical instability
@@ -810,13 +807,14 @@ class PPOAlgorithm(BaseAlgorithm):
             # Fallback: use centered but unscaled advantages
             advantages = (returns - values)  # Use raw advantages without scaling
             advantages = advantages - advantages.mean()  # At least center them
-            
+
         if torch.isnan(returns).any() or torch.isinf(returns).any():
             if self.debug:
                 print("[DEBUG PPO _compute_gae] NaN or Inf detected in returns")
 
         if self.debug:
             print(f"[DEBUG PPO _compute_gae] Returns mean: {returns.mean():.4f}, std: {returns.std():.4f}")
+            print(f"[DEBUG PPO _compute_gae] Returns range: [{returns.min():.4f}, {returns.max():.4f}]")
             print(f"[DEBUG PPO _compute_gae] Advantages (normalized) mean: {advantages.mean():.4f}, std: {advantages.std():.4f}")
 
         return returns, advantages
@@ -988,20 +986,20 @@ class PPOAlgorithm(BaseAlgorithm):
 
                         if curr_log_probs is None: raise ValueError("Could not compute current log probs")
 
-                        # Ratio and surrogate objectives 
+                        # Ratio and surrogate objectives
                         # First check for numerical issues in log probs
                         if torch.isnan(curr_log_probs).any() or torch.isinf(curr_log_probs).any():
                             if self.debug: print("Warning: NaN/Inf in current log probs, clamping")
                             curr_log_probs = torch.clamp(curr_log_probs, -20.0, 0.0)
-                        
+
                         if torch.isnan(batch_old_log_probs).any() or torch.isinf(batch_old_log_probs).any():
-                            if self.debug: print("Warning: NaN/Inf in old log probs, clamping") 
+                            if self.debug: print("Warning: NaN/Inf in old log probs, clamping")
                             batch_old_log_probs = torch.clamp(batch_old_log_probs, -20.0, 0.0)
-                            
+
                         # Calculate policy ratio with stricter numerical safeguards
                         log_ratio = curr_log_probs - batch_old_log_probs
                         ratio = torch.exp(torch.clamp(log_ratio, -10, 10))  # Tighter clipping range
-                        
+
                         # Apply clipping to prevent extreme policy updates
                         surr1 = ratio * batch_advantages
                         surr2 = torch.clamp(ratio, 1.0 - eps, 1.0 + eps) * batch_advantages
@@ -1013,12 +1011,12 @@ class PPOAlgorithm(BaseAlgorithm):
                         if torch.isnan(predicted_values).any() or torch.isinf(predicted_values).any():
                             if self.debug: print("Warning: NaN/Inf in predicted values, clamping")
                             predicted_values = torch.clamp(predicted_values, -10.0, 10.0)
-                            
+
                         value_pred_clipped = batch_old_values + (predicted_values - batch_old_values).clamp(-self.value_clip_epsilon, self.value_clip_epsilon)
                         loss_original = (predicted_values - batch_returns).pow(2)
                         loss_clipped = (value_pred_clipped - batch_returns).pow(2)
                         critic_loss = 0.5 * torch.mean(torch.max(loss_original, loss_clipped))
-                        
+
                         # Add light L2 regularization to prevent value extremes
                         l2_reg = torch.mean(predicted_values.pow(2)) * 0.0001  # Reduced from 0.001
                         critic_loss = critic_loss + l2_reg
@@ -1097,15 +1095,19 @@ class PPOAlgorithm(BaseAlgorithm):
                          nn.utils.clip_grad_norm_(self.aux_task_manager.get_parameters(), self.max_grad_norm)
 
 
-                    # Unscale and clip critic grads if separate
-                    if not self.shared_model and self.critic_optimizer is not self.actor_optimizer:
-                        self.scaler.unscale_(self.critic_optimizer)
+                    # Unscale and clip critic grads - always do this since we always use separate optimizers
+                    self.scaler.unscale_(self.critic_optimizer)
+                    if self.shared_model:
+                        # For shared models, parameters are the same but optimizers are different
+                        # Only clip once to avoid double-clipping the same parameters
+                        pass  # Already clipped above with actor parameters
+                    else:
+                        # For separate models, clip critic parameters separately
                         nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
 
-                # Optimizer Step(s)
+                # Optimizer Step(s) - Always step both optimizers since we always use separate ones
                 self.scaler.step(self.actor_optimizer)
-                if not self.shared_model and self.critic_optimizer is not self.actor_optimizer:
-                     self.scaler.step(self.critic_optimizer)
+                self.scaler.step(self.critic_optimizer)
 
                 # Update scaler
                 self.scaler.update()
